@@ -1,7 +1,21 @@
 # 🎯 Interview Prep — System Design, Low-Level Design & CS Mastery
 
+[![GitHub Pages](https://img.shields.io/badge/GitHub%20Pages-Live-brightgreen?style=for-the-badge&logo=github)](https://cpbrucemeena.github.io/interview-prep/)
+[![MkDocs Material](https://img.shields.io/badge/MkDocs-Material-7c3aed?style=for-the-badge&logo=materialdesign)](https://squidfunk.github.io/mkdocs-material/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
+
 > **A curated collection of 18 Low-Level Design (LLD) projects + 1 complete RAG Learning module + 3 language/CS interview modules**  
 > *Designed for 6+ year experienced backend engineers preparing for Senior/Staff/Principal-level interviews*
+
+---
+
+## 🌐 GitHub Pages Site
+
+All content is available as an interactive, searchable documentation site:
+
+👉 **[https://cpbrucemeena.github.io/interview-prep/](https://cpbrucemeena.github.io/interview-prep/)**
+
+Press <kbd>Ctrl</kbd>+<kbd>K</kbd> to search across all 90+ staff-level questions instantly.
 
 ---
 
