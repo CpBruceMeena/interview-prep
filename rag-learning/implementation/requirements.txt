@@ -1,0 +1,17 @@
+# RAG Chatbot Dependencies
+# Using flexible pins for Python 3.14+ compatibility
+fastapi
+uvicorn[standard]
+pydantic-settings
+sentence-transformers
+chromadb
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+requests
+python-multipart
+numpy
+pypdf
+beautifulsoup4
+pytest
