@@ -1,7 +1,7 @@
-# 🎯 Interview Prep — System Design & Low-Level Design Mastery
+# 🎯 Interview Prep — System Design, Low-Level Design & CS Mastery
 
-> **A curated collection of 18 Low-Level Design (LLD) projects + 1 complete RAG Learning module**  
-> *Designed for 6+ year experienced backend engineers preparing for Senior/Staff-level interviews*
+> **A curated collection of 18 Low-Level Design (LLD) projects + 1 complete RAG Learning module + 3 language/CS interview modules**  
+> *Designed for 6+ year experienced backend engineers preparing for Senior/Staff/Principal-level interviews*
 
 ---
 
@@ -38,6 +38,20 @@ interview-prep/
 │   ├── 06_LOW_LEVEL_DESIGN.md
 │   ├── 07_HIGH_LEVEL_DESIGN.md
 │   └── implementation/      ← Working Python RAG chatbot
+│
+├── python-interview/        ← Staff-level Python interview questions (12 deep-dive topics)
+│
+├── golang-interview/        ← Staff-level Golang interview questions (12 deep-dive topics)
+│
+├── cs-interview/            ← 8 CS core topics for Staff/Principal engineers
+│   ├── operating-systems/
+│   ├── computer-networks/
+│   ├── database-systems/
+│   ├── distributed-systems/
+│   ├── concurrency-parallelism/
+│   ├── data-structures-algorithms/
+│   ├── software-architecture/
+│   └── security/
 │
 ├── pyproject.toml
 └── README.md                ← You are here
@@ -147,6 +161,63 @@ python main.py --serve
 
 ---
 
+## 🧪 Language & CS Interview Modules
+
+### 🐍 Python Deep-Dive (`python-interview/`)
+
+12 staff-level interview questions covering CPython internals:
+
+| # | Topic | Key Concepts |
+|---|-------|-------------|
+| 1 | **GIL Internals** | Tick mechanism, 5ms switch interval, subinterpreters, free-threaded Python 3.13 |
+| 2 | **Async/Await** | Event loop phases, `__await__` protocol, TaskGroup, uvloop |
+| 3 | **Metaclasses & Descriptors** | `__set_name__`, `__init_subclass__`, Django-style ORM design |
+| 4 | **Memory Management** | Arena allocator, cyclic GC, `__slots__`, memory leak patterns |
+| 5 | **Type System** | Covariance/contravariance, Generic, Protocol structural typing |
+| 6 | **C Extensions** | PyObject layout, reference counting, PyPy vs CPython ABI |
+| 7 | **Import System** | MetaPathFinder, PathFinder, circular import resolution |
+| 8 | **Context Managers** | `yield from`, coroutine foundation, async context managers |
+| 9 | **Async Generators** | Streaming pipelines, `aclose()`, cleanup guarantees |
+| 10 | **Packaging** | manylinux wheels, auditwheel, py_limited_api, cibuildwheel |
+| 11 | **Subinterpreters** | Isolation model, `interpreters` module, per-interpreter GIL |
+| 12 | **DI Framework Design** | Auto-wiring, `inspect.signature`, `__init_subclass__`-based |
+
+### 🐹 Golang Deep-Dive (`golang-interview/`)
+
+12 staff-level interview questions covering Go runtime internals:
+
+| # | Topic | Key Concepts |
+|---|-------|-------------|
+| 1 | **GMP Scheduler** | Work stealing, syscall handler unbinding, signal-based preemption |
+| 2 | **Channel Internals** | hchan struct, sudog, direct send optimization, goroutine parking |
+| 3 | **Interface Satisfaction** | itab/iface/eface layout, nil interface trap, structural typing |
+| 4 | **Memory Model** | Happens-before, `atomic.Pointer`, sharded counters, false sharing |
+| 5 | **GC** | Tri-color marking, write barrier, GC trigger formula, GOMEMLIMIT |
+| 6 | **sync Package** | `sync.Map` read/dirty mechanism, `Pool`, `Once`, `Cond` |
+| 7 | **Context** | Custom Done channel, safe value propagation, cancellation patterns |
+| 8 | **Error Handling** | Domain errors, `errors.Is`/`As`, gRPC error mapping, PII safety |
+| 9 | **io.Reader/Writer** | Composition pipeline with encryption + compression, peek vs read |
+| 10 | **reflect** | Struct tag validation, code generation vs reflection trade-offs |
+| 11 | **Testing** | Interface-based mocking, testcontainers, fuzz testing, gotestsum |
+| 12 | **Production Service** | Graceful shutdown, middleware chain, structured logging, health checks |
+
+### 🖥️ Computer Science Core (`cs-interview/`)
+
+8 deep-dive CS topics for Staff/Principal Engineer interviews:
+
+| # | Topic | Key Questions | Depth |
+|---|-------|--------------|-------|
+| 1 | **Operating Systems** | Virtual memory (4-level page tables), TLB & huge pages, CFS scheduler, context switch cost, epoll vs io_uring, malloc internals, page cache, ext4 vs xfs vs btrfs, IPC (shared memory for HFT), signals & EINTR, cgroups v2, OOM killer | ~12 questions |
+| 2 | **Computer Networks** | TCP congestion control (BBR vs Cubic), HTTP/2 HoL blocking, QUIC handshake & 0-RTT, TLS 1.3 optimization, DNS deep dive (anycast, health checks), L4 vs L7 load balancing, connection pooling, gRPC vs REST wire format, CDN caching strategies, TIME_WAIT exhaustion | ~12 questions |
+| 3 | **Database Systems** | B-Tree vs LSM-Tree (financial ledger vs time-series), MVCC (PG vs InnoDB), transaction isolation & anomalies, query optimization (30s→125ms), indexing strategies (B-Tree, Hash, GiST, GIN, BRIN), sync/async replication, sharding, buffer pool internals, deadlock detection, 2PL vs OCC, materialized views, connection pooling, CockroachDB vs Spanner | ~14 questions |
+| 4 | **Distributed Systems** | CAP & PACELC, Raft consensus (leader election, log matching, split-brain prevention), 2PC vs 3PC vs Saga, vector clocks & Lamport timestamps, consistent hashing with virtual nodes, SWIM gossip protocol, distributed caching coherence, CRDTs, Paxos, distributed UUID generation, BFT | ~12 questions |
+| 5 | **Concurrency & Parallelism** | Lock-free structures (Treiber stack, ABA, hazard pointers), memory models (release/acquire, happens-before), Amdahl's Law & Universal Scalability Law, deadlock analysis, work-stealing schedulers, RCU, futex & lock profiling, thread pool design, non-blocking progress guarantees | ~10 questions |
+| 6 | **Data Structures & Algorithms** | Bloom filter math (1B keys at 0.1% FP), consistent hashing ring, HyperLogLog cardinality, Merkle tree anti-entropy, Count-Min Sketch, Trie vs FST for search, priority queue for scheduling, topological sort for DAGs, LRU/LFU/TTL cache design, rate limiting algorithms | ~10 questions |
+| 7 | **Software Architecture** | DDD bounded contexts & event storming, CQRS & event sourcing with read-your-write, Kafka event-driven internals, API gateway vs service mesh, idempotency & exactly-once, circuit breaker & bulkhead, graceful degradation, observability (logging/metrics/tracing), saga choreography vs orchestration, backpressure, strangler fig migration, feature flags | ~12 questions |
+| 8 | **Security** | JWT internals (signed not encrypted, revocation, key rotation), OAuth2 PKCE flow & OIDC, SQL injection prevention at scale, encryption at rest/in-transit, Vault secrets management, rate limiting & DDoS, session vs token vs passwordless auth, CORS/CSRF/SameSite cookies, supply chain security, SSRF prevention | ~10 questions |
+
+---
+
 ## 🚀 Quick Start
 
 ```bash
@@ -164,6 +235,10 @@ done
 # 3. Verify the RAG pipeline end-to-end
 cd rag-learning
 python test_pipeline.py
+
+# 4. Start with CS fundamentals
+cd cs-interview/operating-systems
+# Read INTERVIEW_QUESTIONS.md and trace through the code examples
 ```
 
 ---
@@ -172,24 +247,23 @@ python test_pipeline.py
 
 ### Suggested Learning Roadmap
 
-| Phase | Projects | Goal |
-|-------|----------|------|
-| **Phase 1: Foundations** | Parking Lot, Vending Machine, Tic-Tac-Toe | Master OOD basics, state machines, SOLID |
-| **Phase 2: Data Structures & Algorithms** | LRU Cache, Rate Limiter, Snakes & Ladders | Implement core CS concepts in real designs |
-| **Phase 3: Games & Rules** | Chess, Snakes & Ladders, Tic-Tac-Toe | Complex state management, AI integration |
-| **Phase 4: Real-World Systems** | Library Management, Car Rental, Movie Booking | Concurrency, inventory, transactional integrity |
-| **Phase 5: Scaling & Distribution** | Splitwise, Uber, Search Platform | Graph algorithms, real-time matching, ranking |
-| **Phase 6: Payments & Infrastructure** | Payment Processing, Job Scheduling, ATM | Financial accuracy, security, compliance |
-| **Phase 7: Advanced ML/AI** | RAG Learning Module | RAG pipelines, LLM integration, vector search |
+| Phase | Focus | Resources | Goal |
+|-------|-------|-----------|------|
+| **Phase 1: CS Foundations** | OS, Networks, Data Structures | `cs-interview/` | Build rock-solid CS fundamentals |
+| **Phase 2: Object-Oriented Design** | Parking Lot, Vending Machine, Tic-Tac-Toe | `low-level-design/` | Master OOD, SOLID, state machines |
+| **Phase 3: Language Deep-Dive** | Python or Go internals | `python-interview/` or `golang-interview/` | Show language mastery in interviews |
+| **Phase 4: Concurrency & DB** | LRU Cache, Rate Limiter, Snakes & Ladders | `low-level-design/` + `cs-interview/` | Concurrency patterns, indexing, MVCC |
+| **Phase 5: Distributed Systems** | Splitwise, Uber, Search Platform | `low-level-design/` + `cs-interview/` | Consensus, CAP, distributed transactions |
+| **Phase 6: Architecture & Security** | Payments, Job Scheduling, ATM | `low-level-design/` + `cs-interview/` | CQRS, event sourcing, OAuth2, threat modeling |
+| **Phase 7: ML/AI** | RAG Learning Module | `rag-learning/` | RAG pipelines, vector search, LLM integration |
 
-### How to Study Each Project
+### How to Study Each Module
 
-1. **Read the problem** in the project README
-2. **Study the code** — understand the SOLID principles and design patterns used
-3. **Run the demo** — see the system in action
-4. **Review INTERVIEW_QUESTIONS.md** — understand what interviewers ask and how to answer
-5. **Study HIGH_LEVEL_DESIGN.md** — understand how it scales to production
-6. **Try extending** — add a new feature without modifying existing code (Open/Closed principle)
+1. **Read the question** and attempt to answer aloud
+2. **Study the answer** — pay attention to trade-offs, not just the "right" answer
+3. **Trace the code examples** — understand every edge case
+4. **Connect topics** — e.g., "How does the OS's page cache affect database performance?"
+5. **Apply to your experience** — prepare production war stories that demonstrate this knowledge
 
 ---
 
@@ -197,7 +271,7 @@ python test_pipeline.py
 
 | Area | Technology |
 |------|-----------|
-| **Language** | Python 3.14+ |
+| **Language** | Python 3.14+, Go |
 | **Design Patterns** | Strategy, Factory, Observer, State, Command, Decorator, Facade, Chain of Responsibility, Singleton |
 | **Embeddings** | sentence-transformers (all-MiniLM-L6-v2) |
 | **Vector Store** | ChromaDB |
@@ -214,11 +288,13 @@ python test_pipeline.py
 |--------|-------|
 | **LLD Projects** | 18 |
 | **Python Files** | 18 |
-| **INTERVIEW_QUESTIONS.md** | 18 |
+| **INTERVIEW_QUESTIONS.md (LLD)** | 18 |
 | **HIGH_LEVEL_DESIGN.md** | 18 |
 | **RAG Documents** | 7 comprehensive guides |
 | **RAG Implementation Files** | 9 Python files + 1 requirements.txt |
-| **Sample RAG Documents** | 5 markdown files |
+| **Language-Specific Modules** | 2 (Python + Go) |
+| **CS Core Topics** | 8 (OS, Networks, DB, Distributed, Concurrency, DSA, Architecture, Security) |
+| **Total Staff-Level Questions** | 90+ deep-dive questions |
 
 ---
 
@@ -238,9 +314,14 @@ This is a personal interview preparation repository. Feel free to:
 - [Design Patterns - Gang of Four](https://www.oreilly.com/library/view/design-patterns-elements/0201633612/)
 - [System Design Interview - Alex Xu](https://www.amazon.com/System-Design-Interview-Insiders-Guide/dp/1736049119/)
 - [LLM & RAG - Chip Huyen](https://www.oreilly.com/library/view/ai-engineering/9781098166298/)
+- [Designing Data-Intensive Applications - Kleppmann](https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/)
+- [Operating Systems: Three Easy Pieces](https://pages.cs.wisc.edu/~remzi/OSTEP/)
+- [Computer Networking: A Top-Down Approach](https://www.amazon.com/Computer-Networking-Top-Down-Approach-7th/dp/0133594149)
 - [LangChain Documentation](https://python.langchain.com/docs/get_started/introduction)
 - [LM Studio](https://lmstudio.ai/)
+- [Go Blog - Runtime](https://go.dev/blog/)
+- [CPython Internals](https://realpython.com/cpython-source-code-guide/)
 
 ---
 
-> *Built with ❤️ for backend engineers preparing for Senior/Staff-level interviews*
+> *Built with ❤️ for backend engineers preparing for Senior/Staff/Principal-level interviews*
