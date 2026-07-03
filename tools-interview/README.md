@@ -9,11 +9,13 @@
 ```
 tools-interview/
 ├── README.md
-├── kafka/               ← 12 questions: log internals, ISR, rebalancing, exactly-once
-├── redis/               ← 12 questions: data structures, persistence, clustering, sentinel
-├── elasticsearch/       ← 8 questions: inverted index, sharding, query DSL, cluster mgmt
-├── docker-kubernetes/   ← 8 questions: container runtime, k8s scheduler, networking, RBAC
-└── mongodb/             ← 6 questions: document model, replica sets, aggregation, transactions
+├── kafka/                ← 12 questions: log internals, ISR, rebalancing, exactly-once
+├── redis/                ← 12 questions: data structures, persistence, clustering, sentinel
+├── elasticsearch/        ← 8 questions: inverted index, sharding, query DSL, cluster mgmt
+├── docker-kubernetes/    ← 8 questions: container runtime, k8s scheduler, networking, RBAC
+├── mongodb/              ← 6 questions: document model, replica sets, aggregation, transactions
+├── prometheus-grafana/   ← 8 questions: TSDB internals, PromQL, alerting, Thanos/Mimir
+└── terraform/            ← 8 questions: state management, modules, providers, policy as code
 ```
 
 ## 🎯 How to Use

@@ -7,7 +7,7 @@
             Interview Prep
         </h1>
         <p class="hero-subtitle">
-            Comprehensive preparation for <strong>Staff / Principal / Principal</strong> backend engineering interviews
+            Comprehensive preparation for <strong>Senior / Staff / Principal</strong> backend engineering interviews
         </p>
         <div class="hero-stats">
             <div class="hero-stat">
