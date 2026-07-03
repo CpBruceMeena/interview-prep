@@ -5,3 +5,6 @@ crg-cache/
 .cache/code-review-graph/
 .cache/crg/
 *.crg
+site/
+prompt.txt
+detailed_task.md

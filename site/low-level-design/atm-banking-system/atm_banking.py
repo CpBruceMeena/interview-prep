@@ -407,7 +407,7 @@ class IdleATMState(ATMState):
     def insert_card(self, card_number: str) -> None:
         self._atm._current_card = card_number
         print("  Card inserted. Please enter PIN.")
-        self._atm._state = self._atm._pin_entered_state
+        self._atm._state = self._atm.pin_entered_state
 
     def enter_pin(self, pin: str) -> None: print("  Insert card first")
     def select_account(self, account_number: str) -> None: print("  Insert card first")
@@ -421,11 +421,11 @@ class PinEnteredATMState(ATMState):
     def insert_card(self, card_number: str) -> None: print("  Card already inserted")
 
     def enter_pin(self, pin: str) -> None:
-        account = self._atm._bank.authenticate(self._atm._current_card, pin)
+        account = self._atm.bank.authenticate(self._atm._current_card, pin)
         if account:
             self._atm._current_account = account.account_number
             print(f"  ✅ Authenticated. Account: {account}")
-            self._atm._state = self._atm._ready_state
+            self._atm._state = self._atm.ready_state
         # If failed, stays in same state
 
     def select_account(self, account_number: str) -> None: print("  Enter PIN first")
@@ -434,7 +434,7 @@ class PinEnteredATMState(ATMState):
     def deposit(self, amount: float) -> bool: print("  Enter PIN first"); return False
     def eject_card(self) -> None:
         self._atm._current_card = None
-        self._atm._state = self._atm._idle_state
+        self._atm._state = self._atm.idle_state
         print("  Card ejected")
 
 
@@ -443,23 +443,23 @@ class ReadyATMState(ATMState):
     def enter_pin(self, pin: str) -> None: print("  Already authenticated")
 
     def select_account(self, account_number: str) -> None:
-        if self._atm._bank.get_account(account_number):
+        if self._atm.bank.get_account(account_number):
             self._atm._current_account = account_number
             print(f"  Switched to account {account_number[-4:]}")
         else:
             print("  Account not found")
 
     def check_balance(self) -> Optional[float]:
-        account = self._atm._bank.get_account(self._atm._current_account)
+        account = self._atm.bank.get_account(self._atm._current_account)
         balance = account.balance if account else 0
         print(f"  💰 Balance: ${balance:.2f}")
         return balance
 
     def withdraw(self, amount: float) -> bool:
         try:
-            self._atm._bank.withdraw(self._atm._current_account, amount)
+            self._atm.bank.withdraw(self._atm._current_account, amount)
             print(f"  ✅ Withdrawal successful: ${amount:.2f}")
-            new_balance = self._atm._bank.get_account(self._atm._current_account).balance
+            new_balance = self._atm.bank.get_account(self._atm._current_account).balance
             print(f"  💰 New Balance: ${new_balance:.2f}")
             return True
         except (ValueError, Exception) as e:
@@ -467,7 +467,7 @@ class ReadyATMState(ATMState):
             return False
 
     def deposit(self, amount: float) -> bool:
-        tx = self._atm._bank.deposit(self._atm._current_account, amount)
+        tx = self._atm.bank.deposit(self._atm._current_account, amount)
         if tx:
             print(f"  ✅ Deposit successful: ${amount:.2f}")
             return True
@@ -476,7 +476,7 @@ class ReadyATMState(ATMState):
     def eject_card(self) -> None:
         self._atm._current_card = None
         self._atm._current_account = None
-        self._atm._state = self._atm._idle_state
+        self._atm._state = self._atm.idle_state
         print("  👋 Card ejected. Thank you!")
 
 
@@ -510,6 +510,22 @@ class ATM:
 
     def eject_card(self) -> None:
         self._state.eject_card()
+
+    @property
+    def bank(self):
+        return self._bank
+
+    @property
+    def idle_state(self):
+        return self._idle_state
+
+    @property
+    def pin_entered_state(self):
+        return self._pin_entered_state
+
+    @property
+    def ready_state(self):
+        return self._ready_state
 
 
 # --- Demo ---
