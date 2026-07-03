@@ -8,15 +8,15 @@
 <div align="center">
   
   [![GitHub Pages](https://img.shields.io/badge/%F0%9F%93%96-Live%20Site-8b5cf6?style=for-the-badge&logo=githubpages&logoColor=white)](https://cpbrucemeena.github.io/interview-prep/)
-  [![Build](https://img.shields.io/github/actions/workflow/status/CpBruceMeena/interview-prep/pages.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=Build&color=22c55e)](https://github.com/CpBruceMeena/interview-prep/actions)
   [![License](https://img.shields.io/badge/License-MIT-f59e0b?style=for-the-badge&logo=license&logoColor=white)](LICENSE)
-  [![Questions](https://img.shields.io/badge/120%2B-Staff%20Questions-ef4444?style=for-the-badge&logo=stackoverflow&logoColor=white)](https://cpbrucemeena.github.io/interview-prep/)
+  [![Questions](https://img.shields.io/badge/200%2B-Staff%20Questions-ef4444?style=for-the-badge&logo=stackoverflow&logoColor=white)](https://cpbrucemeena.github.io/interview-prep/)
+  [![Built with MkDocs](https://img.shields.io/badge/MkDocs-Material-7c3aed?style=for-the-badge&logo=materialdesign&logoColor=white)](https://squidfunk.github.io/mkdocs-material/)
   
   <br>
   
   <!-- Typing SVG by DenverCoder1 -->
   <a href="https://cpbrucemeena.github.io/interview-prep/">
-    <img src="https://readme-typing-svg.herokuapp.com?font=Fira+Code&size=22&duration=3000&pause=500&color=8B5CF6&center=true&vCenter=true&width=600&lines=System+Design+%26+LLD+Mastery;18+Low-Level+Design+Projects;120%2B+Staff-Level+Questions;RAG+Chatbot+Implementation;Go+%26+Python+Runtime+Deep-Dives;CS+Core+Fundamentals" alt="Typing SVG" />
+    <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=22&duration=3000&pause=500&color=8B5CF6&center=true&vCenter=true&width=600&lines=System+Design+%26+LLD+Mastery;18+Low-Level+Design+Projects;200%2B+Staff-Level+Questions;RAG+Chatbot+Implementation;Go+%26+Python+Runtime+Deep-Dives;CS+Core+Fundamentals" alt="Typing SVG" />
   </a>
   
 </div>
@@ -36,7 +36,7 @@
         <sub><b>SOLID · Patterns · Python</b></sub>
       </td>
       <td align="center" width="140">
-        <img src="https://img.shields.io/badge/120%2B-Staff%20Questions-ef4444?style=for-the-badge&logo=stackoverflow&logoColor=white" alt="120+ Questions"/><br>
+        <img src="https://img.shields.io/badge/200%2B-Staff%20Questions-ef4444?style=for-the-badge&logo=stackoverflow&logoColor=white" alt="200+ Questions"/><br>
         <sub><b>Principal Engineer Depth</b></sub>
       </td>
       <td align="center" width="140">
@@ -355,7 +355,7 @@ PHASE 7 ─── ML/AI
 | Metric | Count |
 |--------|-------|
 | LLD Projects | **18** |
-| Staff-Level Questions | **120+** |
+| Staff-Level Questions | **200+** |
 | CS Core Topics | **8** |
 | Language Deep-Dives | **2 (Python + Go)** |
 | RAG Guides | **7** |
