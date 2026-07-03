@@ -1,3 +1,32 @@
+<script>
+// Auto-redirect .md URLs to directory equivalents
+(function() {
+    var path = window.location.pathname;
+    var baseUrl = 'https://cpbrucemeena.github.io/interview-prep/';
+
+    // If URL ends in .md, redirect to directory equivalent
+    if (path.endsWith('.md')) {
+        var newPath = path.replace(/\.md$/, '/');
+        window.location.replace(baseUrl + newPath.replace(/^\/interview-prep\//, ''));
+        return;
+    }
+
+    // If URL ends in .md/ (trailing slash after .md), redirect to directory
+    if (path.endsWith('.md/')) {
+        var newPath = path.replace(/\.md\/$/, '/');
+        window.location.replace(baseUrl + newPath.replace(/^\/interview-prep\//, ''));
+        return;
+    }
+
+    // If URL ends in .html, redirect to directory equivalent
+    if (path.endsWith('index.html')) {
+        var dirPath = path.replace(/index\.html$/, '');
+        window.location.replace(baseUrl + dirPath.replace(/^\/interview-prep\//, ''));
+        return;
+    }
+})();
+</script>
+
 <div class="error-page">
     <h1>404</h1>
     <p>Oops! This page doesn't exist yet — maybe it's still being written?<br>
