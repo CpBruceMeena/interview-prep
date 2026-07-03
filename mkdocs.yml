@@ -202,6 +202,8 @@ nav:
     - MongoDB: tools-interview/mongodb/INTERVIEW_QUESTIONS.md
     - Prometheus & Grafana: tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md
     - Terraform: tools-interview/terraform/INTERVIEW_QUESTIONS.md
+    - Nginx: tools-interview/nginx/INTERVIEW_QUESTIONS.md
+    - Compression: tools-interview/compression/INTERVIEW_QUESTIONS.md
 
   - 🖥️ CS Core:
     - Overview: cs-interview/README.md

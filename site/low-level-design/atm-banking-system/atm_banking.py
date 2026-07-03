@@ -512,19 +512,19 @@ class ATM:
         self._state.eject_card()
 
     @property
-    def bank(self):
+    def bank(self) -> BankingService:
         return self._bank
 
     @property
-    def idle_state(self):
+    def idle_state(self) -> ATMState:
         return self._idle_state
 
     @property
-    def pin_entered_state(self):
+    def pin_entered_state(self) -> ATMState:
         return self._pin_entered_state
 
     @property
-    def ready_state(self):
+    def ready_state(self) -> ATMState:
         return self._ready_state
 
 

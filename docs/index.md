@@ -7,7 +7,7 @@
             Interview Prep
         </h1>
         <p class="hero-subtitle">
-            Comprehensive preparation for <strong>Senior / Staff / Principal</strong> backend engineering interviews
+            Comprehensive preparation for <strong>Senior / Staff / Principal</strong> backend engineering interviews<br><small style="display:block;margin-top:0.3rem;opacity:0.8;">Also includes: Nginx internals &bull; Compression (Gzip, Deflate, Zstd, Brotli) &bull; Infrastructure tools</small>
         </p>
         <div class="hero-stats">
             <div class="hero-stat">
@@ -46,17 +46,17 @@
         <span>CS Fundamentals & OOD Basics</span>
     </div>
     <div class="skill-cards">
-        <a href="cs-interview/operating-systems/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/operating-systems/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🖥️</span>
             <span class="skill-card-title">Operating Systems</span>
             <span class="skill-card-desc">Processes, memory, I/O, scheduling</span>
         </a>
-        <a href="cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">📊</span>
             <span class="skill-card-title">Data Structures</span>
             <span class="skill-card-desc">Bloom filters, tries, sketches</span>
         </a>
-        <a href="low-level-design/parking-lot/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="low-level-design/parking-lot/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🏗️</span>
             <span class="skill-card-title">OOD Basics</span>
             <span class="skill-card-desc">Parking Lot, Chess, Tic-Tac-Toe</span>
@@ -70,22 +70,22 @@
         <span>Concurrency, DB, Networks, Design Patterns</span>
     </div>
     <div class="skill-cards">
-        <a href="cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">⚡</span>
             <span class="skill-card-title">Concurrency</span>
             <span class="skill-card-desc">Lock-free, memory models, RCU</span>
         </a>
-        <a href="cs-interview/database-systems/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/database-systems/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🗄️</span>
             <span class="skill-card-title">Database Systems</span>
             <span class="skill-card-desc">MVCC, B-Tree vs LSM, sharding</span>
         </a>
-        <a href="cs-interview/computer-networks/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/computer-networks/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🌐</span>
             <span class="skill-card-title">Networks</span>
             <span class="skill-card-desc">TCP, HTTP/2/3, QUIC, TLS</span>
         </a>
-        <a href="low-level-design/rate-limiter/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="low-level-design/rate-limiter/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🛡️</span>
             <span class="skill-card-title">API Design</span>
             <span class="skill-card-desc">Rate limiter, pub-sub, caching</span>
@@ -99,22 +99,22 @@
         <span>Distributed Systems, Architecture, Security</span>
     </div>
     <div class="skill-cards">
-        <a href="cs-interview/distributed-systems/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/distributed-systems/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🌍</span>
             <span class="skill-card-title">Distributed Systems</span>
             <span class="skill-card-desc">Raft, Paxos, CRDTs, gossip</span>
         </a>
-        <a href="cs-interview/software-architecture/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/software-architecture/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🏛️</span>
             <span class="skill-card-title">Architecture</span>
             <span class="skill-card-desc">CQRS, event sourcing, DDD</span>
         </a>
-        <a href="cs-interview/security/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="cs-interview/security/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🔒</span>
             <span class="skill-card-title">Security</span>
             <span class="skill-card-desc">JWT, OAuth2, OWASP, encryption</span>
         </a>
-        <a href="low-level-design/payment-processing-system/INTERVIEW_QUESTIONS.md" class="skill-card">
+        <a href="low-level-design/payment-processing-system/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">💳</span>
             <span class="skill-card-title">Payments & ATMs</span>
             <span class="skill-card-desc">Idempotency, circuit breaker</span>
@@ -128,19 +128,19 @@
         <span>Language Internals, RAG, Production Systems</span>
     </div>
     <div class="skill-cards">
-        <a href="python-interview/INTERVIEW_QUESTIONS.md" class="skill-card highlight">
+        <a href="python-interview/INTERVIEW_QUESTIONS/" class="skill-card highlight">
             <span class="skill-card-icon">🐍</span>
             <span class="skill-card-title">Python Internals</span>
             <span class="skill-card-desc">GIL, async, metaclasses, C extensions</span>
             <span class="skill-card-tag">12 questions</span>
         </a>
-        <a href="golang-interview/INTERVIEW_QUESTIONS.md" class="skill-card highlight">
+        <a href="golang-interview/INTERVIEW_QUESTIONS/" class="skill-card highlight">
             <span class="skill-card-icon">🐹</span>
             <span class="skill-card-title">Go Internals</span>
             <span class="skill-card-desc">GMP scheduler, GC, channels, sync</span>
             <span class="skill-card-tag">12 questions</span>
         </a>
-        <a href="rag-learning/README.md" class="skill-card highlight">
+        <a href="rag-learning/" class="skill-card highlight">
             <span class="skill-card-icon">🧠</span>
             <span class="skill-card-title">RAG & LLMs</span>
             <span class="skill-card-desc">Retrieval, embeddings, fine-tuning</span>
@@ -157,7 +157,7 @@
 
 <div class="module-grid">
 
-<a href="low-level-design/README.md" class="module-card">
+<a href="low-level-design/" class="module-card">
     <div class="module-card-header">
         <span class="module-card-icon">🖥️</span>
         <span class="module-card-title">Low-Level Design</span>
@@ -173,7 +173,7 @@
     </div>
 </a>
 
-<a href="rag-learning/README.md" class="module-card">
+<a href="rag-learning/" class="module-card">
     <div class="module-card-header">
         <span class="module-card-icon">🧠</span>
         <span class="module-card-title">RAG Learning</span>
@@ -189,7 +189,7 @@
     </div>
 </a>
 
-<a href="python-interview/README.md" class="module-card">
+<a href="python-interview/" class="module-card">
     <div class="module-card-header">
         <span class="module-card-icon">🐍</span>
         <span class="module-card-title">Python Deep-Dive</span>
@@ -204,7 +204,7 @@
     </div>
 </a>
 
-<a href="golang-interview/README.md" class="module-card">
+<a href="golang-interview/" class="module-card">
     <div class="module-card-header">
         <span class="module-card-icon">🐹</span>
         <span class="module-card-title">Golang Deep-Dive</span>
@@ -219,7 +219,7 @@
     </div>
 </a>
 
-<a href="cs-interview/README.md" class="module-card">
+<a href="cs-interview/" class="module-card">
     <div class="module-card-header">
         <span class="module-card-icon">🖥️</span>
         <span class="module-card-title">CS Core</span>

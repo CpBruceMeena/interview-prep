@@ -15,6 +15,8 @@ tools-interview/
 ├── docker-kubernetes/    ← 8 questions: container runtime, k8s scheduler, networking, RBAC
 ├── mongodb/              ← 6 questions: document model, replica sets, aggregation, transactions
 ├── prometheus-grafana/   ← 8 questions: TSDB internals, PromQL, alerting, Thanos/Mimir
+├── nginx/                ← 10 questions: event loop, reverse proxy, TLS, clustering
+├── compression/          ← 10 questions: gzip, deflate, zstd, brotli, HPACK/QPACK
 └── terraform/            ← 8 questions: state management, modules, providers, policy as code
 ```
 
