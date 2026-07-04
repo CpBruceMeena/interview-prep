@@ -22,8 +22,6 @@ theme:
     primary: indigo
     accent: indigo
   features:
-    - navigation.tabs
-    - navigation.tabs.sticky
     - navigation.sections
     - navigation.indexes
     - navigation.top
