@@ -12,7 +12,7 @@ with open(filepath, 'r') as f:
     content = f.read()
 
 # Add the flow diagram and download link after the architecture section
-old_marker = '---\n\n## 3. COMPONENT BREAKDOWN'
+old_marker = '---\n\n## 4. COMPONENT BREAKDOWN'
 
 new_block = """
 > **\U0001f4e5 Download:** [Parking Lot Architecture Diagram (draw.io)](parking-lot-hld.drawio) — Open in [draw.io](https://app.diagrams.net/) to edit.
@@ -63,7 +63,7 @@ sequenceDiagram
 
 ---
 
-## 3. COMPONENT BREAKDOWN"""
+## 4. COMPONENT BREAKDOWN"""
 
 if old_marker in content:
     content = content.replace(old_marker, new_block)
