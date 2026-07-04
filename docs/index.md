@@ -28,8 +28,7 @@
             </div>
         </div>
         <div class="hero-actions">
-            <a href="#modules-overview" class="hero-button hero-button-primary">Explore Modules</a>
-            <button onclick="document.querySelector('.md-search__overlay').click(); document.querySelector('.md-search__input').focus();" class="hero-button hero-button-secondary">Search Questions</button>
+            <a href="#modules-overview" class="hero-button hero-button-primary">📦 Explore Modules</a>
         </div>
     </div>
 </div>

@@ -22,7 +22,7 @@
   {% if page and page.content %}
     {% set feedback_hidden = page.meta.get('hide', []) if page.meta is mapping else [] %}
     {% if 'feedback' not in feedback_hidden %}
-    <div class="feedback-widget feedback-widget-sidebar" id="feedbackWidget">
+    <div class="feedback-widget" id="feedbackWidget">
       <div class="feedback-widget-title">Was this helpful?</div>
       <div class="feedback-widget-buttons">
         <button class="feedback-widget-btn" onclick="handleFeedback(true)">👍 Yes</button>
@@ -61,16 +61,15 @@
     } catch(e) {}
   }
 
-  // Move feedback widget to TOC sidebar on desktop
+  // Move feedback widget to end of main content area
   function relocateFeedback() {
     const widget = document.getElementById('feedbackWidget');
     if (!widget) return;
 
-    // Find the TOC sidebar inner container
-    const tocInner = document.querySelector('.md-sidebar--secondary .md-sidebar__inner');
-    if (tocInner) {
-      // Append widget to the end of the TOC sidebar
-      tocInner.appendChild(widget);
+    // Place feedback widget at the bottom of the content area
+    const content = document.querySelector('.md-content__inner');
+    if (content) {
+      content.appendChild(widget);
     }
   }
 
