@@ -6,14 +6,14 @@
 
 ## Table of Contents
 
-1. [Inverted Index & Segment Structure](#1-inverted-index--segment-structure)
-2. [Sharding, Routing & Rebalancing](#2-sharding-routing--rebalancing)
+1. [Inverted Index & Segment Structure](#1-inverted-index-segment-structure)
+2. [Sharding, Routing & Rebalancing](#2-sharding-routing-rebalancing)
 3. [Query DSL: Filter vs Query Context](#3-query-dsl-filter-vs-query-context)
 4. [Aggregations: Metric, Bucket, Pipeline](#4-aggregations-metric-bucket-pipeline)
 5. [Cluster Management: Discovery, Master Election](#5-cluster-management-discovery-master-election)
 6. [Indexing: Refresh, Flush, Merge](#6-indexing-refresh-flush-merge)
 7. [Tuning: Mapping, Analyzers, Field Data](#7-tuning-mapping-analyzers-field-data)
-8. [Hot-Warm-Cold Architecture & ILM](#8-hot-warm-cold-architecture--ilm)
+8. [Hot-Warm-Cold Architecture & ILM](#8-hot-warm-cold-architecture-ilm)
 
 ---
 

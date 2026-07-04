@@ -10,9 +10,9 @@
 2. [IAM: Least Privilege at Scale](#2-iam-least-privilege-at-scale)
 3. [KMS: Key Management, Encryption at Rest](#3-kms-key-management-encryption-at-rest)
 4. [AWS Cognito: AuthN/AuthZ for Applications](#4-aws-cognito-authnauthz-for-applications)
-5. [AWS WAF & Managed Rules](#5-aws-waf--managed-rules)
-6. [Secrets Manager: Rotation & Vault Architecture](#6-secrets-manager-rotation--vault-architecture)
-7. [GuardDuty & Security Hub: Threat Detection](#7-guardduty--security-hub-threat-detection)
+5. [AWS WAF & Managed Rules](#5-aws-waf-managed-rules)
+6. [Secrets Manager: Rotation & Vault Architecture](#6-secrets-manager-rotation-vault-architecture)
+7. [GuardDuty & Security Hub: Threat Detection](#7-guardduty-security-hub-threat-detection)
 8. [AWS Security Reference Architecture](#8-aws-security-reference-architecture)
 
 ---

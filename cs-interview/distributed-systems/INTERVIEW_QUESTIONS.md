@@ -6,15 +6,15 @@
 
 ## Table of Contents
 
-1. [CAP Theorem & PACELC](#1-cap-theorem--pacelc)
-2. [Raft Consensus — Detailed Walkthrough](#2-raft-consensus--detailed-walkthrough)
+1. [CAP Theorem & PACELC](#1-cap-theorem-pacelc)
+2. [Raft Consensus — Detailed Walkthrough](#2-raft-consensus-detailed-walkthrough)
 3. [Distributed Transactions: 2PC vs 3PC vs Saga](#3-distributed-transactions-2pc-vs-3pc-vs-saga)
-4. [Vector Clocks & Lamport Timestamps](#4-vector-clocks--lamport-timestamps)
-5. [Consistent Hashing & Ring Design](#5-consistent-hashing--ring-design)
-6. [Gossip Protocols: SWIM & Hybrid](#6-gossip-protocols-swim--hybrid)
+4. [Vector Clocks & Lamport Timestamps](#4-vector-clocks-lamport-timestamps)
+5. [Consistent Hashing & Ring Design](#5-consistent-hashing-ring-design)
+6. [Gossip Protocols: SWIM & Hybrid](#6-gossip-protocols-swim-hybrid)
 7. [Distributed Caching: Coherence Protocols](#7-distributed-caching-coherence-protocols)
 8. [Leader Election: Bully Algorithm vs Raft](#8-leader-election-bully-algorithm-vs-raft)
-9. [CRDTs & Conflict-Free Replication](#9-crdts--conflict-free-replication)
+9. [CRDTs & Conflict-Free Replication](#9-crdts-conflict-free-replication)
 10. [Distributed Consensus: Paxos Made Simple](#10-distributed-consensus-paxos-made-simple)
 11. [Distributed UUID Generation](#11-distributed-uuid-generation)
 12. [Byzantine Fault Tolerance](#12-byzantine-fault-tolerance)

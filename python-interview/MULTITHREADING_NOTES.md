@@ -8,17 +8,17 @@
 ## Table of Contents
 
 1. [Concurrency Landscape in Python](#1-concurrency-landscape-in-python)
-2. [The GIL — Global Interpreter Lock](#2-the-gil--global-interpreter-lock)
+2. [The GIL — Global Interpreter Lock](#2-the-gil-global-interpreter-lock)
 3. [Threading Module](#3-threading-module)
 4. [Thread Synchronization](#4-thread-synchronization)
-5. [Thread-Safe Queues & Communication](#5-thread-safe-queues--communication)
-6. [concurrent.futures — High-Level API](#6-concurrentfutures--high-level-api)
-7. [Multiprocessing — True Parallelism](#7-multiprocessing--true-parallelism)
-8. [AsyncIO — Event Loop Concurrency](#8-asyncio--event-loop-concurrency)
+5. [Thread-Safe Queues & Communication](#5-thread-safe-queues-communication)
+6. [concurrent.futures — High-Level API](#6-concurrentfutures-high-level-api)
+7. [Multiprocessing — True Parallelism](#7-multiprocessing-true-parallelism)
+8. [AsyncIO — Event Loop Concurrency](#8-asyncio-event-loop-concurrency)
 9. [Choosing the Right Approach](#9-choosing-the-right-approach)
 10. [Thread Safety Patterns](#10-thread-safety-patterns)
 11. [Debugging Concurrency Issues](#11-debugging-concurrency-issues)
-12. [Concurrency & Parallelism Interview Questions](#12-concurrency--parallelism-interview-questions)
+12. [Concurrency & Parallelism Interview Questions](#12-concurrency-parallelism-interview-questions)
 
 ---
 

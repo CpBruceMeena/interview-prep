@@ -7,14 +7,14 @@
 ## Table of Contents
 
 1. [EC2: Instance Types, ENI, Enhanced Networking](#1-ec2-instance-types-eni-enhanced-networking)
-2. [EC2 Auto Scaling Groups: Policies & Lifecycle](#2-ec2-auto-scaling-groups-policies--lifecycle)
-3. [AWS Lambda: Execution Model & Cold Starts](#3-aws-lambda-execution-model--cold-starts)
-4. [Lambda Performance: Concurrency & Reservations](#4-lambda-performance-concurrency--reservations)
+2. [EC2 Auto Scaling Groups: Policies & Lifecycle](#2-ec2-auto-scaling-groups-policies-lifecycle)
+3. [AWS Lambda: Execution Model & Cold Starts](#3-aws-lambda-execution-model-cold-starts)
+4. [Lambda Performance: Concurrency & Reservations](#4-lambda-performance-concurrency-reservations)
 5. [ECS: Task Definition, Service, Cluster](#5-ecs-task-definition-service-cluster)
 6. [EKS: Control Plane, Node Groups, Fargate](#6-eks-control-plane-node-groups-fargate)
-7. [Fargate: Serverless Containers & Networking](#7-fargate-serverless-containers--networking)
-8. [Spot Instances: Interruption Handling & Strategies](#8-spot-instances-interruption-handling--strategies)
-9. [AWS Batch: Job Scheduling & Compute Environments](#9-aws-batch-job-scheduling--compute-environments)
+7. [Fargate: Serverless Containers & Networking](#7-fargate-serverless-containers-networking)
+8. [Spot Instances: Interruption Handling & Strategies](#8-spot-instances-interruption-handling-strategies)
+9. [AWS Batch: Job Scheduling & Compute Environments](#9-aws-batch-job-scheduling-compute-environments)
 10. [Hybrid: EC2 Reserved, Savings Plans, Cost Optimization](#10-hybrid-ec2-reserved-savings-plans-cost-optimization)
 
 ---

@@ -7,17 +7,17 @@
 ## Table of Contents
 
 1. [Microservices Decomposition: Domain-Driven Design](#1-microservices-decomposition-domain-driven-design)
-2. [CQRS & Event Sourcing](#2-cqrs--event-sourcing)
+2. [CQRS & Event Sourcing](#2-cqrs-event-sourcing)
 3. [Event-Driven Architecture: Kafka Internals](#3-event-driven-architecture-kafka-internals)
 4. [API Gateway vs Service Mesh](#4-api-gateway-vs-service-mesh)
-5. [Idempotency & Exactly-Once Semantics](#5-idempotency--exactly-once-semantics)
-6. [Circuit Breaker & Bulkhead Patterns](#6-circuit-breaker--bulkhead-patterns)
-7. [Graceful Degradation & Fallbacks](#7-graceful-degradation--fallbacks)
+5. [Idempotency & Exactly-Once Semantics](#5-idempotency-exactly-once-semantics)
+6. [Circuit Breaker & Bulkhead Patterns](#6-circuit-breaker-bulkhead-patterns)
+7. [Graceful Degradation & Fallbacks](#7-graceful-degradation-fallbacks)
 8. [Observability: Logging, Metrics, Tracing](#8-observability-logging-metrics-tracing)
 9. [Saga Pattern: Choreography vs Orchestration](#9-saga-pattern-choreography-vs-orchestration)
-10. [Backpressure & Reactive Systems](#10-backpressure--reactive-systems)
+10. [Backpressure & Reactive Systems](#10-backpressure-reactive-systems)
 11. [Migration Strategies: Strangler Fig](#11-migration-strategies-strangler-fig)
-12. [Configuration Management & Feature Flags](#12-configuration-management--feature-flags)
+12. [Configuration Management & Feature Flags](#12-configuration-management-feature-flags)
 
 ---
 

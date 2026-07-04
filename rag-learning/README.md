@@ -25,7 +25,7 @@ User Query → Retrieve (find relevant docs) → Augment (add context) → Gener
 | 5 | [Code Base Design](05_CODE_BASE_DESIGN.md) | Architecture decisions, design patterns, SOLID |
 | 6 | [Low-Level Design](06_LOW_LEVEL_DESIGN.md) | Class diagrams, sequence diagrams, data models |
 | 7 | [High-Level Design](07_HIGH_LEVEL_DESIGN.md) | Production system architecture, scaling |
-| 8 | [Implementation](implementation/) | Working Python RAG chatbot code |
+
 
 ---
 

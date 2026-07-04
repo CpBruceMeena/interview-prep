@@ -13,9 +13,9 @@
 5. [DynamoDB: Data Modeling, Partitioning, Hot Keys](#5-dynamodb-data-modeling-partitioning-hot-keys)
 6. [DynamoDB: DAX, TTL, Streams, Global Tables](#6-dynamodb-dax-ttl-streams-global-tables)
 7. [ElastiCache: Redis Cluster, Replication, Persistence](#7-elasticache-redis-cluster-replication-persistence)
-8. [RDS Proxy & Connection Pooling](#8-rds-proxy--connection-pooling)
-9. [Database Migration: DMS & Schema Conversion](#9-database-migration-dms--schema-conversion)
-10. [S3 Glacier & Archival Strategies](#10-s3-glacier--archival-strategies)
+8. [RDS Proxy & Connection Pooling](#8-rds-proxy-connection-pooling)
+9. [Database Migration: DMS & Schema Conversion](#9-database-migration-dms-schema-conversion)
+10. [S3 Glacier & Archival Strategies](#10-s3-glacier-archival-strategies)
 
 ---
 

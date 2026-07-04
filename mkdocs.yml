@@ -114,57 +114,75 @@ nav:
     - Parking Lot:
       - Questions: low-level-design/parking-lot/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/parking-lot/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/parking-lot/CODE.md
     - Chess Game:
       - Questions: low-level-design/chess-game/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/chess-game/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/chess-game/CODE.md
     - Tic-Tac-Toe:
       - Questions: low-level-design/tic-tac-toe/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/tic-tac-toe/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/tic-tac-toe/CODE.md
     - Snakes & Ladders:
       - Questions: low-level-design/snakes-and-ladders/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/snakes-and-ladders/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/snakes-and-ladders/CODE.md
     - Vending Machine:
       - Questions: low-level-design/vending-machine/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/vending-machine/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/vending-machine/CODE.md
     - LRU/LFU/TTL Cache:
       - Questions: low-level-design/lru-cache/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/lru-cache/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/lru-cache/CODE.md
     - Rate Limiter:
       - Questions: low-level-design/rate-limiter/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/rate-limiter/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/rate-limiter/CODE.md
     - Pub-Sub System:
       - Questions: low-level-design/pub-sub-system/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/pub-sub-system/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/pub-sub-system/CODE.md
     - Movie Ticket Booking:
       - Questions: low-level-design/movie-ticket-booking/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/movie-ticket-booking/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/movie-ticket-booking/CODE.md
     - Splitwise:
       - Questions: low-level-design/splitwise-expense-sharing/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/splitwise-expense-sharing/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/splitwise-expense-sharing/CODE.md
     - Cab Booking (Uber):
       - Questions: low-level-design/cab-booking-uber/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/cab-booking-uber/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/cab-booking-uber/CODE.md
     - Library Management:
       - Questions: low-level-design/library-management/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/library-management/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/library-management/CODE.md
     - Car Rental:
       - Questions: low-level-design/car-rental-platform/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/car-rental-platform/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/car-rental-platform/CODE.md
     - ATM/Banking:
       - Questions: low-level-design/atm-banking-system/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/atm-banking-system/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/atm-banking-system/CODE.md
     - Inventory Management:
       - Questions: low-level-design/inventory-management/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/inventory-management/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/inventory-management/CODE.md
     - Payment Processing:
       - Questions: low-level-design/payment-processing-system/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/payment-processing-system/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/payment-processing-system/CODE.md
     - Job Scheduling:
       - Questions: low-level-design/job-scheduling-system/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/job-scheduling-system/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/job-scheduling-system/CODE.md
     - Search Platform:
       - Questions: low-level-design/search-platform/INTERVIEW_QUESTIONS.md
       - HLD: low-level-design/search-platform/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/search-platform/CODE.md
 
   - 🧠 RAG Learning:
     - Overview: rag-learning/README.md

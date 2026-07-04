@@ -6,14 +6,14 @@
 
 ## Table of Contents
 
-1. [Lock-Free Data Structures & Hazard Pointers](#1-lock-free-data-structures--hazard-pointers)
-2. [Memory Models: Happens-Before & Ordering](#2-memory-models-happens-before--ordering)
-3. [Amdahl's Law & Universal Scalability Law](#3-amdahls-law--universal-scalability-law)
-4. [Deadlock Analysis & Prevention](#4-deadlock-analysis--prevention)
+1. [Lock-Free Data Structures & Hazard Pointers](#1-lock-free-data-structures-hazard-pointers)
+2. [Memory Models: Happens-Before & Ordering](#2-memory-models-happens-before-ordering)
+3. [Amdahl's Law & Universal Scalability Law](#3-amdahls-law-universal-scalability-law)
+4. [Deadlock Analysis & Prevention](#4-deadlock-analysis-prevention)
 5. [Work-Stealing Schedulers](#5-work-stealing-schedulers)
 6. [Read-Copy-Update (RCU)](#6-read-copy-update-rcu)
-7. [Futex & Lock Contention Profiling](#7-futex--lock-contention-profiling)
-8. [Thread Pools: Design & Tuning](#8-thread-pools-design--tuning)
+7. [Futex & Lock Contention Profiling](#7-futex-lock-contention-profiling)
+8. [Thread Pools: Design & Tuning](#8-thread-pools-design-tuning)
 9. [Non-Blocking Progress Guarantees](#9-non-blocking-progress-guarantees)
 
 ---

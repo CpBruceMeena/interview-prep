@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Pre-push hook: prevent direct pushes to the main branch.
+# All changes to main must go through a pull request on GitHub.
+#
+# Install: cp scripts/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+
+protected_branch="main"
+
+while read local_ref local_sha remote_ref remote_sha; do
+    if [[ "$remote_ref" == "refs/heads/$protected_branch" ]]; then
+        echo "🚫 ERROR: Direct pushes to '$protected_branch' are not allowed!"
+        echo "   Please create a pull request on GitHub instead."
+        echo "   Branch protection requires PR review before merging to $protected_branch."
+        exit 1
+    fi
+done
+
+exit 0

@@ -8,17 +8,17 @@
 ## Table of Contents
 
 1. [Concurrency vs Parallelism vs Multithreading](#1-concurrency-vs-parallelism-vs-multithreading)
-2. [Goroutines — The Lightweight Thread](#2-goroutines--the-lightweight-thread)
-3. [Channels — Communicating Between Goroutines](#3-channels--communicating-between-goroutines)
+2. [Goroutines — The Lightweight Thread](#2-goroutines-the-lightweight-thread)
+3. [Channels — Communicating Between Goroutines](#3-channels-communicating-between-goroutines)
 4. [Moving Data Through Channels](#4-moving-data-through-channels)
 5. [Structs and Channels](#5-structs-and-channels)
 6. [The Select Statement](#6-the-select-statement)
 7. [Synchronization Primitives](#7-synchronization-primitives)
-8. [sync/atomic — Lock-Free Operations](#8-syncatomic--lock-free-operations)
-9. [Context — Cancellation & Deadlines](#9-context--cancellation--deadlines)
+8. [sync/atomic — Lock-Free Operations](#8-syncatomic-lock-free-operations)
+9. [Context — Cancellation & Deadlines](#9-context-cancellation-deadlines)
 10. [Production Concurrency Patterns](#10-production-concurrency-patterns)
-11. [Common Pitfalls & Debugging](#11-common-pitfalls--debugging)
-12. [Concurrency & Parallelism Interview Questions](#12-concurrency--parallelism-interview-questions)
+11. [Common Pitfalls & Debugging](#11-common-pitfalls-debugging)
+12. [Concurrency & Parallelism Interview Questions](#12-concurrency-parallelism-interview-questions)
 
 ---
 

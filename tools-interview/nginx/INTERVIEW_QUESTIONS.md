@@ -8,10 +8,10 @@
 
 1. [Event-Driven Architecture: Master/Worker Process Model](#1-event-driven-architecture-masterworker-process-model)
 2. [Event Loop Internals: epoll, kqueue, io_uring](#2-event-loop-internals-epoll-kqueue-io_uring)
-3. [Reverse Proxy Mechanics: Connection Pooling & Buffering](#3-reverse-proxy-mechanics-connection-pooling--buffering)
-4. [Load Balancing Algorithms & Health Checks](#4-load-balancing-algorithms--health-checks)
+3. [Reverse Proxy Mechanics: Connection Pooling & Buffering](#3-reverse-proxy-mechanics-connection-pooling-buffering)
+4. [Load Balancing Algorithms & Health Checks](#4-load-balancing-algorithms-health-checks)
 5. [SSL/TLS Termination Optimization](#5-ssltls-termination-optimization)
-6. [Static File Serving & sendfile Zero-Copy](#6-static-file-serving--sendfile-zero-copy)
+6. [Static File Serving & sendfile Zero-Copy](#6-static-file-serving-sendfile-zero-copy)
 7. [Connection Handling: Keepalive, Timeouts, and Backpressure](#7-connection-handling-keepalive-timeouts-and-backpressure)
 8. [Nginx Configuration Patterns for High Traffic](#8-nginx-configuration-patterns-for-high-traffic)
 9. [Nginx vs Caddy vs Envoy vs HAProxy](#9-nginx-vs-caddy-vs-envoy-vs-haproxy)
