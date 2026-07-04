@@ -16,6 +16,38 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 {% endblock %}
 
+{% block site_nav %}
+  {{ super() }}
+{% endblock %}
+
+{% block libs %}
+  {{ super() }}
+  <script>
+  (function() {
+    'use strict';
+    // Ensure GitHub source link sits at the bottom of the sidebar
+    function fixSidebar() {
+      var sidebar = document.querySelector('.md-sidebar--primary');
+      var source = sidebar && sidebar.querySelector('.md-nav__source');
+      if (!source) return;
+      // Move it after the nav list (it may be before it in the DOM)
+      var list = sidebar.querySelector('.md-nav__list');
+      if (list && source.parentNode) {
+        source.parentNode.appendChild(source);
+      }
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', fixSidebar);
+    } else {
+      fixSidebar();
+    }
+    if (typeof location$ !== 'undefined') {
+      location$.subscribe(function() { setTimeout(fixSidebar, 50); });
+    }
+  })();
+  </script>
+{% endblock %}
+
 {% block content %}
   {{ super() }}
 
