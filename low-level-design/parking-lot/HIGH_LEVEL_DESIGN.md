@@ -1,329 +1,485 @@
-# 🏗️ Parking Lot System — High-Level Design
+# 🏗️ Parking Lot System — High-Level Design (AWS Production)
 
-> **Interviewer:** Principal Software Engineer  
-> **Target Level:** Senior/Staff Engineer  
-> **Focus:** Distributed system architecture, scalability, API design
+> **Role:** Principal Cloud Architect / Systems Designer  
+> **Target Level:** Staff/Principal Engineer  
+> **Focus:** Distributed AWS-native architecture, MCP server integration, resilience engineering
 
 ---
 
 ## 1. SYSTEM OVERVIEW
 
-**Purpose:** Allow vehicles to enter, park, and exit a multi-floor parking facility with automated fee collection and spot allocation.
+**Purpose:** Multi-floor parking facility with automated fee collection, real-time spot allocation, and AI-agent operable interfaces via Model Context Protocol (MCP).
 
-**Scale:** 10 floors × 500 spots = 5,000 total spots. Peak: 500 entries/hour, 500 exits/hour.
+**Scale:** 10 floors × 500 spots = 5,000 total. Peak: 500 entries/hr, 500 exits/hr. Target 99.99% availability.
 
-**Users:** Drivers (end users), Parking Attendants (admin), System Admins
-
-**Use Cases:**
-- Enter parking lot → get ticket
-- Park at assigned spot
-- Exit → pay fee → leave
-- Check availability before arriving
-- Reserve spot in advance (premium)
-
-**Constraints:** Low latency for gate operations (<500ms), 99.9% uptime, no double-booking
+**Domain:** Smart mobility infrastructure with edge computing at gate controllers, cloud-based orchestration, and MCP-exposed management capabilities for autonomous operational agents.
 
 ---
 
-## 2. HIGH-LEVEL ARCHITECTURE
+## 2. SYSTEM TOPOLOGY & AWS COMPONENT SELECTION
 
 ```mermaid
 flowchart TB
-    subgraph Clients["📱 Clients"]
-        A["Mobile App<br/>(React Native)"]
-        B["Web App<br/>(PWA)"]
-        C["Gate Kiosk<br/>(IoT)"]
+    subgraph Edge["🌐 Edge & CDN"]
+        CF["CloudFront\nCDN + WAF"]
+        IoT["IoT Core\nGate Controllers"]
+        GKD["Greengrass\nEdge Compute"]
     end
 
-    subgraph Gateway["🔒 API Layer"]
-        D["API Gateway<br/>(Kong / AWS ALB)"]
-        D1["Auth<br/>(JWT/OAuth2)"]
-        D2["Rate Limiting<br/>(Redis)"]
-        D3["Request Routing"]
+    subgraph Auth["🔐 Auth & Security"]
+        COG["Cognito\nUser Pools"]
+        KMS["KMS\nEncryption Keys"]
+        WAF["WAF\nRate Limiting"]
     end
 
-    subgraph Services["⚙️ Microservices"]
-        E["Entry/Exit Service<br/>(Go)"]
-        F["Booking Service<br/>(Python/FastAPI)"]
-        G["Payment Service<br/>(Node.js)"]
-        H["Admin Dashboard<br/>(React)"]
+    subgraph Compute["⚙️ Compute Layer"]
+        ALB["Application LB\n(Internal)"]
+        L1["Lambda: Entry\n(Ticket Issuance)"]
+        L2["Lambda: Exit\n(Fee Calculation)"]
+        F1["Fargate: Booking\n(Python/FastAPI)"]
+        F2["Fargate: Payment\n(Node.js)"]
+    end
+
+    subgraph Stream["📨 Ingestion & Messaging"]
+        KDS["Kinesis Data Streams\nEntry/Exit Events"]
+        SQS["SQS\nPayment Queue"]
+        SNS["SNS\nNotifications"]
+        DLQ["DLQ\nFailed Payments"]
     end
 
     subgraph Data["💾 Data Layer"]
-        I["PostgreSQL<br/>Tickets · Payments · Users"]
-        J["Redis Cache<br/>Spot status · Rate cards · Locks"]
-        K["S3 Bucket<br/>Receipts · Logs"]
+        AUR["Aurora PostgreSQL\nMulti-AZ\nTickets · Payments · Users"]
+        DDB["DynamoDB\nDAX\nSpot Inventory"]
+        ECR["ElastiCache Redis\nCluster Mode\nLocks · Rate Cards"]
+        S3["S3\nReceipts · Logs · ANPR"]
     end
 
-    subgraph Observability["📊 Observability"]
-        L["Prometheus<br/>Metrics"]
-        M["Grafana<br/>Dashboards"]
-        N["CloudWatch<br/>Alerts"]
+    subgraph MCP["🤖 MCP Server Layer"]
+        MCP_SRV["MCP Server\n(Agent Interface)"]
+        TOOL["tools/list\nCost · Compliance · Deploy"]
+        RES["resources/list\nArch Ref · VPC Rules"]
+        PROMPT["prompts/list\nWell-Architected Review"]
     end
 
-    A --> D
-    B --> D
-    C --> D
+    subgraph Obs["📊 Observability"]
+        CW["CloudWatch\nLogs + Metrics"]
+        XR["X-Ray\nTracing"]
+        PROM["Prometheus\non ECS"]
+        GRA["Grafana\nDashboards"]
+    end
 
-    D --> D1
-    D --> D2
-    D --> D3
+    CF --> WAF
+    WAF --> ALB
+    IoT --> GKD
+    GKD --> KDS
 
-    D3 --> E
-    D3 --> F
-    D3 --> G
-    D3 --> H
+    ALB --> COG
+    ALB --> L1
+    ALB --> L2
+    ALB --> F1
+    ALB --> F2
 
-    E --> I
-    E --> J
-    F --> I
-    F --> J
-    G --> I
-    G --> K
-    H --> I
+    L1 --> KDS
+    L2 --> SQS
+    SQS --> DLQ
+    SQS --> F2
+    F2 --> SNS
 
-    I -.-> L
-    J -.-> L
-    E -.-> L
-    F -.-> L
-    G -.-> L
+    L1 --> DDB
+    L1 --> ECR
+    L2 --> AUR
+    F1 --> AUR
+    F1 --> ECR
+    F2 --> AUR
+    F2 --> S3
 
-    L --> M
-    L --> N
+    AUR -.-> CW
+    DDB -.-> CW
+    L1 -.-> XR
+    F1 -.-> XR
+    CW --> PROM
+    PROM --> GRA
 
-    style A fill:#1e1b4b,stroke:#a78bfa,color:#e6edf3
-    style B fill:#1e1b4b,stroke:#a78bfa,color:#e6edf3
-    style C fill:#1e1b4b,stroke:#a78bfa,color:#e6edf3
-    style D fill:#4c1d95,stroke:#8b5cf6,color:#e6edf3
-    style E fill:#1a365d,stroke:#60a5fa,color:#e6edf3
-    style F fill:#1a365d,stroke:#60a5fa,color:#e6edf3
-    style G fill:#1a365d,stroke:#60a5fa,color:#e6edf3
-    style H fill:#1a365d,stroke:#60a5fa,color:#e6edf3
-    style I fill:#0d3320,stroke:#4ade80,color:#e6edf3
-    style J fill:#0d3320,stroke:#4ade80,color:#e6edf3
-    style K fill:#0d3320,stroke:#4ade80,color:#e6edf3
-    style L fill:#3b0d0d,stroke:#ef4444,color:#e6edf3
-    style M fill:#3b0d0d,stroke:#ef4444,color:#e6edf3
-    style N fill:#3b0d0d,stroke:#ef4444,color:#e6edf3
+    MCP_SRV --> TOOL
+    MCP_SRV --> RES
+    MCP_SRV --> PROMPT
+    MCP_SRV -.-> AUR
+    MCP_SRV -.-> CW
+
+    style CF fill:#3b0d0d,stroke:#ef4444,color:#e6edf3
+    style COG fill:#4c1d95,stroke:#8b5cf6,color:#e6edf3
+    style L1 fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style L2 fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style F1 fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style F2 fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style KDS fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style SQS fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style AUR fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style DDB fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style ECR fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style MCP_SRV fill:#2d1b69,stroke:#a78bfa,color:#e6edf3,stroke-dasharray:5 5
+    style TOOL fill:#2d1b69,stroke:#a78bfa,color:#e6edf3
+    style RES fill:#2d1b69,stroke:#a78bfa,color:#e6edf3
+    style PROMPT fill:#2d1b69,stroke:#a78bfa,color:#e6edf3
 
     linkStyle default stroke:#a78bfa,stroke-width:2px
 ```
 
-> **📥 Download:** [Parking Lot Architecture Diagram (draw.io)](parking-lot-hld.drawio) — Open in [draw.io](https://app.diagrams.net/) to edit.
-
-### Draw.io Architecture Diagram (Editable)
-
-The same architecture rendered as a native draw.io diagram — this version is fully editable in draw.io Desktop:
-
-![Parking Lot HLD Architecture](parking-lot-hld.svg)
+> **📥 Download:** [Parking Lot AWS Architecture (draw.io)](parking-lot-hld.drawio) — Open in draw.io Desktop to edit.
 
 ---
 
-## 2.5 PARKING FLOW
+## 3. MCP INTERFACE SCHEMA
+
+The system exposes its infrastructure and operational capabilities as a Model Context Protocol (MCP) server, enabling AI agents to interact with the architecture programmatically.
+
+### 3.1 Tools (`tools/list`)
+
+```json
+{
+  "tools": [
+    {
+      "name": "calculate_infrastructure_cost",
+      "description": "Estimate monthly AWS cost for the Parking Lot architecture at a given scale",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "num_lots": { "type": "integer", "minimum": 1, "default": 1 },
+          "spots_per_lot": { "type": "integer", "default": 5000 },
+          "monthly_entries": { "type": "integer", "default": 360000 },
+          "high_availability": { "type": "boolean", "default": true }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "validate_iam_compliance",
+      "description": "Scan IAM roles and policies against least-privilege best practices",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": ["entry_service", "booking_service", "payment_service", "all"],
+            "default": "all"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "generate_cloudformation_stub",
+      "description": "Generate a CloudFormation template stub for a given component",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "enum": ["vpc", "aurora", "dynamodb", "elasticache", "lambda_entry", "lambda_exit", "fargate_booking", "fargate_payment", "kinesis", "sqs"]
+          },
+          "environment": {
+            "type": "string",
+            "enum": ["dev", "staging", "prod"],
+            "default": "prod"
+          }
+        },
+        "required": ["component"]
+      }
+    },
+    {
+      "name": "simulate_failure",
+      "description": "Simulate a failure mode and report system behavior",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "failure_mode": {
+            "type": "string",
+            "enum": [
+              "aurora_primary_failover",
+              "redis_cluster_node_loss",
+              "kinesis_shard_throttle",
+              "dlq_backlog",
+              "lambda_concurrency_exhaustion",
+              "cognito_token_expiry"
+            ]
+          }
+        },
+        "required": ["failure_mode"]
+      }
+    },
+    {
+      "name": "optimize_dynamoDB_capacity",
+      "description": "Recommend DynamoDB read/write capacity and DAX cluster size based on traffic patterns",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "peak_tps_read": { "type": "integer", "default": 500 },
+          "peak_tps_write": { "type": "integer", "default": 100 },
+          "item_size_kb": { "type": "number", "default": 2 }
+        },
+        "required": []
+      }
+    }
+  ]
+}
+```
+
+### 3.2 Resources (`resources/list`)
+
+```json
+{
+  "resources": [
+    {
+      "uri": "mcp://parking-lot/architecture/vpc-rules",
+      "name": "VPC Subnet & Routing Rules",
+      "description": "Standard VPC layout with public/private subnets, NAT gateways, and VPC endpoints for all data services",
+      "mimeType": "application/json"
+    },
+    {
+      "uri": "mcp://parking-lot/architecture/data-model",
+      "name": "Data Model & Schema",
+      "description": "Complete relational schema for Aurora PostgreSQL and DynamoDB table designs with GSI/SI keys",
+      "mimeType": "application/json"
+    },
+    {
+      "uri": "mcp://parking-lot/architecture/rto-rpo-matrix",
+      "name": "RTO/RPO Matrix by Component",
+      "description": "Recovery Time Objective and Recovery Point Objective for each service component",
+      "mimeType": "application/json"
+    },
+    {
+      "uri": "mcp://parking-lot/architecture/cost-base",
+      "name": "Baseline Cost Estimate",
+      "description": "Monthly cost breakdown for the reference architecture at stated scale",
+      "mimeType": "application/json"
+    }
+  ]
+}
+```
+
+### 3.3 Prompts (`prompts/list`)
+
+```json
+{
+  "prompts": [
+    {
+      "name": "well-architected-review",
+      "description": "Run an automated AWS Well-Architected Review against the Parking Lot architecture across all six pillars"
+    },
+    {
+      "name": "incident-response-plan",
+      "description": "Generate an incident response runbook for a given failure mode using the simulate_failure tool"
+    },
+    {
+      "name": "capacity-planning",
+      "description": "Analyze current traffic patterns and recommend capacity adjustments using optimize_dynamoDB_capacity and calculate_infrastructure_cost"
+    }
+  ]
+}
+```
+
+---
+
+## 4. PARKING FLOW (Production Sequence)
 
 ```mermaid
 sequenceDiagram
     participant Driver as 🚗 Driver
-    participant Gate as 🚧 Entry Gate
-    participant EntrySvc as 🖥️ Entry Service
-    participant Redis as ⚡ Redis
-    participant DB as 🗄️ PostgreSQL
-    participant PaySvc as 💳 Payment Service
+    participant Gate as 🚧 Gate Controller
+    participant KDS as 🏞️ Kinesis Stream
+    participant L1 as λ Entry
+    participant DDB as DynamoDB
+    participant ECR as Redis
+    participant AUR as Aurora PG
+    participant SQS as SQS Queue
+    participant F2 as Fargate Payment
+    participant SNS as SNS
 
-    Driver->>Gate: Arrive at entry
-    Gate->>EntrySvc: Request entry (ANPR capture)
-    EntrySvc->>Redis: Acquire lock:gate:1
-    EntrySvc->>Redis: Query nearest available spot
-    Redis-->>EntrySvc: Spot A12 (Floor 1)
-    EntrySvc->>DB: Create ticket (UUID, spot, plate)
-    DB-->>EntrySvc: Ticket #TICK-000001
-    EntrySvc->>Redis: Update spot status -> OCCUPIED
-    EntrySvc-->>Gate: Open gate, display spot A12
-    Gate-->>Driver: Gate opens, proceed to spot A12
-    Driver->>Driver: Park at spot A12
+    Driver->>Gate: Arrive at entry (ANPR capture)
+    Gate->>KDS: Publish plate + timestamp to Kinesis
 
-    Note over Driver,PaySvc: Vehicle parked for X hours
+    KDS->>L1: Trigger Lambda (event source mapping)
+    L1->>ECR: Acquire distributed lock (gate:1)
+    L1->>DDB: Query nearest available spot (GSI:status)
+    DDB-->>L1: Spot A12 (Floor 1, Compact)
+    L1->>DDB: Update spot status → RESERVED (conditional write)
+    L1->>AUR: INSERT ticket (UUID, plate, spot, entry_time)
 
-    Driver->>Gate: Return to exit
-    Gate->>EntrySvc: Request exit (ticket scan)
-    EntrySvc->>DB: Retrieve ticket #TICK-000001
-    DB-->>EntrySvc: Ticket: entry=2h ago, spot=A12
-    EntrySvc->>PaySvc: Calculate fee (2h x compact rate)
-    PaySvc->>PaySvc: $40.00
-    PaySvc-->>EntrySvc: Fee = $40.00
-    EntrySvc->>Driver: Display fee: $40.00
-    Driver->>PaySvc: Process payment
-    PaySvc->>DB: Record payment (idempotency key)
-    PaySvc-->>Driver: Payment confirmed
-    EntrySvc->>Redis: Update spot A12 -> AVAILABLE
-    EntrySvc->>DB: Close ticket, record exit time
-    EntrySvc-->>Gate: Open exit gate
-    Gate-->>Driver: Gate opens, goodbye!
+    Note over L1: Circuit breaker: if DDB write fails 3x, fall back to Aurora reservation with optimistic locking
+
+    L1-->>KDS: Return spot assignment
+    KDS-->>Gate: Open gate → display spot A12
+    Gate-->>Driver: Proceed to spot A12
+    Driver->>Driver: Park
+
+    Note over Driver,F2: Vehicle parked for duration
+
+    Driver->>Gate: Request exit (ticket scan)
+    Gate->>KDS: Publish exit request to Kinesis
+    KDS->>L1: Trigger Lambda (fee calculation)
+    L1->>AUR: Retrieve ticket + compute duration
+    AUR-->>L1: Duration = 2h, rate = compact hourly
+    L1->>L1: Fee = $40.00
+    L1-->>Driver: Display fee
+
+    Driver->>F2: Pay $40.00 (idempotency key: tkt-001-attempt-1)
+    F2->>AUR: Record payment (ON CONFLICT DO NOTHING)
+    F2-->>Driver: Receipt generated
+    F2->>SQS: Enqueue exit event
+    SQS->>L1: Process exit (eventual consistency)
+    L1->>DDB: Release spot → AVAILABLE
+    L1->>AUR: UPDATE ticket (exit_time, status=PAID)
+    L1->>SNS: Notify admin (spot freed)
+
+    Note over F2: Payment idempotency: Redis caches processed idempotency keys with 48h TTL. Duplicate requests return cached receipt without re-charging.
 ```
 
 ---
 
-## 3. COMPONENT BREAKDOWN
+## 5. COMPONENT BREAKDOWN
 
-### 3.1 Entry/Exit Service
-- **Technology:** Go (low latency, concurrent gate operations)
-- **Responsibilities:**
-  - Ticket issuance (entry gate)
-  - License plate recognition (ANPR camera integration)
-  - Fee calculation on exit
-  - Payment processing
-  - Gate open/close control
+### 5.1 Compute Layer
 
-**🔴 Interview Question:** *"How would you design the entry gate to handle 500 concurrent vehicles/hour?"*
+| Component | Service | Runtime | Trigger | Scaling |
+|-----------|---------|---------|---------|---------|
+| Entry Lambda | AWS Lambda | Python 3.12 | API GW + Kinesis | Provisioned Concurrency: 100 |
+| Exit Lambda | AWS Lambda | Python 3.12 | SQS FIFO | Reserved Concurrency: 50 |
+| Booking Fargate | ECS Fargate | Python/FastAPI | ALB Target Group | Auto-scale: 2–20 tasks |
+| Payment Fargate | ECS Fargate | Node.js 22 | SQS FIFO + ALB | Auto-scale: 2–10 tasks |
 
-**✅ Answer:** The entry service is stateless and horizontally scalable. When a vehicle arrives:
-1. ANPR camera captures plate → sends to Entry Service via local network
-2. Entry Service acquires a distributed lock from Redis (`lock:gate:{gate_id}`)
-3. Allocates nearest available spot using a geo-spatial query
-4. Issues ticket (UUID), persists to PostgreSQL, returns to gate system
-5. Gate opens — vehicle enters
+### 5.2 Data Layer
 
-Key: Use a local Redis cluster at the parking site for low-latency spot allocation. Sync to central DB asynchronously.
-
----
-
-### 3.2 Booking Service
-- **Technology:** Python/FastAPI
-- **Responsibilities:**
-  - Real-time availability queries
-  - Spot reservation with 15-minute hold
-  - Premium spot booking
-  - Monthly pass management
-
-**🔴 Interview Question:** *"How do you prevent double-booking during reservation?"*
-
-**✅ Answer:** Two-phase locking:
-1. **Application lock:** Redis distributed lock on `booking:{spot_id}:{time_slot}`
-2. **Database lock:** `SELECT ... FOR UPDATE` within transaction
-3. **Optimistic concurrency:** Version column on spot table
-
----
-
-### 3.3 Payment Service
-- **Technology:** Node.js (async I/O for payment gateways)
-- **Responsibilities:**
-  - Fee calculation based on duration + rate card
-  - Payment gateway integration (card, UPI, wallet)
-  - Receipt generation
-  - Refund processing
-
-**🔴 Interview Question:** *"How do you handle idempotency in payment processing?"*
-
-**✅ Answer:** Every payment request carries an idempotency key (ticket_id + attempt_number). Before processing, check Redis for existing result. If found, return cached result — never double-charge.
-
----
-
-### 3.4 Data Layer
-
-**PostgreSQL Schema:**
+**Aurora PostgreSQL (Multi-AZ):**
 ```sql
 CREATE TABLE parking_lots (
-    id UUID PRIMARY KEY, name TEXT, address TEXT, total_spots INT
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    address TEXT,
+    total_spots INT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE TABLE floors (
-    id UUID, lot_id UUID REFERENCES parking_lots(id), floor_num INT
-);
-CREATE TABLE spots (
-    id UUID, floor_id UUID REFERENCES floors(id),
-    spot_type TEXT, status TEXT DEFAULT 'AVAILABLE',
-    version INT DEFAULT 1
-);
+
 CREATE TABLE tickets (
-    id UUID, spot_id UUID, vehicle_plate TEXT,
-    entry_time TIMESTAMP, exit_time TIMESTAMP, fee DECIMAL,
-    status TEXT DEFAULT 'ACTIVE'
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    lot_id UUID REFERENCES parking_lots(id),
+    spot_id TEXT NOT NULL,
+    vehicle_plate TEXT NOT NULL,
+    entry_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    exit_time TIMESTAMPTZ,
+    fee NUMERIC(10,2),
+    idempotency_key TEXT UNIQUE,
+    status TEXT DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','PAID','LOST')),
+    version INT DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX idx_tickets_status ON tickets(status) WHERE status = 'ACTIVE';
+CREATE INDEX idx_tickets_idempotency ON tickets(idempotency_key);
 ```
 
-**Caching Strategy (Redis):**
-- Spot availability: `SET spot:{id}:status AVAILABLE` — TTL: None (write-through)
-- Rate card: `HGETALL rate:{lot_id}` — TTL: 1 hour
-- Active tickets: `HGETALL ticket:{id}` — TTL: 24 hours
+**DynamoDB (with DAX):**
+| Table | Partition Key | Sort Key | GSI | Read Capacity |
+|-------|--------------|----------|-----|---------------|
+| `spots` | `lot_id` | `spot_id` | GSI: `status` | 500 RCU (DAX cached) |
+| `reservations` | `lot_id` | `time_slot` | GSI: `user_id` | 200 RCU |
+| `rate_cards` | `lot_id` | `spot_type` | — | 50 RCU (DAX cached) |
+
+### 5.3 Messaging & Streaming
+
+| Channel | Source | Destination | Pattern | Retention |
+|---------|--------|-------------|---------|-----------|
+| Kinesis Data Stream | Gate controllers | Entry Lambda | At-least-once | 24 hours |
+| SQS FIFO Queue | Exit Lambda | Payment Fargate | Exactly-once (per msg group) | 14 days DLQ |
+| SNS Topic | Payment Fargate | Admin + Driver | Pub/sub fan-out | — |
+
+### 5.4 Edge & Security
+
+- **CloudFront:** Global CDN with AWS WAF rate-based rules (1000 req/s per IP)
+- **Cognito:** User pools for driver accounts + identity pools for gate controller auth
+- **KMS:** Customer-managed key for Aurora storage encryption + S3 SSE-KMS
+- **IRSA (EKS):** Not used (Fargate tasks use IAM task roles directly)
+- **VPC Endpoints:** Gateway endpoints for S3 + DynamoDB; interface endpoints for ECR, CloudWatch, KMS
 
 ---
 
-### 3.5 Monitoring & Observability
+## 6. RESILIENCE, FAILURE MODES & EDGE CASES
 
-| Metric | Tool | Alert Threshold |
-|--------|------|-----------------|
-| Gate open latency | Prometheus | p95 > 2s |
-| Spot allocation time | Prometheus | p95 > 500ms |
-| Payment success rate | CloudWatch | < 95% |
-| Queue depth (exit) | Grafana | > 10 vehicles |
+### 6.1 Consistency vs. Availability
 
----
+| Scenario | Strategy | RPO | RTO |
+|----------|----------|-----|-----|
+| Aurora Primary Failure | Auto-failover to standby (Multi-AZ) | < 1 minute | ~60 seconds |
+| DynamoDB Regional Failure | Global Tables (active-active) | 0 (last writer wins) | < 1 second |
+| Redis Cluster Node Loss | Auto-rebuild from replicas | 0 (replica promotion) | ~10 seconds |
+| Kinesis Shard Failure | Reshard + replay from checkpoint | < 1 minute | ~120 seconds |
+| SQS Message Loss | DLQ + redrive policy | 0 (at-least-once) | Immediate |
 
-## 4. TRADE-OFFS ANALYSIS
+### 6.2 Cascading Failure Mitigation
 
-### Trade-off 1: Local vs Cloud Processing
+**Backpressure:** SQS visibility timeout + lambda reserved concurrency prevents downstream overwhelm. Kinesis shard limits throttle upstream gate controllers (which queue locally via Greengrass).
 
-| Aspect | Local (Edge) | Cloud |
-|--------|-------------|-------|
-| Latency | <10ms gate control | ~50ms |
-| Reliability | Works during internet outage | Dependent on connectivity |
-| Cost | Higher per-site | Centralized, lower per-site |
-| Maintenance | On-site hardware | Remote management |
+**Circuit Breakers:**
+- DynamoDB write failures → fall back to Aurora pessimistic lock within 300ms
+- Payment gateway timeout (3s) → retry with exponential backoff (jitter: base 100ms × 2^n + rand(0, 100ms))
+- Redis connection failure → degrade to direct Aurora reads (p50 increases 40ms → 8ms → skip cache)
 
-**Decision:** Hybrid — gate operations local, booking/payments in cloud. Local cache syncs to cloud when online.
+**Dead-Letter Queue (DLQ) Triage:**
+```
+Failed messages → SQS DLQ → CloudWatch Alarm → SNS → PagerDuty
+  ↓
+Lambda DLQ consumer (every 5 min):
+  - Re-drive up to 3 times
+  - Dead-letter to S3 for manual inspection
+  - Alert if > 10 messages in DLQ for > 1 hour
+```
 
-### Trade-off 2: License Plate Recognition (Camera) vs Manual Entry
+**Retry Jitter Algorithm:**
+```python
+import random, time, math
 
-| Aspect | ANPR | Manual (Attendant) |
-|--------|------|-------------------|
-| Speed | 3 seconds | 15 seconds |
-| Accuracy | 95% (needs fallback) | 100% |
-| Cost | $5K per gate | $3K/month per attendant |
-| Maintenance | Regular cleaning needed | Training needed |
+def retry_with_jitter(attempt, base_ms=100, max_ms=30000):
+    sleep_ms = min(base_ms * math.pow(2, attempt) + random.uniform(0, base_ms), max_ms)
+    time.sleep(sleep_ms / 1000)
+```
 
-**Decision:** ANPR with manual fallback. 5% misreads handled by attendant verification.
+### 6.3 Edge Cases
 
----
-
-## 5. SCALABILITY & RELIABILITY
-
-**Availability Target:** 99.9% (8.7 hours downtime/year)
-
-**Failure Scenarios:**
-
-| Failure | Impact | Mitigation |
-|---------|--------|------------|
-| Internet down | Cloud services unavailable | Local fallback mode — queue transactions, sync later |
-| Gate controller fails | Single gate down | Adjacent gate handles overflow |
-| Database failure | All operations degrade | Read replicas for queries, WAL for recovery |
-| Power outage | Entire lot affected | Backup generator + UPS for gates |
-
-**Scaling Strategy:**
-- Horizontal: Add more gate servers (stateless)
-- Vertical: Larger DB instance for ticket storage
-- Read replicas: For availability queries
-- Sharding: By parking lot ID for multi-lot chains
+| Edge Case | Mitigation |
+|-----------|-----------|
+| **Concurrent entry at same gate** | Redis distributed lock `lock:gate:{id}` (TTL: 5s) prevents double-ticketing |
+| **Vehicle leaves without paying** | ANPR gates capture exit; ticket goes to LOST status → fine applied to registered owner |
+| **Payment idempotency breach** | `ON CONFLICT (idempotency_key) DO NOTHING` + Redis cache of processed keys (48h TTL) |
+| **Kinesis shard hot-spot** | Partition key = `{lot_id}:{gate_id}:{epoch_hour}` ensures uniform shard distribution |
+| **DynamoDB hot key (popular spot)** | Add `spot_id` suffix to partition key to distribute writes; DAX absorbs reads |
+| **Aurora deadlock on concurrent ticket** | `SELECT ... FOR UPDATE NOWAIT` + retry in application layer (max 3 attempts) |
 
 ---
 
-## 6. COST BREAKDOWN (Monthly)
+## 7. COST BREAKDOWN (Monthly)
 
-| Component | Cost | Notes |
-|-----------|------|-------|
-| Gate hardware (ANPR × 10) | $5,000 | Amortized over 3 years |
-| Cloud compute (Entry/Booking) | $2,500 | Auto-scaled |
-| Database (PostgreSQL RDS) | $1,500 | Multi-AZ |
-| Redis Cache | $500 | Cluster mode |
-| Monitoring + Alerts | $300 | Datadog/Prometheus |
-| **Total** | **$9,800** | |
+| Component | Configuration | Monthly Cost |
+|-----------|--------------|-------------|
+| CloudFront | 500 GB data transfer, WAF | $150 |
+| Cognito | 10,000 MAUs | $0 |
+| Lambda (Entry + Exit) | 500K invocations, 1GB RAM | $85 |
+| Fargate (Booking + Payment) | 4 tasks × 2 vCPU × 4GB | $520 |
+| Aurora PostgreSQL | db.r6g.large, Multi-AZ, 500GB | $700 |
+| DynamoDB + DAX | 500 RCU / 200 WCU, DAX cluster (2 nodes) | $380 |
+| ElastiCache Redis | cache.r6g.large, cluster mode (3 shards) | $420 |
+| Kinesis Data Streams | 5 shards, 24h retention | $180 |
+| SQS + SNS | 10M requests/month | $30 |
+| S3 + KMS | 100GB storage, SSE-KMS | $15 |
+| CloudWatch + X-Ray | Metrics, logs, tracing | $120 |
+| **Total** | | **$2,600** |
 
 ---
 
-## 7. IMPLEMENTATION ROADMAP
+## 8. IMPLEMENTATION ROADMAP
 
-**Phase 1 (Month 1-2):** Basic gate entry/exit with attendant. Manual fee calculation.
+**Phase 1 (Weeks 1-3):** Core infrastructure — VPC, Aurora Multi-AZ, DynamoDB tables, Redis cluster. Basic Lambda entry/exit with SQS.
 
-**Phase 2 (Month 3-4):** ANPR integration. Automated fee calculation. Payment gateway.
+**Phase 2 (Weeks 4-6):** Fargate services (Booking + Payment), Kinesis streaming, CloudFront + WAF, Cognito auth. MCP `tools/list` endpoints.
 
-**Phase 3 (Month 5-6):** Mobile app for availability check. Premium reservations.
+**Phase 3 (Weeks 7-8):** DLQ pipeline, circuit breakers, retry jitter, Chaos Engineering experiments. MCP `resources/list` + `prompts/list`.
 
-**Phase 4 (Month 7-8):** Multi-site support. Centralized management dashboard. Analytics.
+**Phase 4 (Weeks 9-10):** Dashboards (Grafana), X-Ray tracing, CloudWatch alarms, Well-Architected Review via MCP prompt. Production hardening.
