@@ -15,7 +15,7 @@
                 <span class="hero-stat-label">LLD Projects</span>
             </div>
             <div class="hero-stat">
-                <span class="hero-stat-number">90+</span>
+                <span class="hero-stat-number">200+</span>
                 <span class="hero-stat-label">Staff-Level Questions</span>
             </div>
             <div class="hero-stat">
@@ -23,7 +23,7 @@
                 <span class="hero-stat-label">CS Core Topics</span>
             </div>
             <div class="hero-stat">
-                <span class="hero-stat-number">2</span>
+                <span class="hero-stat-number">3+</span>
                 <span class="hero-stat-label">Language Deep-Dives</span>
             </div>
         </div>
@@ -132,13 +132,19 @@
             <span class="skill-card-icon">🐍</span>
             <span class="skill-card-title">Python Internals</span>
             <span class="skill-card-desc">GIL, async, metaclasses, C extensions</span>
-            <span class="skill-card-tag">12 questions</span>
+            <span class="skill-card-tag">12 questions + concurrency</span>
+        </a>
+        <a href="python-interview/DJANGO_NOTES/" class="skill-card highlight">
+            <span class="skill-card-icon">🎯</span>
+            <span class="skill-card-title">Django Deep-Dive</span>
+            <span class="skill-card-desc">ORM internals, DRF, Celery, CQRS, multi-tenancy</span>
+            <span class="skill-card-tag">16 questions</span>
         </a>
         <a href="golang-interview/INTERVIEW_QUESTIONS/" class="skill-card highlight">
             <span class="skill-card-icon">🐹</span>
             <span class="skill-card-title">Go Internals</span>
             <span class="skill-card-desc">GMP scheduler, GC, channels, sync</span>
-            <span class="skill-card-tag">12 questions</span>
+            <span class="skill-card-tag">12 questions + concurrency</span>
         </a>
         <a href="rag-learning/" class="skill-card highlight">
             <span class="skill-card-icon">🧠</span>
@@ -195,12 +201,29 @@
         <span class="module-card-title">Python Deep-Dive</span>
     </div>
     <div class="module-card-body">
-        <span class="module-card-count">12 questions</span>
-        <span class="module-card-desc">CPython internals: GIL, event loops, metaclasses, memory management, C extensions, packaging.</span>
+        <span class="module-card-count">12 questions + guides</span>
+        <span class="module-card-desc">CPython internals: GIL, event loops, metaclasses, memory management. Includes multithreading notes with GIL workarounds, async patterns.</span>
     </div>
     <div class="module-card-footer">
         <span class="module-card-tag">CPython</span>
+        <span class="module-card-tag">GIL</span>
+        <span class="module-card-tag">Async</span>
+    </div>
+</a>
+
+<a href="python-interview/DJANGO_NOTES/" class="module-card">
+    <div class="module-card-header">
+        <span class="module-card-icon">🎯</span>
+        <span class="module-card-title">Django Framework</span>
+    </div>
+    <div class="module-card-body">
+        <span class="module-card-count">16 questions</span>
+        <span class="module-card-desc">ORM internals, DRF optimization, CQRS, multi-tenancy, Celery, caching strategies, zero-downtime migrations.</span>
+    </div>
+    <div class="module-card-footer">
+        <span class="module-card-tag">Web</span>
         <span class="module-card-tag">Staff</span>
+        <span class="module-card-tag">DRF</span>
     </div>
 </a>
 
@@ -210,11 +233,12 @@
         <span class="module-card-title">Golang Deep-Dive</span>
     </div>
     <div class="module-card-body">
-        <span class="module-card-count">12 questions</span>
-        <span class="module-card-desc">Go runtime: GMP scheduler, GC, channels, interfaces, memory model, production patterns.</span>
+        <span class="module-card-count">12 questions + guides</span>
+        <span class="module-card-desc">Go runtime: GMP scheduler, GC, channels, interfaces, memory model. Includes concurrency notes with goroutines, channels, lock-free patterns.</span>
     </div>
     <div class="module-card-footer">
         <span class="module-card-tag">Runtime</span>
+        <span class="module-card-tag">CSP</span>
         <span class="module-card-tag">Staff</span>
     </div>
 </a>

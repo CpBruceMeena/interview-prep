@@ -179,10 +179,13 @@ nav:
   - 🐍 Python:
     - Overview: python-interview/README.md
     - Interview Questions: python-interview/INTERVIEW_QUESTIONS.md
+    - Multithreading & Concurrency: python-interview/MULTITHREADING_NOTES.md
+    - Django: python-interview/DJANGO_NOTES.md
 
   - 🐹 Golang:
     - Overview: golang-interview/README.md
     - Interview Questions: golang-interview/INTERVIEW_QUESTIONS.md
+    - Concurrency & Goroutines: golang-interview/CONCURRENCY_NOTES.md
 
   - ☁️ AWS:
     - Overview: aws-interview/README.md
