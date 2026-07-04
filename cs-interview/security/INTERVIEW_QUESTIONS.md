@@ -6,16 +6,16 @@
 
 ## Table of Contents
 
-1. [JWT Internals & Security Considerations](#1-jwt-internals--security-considerations)
-2. [OAuth2 Flows & OpenID Connect](#2-oauth2-flows--openid-connect)
+1. [JWT Internals & Security Considerations](#1-jwt-internals-security-considerations)
+2. [OAuth2 Flows & OpenID Connect](#2-oauth2-flows-openid-connect)
 3. [SQL Injection Prevention at Scale](#3-sql-injection-prevention-at-scale)
-4. [Encryption at Rest & In Transit](#4-encryption-at-rest--in-transit)
-5. [Secrets Management & Vault](#5-secrets-management--vault)
-6. [Rate Limiting & DDoS Protection](#6-rate-limiting--ddos-protection)
+4. [Encryption at Rest & In Transit](#4-encryption-at-rest-in-transit)
+5. [Secrets Management & Vault](#5-secrets-management-vault)
+6. [Rate Limiting & DDoS Protection](#6-rate-limiting-ddos-protection)
 7. [Authentication: Session vs Token vs Passwordless](#7-authentication-session-vs-token-vs-passwordless)
 8. [CORS, CSRF, and SameSite Cookies](#8-cors-csrf-and-samesite-cookies)
 9. [Supply Chain Security](#9-supply-chain-security)
-10. [SSRF & Server-Side Vulnerabilities](#10-ssrf--server-side-vulnerabilities)
+10. [SSRF & Server-Side Vulnerabilities](#10-ssrf-server-side-vulnerabilities)
 
 ---
 

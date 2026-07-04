@@ -696,10 +696,65 @@
     padding: 0 1rem;
 }
 
-/* ── Sidebar ─────────────────────────────────────────────── */
+/* ── Sidebar ── Narrower + Better Visual Hierarchy ─────── */
+
+/* Reinforce MkDocs Material's default: ensure nested nav sections start collapsed.
+   Sections expand with the theme's built-in max-height transition when toggled. */
+.md-nav--primary .md-nav__item--nested > .md-nav__toggle:not(:checked) ~ .md-nav {
+    max-height: 0;
+    overflow: hidden;
+}
+
+/* Narrower sidebar */
+.md-sidebar--primary {
+    width: 14rem;
+}
+
+/* Section title — more prominent (only nested nav titles, not the site name) */
+.md-nav--primary .md-nav .md-nav__title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--md-default-fg-color--light);
+    padding: 0.6rem 0.6rem 0.3rem;
+}
+
+/* Top-level nav items (section headers in sidebar) */
+.md-nav--primary .md-nav__item--nested > .md-nav__link {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--md-default-fg-color);
+    padding: 0.35rem 0.6rem;
+    border-radius: 0.4rem;
+    transition: background 0.15s;
+}
+
+.md-nav--primary .md-nav__item--nested > .md-nav__link:hover {
+    background: rgba(255,255,255,0.04);
+}
+
+/* Second-level nav items (subsections) */
+.md-nav--primary .md-nav__item--nested .md-nav__item--nested > .md-nav__link {
+    font-size: 0.76rem;
+    font-weight: 500;
+    padding: 0.2rem 0.6rem 0.2rem 1.2rem;
+}
+
+/* Third-level nav items (leaf pages) */
+.md-nav--primary .md-nav__item--nested .md-nav__item--nested .md-nav__item > .md-nav__link {
+    font-size: 0.72rem;
+    font-weight: 400;
+    padding: 0.15rem 0.6rem 0.15rem 2rem;
+    color: var(--md-default-fg-color--light);
+}
+
+/* Active link styling */
 .md-sidebar--primary .md-nav__item--active > .md-nav__link {
     color: #c084fc;
     font-weight: 600;
+    background: rgba(139,92,246,0.08);
+    border-radius: 0.3rem;
 }
 
 .md-sidebar--primary .md-nav__link:hover {
@@ -707,27 +762,26 @@
 }
 
 /* Make nav sections collapsible with visible chevron */
-/* Style the native Material expand/collapse icon instead of adding a duplicate */
 .md-nav--primary .md-nav__item--nested .md-nav__icon {
     transition: transform 0.2s ease, opacity 0.2s ease;
-    opacity: 0.35;
+    opacity: 0.3;
 }
 
 .md-nav--primary .md-nav__item--nested .md-nav__icon svg {
     transition: transform 0.2s ease;
 }
 
-/* Rotate icon when nav is expanded (toggle checkbox checked) */
+/* Rotate icon when nav is expanded */
 .md-nav--primary .md-nav__item--nested .md-nav__toggle:checked ~ .md-nav__link .md-nav__icon svg {
     transform: rotate(90deg);
 }
 
 .md-nav--primary .md-nav__item--nested .md-nav__toggle:checked ~ .md-nav__link .md-nav__icon {
-    opacity: 0.7;
+    opacity: 0.6;
 }
 
 .md-nav--primary .md-nav__item--nested .md-nav__link:hover .md-nav__icon {
-    opacity: 0.8;
+    opacity: 0.7;
 }
 
 /* ── Footer ───────────────────────────────────────────────── */

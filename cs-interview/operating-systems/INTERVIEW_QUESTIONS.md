@@ -6,18 +6,18 @@
 
 ## Table of Contents
 
-1. [Virtual Memory & Page Tables](#1-virtual-memory--page-tables)
-2. [TLB & Huge Pages](#2-tlb--huge-pages)
+1. [Virtual Memory & Page Tables](#1-virtual-memory-page-tables)
+2. [TLB & Huge Pages](#2-tlb-huge-pages)
 3. [Process Scheduling (CFS)](#3-process-scheduling-cfs)
 4. [Context Switch Cost](#4-context-switch-cost)
 5. [I/O Models: epoll, io_uring, kqueue](#5-io-models-epoll-io_uring-kqueue)
 6. [Memory Allocation: malloc to mmap](#6-memory-allocation-malloc-to-mmap)
-7. [Page Cache & Buffer Cache](#7-page-cache--buffer-cache)
+7. [Page Cache & Buffer Cache](#7-page-cache-buffer-cache)
 8. [File Systems: ext4 vs xfs vs btrfs](#8-file-systems-ext4-vs-xfs-vs-btrfs)
 9. [IPC Mechanisms](#9-ipc-mechanisms)
-10. [Signals & Async Signal Safety](#10-signals--async-signal-safety)
-11. [cgroups & Namespaces (Container Isolation)](#11-cgroups--namespaces-container-isolation)
-12. [OOM Killer & Memory Overcommit](#12-oom-killer--memory-overcommit)
+10. [Signals & Async Signal Safety](#10-signals-async-signal-safety)
+11. [cgroups & Namespaces (Container Isolation)](#11-cgroups-namespaces-container-isolation)
+12. [OOM Killer & Memory Overcommit](#12-oom-killer-memory-overcommit)
 
 ---
 

@@ -6,12 +6,12 @@
 
 ## Table of Contents
 
-1. [Bloom Filters: Design & Math](#1-bloom-filters-design--math)
+1. [Bloom Filters: Design & Math](#1-bloom-filters-design-math)
 2. [Consistent Hashing: Ring Design](#2-consistent-hashing-ring-design)
 3. [HyperLogLog: Cardinality Estimation](#3-hyperloglog-cardinality-estimation)
-4. [Merkle Trees: Anti-Entropy & Verification](#4-merkle-trees-anti-entropy--verification)
+4. [Merkle Trees: Anti-Entropy & Verification](#4-merkle-trees-anti-entropy-verification)
 5. [Count-Min Sketch: Frequency Estimation](#5-count-min-sketch-frequency-estimation)
-6. [Trie vs FST: Autocomplete & Search](#6-trie-vs-fst-autocomplete--search)
+6. [Trie vs FST: Autocomplete & Search](#6-trie-vs-fst-autocomplete-search)
 7. [Priority Queues: Scheduling at Scale](#7-priority-queues-scheduling-at-scale)
 8. [Topological Sort: DAG Scheduling](#8-topological-sort-dag-scheduling)
 9. [LRU/LFU/TTL Cache Design](#9-lru-lfu-ttl-cache-design)

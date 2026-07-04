@@ -7,9 +7,9 @@
 ## Table of Contents
 
 1. [State Management: Local vs Remote, Locking, Migration](#1-state-management-local-vs-remote-locking-migration)
-2. [Resource Graph & Dependency Resolution](#2-resource-graph--dependency-resolution)
+2. [Resource Graph & Dependency Resolution](#2-resource-graph-dependency-resolution)
 3. [Modules: Composition, Versioning, Registry](#3-modules-composition-versioning-registry)
-4. [Workspaces & Multi-Environment Strategy](#4-workspaces--multi-environment-strategy)
+4. [Workspaces & Multi-Environment Strategy](#4-workspaces-multi-environment-strategy)
 5. [Providers: Architecture, CRUD, Custom Providers](#5-providers-architecture-crud-custom-providers)
 6. [CI/CD Integration: Terraform Cloud, Atlantis](#6-cicd-integration-terraform-cloud-atlantis)
 7. [Advanced HCL: Functions, Dynamic Blocks, Expressions](#7-advanced-hcl-functions-dynamic-blocks-expressions)

@@ -7,13 +7,13 @@
 ## Table of Contents
 
 1. [AWS Well-Architected Framework: The Six Pillars](#1-aws-well-architected-framework-the-six-pillars)
-2. [Multi-Region Architecture & Disaster Recovery](#2-multi-region-architecture--disaster-recovery)
+2. [Multi-Region Architecture & Disaster Recovery](#2-multi-region-architecture-disaster-recovery)
 3. [Cloud Migration Strategies: The 6 Rs](#3-cloud-migration-strategies-the-6-rs)
 4. [Cost Optimization Architecture at Scale](#4-cost-optimization-architecture-at-scale)
 5. [Microservices Architecture Patterns on AWS](#5-microservices-architecture-patterns-on-aws)
 6. [Serverless vs Containers: Architecture Decision](#6-serverless-vs-containers-architecture-decision)
 7. [Cloud-Native Design Patterns: Strangler Fig, CQRS, Saga](#7-cloud-native-design-patterns-strangler-fig-cqrs-saga)
-8. [Resilience Engineering & Chaos Engineering](#8-resilience-engineering--chaos-engineering)
+8. [Resilience Engineering & Chaos Engineering](#8-resilience-engineering-chaos-engineering)
 
 ---
 

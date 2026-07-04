@@ -6,16 +6,16 @@
 
 ## Table of Contents
 
-1. [Log Segment Structure & Storage Internals](#1-log-segment-structure--storage-internals)
-2. [ISR Replication & Leader Election](#2-isr-replication--leader-election)
+1. [Log Segment Structure & Storage Internals](#1-log-segment-structure-storage-internals)
+2. [ISR Replication & Leader Election](#2-isr-replication-leader-election)
 3. [Consumer Group Rebalancing](#3-consumer-group-rebalancing)
-4. [Exactly-Once Semantics & Transactions](#4-exactly-once-semantics--transactions)
+4. [Exactly-Once Semantics & Transactions](#4-exactly-once-semantics-transactions)
 5. [Producer: Batching, Compression, Idempotency](#5-producer-batching-compression-idempotency)
-6. [Kafka Connect & Connector Design](#6-kafka-connect--connector-design)
+6. [Kafka Connect & Connector Design](#6-kafka-connect-connector-design)
 7. [Kafka Streams: Stateful Processing](#7-kafka-streams-stateful-processing)
-8. [Disk I/O & Page Cache Optimization](#8-disk-io--page-cache-optimization)
-9. [Cluster Scaling & Partition Reassignment](#9-cluster-scaling--partition-reassignment)
-10. [Monitoring, Metrics & Alerting](#10-monitoring-metrics--alerting)
+8. [Disk I/O & Page Cache Optimization](#8-disk-io-page-cache-optimization)
+9. [Cluster Scaling & Partition Reassignment](#9-cluster-scaling-partition-reassignment)
+10. [Monitoring, Metrics & Alerting](#10-monitoring-metrics-alerting)
 11. [Security: TLS, SASL, ACLs](#11-security-tls-sasl-acls)
 12. [Kafka vs Pulsar vs Redpanda](#12-kafka-vs-pulsar-vs-redpanda)
 

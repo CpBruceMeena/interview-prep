@@ -6,9 +6,9 @@
 
 ## Table of Contents
 
-1. [Container Runtime: Namespaces & Cgroups](#1-container-runtime-namespaces--cgroups)
-2. [Docker: Images, Layers & UnionFS](#2-docker-images-layers--unionfs)
-3. [Kubernetes Scheduler: Binding & Node Selection](#3-kubernetes-scheduler-binding--node-selection)
+1. [Container Runtime: Namespaces & Cgroups](#1-container-runtime-namespaces-cgroups)
+2. [Docker: Images, Layers & UnionFS](#2-docker-images-layers-unionfs)
+3. [Kubernetes Scheduler: Binding & Node Selection](#3-kubernetes-scheduler-binding-node-selection)
 4. [Kubernetes Networking: CNI, Services, DNS](#4-kubernetes-networking-cni-services-dns)
 5. [Kubernetes Security: RBAC, PSP, Pod Identity](#5-kubernetes-security-rbac-psp-pod-identity)
 6. [Storage: CSI, Persistent Volumes, StatefulSets](#6-storage-csi-persistent-volumes-statefulsets)

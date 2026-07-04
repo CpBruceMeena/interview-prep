@@ -8,13 +8,13 @@
 
 1. [VPC Design: Subnets, NAT, Peering, Endpoints](#1-vpc-design-subnets-nat-peering-endpoints)
 2. [ALB vs NLB: Load Balancer Deep Dive](#2-alb-vs-nlb-load-balancer-deep-dive)
-3. [Route53: Routing Policies & Health Checks](#3-route53-routing-policies--health-checks)
-4. [CloudFront: CDN Architecture & Origin Shield](#4-cloudfront-cdn-architecture--origin-shield)
+3. [Route53: Routing Policies & Health Checks](#3-route53-routing-policies-health-checks)
+4. [CloudFront: CDN Architecture & Origin Shield](#4-cloudfront-cdn-architecture-origin-shield)
 5. [AWS Global Accelerator vs CloudFront](#5-aws-global-accelerator-vs-cloudfront)
 6. [Transit Gateway: Multi-VPC Connectivity](#6-transit-gateway-multi-vpc-connectivity)
-7. [Site-to-Site VPN & Direct Connect](#7-site-to-site-vpn--direct-connect)
-8. [VPC Flow Logs & Network Traffic Analysis](#8-vpc-flow-logs--network-traffic-analysis)
-9. [AWS WAF & Shield: DDoS Protection](#9-aws-waf--shield-ddos-protection)
+7. [Site-to-Site VPN & Direct Connect](#7-site-to-site-vpn-direct-connect)
+8. [VPC Flow Logs & Network Traffic Analysis](#8-vpc-flow-logs-network-traffic-analysis)
+9. [AWS WAF & Shield: DDoS Protection](#9-aws-waf-shield-ddos-protection)
 10. [Network ACLs vs Security Groups](#10-network-acls-vs-security-groups)
 
 ---

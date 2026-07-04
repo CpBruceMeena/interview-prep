@@ -8,24 +8,24 @@ A comprehensive collection of **18 Low-Level Design (LLD)** problems implemented
 
 | # | Project | Focus Area | Key Design Patterns |
 |---|---------|-----------|-------------------|
-| 1 | [Parking Lot](parking-lot/) | OOD Basics, Vehicle Management | Strategy, Factory, Singleton |
-| 2 | [Chess Game](chess-game/) | Game State, Complex Rules | Factory, State, Memento |
-| 3 | [Tic-Tac-Toe](tic-tac-toe/) | Simple Game, AI (Minimax) | Strategy, State, Command |
-| 4 | [Snakes & Ladders](snakes-and-ladders/) | Board Game, Dice Strategies | Strategy, Observer, State |
-| 5 | [Vending Machine](vending-machine/) | State Machine, Payments | State, Strategy, Factory |
-| 6 | [LRU/LFU/TTL Cache](lru-cache/) | Data Structures, Eviction | Strategy, Decorator |
-| 7 | [Rate Limiter](rate-limiter/) | API Rate Limiting | Strategy, Factory, Decorator |
-| 8 | [Pub-Sub System](pub-sub-system/) | Messaging, Events | Observer, Strategy, Decorator |
-| 9 | [Movie Ticket Booking](movie-ticket-booking/) | Concurrency, Booking | Strategy, Singleton, Observer |
-| 10 | [Splitwise (Expense Sharing)](splitwise-expense-sharing/) | Graphs, Debt Simplification | Strategy, Factory |
-| 11 | [Cab Booking (Uber)](cab-booking-uber/) | Real-time Matching, Pricing | Strategy, State, Observer |
-| 12 | [Library Management](library-management/) | Catalog, Fines, Circulation | Strategy, Observer, Facade |
-| 13 | [Car Rental Platform](car-rental-platform/) | Fleet, Reservations | Strategy, State, Decorator |
-| 14 | [ATM/Banking System](atm-banking-system/) | State Machine, Security | State, Strategy, Chain of Responsibility |
-| 15 | [Inventory Management](inventory-management/) | Stock, Reorder, Warehouse | Strategy, Observer, Facade |
-| 16 | [Payment Processing](payment-processing-system/) | Payments, Refunds, Fraud | Strategy, Chain of Responsibility |
-| 17 | [Job Scheduling](job-scheduling-system/) | Scheduling, Recurring Jobs | Command, Strategy, Observer |
-| 18 | [Search Platform](search-platform/) | Indexing, Ranking, TF-IDF | Strategy, Facade, Decorator |
+| 1 | [Parking Lot](parking-lot/INTERVIEW_QUESTIONS.md) | OOD Basics, Vehicle Management | Strategy, Factory, Singleton |
+| 2 | [Chess Game](chess-game/INTERVIEW_QUESTIONS.md) | Game State, Complex Rules | Factory, State, Memento |
+| 3 | [Tic-Tac-Toe](tic-tac-toe/INTERVIEW_QUESTIONS.md) | Simple Game, AI (Minimax) | Strategy, State, Command |
+| 4 | [Snakes & Ladders](snakes-and-ladders/INTERVIEW_QUESTIONS.md) | Board Game, Dice Strategies | Strategy, Observer, State |
+| 5 | [Vending Machine](vending-machine/INTERVIEW_QUESTIONS.md) | State Machine, Payments | State, Strategy, Factory |
+| 6 | [LRU/LFU/TTL Cache](lru-cache/INTERVIEW_QUESTIONS.md) | Data Structures, Eviction | Strategy, Decorator |
+| 7 | [Rate Limiter](rate-limiter/INTERVIEW_QUESTIONS.md) | API Rate Limiting | Strategy, Factory, Decorator |
+| 8 | [Pub-Sub System](pub-sub-system/INTERVIEW_QUESTIONS.md) | Messaging, Events | Observer, Strategy, Decorator |
+| 9 | [Movie Ticket Booking](movie-ticket-booking/INTERVIEW_QUESTIONS.md) | Concurrency, Booking | Strategy, Singleton, Observer |
+| 10 | [Splitwise (Expense Sharing)](splitwise-expense-sharing/INTERVIEW_QUESTIONS.md) | Graphs, Debt Simplification | Strategy, Factory |
+| 11 | [Cab Booking (Uber)](cab-booking-uber/INTERVIEW_QUESTIONS.md) | Real-time Matching, Pricing | Strategy, State, Observer |
+| 12 | [Library Management](library-management/INTERVIEW_QUESTIONS.md) | Catalog, Fines, Circulation | Strategy, Observer, Facade |
+| 13 | [Car Rental Platform](car-rental-platform/INTERVIEW_QUESTIONS.md) | Fleet, Reservations | Strategy, State, Decorator |
+| 14 | [ATM/Banking System](atm-banking-system/INTERVIEW_QUESTIONS.md) | State Machine, Security | State, Strategy, Chain of Responsibility |
+| 15 | [Inventory Management](inventory-management/INTERVIEW_QUESTIONS.md) | Stock, Reorder, Warehouse | Strategy, Observer, Facade |
+| 16 | [Payment Processing](payment-processing-system/INTERVIEW_QUESTIONS.md) | Payments, Refunds, Fraud | Strategy, Chain of Responsibility |
+| 17 | [Job Scheduling](job-scheduling-system/INTERVIEW_QUESTIONS.md) | Scheduling, Recurring Jobs | Command, Strategy, Observer |
+| 18 | [Search Platform](search-platform/INTERVIEW_QUESTIONS.md) | Indexing, Ranking, TF-IDF | Strategy, Facade, Decorator |
 
 ---
 

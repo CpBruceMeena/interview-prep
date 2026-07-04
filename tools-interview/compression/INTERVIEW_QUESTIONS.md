@@ -6,15 +6,15 @@
 
 ## Table of Contents
 
-1. [LZ77 & Huffman Coding Internals](#1-lz77--huffman-coding-internals)
+1. [LZ77 & Huffman Coding Internals](#1-lz77-huffman-coding-internals)
 2. [Deflate vs Gzip: The Difference Is the Wrapper](#2-deflate-vs-gzip-the-difference-is-the-wrapper)
-3. [Zstandard: Finite-State-Entropy & Dictionary Compression](#3-zstandard-finite-state-entropy--dictionary-compression)
+3. [Zstandard: Finite-State-Entropy & Dictionary Compression](#3-zstandard-finite-state-entropy-dictionary-compression)
 4. [Brotli: Why It Won for Web Assets](#4-brotli-why-it-won-for-web-assets)
 5. [Content-Encoding vs Transfer-Encoding](#5-content-encoding-vs-transfer-encoding)
 6. [Compression Level Trade-offs: Speed vs Ratio](#6-compression-level-trade-offs-speed-vs-ratio)
 7. [Dictionary Compression: Training Domain-Specific Dictionaries](#7-dictionary-compression-training-domain-specific-dictionaries)
 8. [Streaming Compression vs Block Compression](#8-streaming-compression-vs-block-compression)
-9. [Compression in HTTP/2 & HTTP/3: HPACK, QPACK, and Beyond](#9-compression-in-http2--http3-hpack-qpack-and-beyond)
+9. [Compression in HTTP/2 & HTTP/3: HPACK, QPACK, and Beyond](#9-compression-in-http2-http3-hpack-qpack-and-beyond)
 10. [Production Compression Strategy: When to Compress, What to Skip](#10-production-compression-strategy-when-to-compress-what-to-skip)
 
 ---

@@ -7,16 +7,16 @@
 ## Table of Contents
 
 1. [TCP Congestion Control (BBR vs Cubic)](#1-tcp-congestion-control-bbr-vs-cubic)
-2. [HTTP/2 Multiplexing & Head-of-Line Blocking](#2-http2-multiplexing--head-of-line-blocking)
-3. [HTTP/3 & QUIC](#3-http3--quic)
-4. [TLS 1.3 Handshake & 0-RTT](#4-tls-13-handshake--0-rtt)
+2. [HTTP/2 Multiplexing & Head-of-Line Blocking](#2-http2-multiplexing-head-of-line-blocking)
+3. [HTTP/3 & QUIC](#3-http3-quic)
+4. [TLS 1.3 Handshake & 0-RTT](#4-tls-13-handshake-0-rtt)
 5. [DNS Resolution Deep Dive](#5-dns-resolution-deep-dive)
 6. [Load Balancing: L4 vs L7, Consistent Hashing](#6-load-balancing-l4-vs-l7-consistent-hashing)
-7. [Connection Pooling & Keep-Alive](#7-connection-pooling--keep-alive)
+7. [Connection Pooling & Keep-Alive](#7-connection-pooling-keep-alive)
 8. [gRPC vs REST: Wire Protocol Comparison](#8-grpc-vs-rest-wire-protocol-comparison)
-9. [CDN Architecture & Caching Strategies](#9-cdn-architecture--caching-strategies)
-10. [TCP TIME_WAIT & Ephemeral Port Exhaustion](#10-tcp-time_wait--ephemeral-port-exhaustion)
-11. [Network Namespaces & Overlay Networks](#11-network-namespaces--overlay-networks)
+9. [CDN Architecture & Caching Strategies](#9-cdn-architecture-caching-strategies)
+10. [TCP TIME_WAIT & Ephemeral Port Exhaustion](#10-tcp-time_wait-ephemeral-port-exhaustion)
+11. [Network Namespaces & Overlay Networks](#11-network-namespaces-overlay-networks)
 12. [Packet Capture Analysis: Production Debugging](#12-packet-capture-analysis-production-debugging)
 
 ---

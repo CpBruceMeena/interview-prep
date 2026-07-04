@@ -6,12 +6,12 @@
 
 ## Table of Contents
 
-1. [Prometheus Architecture: Pull Model & Time Series](#1-prometheus-architecture-pull-model--time-series)
-2. [Service Discovery & Target Configuration](#2-service-discovery--target-configuration)
+1. [Prometheus Architecture: Pull Model & Time Series](#1-prometheus-architecture-pull-model-time-series)
+2. [Service Discovery & Target Configuration](#2-service-discovery-target-configuration)
 3. [PromQL: Queries, Aggregations, Functions](#3-promql-queries-aggregations-functions)
 4. [Alerting: Alertmanager, Routing, Silences](#4-alerting-alertmanager-routing-silences)
 5. [Grafana: Dashboards, Panels, Data Sources](#5-grafana-dashboards-panels-data-sources)
-6. [Recording Rules & Dashboard Efficiency](#6-recording-rules--dashboard-efficiency)
+6. [Recording Rules & Dashboard Efficiency](#6-recording-rules-dashboard-efficiency)
 7. [High Availability: Thanos, Cortex, Mimir](#7-high-availability-thanos-cortex-mimir)
 8. [Observability Strategy: Metrics, Logs, Traces](#8-observability-strategy-metrics-logs-traces)
 

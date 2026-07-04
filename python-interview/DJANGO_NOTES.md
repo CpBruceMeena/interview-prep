@@ -8,14 +8,14 @@
 ## Table of Contents
 
 1. [Django ORM Deep Dive](#1-django-orm-deep-dive)
-2. [Request Lifecycle & Middleware](#2-request-lifecycle--middleware)
+2. [Request Lifecycle & Middleware](#2-request-lifecycle-middleware)
 3. [Django REST Framework (DRF)](#3-django-rest-framework-drf)
-4. [Authentication & Authorization](#4-authentication--authorization)
+4. [Authentication & Authorization](#4-authentication-authorization)
 5. [Database Migrations](#5-database-migrations)
 6. [Caching Strategies](#6-caching-strategies)
-7. [Celery & Async Tasks](#7-celery--async-tasks)
+7. [Celery & Async Tasks](#7-celery-async-tasks)
 8. [Performance Optimization](#8-performance-optimization)
-9. [Signals & Event-Driven Patterns](#9-signals--event-driven-patterns)
+9. [Signals & Event-Driven Patterns](#9-signals-event-driven-patterns)
 10. [Production Deployment](#10-production-deployment)
 11. [Django Design Patterns](#11-django-design-patterns)
 12. [Django Interview Questions](#12-django-interview-questions)

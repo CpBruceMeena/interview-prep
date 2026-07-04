@@ -6,11 +6,11 @@
 
 ## Table of Contents
 
-1. [Document Model & WiredTiger Storage Engine](#1-document-model--wiredtiger-storage-engine)
+1. [Document Model & WiredTiger Storage Engine](#1-document-model-wiredtiger-storage-engine)
 2. [Replica Sets: Election, Rollback, Write Concern](#2-replica-sets-election-rollback-write-concern)
 3. [Sharding: Architecture, Balancer, Chunk Splitting](#3-sharding-architecture-balancer-chunk-splitting)
 4. [Indexing: Compound, Multikey, Text, Geospatial](#4-indexing-compound-multikey-text-geospatial)
-5. [Aggregation Pipeline: Optimization & Memory](#5-aggregation-pipeline-optimization--memory)
+5. [Aggregation Pipeline: Optimization & Memory](#5-aggregation-pipeline-optimization-memory)
 6. [Transactions: Multi-Document ACID in MongoDB 4.0+](#6-transactions-multi-document-acid-in-mongodb-40)
 
 ---
