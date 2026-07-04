@@ -898,3 +898,442 @@
         grid-template-columns: 1fr;
     }
 }
+
+/* ===========================================================================
+   PREMIUM ADDITIONS — Grid Background, Glassmorphism, Feedback, etc.
+   =========================================================================== */
+
+/* ── Grid Background ───────────────────────────────────────── */
+body {
+    background-image:
+        radial-gradient(circle at 20% 0%, rgba(91,140,255,0.08), transparent 40%),
+        radial-gradient(circle at 90% 10%, rgba(167,139,250,0.08), transparent 40%),
+        linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 48px 48px, 48px 48px;
+    background-position: 0 0, 0 0, -1px -1px, -1px -1px;
+}
+
+/* ── Premium Scrollbar ─────────────────────────────────────── */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #232b3c;
+    border-radius: 8px;
+    border: 2px solid var(--md-default-bg-color);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #2d3648;
+}
+
+/* ── Typography (Inter override) ───────────────────────────── */
+body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, ui-sans-serif, system-ui, sans-serif !important;
+}
+
+.md-typeset code, .md-typeset pre, .highlight, .md-nav__title, .md-tabs__link {
+    font-family: 'JetBrains Mono', ui-monospace, 'Roboto Mono', monospace !important;
+}
+
+/* ── Enhanced Code Blocks ──────────────────────────────────── */
+.md-typeset .highlight {
+    border-radius: 0.75rem;
+    position: relative;
+}
+
+.md-typeset .highlight code {
+    padding-top: 0.8rem;
+    padding-bottom: 1rem;
+}
+
+.md-typeset .highlighttable {
+    border-radius: 0.75rem;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 8px 30px -12px rgba(0,0,0,0.5);
+    margin: 1.4rem 0;
+}
+
+.md-typeset .highlighttable .linenos {
+    background: rgba(0,0,0,0.2);
+    border-right: 1px solid rgba(255,255,255,0.04);
+    padding: 1rem 0.4rem 1rem 0.8rem;
+    font-size: 0.7rem;
+    color: rgba(255,255,255,0.2);
+    user-select: none;
+}
+
+.md-typeset .highlighttable .codehilite {
+    background: #0b0e15 !important;
+}
+
+/* ── Enhanced Admonitions / Callouts ───────────────────────── */
+.md-typeset .admonition {
+    border-radius: 0.85rem;
+    box-shadow: 0 8px 30px -12px rgba(0,0,0,0.4);
+    padding: 0.8rem 1rem 0.8rem 2.6rem;
+    font-size: 0.82rem;
+    position: relative;
+    border: none !important;
+    background: rgba(255,255,255,0.03);
+}
+
+.md-typeset .admonition::before {
+    display: none;
+}
+
+.md-typeset .admonition > .admonition-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0;
+    margin-bottom: 0.4rem;
+    background: none !important;
+    border: none !important;
+    line-height: 1.5;
+}
+
+.md-typeset .admonition > .admonition-title::before {
+    display: none;
+}
+
+/* Tip admonition — emerald theme */
+.md-typeset .admonition.tip {
+    background: rgba(34,211,165,0.06);
+    border-left: 3px solid #22d3a5 !important;
+}
+.md-typeset .admonition.tip > .admonition-title {
+    color: #22d3a5;
+}
+
+/* Warning admonition — amber theme */
+.md-typeset .admonition.warning {
+    background: rgba(255,178,72,0.07);
+    border-left: 3px solid #fbbf24 !important;
+}
+.md-typeset .admonition.warning > .admonition-title {
+    color: #fbbf24;
+}
+
+/* Note admonition — blue theme */
+.md-typeset .admonition.note {
+    background: rgba(91,140,255,0.06);
+    border-left: 3px solid #5b8cff !important;
+}
+.md-typeset .admonition.note > .admonition-title {
+    color: #5b8cff;
+}
+
+/* Danger admonition — red theme */
+.md-typeset .admonition.danger {
+    background: rgba(239,68,68,0.07);
+    border-left: 3px solid #ef4444 !important;
+}
+.md-typeset .admonition.danger > .admonition-title {
+    color: #ef4444;
+}
+
+/* Info admonition — indigo theme */
+.md-typeset .admonition.info {
+    background: rgba(139,92,246,0.07);
+    border-left: 3px solid #a78bfa !important;
+}
+.md-typeset .admonition.info > .admonition-title {
+    color: #a78bfa;
+}
+
+/* Example admonition — violet theme */
+.md-typeset .admonition.example {
+    background: rgba(167,139,250,0.06);
+    border-left: 3px solid #a78bfa !important;
+}
+.md-typeset .admonition.example > .admonition-title {
+    color: #a78bfa;
+}
+
+/* ── Enhanced Blockquotes ──────────────────────────────────── */
+.md-typeset blockquote {
+    border-left: 3px solid var(--md-primary-fg-color, #7c3aed);
+    background: rgba(255,255,255,0.02);
+    padding: 0.8rem 1.1rem;
+    border-radius: 0.4rem;
+    margin: 1.3rem 0;
+    color: var(--md-default-fg-color);
+    font-style: italic;
+}
+
+.md-typeset blockquote p {
+    margin: 0;
+}
+
+/* ── Enhanced TOC Sidebar ──────────────────────────────────── */
+.md-sidebar--secondary .md-nav__item .md-nav__link {
+    font-size: 0.78rem;
+    padding: 0.2rem 0;
+    border-left: 2px solid transparent;
+    padding-left: 0.5rem;
+    transition: border-color 0.15s, color 0.15s;
+}
+
+.md-sidebar--secondary .md-nav__item .md-nav__link:hover {
+    opacity: 1;
+}
+
+.md-sidebar--secondary .md-nav__item--active > .md-nav__link {
+    border-left-color: var(--md-primary-fg-color, #7c3aed);
+    color: var(--md-primary-fg-color, #7c3aed);
+    font-weight: 600;
+}
+
+/* ── Content fade-in animation ─────────────────────────────── */
+.md-content__inner {
+    animation: md-fade-in 0.4s ease both;
+}
+
+@keyframes md-fade-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Glassmorphism headers ─────────────────────────────────── */
+.md-header {
+    background: rgba(13, 17, 23, 0.75) !important;
+    backdrop-filter: blur(16px) saturate(1.2);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
+}
+
+.md-tabs {
+    background: rgba(13, 17, 23, 0.8) !important;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+
+/* ── GitHub Source Button Enhancement ──────────────────────── */
+.md-header__source {
+    margin-left: 0 !important;
+}
+
+.md-source {
+    background: linear-gradient(135deg, rgba(124,58,237,0.12), rgba(37,99,235,0.12));
+    border-radius: 0.5rem;
+    padding: 0.2rem 0.8rem;
+    border: 1px solid rgba(124,58,237,0.2);
+    transition: all 0.25s;
+}
+
+.md-source:hover {
+    background: linear-gradient(135deg, rgba(124,58,237,0.2), rgba(37,99,235,0.2));
+    border-color: rgba(124,58,237,0.4);
+    transform: translateY(-1px);
+}
+
+/* ── Feedback Widget ────────────────────────────────────────── */
+.feedback-widget {
+    padding: 1rem 1.2rem;
+    border-radius: 0.85rem;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.02);
+    text-align: center;
+}
+
+.feedback-widget-sidebar {
+    margin: 0.6rem 0.6rem 1rem 0.6rem;
+    padding: 0.75rem 0.8rem;
+    border-radius: 0.65rem;
+}
+
+.feedback-widget-title {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--md-default-fg-color--light);
+    margin-bottom: 0.5rem;
+}
+
+.feedback-widget-buttons {
+    display: flex;
+    gap: 0.4rem;
+    justify-content: center;
+}
+
+.feedback-widget-btn {
+    flex: 1;
+    max-width: 80px;
+    padding: 0.35rem 0.6rem;
+    border-radius: 0.45rem;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.03);
+    color: var(--md-default-fg-color--light);
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    line-height: 1.2;
+}
+
+.feedback-widget-btn:hover {
+    background: rgba(34,211,165,0.12);
+    border-color: rgba(34,211,165,0.3);
+    color: #22d3a5;
+}
+
+.feedback-widget-btn-no:hover {
+    background: rgba(239,68,68,0.12);
+    border-color: rgba(239,68,68,0.3);
+    color: #ef4444;
+}
+
+.feedback-widget-thanks {
+    display: none;
+    font-size: 0.7rem;
+    color: #22d3a5;
+    font-weight: 500;
+}
+
+/* ── Enhanced Lists ────────────────────────────────────────── */
+.md-typeset ul li {
+    position: relative;
+    padding-left: 1.4rem;
+}
+
+.md-typeset ul li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0.6rem;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--md-primary-fg-color, #7c3aed), var(--md-accent-fg-color, #2563eb));
+}
+
+.md-typeset ul li li::before {
+    width: 4px;
+    height: 4px;
+    top: 0.65rem;
+    opacity: 0.5;
+}
+
+.md-typeset ul li li li::before {
+    display: none;
+}
+
+/* ── Enhanced Table Hover ──────────────────────────────────── */
+.md-typeset table:not([class]) tbody tr {
+    transition: background 0.15s;
+}
+
+.md-typeset table:not([class]) tbody tr:hover td {
+    background: rgba(139,92,246,0.04);
+}
+
+/* ── Image Glass Effect ─────────────────────────────────────── */
+.md-typeset img {
+    border: 1px solid rgba(255,255,255,0.04);
+    transition: transform 0.3s, box-shadow 0.3s;
+}
+
+.md-typeset img:hover {
+    transform: scale(1.01);
+    box-shadow: 0 8px 40px rgba(0,0,0,0.2);
+}
+
+/* ── Search Dialog Premium ──────────────────────────────────── */
+.md-search__inner {
+    border-radius: 0.75rem !important;
+}
+
+.md-search__form {
+    border-radius: 0.75rem 0.75rem 0 0 !important;
+}
+
+.md-search__output {
+    border-radius: 0 0 0.75rem 0.75rem !important;
+}
+
+/* ── Better Code Copy Button ────────────────────────────────── */
+.md-clipboard {
+    transition: opacity 0.2s, transform 0.2s;
+    opacity: 0.4;
+}
+
+.md-clipboard:hover {
+    opacity: 1;
+    transform: scale(1.1);
+}
+
+/* ── Tabbed Content ─────────────────────────────────────────── */
+.md-typeset .tabbed-set {
+    border: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+}
+
+.md-typeset .tabbed-set .tabbed-labels {
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.md-typeset .tabbed-set .tabbed-labels label {
+    font-size: 0.75rem;
+    font-weight: 500;
+}
+
+.md-typeset .tabbed-set .tabbed-labels label:hover {
+    color: #c084fc;
+}
+
+/* ── Details / Collapsible ──────────────────────────────────── */
+.md-typeset details {
+    border-radius: 0.75rem;
+    border: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 4px 15px rgba(0,0,0,0.06);
+}
+
+.md-typeset details summary {
+    border-radius: 0.75rem;
+    font-weight: 600;
+}
+
+/* ── Back-to-top button ─────────────────────────────────────── */
+.md-top {
+    border-radius: 0.5rem;
+    backdrop-filter: blur(8px);
+    background: rgba(13,17,23,0.85);
+    border: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+    transition: all 0.25s;
+}
+
+.md-top:hover {
+    background: rgba(124,58,237,0.2);
+    border-color: rgba(124,58,237,0.3);
+    transform: translateY(-2px);
+}
+
+/* ── Footer enhancement ─────────────────────────────────────── */
+.md-footer-meta {
+    border-top: 1px solid rgba(255,255,255,0.04);
+    position: relative;
+}
+
+.md-footer-meta::before {
+    content: '';
+    position: absolute;
+    top: -1px;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(139,92,246,0.3), transparent);
+}
+
+.md-footer-copyright {
+    font-size: 0.72rem;
+}

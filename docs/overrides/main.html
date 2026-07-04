@@ -9,4 +9,108 @@
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="{{ config.site_name }}" />
   <meta name="twitter:description" content="{{ config.site_description | truncate(200) }}" />
+
+  <!-- Google Fonts: Inter + JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+{% endblock %}
+
+{% block content %}
+  {{ super() }}
+
+  {% if page and page.content %}
+    {% set feedback_hidden = page.meta.get('hide', []) if page.meta is mapping else [] %}
+    {% if 'feedback' not in feedback_hidden %}
+    <div class="feedback-widget feedback-widget-sidebar" id="feedbackWidget">
+      <div class="feedback-widget-title">Was this helpful?</div>
+      <div class="feedback-widget-buttons">
+        <button class="feedback-widget-btn" onclick="handleFeedback(true)">👍 Yes</button>
+        <button class="feedback-widget-btn feedback-widget-btn-no" onclick="handleFeedback(false)">👎 No</button>
+      </div>
+      <div class="feedback-widget-thanks" id="feedbackThanks">Thanks for your feedback!</div>
+    </div>
+    {% endif %}
+  {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script>
+  function handleFeedback(helpful) {
+    const widget = document.getElementById('feedbackWidget');
+    const thanks = document.getElementById('feedbackThanks');
+    if (!widget || !thanks) return;
+
+    // Hide buttons, show thanks
+    widget.querySelector('.feedback-widget-buttons').style.display = 'none';
+    thanks.style.display = 'block';
+
+    // Optional: track with analytics
+    if (typeof gtag !== 'undefined') {
+      gtag('event', 'feedback', {
+        'helpful': helpful,
+        'page': window.location.pathname
+      });
+    }
+
+    // Store in localStorage to avoid showing again on same page
+    try {
+      const key = 'feedback_' + window.location.pathname;
+      localStorage.setItem(key, helpful ? 'yes' : 'no');
+    } catch(e) {}
+  }
+
+  // Move feedback widget to TOC sidebar on desktop
+  function relocateFeedback() {
+    const widget = document.getElementById('feedbackWidget');
+    if (!widget) return;
+
+    // Find the TOC sidebar inner container
+    const tocInner = document.querySelector('.md-sidebar--secondary .md-sidebar__inner');
+    if (tocInner) {
+      // Append widget to the end of the TOC sidebar
+      tocInner.appendChild(widget);
+    }
+  }
+
+  // Check if user already gave feedback on this page
+  (function() {
+    // Run after page is fully loaded
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function() {
+        relocateFeedback();
+        restoreFeedbackState();
+      });
+    } else {
+      relocateFeedback();
+      restoreFeedbackState();
+    }
+
+    // Also re-run on navigation (for instant loading / SPA behavior)
+    if (typeof location$ !== 'undefined') {
+      location$.subscribe(function() {
+        setTimeout(function() {
+          relocateFeedback();
+          restoreFeedbackState();
+        }, 100);
+      });
+    }
+
+    function restoreFeedbackState() {
+      try {
+        const key = 'feedback_' + window.location.pathname;
+        const val = localStorage.getItem(key);
+        if (val) {
+          const widget = document.getElementById('feedbackWidget');
+          const thanks = document.getElementById('feedbackThanks');
+          if (widget && thanks) {
+            widget.querySelector('.feedback-widget-buttons').style.display = 'none';
+            thanks.style.display = 'block';
+          }
+        }
+      } catch(e) {}
+    }
+  })();
+  </script>
 {% endblock %}
