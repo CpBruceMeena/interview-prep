@@ -65,6 +65,7 @@ plugins:
   - search:
       lang:
         - en
+  - drawio
 
 markdown_extensions:
   - admonition

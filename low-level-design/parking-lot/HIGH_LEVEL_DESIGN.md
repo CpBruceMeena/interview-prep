@@ -18,16 +18,11 @@
 
 ## 2. SYSTEM ARCHITECTURE (AWS Production)
 
-The diagram below uses **official AWS Architecture Icons**. Scroll to zoom and inspect individual services.
+The diagram uses **official AWS Architecture Icons** with a strict 5-tier layout and color-coded connectors (blue=sync, green=async, orange=streaming, red=DLQ).
 
-<div style="overflow: auto; border: 1px solid #333; border-radius: 0.5rem; background: #1e1e1e; padding: 1rem;">
+![Parking Lot AWS Architecture](parking-lot-hld.drawio)
 
-<img alt="Parking Lot HLD Architecture" src="parking-lot-hld.svg" style="width: 100%; min-width: 900px;">
-
-</div>
-
-> **📥 Download:** [Parking Lot AWS Architecture (draw.io)](parking-lot-hld.drawio) — Open in [draw.io Desktop](https://github.com/jgraph/drawio-desktop/releases) or [app.diagrams.net](https://app.diagrams.net/) to edit.  
-> **🔍 Tip:** [Open in draw.io Viewer](https://viewer.diagrams.net/?tags=%7B%7D&lightbox=1&highlight=0000ff&edit=_blank&layers=1&nav=1#Uhttps://raw.githubusercontent.com/CpBruceMeena/interview-prep/main/low-level-design/parking-lot/parking-lot-hld.drawio) for interactive zoom/pan.
+> **📥 Download:** [Architecture (draw.io)](parking-lot-hld.drawio) | [Sequence Flow (draw.io)](parking-lot-sequence.drawio) — Open in [draw.io Desktop](https://github.com/jgraph/drawio-desktop/releases) to edit.
 
 ### Architecture Layers
 
@@ -45,57 +40,9 @@ The diagram below uses **official AWS Architecture Icons**. Scroll to zoom and i
 
 ## 3. PARKING FLOW (Production Sequence)
 
-```mermaid
-sequenceDiagram
-    participant Driver as 🚗 Driver
-    participant Gate as 🚧 Gate Controller
-    participant KDS as 🏞️ Kinesis Stream
-    participant L1 as λ Entry
-    participant DDB as DynamoDB
-    participant ECR as Redis
-    participant AUR as Aurora PG
-    participant SQS as SQS Queue
-    participant F2 as Fargate Payment
-    participant SNS as SNS
+The sequence diagram below shows the complete entry → park → exit → payment lifecycle with color-coded flows.
 
-    Driver->>Gate: Arrive at entry (ANPR capture)
-    Gate->>KDS: Publish plate + timestamp to Kinesis
-
-    KDS->>L1: Trigger Lambda (event source mapping)
-    L1->>ECR: Acquire distributed lock (gate:1)
-    L1->>DDB: Query nearest available spot (GSI:status)
-    DDB-->>L1: Spot A12 (Floor 1, Compact)
-    L1->>DDB: Update spot status → RESERVED (conditional write)
-    L1->>AUR: INSERT ticket (UUID, plate, spot, entry_time)
-
-    Note over L1: Circuit breaker: if DDB write fails 3x, fall back to Aurora reservation with optimistic locking
-
-    L1-->>KDS: Return spot assignment
-    KDS-->>Gate: Open gate → display spot A12
-    Gate-->>Driver: Proceed to spot A12
-    Driver->>Driver: Park
-
-    Note over Driver,F2: Vehicle parked for duration
-
-    Driver->>Gate: Request exit (ticket scan)
-    Gate->>KDS: Publish exit request to Kinesis
-    KDS->>L1: Trigger Lambda (fee calculation)
-    L1->>AUR: Retrieve ticket + compute duration
-    AUR-->>L1: Duration = 2h, rate = compact hourly
-    L1->>L1: Fee = $40.00
-    L1-->>Driver: Display fee
-
-    Driver->>F2: Pay $40.00 (idempotency key: tkt-001-attempt-1)
-    F2->>AUR: Record payment (ON CONFLICT DO NOTHING)
-    F2-->>Driver: Receipt generated
-    F2->>SQS: Enqueue exit event
-    SQS->>L1: Process exit (eventual consistency)
-    L1->>DDB: Release spot → AVAILABLE
-    L1->>AUR: UPDATE ticket (exit_time, status=PAID)
-    L1->>SNS: Notify admin (spot freed)
-
-    Note over F2: Payment idempotency: Redis caches processed idempotency keys with 48h TTL. Duplicate requests return cached receipt without re-charging.
-```
+![Parking Flow Sequence](parking-lot-sequence.drawio)
 
 ---
 

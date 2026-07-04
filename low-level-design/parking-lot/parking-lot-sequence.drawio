@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" modified="2026-07-05T01:00:00.000Z" agent="Codebuff" version="24.7.8" etag="parking-lot-sequence-v1">
+  <diagram name="Parking Flow Sequence" id="parking-lot-sequence-v1">
+    <mxGraphModel dx="1600" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="&lt;b&gt;Parking Lot — Production Flow Sequence&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=18;fontColor=#c084fc;" vertex="1" parent="1">
+          <mxGeometry x="400" y="5" width="800" height="35" as="geometry"/>
+        </mxCell>
+
+        <!-- PARTICIPANT HEADERS -->
+        <mxCell id="p-driver" value="🚗 Driver" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#3b0d0d;strokeColor=#ef4444;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="50" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-gate" value="🚧 Gate" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#3b0d0d;strokeColor=#ef4444;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="220" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-kds" value="🏞️ Kinesis" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="390" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-lambda" value="λ Entry" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#1a365d;strokeColor=#60a5fa;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="560" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-ddb" value="DynamoDB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="730" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-redis" value="Redis" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="900" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-aurora" value="Aurora PG" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-sqs" value="SQS" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p-fpay" value="Fargate Pay" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#1a365d;strokeColor=#60a5fa;fontSize=11;fontColor=#e6edf3;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1410" y="50" width="120" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- LIFELINES -->
+        <mxCell id="ll-driver" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="110" y="90"/><mxPoint x="110" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-gate" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="280" y="90"/><mxPoint x="280" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-kds" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="450" y="90"/><mxPoint x="450" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-lambda" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="90"/><mxPoint x="620" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-ddb" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="790" y="90"/><mxPoint x="790" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-redis" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="960" y="90"/><mxPoint x="960" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-aurora" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1130" y="90"/><mxPoint x="1130" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-sqs" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1300" y="90"/><mxPoint x="1300" y="1080"/></mxGeometry>
+        </mxCell>
+        <mxCell id="ll-fpay" style="endArrow=none;dashed=1;html=1;strokeColor=#666666;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1470" y="90"/><mxPoint x="1470" y="1080"/></mxGeometry>
+        </mxCell>
+
+        <!-- ======== ENTRY FLOW ======== -->
+        <mxCell id="m1" value="Arrive at entry (ANPR capture)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="110" y="130" as="sourcePoint"/><mxPoint x="280" y="130" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m2" value="Publish plate + timestamp" style="html=1;strokeColor=#f59e0b;strokeWidth=2;fontSize=9;fontColor=#f59e0b;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="280" y="170" as="sourcePoint"/><mxPoint x="450" y="170" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m3" value="Trigger Lambda (event source mapping)" style="html=1;strokeColor=#f59e0b;strokeWidth=2;fontSize=9;fontColor=#f59e0b;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="450" y="210" as="sourcePoint"/><mxPoint x="620" y="210" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m4" value="Acquire lock:gate:1" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="250" as="sourcePoint"/><mxPoint x="960" y="250" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m5" value="Query nearest available spot (GSI:status)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="290" as="sourcePoint"/><mxPoint x="790" y="290" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m6" value="Spot A12 (Floor 1, Compact)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;dashed=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="790" y="320" as="sourcePoint"/><mxPoint x="620" y="320" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m7" value="Update spot → RESERVED (conditional write)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="350" as="sourcePoint"/><mxPoint x="790" y="350" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m8" value="INSERT ticket (UUID, plate, spot, entry_time)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="390" as="sourcePoint"/><mxPoint x="1130" y="390" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m9" value="Return spot assignment" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;dashed=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="430" as="sourcePoint"/><mxPoint x="450" y="430" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m10" value="Open gate → display spot A12" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;dashed=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="280" y="460" as="sourcePoint"/><mxPoint x="110" y="460" as="targetPoint"/></mxGeometry>
+        </mxCell>
+
+        <!-- NOTE: Circuit Breaker -->
+        <mxCell id="note1" value="Circuit breaker: if DDB write fails 3x, fall back to Aurora with optimistic locking" style="shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;fontColor=#333333;align=left;" vertex="1" parent="1">
+          <mxGeometry x="640" y="380" width="250" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- PARKING DURATION -->
+        <mxCell id="m11" value="Park at spot A12" style="html=1;strokeColor=#60a5fa;strokeWidth=1;fontSize=9;fontColor=#60a5fa;dashed=1;exitX=0.5;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="110" y="500" as="sourcePoint"/><mxPoint x="110" y="500" as="targetPoint"/></mxGeometry>
+        </mxCell>
+
+        <!-- NOTE: Vehicle Parked -->
+        <mxCell id="note2" value="🚗 Vehicle parked for duration" style="shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="100" y="520" width="200" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ======== EXIT FLOW ======== -->
+        <mxCell id="m12" value="Request exit (ticket scan)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="110" y="590" as="sourcePoint"/><mxPoint x="280" y="590" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m13" value="Publish exit request to Kinesis" style="html=1;strokeColor=#f59e0b;strokeWidth=2;fontSize=9;fontColor=#f59e0b;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="280" y="620" as="sourcePoint"/><mxPoint x="450" y="620" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m14" value="Trigger Lambda (fee calculation)" style="html=1;strokeColor=#f59e0b;strokeWidth=2;fontSize=9;fontColor=#f59e0b;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="450" y="650" as="sourcePoint"/><mxPoint x="620" y="650" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m15" value="Retrieve ticket + compute duration" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="680" as="sourcePoint"/><mxPoint x="1130" y="680" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m16" value="Duration = 2h, rate = compact hourly" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;dashed=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1130" y="710" as="sourcePoint"/><mxPoint x="620" y="710" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m17" value="Display fee: $40.00" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;dashed=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="740" as="sourcePoint"/><mxPoint x="110" y="740" as="targetPoint"/></mxGeometry>
+        </mxCell>
+
+        <!-- ======== PAYMENT FLOW ======== -->
+        <mxCell id="m18" value="Pay $40.00 (idempotency key: tkt-001)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="110" y="780" as="sourcePoint"/><mxPoint x="1470" y="780" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m19" value="Record payment (ON CONFLICT DO NOTHING)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1470" y="810" as="sourcePoint"/><mxPoint x="1130" y="810" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m20" value="Receipt generated" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1470" y="840" as="sourcePoint"/><mxPoint x="110" y="840" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m21" value="Enqueue exit event" style="html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1470" y="870" as="sourcePoint"/><mxPoint x="1300" y="870" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m22" value="Process exit (eventual consistency)" style="html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1300" y="900" as="sourcePoint"/><mxPoint x="620" y="900" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m23" value="Release spot → AVAILABLE" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="930" as="sourcePoint"/><mxPoint x="790" y="930" as="targetPoint"/></mxGeometry>
+        </mxCell>
+        <mxCell id="m24" value="UPDATE ticket (exit_time, status=PAID)" style="html=1;strokeColor=#60a5fa;strokeWidth=2;fontSize=9;fontColor=#60a5fa;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="620" y="960" as="sourcePoint"/><mxPoint x="1130" y="960" as="targetPoint"/></mxGeometry>
+        </mxCell>
+
+        <!-- NOTE: Idempotency -->
+        <mxCell id="note3" value="Payment idempotency: Redis caches processed keys with 48h TTL. Duplicates return cached receipt." style="shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;fontColor=#333333;align=left;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="790" width="300" height="50" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
