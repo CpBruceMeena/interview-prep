@@ -684,10 +684,7 @@
     overflow: hidden;
 }
 
-/* Narrower sidebar */
-.md-sidebar--primary {
-    width: 14rem;
-}
+
 
 /* Section title — more prominent (only nested nav titles, not the site name) */
 .md-nav--primary .md-nav .md-nav__title {
@@ -780,7 +777,7 @@
 
 /* Increase main content width since right sidebar is removed */
 :root {
-    --md-grid-max-width: 80rem;
+    --md-grid-max-width: 96rem;
 }
 
 .md-content {
@@ -1161,6 +1158,7 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
 
 /* ── Sidebar: Full-height flex with GitHub at bottom ────── */
 .md-sidebar--primary {
+    width: 16rem;
     height: 100vh;
     position: sticky;
     top: 0;
@@ -1170,13 +1168,15 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
 
 .md-sidebar__scrollwrap {
     flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    overflow: hidden;  /* container doesn't scroll — inner nav does */
+    overflow: hidden;
 }
 
 .md-sidebar__inner {
     flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -1186,12 +1186,17 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
     display: flex;
     flex-direction: column;
     flex: 1;
+    min-height: 0;
     overflow: hidden;
 }
 
-/* Nav list — scrollable body */
+.md-nav--primary .md-nav__title:first-child {
+    flex-shrink: 0;
+}
+
 .md-nav--primary .md-nav__list {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding-bottom: 0.5rem;
 }
