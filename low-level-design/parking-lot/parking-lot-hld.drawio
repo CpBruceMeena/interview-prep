@@ -1,127 +1,334 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mxfile host="app.diagrams.net" modified="2026-07-04T12:00:00.000Z" agent="Codebuff" version="24.7.8" etag="parking-lot-hld">
-  <diagram name="Parking Lot HLD" id="parking-lot-hld">
-    <mxGraphModel dx="1420" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+<mxfile host="app.diagrams.net" modified="2026-07-04T21:00:00.000Z" agent="Codebuff" version="24.7.8" etag="parking-lot-aws-icons-v2">
+  <diagram name="Parking Lot AWS Architecture" id="parking-lot-aws-icons-v2">
+    <mxGraphModel dx="1600" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1300" pageHeight="1100" math="0" shadow="0">
       <root>
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
 
         <!-- Title -->
-        <mxCell id="title" value="&lt;b&gt;Parking Lot System — High-Level Architecture&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=18;fontColor=#c084fc;rounded=1;" vertex="1" parent="1">
-          <mxGeometry x="200" y="10" width="600" height="40" as="geometry"/>
+        <mxCell id="title" value="&lt;b&gt;Parking Lot System — AWS Production Architecture&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontColor=#c084fc;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="200" y="10" width="900" height="40" as="geometry"/>
         </mxCell>
 
-        <!-- === CLIENTS === -->
-        <mxCell id="client-box" value="📱 Clients" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1e1b4b;strokeColor=#a78bfa;strokeWidth=2;fontSize=14;fontColor=#e6edf3;dashed=0;" vertex="1" parent="1">
-          <mxGeometry x="320" y="70" width="360" height="110" as="geometry"/>
-        </mxCell>
-        <mxCell id="mobile-app" value="Mobile App&#10;(React Native)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="340" y="100" width="100" height="50" as="geometry"/>
-        </mxCell>
-        <mxCell id="web-app" value="Web App&#10;(PWA)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="460" y="100" width="100" height="50" as="geometry"/>
-        </mxCell>
-        <mxCell id="gate-kiosk" value="Gate Kiosk&#10;(IoT)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="580" y="100" width="90" height="50" as="geometry"/>
+        <!-- ============================================= -->
+        <!-- LAYER 1: EDGE & CDN                            -->
+        <!-- ============================================= -->
+        <mxCell id="layer-edge" value="&lt;b&gt;🌐 1. Edge &amp; CDN Layer&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3b0d0d;strokeColor=#ef4444;strokeWidth=2;fontSize=13;fontColor=#e6edf3;container=1;collapsible=0;expand=0;" vertex="1" parent="1">
+          <mxGeometry x="30" y="70" width="1240" height="110" as="geometry"/>
         </mxCell>
 
-        <!-- === API GATEWAY === -->
-        <mxCell id="api-gateway-box" value="🔒 API Layer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#4c1d95;strokeColor=#8b5cf6;strokeWidth=2;fontSize=14;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="320" y="220" width="360" height="100" as="geometry"/>
-        </mxCell>
-        <mxCell id="api-gateway" value="API Gateway&#10;(Kong / AWS ALB)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#5b21b6;strokeColor=#8b5cf6;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="340" y="245" width="320" height="55" as="geometry"/>
+        <mxCell id="cf-cell" value="CloudFront" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cloudfront;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="70" y="90" width="95" height="75" as="geometry"/>
         </mxCell>
 
-        <!-- === MICROSERVICES === -->
-        <mxCell id="services-box" value="⚙️ Microservices" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a365d;strokeColor=#60a5fa;strokeWidth=2;fontSize=14;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="50" y="370" width="900" height="130" as="geometry"/>
-        </mxCell>
-        <mxCell id="entry-service" value="Entry/Exit Service&#10;(Go)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1e3a5f;strokeColor=#60a5fa;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="80" y="400" width="180" height="75" as="geometry"/>
-        </mxCell>
-        <mxCell id="booking-service" value="Booking Service&#10;(Python / FastAPI)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1e3a5f;strokeColor=#60a5fa;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="320" y="400" width="180" height="75" as="geometry"/>
-        </mxCell>
-        <mxCell id="payment-service" value="Payment Service&#10;(Node.js)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1e3a5f;strokeColor=#60a5fa;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="560" y="400" width="180" height="75" as="geometry"/>
-        </mxCell>
-        <mxCell id="admin-dashboard" value="Admin Dashboard&#10;(React)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1e3a5f;strokeColor=#60a5fa;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="800" y="400" width="130" height="75" as="geometry"/>
+        <mxCell id="waf-cell" value="AWS WAF" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.waf;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="220" y="90" width="95" height="75" as="geometry"/>
         </mxCell>
 
-        <!-- === DATA LAYER === -->
-        <mxCell id="data-box" value="💾 Data Layer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;strokeWidth=2;fontSize=14;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="50" y="540" width="540" height="120" as="geometry"/>
-        </mxCell>
-        <mxCell id="postgres" value="PostgreSQL&#10;Tickets · Payments · Users" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#4ade80;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="80" y="570" width="200" height="65" as="geometry"/>
-        </mxCell>
-        <mxCell id="redis" value="Redis Cache&#10;Spot status · Rate cards · Locks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#4ade80;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="320" y="570" width="240" height="65" as="geometry"/>
+        <mxCell id="iot-cell" value="IoT Core" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.iot;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="400" y="90" width="95" height="75" as="geometry"/>
         </mxCell>
 
-        <!-- === OBSERVABILITY === -->
-        <mxCell id="obs-box" value="📊 Observability" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3b0d0d;strokeColor=#ef4444;strokeWidth=2;fontSize=14;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="650" y="540" width="300" height="120" as="geometry"/>
-        </mxCell>
-        <mxCell id="prometheus" value="Prometheus&#10;Metrics" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#581c1c;strokeColor=#ef4444;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="670" y="570" width="120" height="65" as="geometry"/>
-        </mxCell>
-        <mxCell id="grafana" value="Grafana&#10;Dashboards" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#581c1c;strokeColor=#ef4444;fontSize=11;fontColor=#e6edf3;" vertex="1" parent="1">
-          <mxGeometry x="810" y="570" width="120" height="65" as="geometry"/>
+        <mxCell id="gg-cell" value="Greengrass" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.greengrass;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="570" y="90" width="95" height="75" as="geometry"/>
         </mxCell>
 
-        <!-- === EDGES: Clients → Gateway === -->
-        <mxCell id="e-mobile-gateway" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;" edge="1" parent="1" source="mobile-app" target="api-gateway">
-          <mxGeometry relative="1" as="geometry"/>
+        <!-- ============================================= -->
+        <!-- LAYER 2: AUTH & SECURITY                       -->
+        <!-- ============================================= -->
+        <mxCell id="layer-auth" value="&lt;b&gt;🔐 2. Auth &amp; Security Layer&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#4c1d95;strokeColor=#8b5cf6;strokeWidth=2;fontSize=13;fontColor=#e6edf3;container=1;collapsible=0;expand=0;" vertex="1" parent="1">
+          <mxGeometry x="30" y="210" width="1240" height="110" as="geometry"/>
         </mxCell>
-        <mxCell id="e-web-gateway" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;" edge="1" parent="1" source="web-app" target="api-gateway">
-          <mxGeometry relative="1" as="geometry"/>
+
+        <mxCell id="cog-cell" value="Cognito" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cognito;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="70" y="230" width="95" height="75" as="geometry"/>
         </mxCell>
-        <mxCell id="e-kiosk-gateway" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;" edge="1" parent="1" source="gate-kiosk" target="api-gateway">
+
+        <mxCell id="iam-cell" value="IAM Roles (IRSA)" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.iam_role;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="220" y="230" width="95" height="75" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="kms-cell" value="KMS" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.kms;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="400" y="230" width="95" height="75" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sm-cell" value="Secrets Manager" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.secrets_manager;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="570" y="230" width="95" height="75" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="alb-cell" value="ALB (Internal)" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.elasticloadbalancing;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="750" y="230" width="95" height="75" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- LAYER 3: COMPUTE                               -->
+        <!-- ============================================= -->
+        <mxCell id="layer-compute" value="&lt;b&gt;⚙️ 3. Compute Layer&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a365d;strokeColor=#60a5fa;strokeWidth=2;fontSize=13;fontColor=#e6edf3;container=1;collapsible=0;expand=0;" vertex="1" parent="1">
+          <mxGeometry x="30" y="350" width="1240" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="lambda-entry-cell" value="Lambda (Entry)&#xa;Ticket Issuance" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="70" y="368" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="lambda-exit-cell" value="Lambda (Exit)&#xa;Fee Calculation" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="290" y="368" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="fargate-booking-cell" value="ECS Fargate (Booking)&#xa;Python / FastAPI" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.fargate;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="510" y="368" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="fargate-payment-cell" value="ECS Fargate (Payment)&#xa;Node.js" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.fargate;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="730" y="368" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- LAYER 4: MESSAGING                             -->
+        <!-- ============================================= -->
+        <mxCell id="layer-msg" value="&lt;b&gt;📨 4. Messaging &amp; Streaming Layer&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;strokeWidth=2;fontSize=13;fontColor=#e6edf3;container=1;collapsible=0;expand=0;" vertex="1" parent="1">
+          <mxGeometry x="30" y="500" width="1240" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="kds-cell" value="Kinesis Data Streams" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.kinesis;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="70" y="520" width="100" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sqs-cell" value="SQS FIFO" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.sqs;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="250" y="520" width="100" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- DLQ near SQS -->
+        <mxCell id="dlq-cell" value="SQS DLQ&#xa;Failed Payments" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.sqs;whiteSpace=wrap;html=1;fontSize=9;fontColor=#ef4444;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="250" y="580" width="100" height="30" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sns-cell" value="SNS" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.sns;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="430" y="520" width="100" height="80" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="eb-cell" value="EventBridge" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.eventbridge;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="620" y="520" width="100" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- LAYER 5: DATA                                  -->
+        <!-- ============================================= -->
+        <mxCell id="layer-data" value="&lt;b&gt;💾 5. Data Layer&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0d3320;strokeColor=#4ade80;strokeWidth=2;fontSize=13;fontColor=#e6edf3;container=1;collapsible=0;expand=0;" vertex="1" parent="1">
+          <mxGeometry x="30" y="650" width="800" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="aurora-cell" value="Aurora PostgreSQL&#xa;Serverless v2 Multi-AZ" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.aurora;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="60" y="668" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="dynamodb-cell" value="DynamoDB + DAX" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.dynamodb;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="240" y="668" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="ec-cell" value="ElastiCache Redis" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.elasticache;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="420" y="668" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="s3-cell" value="S3" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;whiteSpace=wrap;html=1;fontSize=11;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="600" y="668" width="110" height="85" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- LAYER 6: OBSERVABILITY                         -->
+        <!-- ============================================= -->
+        <mxCell id="layer-obs" value="&lt;b&gt;📊 6. Observability Layer&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3b0d0d;strokeColor=#ef4444;strokeWidth=2;fontSize=13;fontColor=#e6edf3;container=1;collapsible=0;expand=0;" vertex="1" parent="1">
+          <mxGeometry x="870" y="650" width="400" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="cw-cell" value="CloudWatch&#xa;Logs + Metrics" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cloudwatch;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="890" y="668" width="90" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="xray-cell" value="X-Ray&#xa;Tracing" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.xray;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="1010" y="668" width="90" height="85" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="prom-cell" value="AMP (Prometheus)" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.prometheus;whiteSpace=wrap;html=1;fontSize=10;fontColor=#e6edf3;align=center;verticalAlign=bottom;shadow=0;" vertex="1" parent="1">
+          <mxGeometry x="1130" y="668" width="90" height="85" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- LAYER 7: MCP SERVER                            -->
+        <!-- ============================================= -->
+        <mxCell id="layer-mcp" value="&lt;b&gt;🤖 7. MCP Server Layer (AI Agent Interface)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d1b69;strokeColor=#a78bfa;strokeWidth=2;fontSize=13;fontColor=#e6edf3;container=1;collapsible=0;expand=0;strokeDasharray=5 5;" vertex="1" parent="1">
+          <mxGeometry x="30" y="800" width="1240" height="100" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="mcp-server-cell" value="MCP Server&#xa;tools/list · resources/list&#xa;prompts/list" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.generic;whiteSpace=wrap;html=1;fontSize=10;fontColor=#c4b5fd;align=center;verticalAlign=bottom;shadow=0;fillColor=#4c1d95;" vertex="1" parent="1">
+          <mxGeometry x="70" y="818" width="120" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="mcp-tool1" value="calculate_infrastructure_cost" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=9;fontColor=#c4b5fd;" vertex="1" parent="1">
+          <mxGeometry x="280" y="820" width="180" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="mcp-tool2" value="validate_iam_compliance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=9;fontColor=#c4b5fd;" vertex="1" parent="1">
+          <mxGeometry x="280" y="848" width="180" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="mcp-tool3" value="simulate_failure" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=9;fontColor=#c4b5fd;" vertex="1" parent="1">
+          <mxGeometry x="280" y="876" width="180" height="22" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="mcp-res1" value="Architecture Ref. (VPC, Data Model)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=9;fontColor=#c4b5fd;" vertex="1" parent="1">
+          <mxGeometry x="550" y="820" width="200" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="mcp-res2" value="RTO / RPO Matrix" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=9;fontColor=#c4b5fd;" vertex="1" parent="1">
+          <mxGeometry x="550" y="848" width="200" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="mcp-res3" value="Baseline Cost Estimate" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=9;fontColor=#c4b5fd;" vertex="1" parent="1">
+          <mxGeometry x="550" y="876" width="200" height="22" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="mcp-prompts" value="📝 Well-Architected Review · Incident Response · Capacity Planning" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d246b;strokeColor=#a78bfa;fontSize=9;fontColor=#c4b5fd;" vertex="1" parent="1">
+          <mxGeometry x="840" y="840" width="300" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- EDGES: LAYER 1 → LAYER 2                       -->
+        <!-- ============================================= -->
+        <mxCell id="e-cf-waf" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="cf-cell" target="waf-cell">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- === EDGES: Gateway → Services === -->
-        <mxCell id="e-gateway-entry" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;" edge="1" parent="1" source="api-gateway" target="entry-service">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e-gateway-booking" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;" edge="1" parent="1" source="api-gateway" target="booking-service">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e-gateway-payment" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;" edge="1" parent="1" source="api-gateway" target="payment-service">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e-gateway-admin" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;" edge="1" parent="1" source="api-gateway" target="admin-dashboard">
+        <mxCell id="e-iot-gg" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="iot-cell" target="gg-cell">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- === EDGES: Services → Data === -->
-        <mxCell id="e-entry-pg" value="reads/writes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=10;fontColor=#4ade80;" edge="1" parent="1" source="entry-service" target="postgres">
-          <mxGeometry relative="1" as="geometry"/>
+        <!-- Layer 1 → Layer 2 vertical edges -->
+        <mxCell id="e-edge-auth" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="117" y="180"/>
+            <mxPoint x="117" y="230"/>
+          </mxGeometry>
         </mxCell>
-        <mxCell id="e-entry-redis" value="caches" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=10;fontColor=#4ade80;" edge="1" parent="1" source="entry-service" target="redis">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e-booking-pg" value="reads/writes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=10;fontColor=#4ade80;" edge="1" parent="1" source="booking-service" target="postgres">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e-booking-redis" value="caches" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=10;fontColor=#4ade80;" edge="1" parent="1" source="booking-service" target="redis">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e-payment-pg" value="writes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=10;fontColor=#4ade80;" edge="1" parent="1" source="payment-service" target="postgres">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e-admin-pg" value="reads" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=10;fontColor=#4ade80;" edge="1" parent="1" source="admin-dashboard" target="postgres">
+
+        <!-- WAF → ALB -->
+        <mxCell id="e-waf-alb" value="routes traffic" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=2;fontSize=9;fontColor=#a78bfa;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="waf-cell" target="alb-cell">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
-        <!-- === EDGES: Services/Metrics → Monitoring === -->
-        <mxCell id="e-metrics-prom" value="metrics" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ef4444;strokeWidth=1;fontSize=10;fontColor=#ef4444;dashed=1;" edge="1" parent="1" source="entry-service" target="prometheus">
+        <!-- Greengrass → Kinesis -->
+        <mxCell id="e-gg-kds" value="publishes events" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="gg-cell" target="kds-cell">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="e-prom-grafana" value="visualizes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ef4444;strokeWidth=2;fontSize=10;fontColor=#ef4444;" edge="1" parent="1" source="prometheus" target="grafana">
+
+        <!-- ============================================= -->
+        <!-- EDGES: ALB → COMPUTE                           -->
+        <!-- ============================================= -->
+        <mxCell id="e-alb-entry" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#60a5fa;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="alb-cell" target="lambda-entry-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e-alb-exit" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#60a5fa;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="alb-cell" target="lambda-exit-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e-alb-booking" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#60a5fa;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="alb-cell" target="fargate-booking-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e-alb-payment" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#60a5fa;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="alb-cell" target="fargate-payment-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- EDGES: COMPUTE → MESSAGING                     -->
+        <!-- ============================================= -->
+        <!-- Lambda Entry → Kinesis -->
+        <mxCell id="e-entry-kds" value="writes events" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="lambda-entry-cell" target="kds-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Lambda Exit → SQS -->
+        <mxCell id="e-exit-sqs" value="enqueues payment" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="lambda-exit-cell" target="sqs-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- SQS → DLQ -->
+        <mxCell id="e-sqs-dlq" value="redrive on failure" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ef4444;strokeWidth=1;fontSize=9;fontColor=#ef4444;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="sqs-cell" target="dlq-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- SQS → Fargate Payment -->
+        <mxCell id="e-sqs-payment" value="consumes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="sqs-cell" target="fargate-payment-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Fargate Payment → SNS -->
+        <mxCell id="e-payment-sns" value="notifies" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fargate-payment-cell" target="sns-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- EDGES: COMPUTE → DATA                          -->
+        <!-- ============================================= -->
+        <!-- Lambda Entry → DynamoDB -->
+        <mxCell id="e-entry-ddb" value="reads/writes spots" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="lambda-entry-cell" target="dynamodb-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Lambda Entry → ElastiCache -->
+        <mxCell id="e-entry-ec" value="distributed locks" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="lambda-entry-cell" target="ec-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Lambda Exit → Aurora -->
+        <mxCell id="e-exit-aurora" value="reads ticket" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="lambda-exit-cell" target="aurora-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Fargate Booking → Aurora -->
+        <mxCell id="e-booking-aurora" value="reads/writes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fargate-booking-cell" target="aurora-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Fargate Booking → ElastiCache -->
+        <mxCell id="e-booking-ec" value="caches rate cards" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fargate-booking-cell" target="ec-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Fargate Payment → Aurora -->
+        <mxCell id="e-payment-aurora" value="writes payment" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fargate-payment-cell" target="aurora-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Fargate Payment → S3 -->
+        <mxCell id="e-payment-s3" value="stores receipts" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4ade80;strokeWidth=2;fontSize=9;fontColor=#4ade80;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="fargate-payment-cell" target="s3-cell">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- EDGES: DATA → OBSERVABILITY                    -->
+        <!-- ============================================= -->
+        <!-- Aurora → CloudWatch -->
+        <mxCell id="e-aurora-cw" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ef4444;strokeWidth=1;fontSize=9;fontColor=#ef4444;dashed=1;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="layer-data" target="layer-obs">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- DynamoDB → CloudWatch -->
+        <mxCell id="e-ddb-cw" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ef4444;strokeWidth=1;fontSize=9;fontColor=#ef4444;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="layer-data" target="layer-obs">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Lambda → X-Ray -->
+        <mxCell id="e-lambda-xray" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ef4444;strokeWidth=1;fontSize=9;fontColor=#ef4444;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.7;entryDx=0;entryDy=0;" edge="1" parent="1" source="layer-compute" target="layer-obs">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ============================================= -->
+        <!-- EDGES: MCP → DATA + OBSERVABILITY              -->
+        <!-- ============================================= -->
+        <mxCell id="e-mcp-aurora" value="queries schema" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=1;fontSize=9;fontColor=#a78bfa;dashed=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="layer-mcp" target="layer-data">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e-mcp-cw" value="reads metrics" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#a78bfa;strokeWidth=1;fontSize=9;fontColor=#a78bfa;dashed=1;exitX=0.8;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="layer-mcp" target="layer-obs">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
 
