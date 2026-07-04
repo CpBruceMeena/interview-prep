@@ -27,36 +27,133 @@
 
 ## 2. HIGH-LEVEL ARCHITECTURE
 
+```mermaid
+flowchart TB
+    subgraph Clients["📱 Clients"]
+        A["Mobile App<br/>(React Native)"]
+        B["Web App<br/>(PWA)"]
+        C["Gate Kiosk<br/>(IoT)"]
+    end
+
+    subgraph Gateway["🔒 API Layer"]
+        D["API Gateway<br/>(Kong / AWS ALB)"]
+        D1["Auth<br/>(JWT/OAuth2)"]
+        D2["Rate Limiting<br/>(Redis)"]
+        D3["Request Routing"]
+    end
+
+    subgraph Services["⚙️ Microservices"]
+        E["Entry/Exit Service<br/>(Go)"]
+        F["Booking Service<br/>(Python/FastAPI)"]
+        G["Payment Service<br/>(Node.js)"]
+        H["Admin Dashboard<br/>(React)"]
+    end
+
+    subgraph Data["💾 Data Layer"]
+        I["PostgreSQL<br/>Tickets · Payments · Users"]
+        J["Redis Cache<br/>Spot status · Rate cards · Locks"]
+        K["S3 Bucket<br/>Receipts · Logs"]
+    end
+
+    subgraph Observability["📊 Observability"]
+        L["Prometheus<br/>Metrics"]
+        M["Grafana<br/>Dashboards"]
+        N["CloudWatch<br/>Alerts"]
+    end
+
+    A --> D
+    B --> D
+    C --> D
+
+    D --> D1
+    D --> D2
+    D --> D3
+
+    D3 --> E
+    D3 --> F
+    D3 --> G
+    D3 --> H
+
+    E --> I
+    E --> J
+    F --> I
+    F --> J
+    G --> I
+    G --> K
+    H --> I
+
+    I -.-> L
+    J -.-> L
+    E -.-> L
+    F -.-> L
+    G -.-> L
+
+    L --> M
+    L --> N
+
+    style A fill:#1e1b4b,stroke:#a78bfa,color:#e6edf3
+    style B fill:#1e1b4b,stroke:#a78bfa,color:#e6edf3
+    style C fill:#1e1b4b,stroke:#a78bfa,color:#e6edf3
+    style D fill:#4c1d95,stroke:#8b5cf6,color:#e6edf3
+    style E fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style F fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style G fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style H fill:#1a365d,stroke:#60a5fa,color:#e6edf3
+    style I fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style J fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style K fill:#0d3320,stroke:#4ade80,color:#e6edf3
+    style L fill:#3b0d0d,stroke:#ef4444,color:#e6edf3
+    style M fill:#3b0d0d,stroke:#ef4444,color:#e6edf3
+    style N fill:#3b0d0d,stroke:#ef4444,color:#e6edf3
+
+    linkStyle default stroke:#a78bfa,stroke-width:2px
 ```
-                    ┌──────────────────────┐
-                    │    Mobile App / Web   │
-                    │   (React Native/PWA)  │
-                    └──────────┬───────────┘
-                               │ HTTPS/WSS
-                    ┌──────────▼───────────┐
-                    │    API Gateway        │
-                    │  (Kong / AWS ALB)     │
-                    │  - Auth (JWT/OAuth2)  │
-                    │  - Rate Limiting      │
-                    │  - Request Routing    │
-                    └──────────┬───────────┘
-                               │
-          ┌────────────────────┼────────────────────┐
-          │                    │                    │
-  ┌───────▼───────┐   ┌───────▼───────┐   ┌───────▼───────┐
-  │  Entry/Exit   │   │  Booking      │   │  Admin        │
-  │  Service      │   │  Service      │   │  Dashboard    │
-  │  (Go)         │   │  (Python)     │   │  (React)      │
-  └───────┬───────┘   └───────┬───────┘   └───────────────┘
-          │                   │
-          └───────────────────┼───────────────────────────┐
-                              │                           │
-                     ┌────────▼────────┐          ┌───────▼───────┐
-                     │    Redis Cache   │          │  PostgreSQL   │
-                     │  (Spot status,   │          │  - Tickets    │
-                     │   rate limits)   │          │  - Payments   │
-                     └─────────────────┘          │  - Users      │
-                                                  └───────────────┘
+
+
+> **📥 Download:** [Parking Lot Architecture Diagram (draw.io)](parking-lot-hld.drawio) — Open in [draw.io](https://app.diagrams.net/) to edit.
+
+---
+
+## 2.5 PARKING FLOW
+
+```mermaid
+sequenceDiagram
+    participant Driver as 🚗 Driver
+    participant Gate as 🚧 Entry Gate
+    participant EntrySvc as 🖥️ Entry Service
+    participant Redis as ⚡ Redis
+    participant DB as 🗄️ PostgreSQL
+    participant PaySvc as 💳 Payment Service
+
+    Driver->>Gate: Arrive at entry
+    Gate->>EntrySvc: Request entry (ANPR capture)
+    EntrySvc->>Redis: Acquire lock:gate:1
+    EntrySvc->>Redis: Query nearest available spot
+    Redis-->>EntrySvc: Spot A12 (Floor 1)
+    EntrySvc->>DB: Create ticket (UUID, spot, plate)
+    DB-->>EntrySvc: Ticket #TICK-000001
+    EntrySvc->>Redis: Update spot status -> OCCUPIED
+    EntrySvc-->>Gate: Open gate, display spot A12
+    Gate-->>Driver: Gate opens, proceed to spot A12
+    Driver->>Driver: Park at spot A12
+
+    Note over Driver,PaySvc: Vehicle parked for X hours
+
+    Driver->>Gate: Return to exit
+    Gate->>EntrySvc: Request exit (ticket scan)
+    EntrySvc->>DB: Retrieve ticket #TICK-000001
+    DB-->>EntrySvc: Ticket: entry=2h ago, spot=A12
+    EntrySvc->>PaySvc: Calculate fee (2h x compact rate)
+    PaySvc->>PaySvc: $40.00
+    PaySvc-->>EntrySvc: Fee = $40.00
+    EntrySvc->>Driver: Display fee: $40.00
+    Driver->>PaySvc: Process payment
+    PaySvc->>DB: Record payment (idempotency key)
+    PaySvc-->>Driver: Payment confirmed
+    EntrySvc->>Redis: Update spot A12 -> AVAILABLE
+    EntrySvc->>DB: Close ticket, record exit time
+    EntrySvc-->>Gate: Open exit gate
+    Gate-->>Driver: Gate opens, goodbye!
 ```
 
 ---
