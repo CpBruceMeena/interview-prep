@@ -109,8 +109,13 @@ flowchart TB
     linkStyle default stroke:#a78bfa,stroke-width:2px
 ```
 
-
 > **📥 Download:** [Parking Lot Architecture Diagram (draw.io)](parking-lot-hld.drawio) — Open in [draw.io](https://app.diagrams.net/) to edit.
+
+### Draw.io Architecture Diagram (Editable)
+
+The same architecture rendered as a native draw.io diagram — this version is fully editable in draw.io Desktop:
+
+![Parking Lot HLD Architecture](parking-lot-hld.svg)
 
 ---
 
