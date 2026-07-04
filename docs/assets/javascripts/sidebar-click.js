@@ -3,14 +3,24 @@
  * Makes MkDocs Material sidebar section headers clickable.
  * Clicking the section title navigates to the first child page.
  * Clicking the chevron icon still toggles expand/collapse.
+ *
+ * IMPORTANT: Only intercepts <label> elements (section headers),
+ * NOT <a> elements (leaf page links). This prevents the script
+ * from hijacking clicks on HLD/Code/Questions links.
  */
 (function() {
   'use strict';
 
   document.addEventListener('click', function(e) {
-    // Find the clicked nav link label
+    // Find the clicked nav link
     var label = e.target.closest('.md-nav__link');
     if (!label) return;
+
+    // ── ONLY intercept <label> elements (section headers) ──
+    // Leaf pages use <a> links — never intercept those.
+    // Without this check, closest('.md-nav__item--nested') below
+    // would find the PARENT section and redirect to its first child.
+    if (label.tagName === 'A') return;
 
     // Only handle nested section headers (not leaf pages)
     var item = label.closest('.md-nav__item--nested');
