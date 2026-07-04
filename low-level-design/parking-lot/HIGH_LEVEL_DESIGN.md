@@ -129,6 +129,14 @@ flowchart TB
 
 ---
 
+## 2.5 DRAW.IO ARCHITECTURE DIAGRAM
+
+<img alt="Parking Lot HLD Architecture" src="parking-lot-hld.svg" style="max-width:100%;border-radius:0.5rem;margin:1rem 0;">
+
+*The diagram above uses official AWS Architecture Icons. Open the .drawio file in draw.io Desktop to edit.*
+
+---
+
 ## 3. MCP INTERFACE SCHEMA
 
 The system exposes its infrastructure and operational capabilities as a Model Context Protocol (MCP) server, enabling AI agents to interact with the architecture programmatically.
