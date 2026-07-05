@@ -5,6 +5,17 @@
 
 ---
 
+## 🗄️ Database Schema
+
+The complete production schema for the cab booking system is in [**DB_SCHEMA.md**](DB_SCHEMA.md).
+It includes 8 PostgreSQL + PostGIS tables:
+- `riders`, `drivers`, `trips`, `zones`, `driver_location_history` (partitioned by month)
+- `payments`, `rider_ratings`, `surge_pricing_log`
+- Redis GEO keys for real-time matching
+- PostGIS geo-radius query examples
+
+---
+
 ## 📦 Core Implementation
 
 ```python
@@ -595,162 +606,7 @@ class CabBookingService:
     # ... (start_trip, complete_trip, cancel_trip remain the same)
 ```
 
----
 
-## 🗄️ Production Database Schema
-
-The complete production schema for the cab booking system includes 9 tables across riders, drivers, trips, zones, location history, payments, ratings, and surge pricing logs:
-
-```sql
--- ============================================================
--- Cab Booking Service - Production Database Schema
--- Database: PostgreSQL 16 with PostGIS extension
--- ============================================================
-
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "postgis";
-
--- -----------------------------------------------------------
--- 1. RIDERS
--- -----------------------------------------------------------
-CREATE TABLE riders (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    phone VARCHAR(20) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    rating DECIMAL(2,1) DEFAULT 5.0 CHECK (rating >= 1.0 AND rating <= 5.0),
-    total_rides INT DEFAULT 0,
-    payment_methods JSONB DEFAULT '[]',
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- -----------------------------------------------------------
--- 2. DRIVERS (with PostGIS spatial index for geo queries)
--- -----------------------------------------------------------
-CREATE TABLE drivers (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    phone VARCHAR(20) UNIQUE NOT NULL,
-    license_number VARCHAR(50) UNIQUE NOT NULL,
-    cab_type VARCHAR(20) NOT NULL CHECK (cab_type IN ('MINI','SEDAN','SUV','PREMIUM','AUTO')),
-    cab_registration VARCHAR(50) UNIQUE NOT NULL,
-    rating DECIMAL(2,1) DEFAULT 5.0,
-    total_rides INT DEFAULT 0,
-    status VARCHAR(20) DEFAULT 'AVAILABLE'
-        CHECK (status IN ('AVAILABLE','BOOKED','ON_TRIP','OFFLINE','MAINTENANCE')),
-    current_location GEOGRAPHY(Point, 4326),
-    last_location_update TIMESTAMPTZ,
-    is_verified BOOLEAN DEFAULT false,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
--- Index for fast geo-radius queries
-CREATE INDEX idx_drivers_location ON drivers USING GIST (current_location);
--- Partial index for available drivers only
-CREATE INDEX idx_drivers_available ON drivers(id) WHERE status = 'AVAILABLE';
-
--- -----------------------------------------------------------
--- 3. TRIPS
--- -----------------------------------------------------------
-CREATE TABLE trips (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    rider_id UUID NOT NULL REFERENCES riders(id),
-    driver_id UUID REFERENCES drivers(id),
-    pickup_location GEOGRAPHY(Point, 4326) NOT NULL,
-    dropoff_location GEOGRAPHY(Point, 4326) NOT NULL,
-    status VARCHAR(20) DEFAULT 'REQUESTED'
-        CHECK (status IN ('REQUESTED','ACCEPTED','DRIVER_ARRIVED',
-                          'STARTED','COMPLETED','CANCELLED')),
-    fare_estimate DECIMAL(10,2),
-    final_fare DECIMAL(10,2),
-    surge_multiplier DECIMAL(3,2) DEFAULT 1.0,
-    distance_km DECIMAL(8,2),
-    duration_min INT,
-    payment_status VARCHAR(20) DEFAULT 'PENDING',
-    idempotency_key VARCHAR(64) UNIQUE,
-    requested_at TIMESTAMPTZ DEFAULT NOW(),
-    accepted_at TIMESTAMPTZ,
-    started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ
-);
-CREATE INDEX idx_trips_rider ON trips(rider_id);
-CREATE INDEX idx_trips_driver ON trips(driver_id);
-CREATE INDEX idx_trips_status ON trips(status);
-
--- -----------------------------------------------------------
--- 4. ZONES (City Partitioning)
--- -----------------------------------------------------------
-CREATE TABLE zones (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    city_id UUID NOT NULL,
-    zone_code VARCHAR(10) NOT NULL,
-    center GEOGRAPHY(Point, 4326) NOT NULL,
-    radius_meters DECIMAL(10,2) NOT NULL DEFAULT 500,
-    surge_multiplier DECIMAL(3,2) DEFAULT 1.0,
-    driver_count INT DEFAULT 0,
-    ride_request_count INT DEFAULT 0,
-    last_calculated TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_zones_center ON zones USING GIST (center);
-
--- -----------------------------------------------------------
--- 5. GPS LOCATION HISTORY (Partitioned by month)
--- -----------------------------------------------------------
-CREATE TABLE driver_location_history (
-    id BIGSERIAL,
-    driver_id UUID NOT NULL REFERENCES drivers(id),
-    location GEOGRAPHY(Point, 4326) NOT NULL,
-    speed_kmh DECIMAL(5,1),
-    heading INT,
-    zone_id UUID REFERENCES zones(id),
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (driver_id, recorded_at)
-) PARTITION BY RANGE (recorded_at);
-
--- -----------------------------------------------------------
--- 6. PAYMENTS
--- -----------------------------------------------------------
-CREATE TABLE payments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    trip_id UUID NOT NULL REFERENCES trips(id),
-    amount DECIMAL(10,2) NOT NULL,
-    method VARCHAR(20) NOT NULL,
-    status VARCHAR(20) DEFAULT 'PENDING',
-    gateway_transaction_id VARCHAR(255),
-    idempotency_key VARCHAR(64) UNIQUE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- -----------------------------------------------------------
--- 7. SURGE PRICING LOG
--- -----------------------------------------------------------
-CREATE TABLE surge_pricing_log (
-    id BIGSERIAL,
-    zone_id UUID NOT NULL REFERENCES zones(id),
-    surge_multiplier DECIMAL(3,2) NOT NULL,
-    driver_count INT NOT NULL,
-    demand_count INT NOT NULL,
-    calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (zone_id, calculated_at)
-);
-
--- -----------------------------------------------------------
--- Geo-Radius Query Example (PostGIS):
--- -----------------------------------------------------------
--- SELECT d.id, d.name, d.cab_type, d.rating,
---        ST_Distance(d.current_location, ST_MakePoint(-73.9857, 40.7484)::geography) / 1000 AS distance_km
--- FROM drivers d
--- WHERE d.status = 'AVAILABLE'
---   AND ST_DWithin(d.current_location, ST_MakePoint(-73.9857, 40.7484)::geography, 3000)
--- ORDER BY distance_km ASC LIMIT 5;
-```
-
----
 
 ## 🏛️ Architecture: GeoRadius + Kafka Pipeline
 
