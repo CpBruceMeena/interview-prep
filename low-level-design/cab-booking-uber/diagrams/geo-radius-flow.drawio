@@ -1,0 +1,103 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/24.0.0 Chrome/120.0.6099.109 Electron/28.1.0 Safari/537.36">
+  <diagram name="GeoRadius Flow" id="geo-radius-flow">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="t1" value="GeoRadius Driver Matching Flow" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="500" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Rider App -->
+        <mxCell id="rider" value="Rider App&lt;br&gt;Requests Ride&lt;br&gt;(Pickup Lat/Lng)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=12;fontStyle=0;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="160" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- API Gateway -->
+        <mxCell id="gw" value="API Gateway" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="140" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Driver Service -->
+        <mxCell id="ds" value="Driver Service&lt;br&gt;(Matching Logic)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="570" y="80" width="150" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Redis Geo -->
+        <mxCell id="redis" value="Redis GEO&lt;br&gt;drivers:available&lt;br&gt;GEOADD / GEORADIUS" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="830" y="80" width="170" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- Decision: Found drivers? -->
+        <mxCell id="decision" value="Drivers &lt;br&gt;Found?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="610" y="220" width="120" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- Yes path: Dispatch -->
+        <mxCell id="yes" value="YES" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;" vertex="1" parent="1" connectable="0">
+          <mxGeometry x="680" y="310" as="geometry"/>
+        </mxCell>
+        <mxCell id="dispatch" value="Dispatch Nearest&lt;br&gt;Driver to Pickup" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="610" y="340" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- No path: Expand radius -->
+        <mxCell id="no" value="NO" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;" vertex="1" parent="1" connectable="0">
+          <mxGeometry x="530" y="270" as="geometry"/>
+        </mxCell>
+        <mxCell id="expand" value="Expand Radius&lt;br&gt;2km → 5km → 10km" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E53935;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="380" y="240" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Progressive Radius Labels -->
+        <mxCell id="r1" value="Radius 2km:&lt;br&gt;Geohash prefix len 6" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=10;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="830" y="180" width="180" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="r2" value="Radius 5km:&lt;br&gt;Geohash prefix len 5" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=10;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="830" y="210" width="180" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="r3" value="Radius 10km:&lt;br&gt;Geohash prefix len 4" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=10;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="830" y="240" width="180" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- Returns -->
+        <mxCell id="nofound" value="No Drivers →&lt;br&gt;'No cabs available'" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E53935;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="380" y="320" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Geohash Explanation -->
+        <mxCell id="geohash" value="Geohash Encoding:&lt;br&gt;Pickup (19.078, 72.878)&lt;br&gt;→ te7u1qj&lt;br&gt;Scan buckets matching prefix" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;fontStyle=0;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="830" y="340" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=2;" edge="1" parent="1" source="rider" target="gw">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;" edge="1" parent="1" source="gw" target="ds">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="GEORADIUS query" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=2;" edge="1" parent="1" source="ds" target="redis">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;" edge="1" parent="1" source="ds" target="decision">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#388E3C;strokeWidth=2;" edge="1" parent="1" source="decision" target="dispatch">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E53935;strokeWidth=2;" edge="1" parent="1" source="decision" target="expand">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E53935;strokeWidth=2;dashed=1;" edge="1" parent="1" source="expand" target="ds">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E53935;strokeWidth=2;dashed=1;" edge="1" parent="1" source="expand" target="nofound">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
