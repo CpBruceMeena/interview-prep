@@ -20,7 +20,7 @@
 
 The diagram follows the **C4 Model (Level 2 — Container Diagram)** with a clean light-mode layout. Containers are grouped by architectural layer with color-coded connectors (blue=sync, green=async, orange=streaming, red=DLQ/failure).
 
-![Parking Lot C4 Container Diagram](diagrams/parking-lot-hld.drawio)
+![Parking Lot — C4 Container Diagram](diagrams/parking-lot-hld.drawio)
 
 > **📥 Download:** [C4 Container Diagram (draw.io)](diagrams/parking-lot-hld.drawio) · [SVG Preview](diagrams/parking-lot-hld.svg)  
 > [Sequence Flow (draw.io)](diagrams/parking-lot-sequence.drawio) · [SVG Preview](diagrams/parking-lot-sequence.svg)  
@@ -44,7 +44,7 @@ The diagram follows the **C4 Model (Level 2 — Container Diagram)** with a clea
 
 The sequence diagram below shows the complete entry → park → exit → payment lifecycle with color-coded flows.
 
-![Parking Flow Sequence](diagrams/parking-lot-sequence.drawio)
+![Parking Lot — Simplified Sequence](diagrams/parking-lot-sequence.drawio)
 
 ---
 
