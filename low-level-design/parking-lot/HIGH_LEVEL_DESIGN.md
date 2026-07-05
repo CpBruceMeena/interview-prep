@@ -18,11 +18,11 @@
 
 ## 2. SYSTEM ARCHITECTURE (AWS Production)
 
-The diagram uses **official AWS Architecture Icons** with a strict 5-tier layout and color-coded connectors (blue=sync, green=async, orange=streaming, red=DLQ).
+The diagram uses **official AWS Architecture Icons** with a natural, flowing left-to-right layout and color-coded connectors (blue=sync, green=async, orange=streaming, red=DLQ).
 
-![Parking Lot AWS Architecture](parking-lot-hld.drawio)
+![Parking Lot AWS Architecture](diagrams/parking-lot-hld.drawio)
 
-> **📥 Download:** [Architecture (draw.io)](parking-lot-hld.drawio) | [Sequence Flow (draw.io)](parking-lot-sequence.drawio) — Open in [draw.io Desktop](https://github.com/jgraph/drawio-desktop/releases) to edit.
+> **📥 Download:** [Architecture (draw.io)](diagrams/parking-lot-hld.drawio) | [Sequence Flow (draw.io)](diagrams/parking-lot-sequence.drawio) — Open in [draw.io Desktop](https://github.com/jgraph/drawio-desktop/releases) to edit.
 
 ### Architecture Layers
 
@@ -42,7 +42,7 @@ The diagram uses **official AWS Architecture Icons** with a strict 5-tier layout
 
 The sequence diagram below shows the complete entry → park → exit → payment lifecycle with color-coded flows.
 
-![Parking Flow Sequence](parking-lot-sequence.drawio)
+![Parking Flow Sequence](diagrams/parking-lot-sequence.drawio)
 
 ---
 

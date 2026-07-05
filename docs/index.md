@@ -145,8 +145,8 @@
             <span class="skill-card-desc">GMP scheduler, GC, channels, sync</span>
             <span class="skill-card-tag">12 questions + concurrency</span>
         </a>
-        <a href="rag-learning/" class="skill-card highlight">
-            <span class="skill-card-icon">🧠</span>
+        <a href="ai-engineering/rag/" class="skill-card highlight">
+            <span class="skill-card-icon">📚</span>
             <span class="skill-card-title">RAG & LLMs</span>
             <span class="skill-card-desc">Retrieval, embeddings, fine-tuning</span>
             <span class="skill-card-tag">7 guides</span>
@@ -178,18 +178,19 @@
     </div>
 </a>
 
-<a href="rag-learning/" class="module-card">
+<a href="ai-engineering/" class="module-card">
     <div class="module-card-header">
         <span class="module-card-icon">🧠</span>
-        <span class="module-card-title">RAG Learning</span>
+        <span class="module-card-title">AI Engineering</span>
     </div>
     <div class="module-card-body">
-        <span class="module-card-count">7 guides + code</span>
-        <span class="module-card-desc">Complete RAG chatbot with FastAPI, ChromaDB, and LM Studio. From fundamentals to production scaling.</span>
+        <span class="module-card-count">3 modules + code</span>
+        <span class="module-card-desc">RAG chatbot, MCP protocol, AI agents. From fundamentals to production deployment.</span>
     </div>
     <div class="module-card-footer">
-        <span class="module-card-tag">AI/ML</span>
         <span class="module-card-tag">RAG</span>
+        <span class="module-card-tag">MCP</span>
+        <span class="module-card-tag">Agents</span>
         <span class="module-card-tag">FastAPI</span>
     </div>
 </a>

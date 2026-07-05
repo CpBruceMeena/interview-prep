@@ -1,0 +1,20 @@
+# MCP Servers — Dependencies
+# Install: pip install -r requirements.txt
+
+# ── MCP SDK ──
+mcp >= 1.0.0
+
+# ── Common Utilities ──
+pyjwt >= 2.0.0           # JWT authentication (optional, for auth.py)
+
+# ── Database Server ──
+psycopg2-binary >= 2.9.0  # PostgreSQL connectivity (optional)
+
+# ── RAG Server ──
+# Note: The RAG server relies on ai-engineering/implementation/requirements.txt
+# for sentence-transformers, chromadb, langchain, etc.
+# Those are NOT duplicated here — install from there or use the shared venv.
+
+# ── Testing ──
+pytest >= 8.0.0
+pytest-asyncio >= 0.23.0

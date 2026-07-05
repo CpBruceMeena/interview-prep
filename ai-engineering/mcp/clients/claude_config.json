@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "calculator": {
+      "description": "Basic math operations — add, subtract, multiply, divide, power",
+      "command": "python",
+      "args": [
+        "-m",
+        "servers.calculator_server"
+      ],
+      "env": {}
+    },
+    "database": {
+      "description": "PostgreSQL database connector — read-only SQL queries with rate limiting",
+      "command": "python",
+      "args": [
+        "-m",
+        "servers.database_server"
+      ],
+      "env": {
+        "DATABASE_URL": "postgresql://localhost:5432/analytics",
+        "MAX_ROWS": "1000",
+        "QUERY_TIMEOUT": "10"
+      }
+    },
+    "rag-pipeline": {
+      "description": "RAG knowledge base — document indexing, retrieval, and Q&A",
+      "command": "python",
+      "args": [
+        "-m",
+        "servers.rag_server"
+      ],
+      "env": {
+        "USE_MOCK_LLM": "true",
+        "RAG_PORT": "8000"
+      }
+    }
+  }
+}
