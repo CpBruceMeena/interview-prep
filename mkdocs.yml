@@ -209,6 +209,10 @@ nav:
       - MCP Production Architecture: ai-engineering/mcp/11_MCP_PRODUCTION_ARCHITECTURE.md
     - 🤖 Agents:
       - Overview: ai-engineering/agents/README.md
+      - Agent Fundamentals: ai-engineering/agents/01_AGENT_FUNDAMENTALS.md
+      - Agent Interview Questions: ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md
+      - Agent Implementation Guide: ai-engineering/agents/03_AGENT_IMPLEMENTATION_GUIDE.md
+      - Agent Production Architecture: ai-engineering/agents/04_AGENT_PRODUCTION_ARCHITECTURE.md
 
   - 🐍 Python:
     - Overview: python-interview/README.md
