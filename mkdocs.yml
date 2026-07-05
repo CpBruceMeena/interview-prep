@@ -119,6 +119,7 @@ nav:
     - Overview: low-level-design/README.md
     - Parking Lot:
       - Code: low-level-design/parking-lot/CODE.md
+      - Schema: low-level-design/parking-lot/DB_SCHEMA.md
       - HLD: low-level-design/parking-lot/HIGH_LEVEL_DESIGN.md
       - Questions: low-level-design/parking-lot/INTERVIEW_QUESTIONS.md
     - Chess Game:
@@ -159,6 +160,7 @@ nav:
       - Questions: low-level-design/splitwise-expense-sharing/INTERVIEW_QUESTIONS.md
     - Cab Booking (Uber):
       - Code: low-level-design/cab-booking-uber/CODE.md
+      - Schema: low-level-design/cab-booking-uber/DB_SCHEMA.md
       - HLD: low-level-design/cab-booking-uber/HIGH_LEVEL_DESIGN.md
       - Questions: low-level-design/cab-booking-uber/INTERVIEW_QUESTIONS.md
     - Library Management:
@@ -167,6 +169,7 @@ nav:
       - Questions: low-level-design/library-management/INTERVIEW_QUESTIONS.md
     - Car Rental:
       - Code: low-level-design/car-rental-platform/CODE.md
+      - Schema: low-level-design/car-rental-platform/DB_SCHEMA.md
       - HLD: low-level-design/car-rental-platform/HIGH_LEVEL_DESIGN.md
       - Questions: low-level-design/car-rental-platform/INTERVIEW_QUESTIONS.md
     - ATM/Banking:

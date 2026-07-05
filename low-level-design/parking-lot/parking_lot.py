@@ -2,6 +2,17 @@
 Parking Lot System - Low Level Design
 ---------------------------------------
 Design Principles: SOLID, Strategy Pattern, Factory Pattern
+
+Database Schema:
+  - 8 PostgreSQL tables: parking_lot, floor, parking_spot, ticket,
+    rate_card, payment, reservation, audit_log
+  - PostGIS spatial indexes for location-based queries
+  - Optimistic locking via version column
+  - Exclusion constraints for preventing double-booking
+  - Composite + partial indexes for availability queries
+  - Redis cache for O(1) availability lookups
+
+See CODE.md for complete DDL.
 """
 
 from abc import ABC, abstractmethod

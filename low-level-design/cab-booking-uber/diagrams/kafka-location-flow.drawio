@@ -1,0 +1,109 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/24.0.0 Chrome/120.0.6099.109 Electron/28.1.0 Safari/537.36">
+  <diagram name="Kafka Location Flow" id="kafka-location-flow">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="t1" value="Kafka GPS Location Update Pipeline" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="500" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Driver App -->
+        <mxCell id="driver" value="Driver App&lt;br&gt;GPS Update&lt;br&gt;(Every 3s)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="30" y="100" width="140" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- WebSocket Gateway -->
+        <mxCell id="ws" value="WebSocket&lt;br&gt;Gateway&lt;br&gt;(Protobuf)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="250" y="100" width="140" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Kafka Raw Updates Topic -->
+        <mxCell id="kafka_raw" value="Kafka Topic&lt;br&gt;gps.raw.updates&lt;br&gt;(5 partitions)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="470" y="90" width="160" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- GPS Stream Processor -->
+        <mxCell id="sp" value="GPS Stream&lt;br&gt;Processor&lt;br&gt;(Kafka Streams)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="720" y="50" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Processing Steps -->
+        <mxCell id="steps" value="Processing Steps:&lt;br&gt;1. Validate GPS coordinates&lt;br&gt;2. Update Redis Geo (GEOADD)&lt;br&gt;3. Determine H3 zone cell&lt;br&gt;4. Calculate speed/heading&lt;br&gt;5. Publish enriched event" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="720" y="130" width="200" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Kafka Enriched Topic -->
+        <mxCell id="kafka_enc" value="Kafka Topic&lt;br&gt;gps.enriched.locations&lt;br&gt;(5 partitions)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="360" width="160" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- Zone Analytics Aggregator -->
+        <mxCell id="za" value="Zone Analytics&lt;br&gt;Aggregator&lt;br&gt;(30s window)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="350" y="360" width="150" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Kafka Zone Counts Topic -->
+        <mxCell id="kafka_zc" value="Kafka Topic&lt;br&gt;gps.zone.driver_counts" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="590" y="360" width="160" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Surface Engine -->
+        <mxCell id="se" value="Surge Engine&lt;br&gt;Calculate Multiplier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E53935;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="840" y="360" width="150" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Redis Geo -->
+        <mxCell id="redis" value="Redis Geo&lt;br&gt;drivers:available&lt;br&gt;(Real-time)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="260" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- DLQ -->
+        <mxCell id="dlq" value="Kafka DLQ&lt;br&gt;gps.dlq&lt;br&gt;(Failed messages)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E53935;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="720" y="480" width="150" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=2;" edge="1" parent="1" source="driver" target="ws">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="protobuf: {driver_id, lat, lng, speed, heading, ts}" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=2;" edge="1" parent="1" source="ws" target="kafka_raw">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="Consume batch" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;" edge="1" parent="1" source="kafka_raw" target="sp">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="Publish enriched" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;" edge="1" parent="1" source="sp" target="kafka_enc">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="790" y="300"/>
+              <mxPoint x="180" y="300"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=2;" edge="1" parent="1" source="kafka_enc" target="za">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;" edge="1" parent="1" source="za" target="kafka_zc">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E53935;strokeWidth=2;" edge="1" parent="1" source="kafka_zc" target="se">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" value="GEOADD" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=2;" edge="1" parent="1" source="sp" target="redis">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" value="Error → DLQ" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E53935;strokeWidth=2;dashed=1;" edge="1" parent="1" source="sp" target="dlq">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="legend" value="Legend:&lt;br&gt;🟢 Source → ⚡ Process → 💾 Store → 🔴 Alert" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=10;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="840" y="550" width="200" height="40" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

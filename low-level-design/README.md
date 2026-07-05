@@ -18,9 +18,9 @@ A comprehensive collection of **18 Low-Level Design (LLD)** problems implemented
 | 8 | [Pub-Sub System](pub-sub-system/INTERVIEW_QUESTIONS.md) | Messaging, Events | Observer, Strategy, Decorator |
 | 9 | [Movie Ticket Booking](movie-ticket-booking/INTERVIEW_QUESTIONS.md) | Concurrency, Booking | Strategy, Singleton, Observer |
 | 10 | [Splitwise (Expense Sharing)](splitwise-expense-sharing/INTERVIEW_QUESTIONS.md) | Graphs, Debt Simplification | Strategy, Factory |
-| 11 | [Cab Booking (Uber)](cab-booking-uber/INTERVIEW_QUESTIONS.md) | Real-time Matching, Pricing | Strategy, State, Observer |
+| 11 | [Cab Booking (Uber)](cab-booking-uber/INTERVIEW_QUESTIONS.md) | Real-time Matching, GeoRadius, Kafka, Zone Surge | Strategy, State, Observer, Pub-Sub |
 | 12 | [Library Management](library-management/INTERVIEW_QUESTIONS.md) | Catalog, Fines, Circulation | Strategy, Observer, Facade |
-| 13 | [Car Rental Platform](car-rental-platform/INTERVIEW_QUESTIONS.md) | Fleet, Reservations | Strategy, State, Decorator |
+| 13 | [Car Rental Platform](car-rental-platform/INTERVIEW_QUESTIONS.md) | Fleet, Availability Calendar, Hourly Booking | Strategy, State, Decorator |
 | 14 | [ATM/Banking System](atm-banking-system/INTERVIEW_QUESTIONS.md) | State Machine, Security | State, Strategy, Chain of Responsibility |
 | 15 | [Inventory Management](inventory-management/INTERVIEW_QUESTIONS.md) | Stock, Reorder, Warehouse | Strategy, Observer, Facade |
 | 16 | [Payment Processing](payment-processing-system/INTERVIEW_QUESTIONS.md) | Payments, Refunds, Fraud | Strategy, Chain of Responsibility |

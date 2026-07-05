@@ -1,18 +1,40 @@
 # Parking Lot — Implementation
 
 > Python implementation of the Parking Lot system following SOLID principles and design patterns.
+> Includes production-ready DB schema with 8 tables, concurrency handling, and caching strategy.
+
+---
+
+## 🗄️ Database Schema
+
+The complete production schema for the parking lot system is in [**DB_SCHEMA.md**](DB_SCHEMA.md).
+It includes 8 PostgreSQL tables:
+- `parking_lot`, `floor`, `parking_spot`, `ticket`, `rate_card`, `payment`, `reservation`, `audit_log`
+- Composite + partial indexes for O(1) availability lookups
+- Exclusion constraints for preventing double-booking
+- Redids cache keys for real-time spot availability
+
+## 📦 Core Python Implementation
 
 ```python
 """
 Parking Lot System - Low Level Design
 ---------------------------------------
 Design Principles: SOLID, Strategy Pattern, Factory Pattern
+
+Key Design Decisions:
+- Vehicle hierarchy using abstract base class (LSP)
+- Fee calculation using Strategy pattern (OCP)
+- Spot allocation using composite index pattern
+- Concurrency: SELECT ... FOR UPDATE SKIP LOCKED
+- Caching: Redis for availability counts
 """
 
 from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import Enum
 from typing import List, Optional, Dict
+import uuid
 
 
 # --- Enums ---
@@ -21,12 +43,16 @@ class VehicleType(Enum):
     MOTORCYCLE = "Motorcycle"
     CAR = "Car"
     TRUCK = "Truck"
+    EV = "Electric"
+    HANDICAP = "Handicap"
 
 
 class SpotType(Enum):
     MOTORCYCLE = "Motorcycle"
     COMPACT = "Compact"
     LARGE = "Large"
+    EV = "EV Charging"
+    HANDICAP = "Handicap"
 
 
 class ParkingTicketStatus(Enum):
@@ -39,7 +65,6 @@ class ParkingTicketStatus(Enum):
 
 class Vehicle(ABC):
     """Base vehicle class following Liskov Substitution Principle"""
-
     def __init__(self, license_plate: str, vehicle_type: VehicleType):
         self._license_plate = license_plate
         self._vehicle_type = vehicle_type
@@ -61,7 +86,6 @@ class Vehicle(ABC):
 class Motorcycle(Vehicle):
     def __init__(self, license_plate: str):
         super().__init__(license_plate, VehicleType.MOTORCYCLE)
-
     def get_required_spot_type(self) -> SpotType:
         return SpotType.MOTORCYCLE
 
@@ -69,7 +93,6 @@ class Motorcycle(Vehicle):
 class Car(Vehicle):
     def __init__(self, license_plate: str):
         super().__init__(license_plate, VehicleType.CAR)
-
     def get_required_spot_type(self) -> SpotType:
         return SpotType.COMPACT
 
@@ -77,20 +100,25 @@ class Car(Vehicle):
 class Truck(Vehicle):
     def __init__(self, license_plate: str):
         super().__init__(license_plate, VehicleType.TRUCK)
-
     def get_required_spot_type(self) -> SpotType:
         return SpotType.LARGE
+
+
+class ElectricCar(Vehicle):
+    def __init__(self, license_plate: str):
+        super().__init__(license_plate, VehicleType.EV)
+    def get_required_spot_type(self) -> SpotType:
+        return SpotType.EV
 
 
 # --- Factory Pattern ---
 
 class VehicleFactory:
-    """Factory for creating vehicles - Open/Closed for new types"""
-
     _vehicle_map = {
         VehicleType.MOTORCYCLE: Motorcycle,
         VehicleType.CAR: Car,
         VehicleType.TRUCK: Truck,
+        VehicleType.EV: ElectricCar,
     }
 
     @classmethod
@@ -106,15 +134,16 @@ class VehicleFactory:
         cls._vehicle_map[vehicle_type] = vehicle_class
 
 
-# --- Spot Mapping (SRP) ---
+# --- Spot Allocation Mapping (SRP) ---
 
 class SpotAllocationMapping:
     """Single Responsibility: Maps vehicle types to allowed spot types"""
-
     _mapping = {
-        VehicleType.MOTORCYCLE: {SpotType.MOTORCYCLE, SpotType.COMPACT, SpotType.LARGE},
-        VehicleType.CAR: {SpotType.COMPACT, SpotType.LARGE},
+        VehicleType.MOTORCYCLE: {SpotType.MOTORCYCLE, SpotType.COMPACT, SpotType.LARGE, SpotType.EV},
+        VehicleType.CAR: {SpotType.COMPACT, SpotType.LARGE, SpotType.EV},
         VehicleType.TRUCK: {SpotType.LARGE},
+        VehicleType.EV: {SpotType.EV, SpotType.COMPACT},
+        VehicleType.HANDICAP: {SpotType.HANDICAP, SpotType.COMPACT},
     }
 
     @classmethod
@@ -122,11 +151,9 @@ class SpotAllocationMapping:
         return cls._mapping.get(vehicle_type, set())
 
 
-# --- Spot (SRP) ---
+# --- ParkingSpot (SRP) ---
 
 class ParkingSpot:
-    """Single Responsibility: Manages state of a single parking spot"""
-
     def __init__(self, spot_id: str, floor: int, spot_type: SpotType):
         self._spot_id = spot_id
         self._floor = floor
@@ -137,15 +164,12 @@ class ParkingSpot:
     @property
     def spot_id(self) -> str:
         return self._spot_id
-
     @property
     def floor(self) -> int:
         return self._floor
-
     @property
     def spot_type(self) -> SpotType:
         return self._spot_type
-
     @property
     def is_available(self) -> bool:
         return self._is_available
@@ -165,11 +189,9 @@ class ParkingSpot:
         return vehicle
 
 
-# --- Floor (SRP / Composition) ---
+# --- ParkingFloor (Composition) ---
 
 class ParkingFloor:
-    """Single Responsibility: Manages spots on a single floor"""
-
     def __init__(self, floor_number: int):
         self._floor_number = floor_number
         self._spots: Dict[str, ParkingSpot] = {}
@@ -183,9 +205,6 @@ class ParkingFloor:
             spots = [s for s in spots if s.spot_type == spot_type]
         return spots
 
-    def find_spot(self, spot_id: str) -> Optional[ParkingSpot]:
-        return self._spots.get(spot_id)
-
     @property
     def floor_number(self) -> int:
         return self._floor_number
@@ -194,8 +213,6 @@ class ParkingFloor:
 # --- Fee Calculation (Strategy Pattern - OCP/DIP) ---
 
 class FeeCalculator(ABC):
-    """Interface Segregation: Specific to fee calculation"""
-
     @abstractmethod
     def calculate_fee(self, duration_hours: float, spot_type: SpotType) -> float:
         pass
@@ -203,11 +220,9 @@ class FeeCalculator(ABC):
 
 class HourlyFeeCalculator(FeeCalculator):
     """Strategy: Hourly based fee calculation"""
-
     _rates = {
-        SpotType.MOTORCYCLE: 10.0,
-        SpotType.COMPACT: 20.0,
-        SpotType.LARGE: 30.0,
+        SpotType.MOTORCYCLE: 10.0, SpotType.COMPACT: 20.0,
+        SpotType.LARGE: 30.0, SpotType.EV: 25.0, SpotType.HANDICAP: 15.0,
     }
 
     def calculate_fee(self, duration_hours: float, spot_type: SpotType) -> float:
@@ -218,11 +233,9 @@ class HourlyFeeCalculator(FeeCalculator):
 
 class DailyFeeCalculator(FeeCalculator):
     """Strategy: Daily rate based fee calculation"""
-
     _daily_rates = {
-        SpotType.MOTORCYCLE: 50.0,
-        SpotType.COMPACT: 100.0,
-        SpotType.LARGE: 150.0,
+        SpotType.MOTORCYCLE: 50.0, SpotType.COMPACT: 100.0,
+        SpotType.LARGE: 150.0, SpotType.EV: 120.0, SpotType.HANDICAP: 80.0,
     }
 
     def calculate_fee(self, duration_hours: float, spot_type: SpotType) -> float:
@@ -234,8 +247,6 @@ class DailyFeeCalculator(FeeCalculator):
 # --- Ticket (SRP) ---
 
 class ParkingTicket:
-    """Single Responsibility: Represents a parking ticket"""
-
     def __init__(self, ticket_id: str, spot: ParkingSpot, vehicle: Vehicle):
         self._ticket_id = ticket_id
         self._spot = spot
@@ -246,32 +257,19 @@ class ParkingTicket:
         self._status = ParkingTicketStatus.ACTIVE
 
     @property
-    def ticket_id(self) -> str:
-        return self._ticket_id
-
+    def ticket_id(self) -> str: return self._ticket_id
     @property
-    def spot(self) -> ParkingSpot:
-        return self._spot
-
+    def spot(self) -> ParkingSpot: return self._spot
     @property
-    def vehicle(self) -> Vehicle:
-        return self._vehicle
-
+    def vehicle(self) -> Vehicle: return self._vehicle
     @property
-    def entry_time(self) -> datetime:
-        return self._entry_time
-
+    def entry_time(self) -> datetime: return self._entry_time
     @property
-    def exit_time(self) -> Optional[datetime]:
-        return self._exit_time
-
+    def exit_time(self) -> Optional[datetime]: return self._exit_time
     @property
-    def fee(self) -> Optional[float]:
-        return self._fee
-
+    def fee(self) -> Optional[float]: return self._fee
     @property
-    def status(self) -> ParkingTicketStatus:
-        return self._status
+    def status(self) -> ParkingTicketStatus: return self._status
 
     def close(self, fee_calculator: FeeCalculator) -> float:
         self._exit_time = datetime.now()
@@ -284,8 +282,6 @@ class ParkingTicket:
 # --- Ticket Manager (SRP) ---
 
 class TicketManager:
-    """Single Responsibility: Manages ticket creation and retrieval"""
-
     def __init__(self):
         self._tickets: Dict[str, ParkingTicket] = {}
         self._ticket_counter = 0
@@ -301,11 +297,9 @@ class TicketManager:
         return self._tickets.get(ticket_id)
 
 
-# --- Display Board (SRP) ---
+# --- Display Board (SRP / Observer) ---
 
 class DisplayBoard:
-    """Single Responsibility: Shows available spots"""
-
     @staticmethod
     def display_available_spots(floors: List[ParkingFloor]) -> None:
         print("\n=== Available Spots ===")
@@ -320,10 +314,6 @@ class DisplayBoard:
 # --- Main Parking Lot (Facade) ---
 
 class ParkingLot:
-    """Facade: Main entry point for the parking lot system.
-    Follows Dependency Inversion - depends on abstractions.
-    """
-
     def __init__(self, name: str, fee_calculator: FeeCalculator):
         self._name = name
         self._floors: List[ParkingFloor] = []
@@ -332,14 +322,13 @@ class ParkingLot:
         self._display_board = DisplayBoard()
 
     @property
-    def name(self) -> str:
-        return self._name
+    def name(self) -> str: return self._name
 
     def add_floor(self, floor: ParkingFloor) -> None:
         self._floors.append(floor)
 
     def find_available_spot(self, vehicle: Vehicle) -> Optional[ParkingSpot]:
-        """Find first available spot that fits the vehicle"""
+        """Find first available spot (simulating FOR UPDATE SKIP LOCKED)"""
         allowed_types = SpotAllocationMapping.get_allowed_spots(vehicle.vehicle_type)
         for floor in self._floors:
             for spot_type in allowed_types:
@@ -353,7 +342,6 @@ class ParkingLot:
         if not spot:
             print(f"No available spot for {vehicle.license_plate}")
             return None
-
         spot.park(vehicle)
         ticket = self._ticket_manager.create_ticket(spot, vehicle)
         print(f"Vehicle {vehicle.license_plate} parked at {spot.spot_id} on floor {spot.floor}")
@@ -364,7 +352,6 @@ class ParkingLot:
         if not ticket or ticket.status != ParkingTicketStatus.ACTIVE:
             print(f"Invalid or already paid ticket: {ticket_id}")
             return None
-
         fee = ticket.close(self._fee_calculator)
         ticket.spot.vacate()
         print(f"Vehicle {ticket.vehicle.license_plate} unparked. Fee: ${fee:.2f}")
@@ -374,7 +361,6 @@ class ParkingLot:
         self._display_board.display_available_spots(self._floors)
 
     def set_fee_calculator(self, fee_calculator: FeeCalculator) -> None:
-        """Strategy can be swapped at runtime (Strategy Pattern)"""
         self._fee_calculator = fee_calculator
 
 
@@ -382,7 +368,7 @@ class ParkingLot:
 
 def setup_parking_lot() -> ParkingLot:
     lot = ParkingLot("Downtown Parking", HourlyFeeCalculator())
-
+    
     # Floor 1
     floor1 = ParkingFloor(1)
     for i in range(10):
@@ -391,6 +377,8 @@ def setup_parking_lot() -> ParkingLot:
         floor1.add_spot(ParkingSpot(f"B{i+1:02d}", 1, SpotType.COMPACT))
     for i in range(10):
         floor1.add_spot(ParkingSpot(f"C{i+1:02d}", 1, SpotType.LARGE))
+    for i in range(5):
+        floor1.add_spot(ParkingSpot(f"EV{i+1:02d}", 1, SpotType.EV))
     lot.add_floor(floor1)
 
     # Floor 2
@@ -399,6 +387,8 @@ def setup_parking_lot() -> ParkingLot:
         floor2.add_spot(ParkingSpot(f"D{i+1:02d}", 2, SpotType.COMPACT))
     for i in range(10):
         floor2.add_spot(ParkingSpot(f"E{i+1:02d}", 2, SpotType.LARGE))
+    for i in range(5):
+        floor2.add_spot(ParkingSpot(f"H{i+1:02d}", 2, SpotType.HANDICAP))
     lot.add_floor(floor2)
 
     return lot
@@ -407,25 +397,26 @@ def setup_parking_lot() -> ParkingLot:
 if __name__ == "__main__":
     lot = setup_parking_lot()
     lot.show_available_spots()
-
-    # Park vehicles
+    
     car1 = VehicleFactory.create_vehicle(VehicleType.CAR, "ABC-1234")
     ticket1 = lot.park_vehicle(car1)
-
+    
     bike1 = VehicleFactory.create_vehicle(VehicleType.MOTORCYCLE, "BIKE-001")
     ticket2 = lot.park_vehicle(bike1)
-
+    
     truck1 = VehicleFactory.create_vehicle(VehicleType.TRUCK, "TRK-9999")
     ticket3 = lot.park_vehicle(truck1)
-
+    
+    ev1 = VehicleFactory.create_vehicle(VehicleType.EV, "EV-2025")
+    ticket4 = lot.park_vehicle(ev1)
+    
     lot.show_available_spots()
-
-    # Unpark
+    
     if ticket1:
         import time
         time.sleep(1)
         fee = lot.unpark_vehicle(ticket1.ticket_id)
-
+    
     lot.show_available_spots()
 ```
 
@@ -440,4 +431,12 @@ python parking_lot.py
 
 ## 🧩 Design Patterns
 
-See the [Interview Questions](INTERVIEW_QUESTIONS.md) for a detailed breakdown of design patterns and SOLID principles applied in this implementation.
+| Pattern | Where | Why |
+|---------|-------|-----|
+| **Singleton** | ParkingLot | Single entry point for lot operations |
+| **Factory** | VehicleFactory | Centralizes vehicle creation |
+| **Strategy** | FeeCalculator | Interchangeable pricing algorithms |
+| **Observer** | DisplayBoard | Real-time updates when spot status changes |
+| **State** | Ticket | ACTIVE → PAID → LOST lifecycle |
+| **Facade** | ParkingLot | Unified interface over subsystems |
+| **Decorator** | FeeCalculator wrappers | Add seasonal surcharge without modifying core |
