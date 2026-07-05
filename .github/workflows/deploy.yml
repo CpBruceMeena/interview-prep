@@ -14,7 +14,7 @@ on:
 jobs:
   deploy:
     name: Deploy to GitHub Pages
-    if: github.actor == github.repository_owner && github.event.inputs.confirm == 'deploy'
+    if: github.actor == github.repository_owner && github.ref == 'refs/heads/main' && github.event.inputs.confirm == 'deploy'
     runs-on: ubuntu-latest
 
     permissions:
