@@ -201,12 +201,14 @@ nav:
       - Code Base Design: ai-engineering/rag/05_CODE_BASE_DESIGN.md
       - Low-Level Design: ai-engineering/rag/06_LOW_LEVEL_DESIGN.md
       - High-Level Design: ai-engineering/rag/07_HIGH_LEVEL_DESIGN.md
+      - Implementation: ai-engineering/rag/implementation/index.md
     - 🔌 MCP:
       - Overview: ai-engineering/mcp/README.md
       - MCP Fundamentals: ai-engineering/mcp/08_MCP_FUNDAMENTALS.md
       - MCP Interview Questions: ai-engineering/mcp/09_MCP_INTERVIEW_QUESTIONS.md
       - MCP Implementation & RAG: ai-engineering/mcp/10_MCP_IMPLEMENTATION.md
       - MCP Production Architecture: ai-engineering/mcp/11_MCP_PRODUCTION_ARCHITECTURE.md
+      - Servers: ai-engineering/mcp/servers/index.md
     - 🤖 Agents:
       - Overview: ai-engineering/agents/README.md
       - Agent Fundamentals: ai-engineering/agents/01_AGENT_FUNDAMENTALS.md
