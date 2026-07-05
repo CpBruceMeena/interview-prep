@@ -108,7 +108,7 @@
 
 | # | Project | Domain | Key Patterns | HLD Focus |
 |---|---------|--------|-------------|-----------|
-| 1 | **[Parking Lot](low-level-design/parking-lot/)** | OOD Basics | Strategy, Factory, Singleton | IoT gate mgmt, Redis spot allocation |
+| 1 | **[Parking Lot](low-level-design/parking-lot/)** | OOD Basics | Strategy, Factory, Singleton | 8-table DB schema, SKIP LOCKED concurrency, Redis cache, rate cards |
 | 2 | **[Chess Game](low-level-design/chess-game/)** | Game State | Factory, State, Memento | Bitboard, WebSocket, Stockfish AI |
 | 3 | **[Tic-Tac-Toe](low-level-design/tic-tac-toe/)** | Game AI | Strategy, State, Command | MCTS AI, N×N board scaling |
 | 4 | **[Snakes & Ladders](low-level-design/snakes-and-ladders/)** | Board Game | Strategy, Observer, State | Seeded PRNG, real-time multiplayer |
@@ -118,9 +118,9 @@
 | 8 | **[Pub-Sub System](low-level-design/pub-sub-system/)** | Messaging | Observer, Strategy, Decorator | Kafka-style append-log, ISR replication |
 | 9 | **[Movie Ticket Booking](low-level-design/movie-ticket-booking/)** | Concurrency | Strategy, Singleton, Observer | CQRS, flash sales, thundering herd |
 | 10 | **[Splitwise](low-level-design/splitwise-expense-sharing/)** | Graphs | Strategy, Factory | Debt graph, min-transactions |
-| 11 | **[Cab Booking (Uber)](low-level-design/cab-booking-uber/)** | Real-time | Strategy, State, Observer | Redis GEO, surge pricing, Kalman filter |
+| 11 | **[Cab Booking (Uber)](low-level-design/cab-booking-uber/)** | Real-time | Strategy, State, Observer, Pub-Sub | Redis GEO, Kafka pipeline, GeoRadius matching, hexagonal zones, surge pricing |
 | 12 | **[Library Management](low-level-design/library-management/)** | Catalog | Strategy, Observer, Facade | Elasticsearch fuzzy search |
-| 13 | **[Car Rental](low-level-design/car-rental-platform/)** | Fleet | Strategy, State, Decorator | PG exclusion constraints |
+| 13 | **[Car Rental](low-level-design/car-rental-platform/)** | Fleet | Strategy, State, Decorator | Availability calendar, hourly booking, 7-day lookahead, PG exclusion constraints |
 | 14 | **[ATM/Banking](low-level-design/atm-banking-system/)** | Security | State, Strategy, Chain | HSM PIN, two-phase dispense |
 | 15 | **[Inventory Management](low-level-design/inventory-management/)** | Stock | Strategy, Observer, Facade | EOQ + safety stock, optimistic locking |
 | 16 | **[Payment Processing](low-level-design/payment-processing-system/)** | Payments | Strategy, Chain of Resp. | Idempotency keys, fraud ML pipeline |
