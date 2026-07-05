@@ -1,0 +1,40 @@
+# 🚀 Deploy MkDocs Site to GitHub Pages
+# Manual trigger only — restricted to repository owner.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm'
+        required: true
+        default: ''
+
+jobs:
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.actor == github.repository_owner && github.event.inputs.confirm == 'deploy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mkdocs-material mkdocs-drawio-plugin
+          pip list 2>/dev/null | grep -i mkdocs
+
+      - name: Build and deploy site
+        run: mkdocs gh-deploy --force
+
+      - name: Report deployment URL
+        run: |
+          echo "✅ Deployed to: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
