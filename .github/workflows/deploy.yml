@@ -16,6 +16,10 @@ jobs:
     name: Deploy to GitHub Pages
     if: github.actor == github.repository_owner && github.event.inputs.confirm == 'deploy'
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,8 +36,14 @@ jobs:
           pip install mkdocs-material mkdocs-drawio
           pip list 2>/dev/null | grep -i mkdocs
 
-      - name: Build and deploy site
-        run: mkdocs gh-deploy --force
+      - name: Build site
+        run: mkdocs build
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
 
       - name: Report deployment URL
         run: |
