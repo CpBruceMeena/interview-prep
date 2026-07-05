@@ -11,6 +11,11 @@ on:
         required: true
         default: ''
 
+# Allow one deployment at a time
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: Deploy to GitHub Pages
@@ -18,7 +23,13 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repository
@@ -36,15 +47,17 @@ jobs:
           pip install mkdocs-material mkdocs-drawio
           pip list 2>/dev/null | grep -i mkdocs
 
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
       - name: Build site
         run: mkdocs build
 
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./site
+          path: ./site
 
-      - name: Report deployment URL
-        run: |
-          echo "✅ Deployed to: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
