@@ -16,25 +16,27 @@
 
 ---
 
-## 2. SYSTEM ARCHITECTURE (AWS Production)
+## 2. SYSTEM ARCHITECTURE (C4 Container Diagram)
 
-The diagram uses **official AWS Architecture Icons** with a strict 5-tier layout and color-coded connectors (blue=sync, green=async, orange=streaming, red=DLQ).
+The diagram follows the **C4 Model (Level 2 — Container Diagram)** with a clean light-mode layout. Containers are grouped by architectural layer with color-coded connectors (blue=sync, green=async, orange=streaming, red=DLQ/failure).
 
-![Parking Lot AWS Architecture](parking-lot-hld.drawio)
+![Parking Lot C4 Container Diagram](diagrams/parking-lot-hld.drawio)
 
-> **📥 Download:** [Architecture (draw.io)](parking-lot-hld.drawio) | [Sequence Flow (draw.io)](parking-lot-sequence.drawio) — Open in [draw.io Desktop](https://github.com/jgraph/drawio-desktop/releases) to edit.
+> **📥 Download:** [C4 Container Diagram (draw.io)](diagrams/parking-lot-hld.drawio) · [SVG Preview](diagrams/parking-lot-hld.svg)  
+> [Sequence Flow (draw.io)](diagrams/parking-lot-sequence.drawio) · [SVG Preview](diagrams/parking-lot-sequence.svg)  
+> Open `.drawio` files in [draw.io Desktop](https://github.com/jgraph/drawio-desktop/releases) to edit.
 
 ### Architecture Layers
 
-| Layer | Services | Purpose |
-|-------|----------|---------|
-| **🌐 Edge & CDN** | CloudFront, WAF, IoT Core, Greengrass | Global CDN, WAF rate limiting, gate controller connectivity |
-| **🔐 Auth & Security** | Cognito, IAM, KMS, Secrets Manager, ALB | User pools, least-privilege roles, encryption, load balancing |
-| **⚙️ Compute** | Lambda (Entry/Exit), ECS Fargate (Booking/Payment) | Event-driven ticketing, booking orchestration, payment processing |
-| **📨 Messaging** | Kinesis Data Streams, SQS FIFO, SNS, DLQ, EventBridge | At-least-once ingestion, exactly-once payment processing, notifications |
-| **💾 Data** | Aurora PostgreSQL, DynamoDB + DAX, ElastiCache Redis, S3 | Relational tickets/payments, high-speed spot inventory, distributed locks, receipts |
-| **📊 Observability** | CloudWatch, X-Ray, AMP (Prometheus) | Logs, metrics, distributed tracing, dashboards |
-| **🤖 MCP Server** | MCP Server (Agent Interface) | AI-agent operable management interface |
+| Layer | Container | Services | Purpose |
+|-------|-----------|----------|---------|
+| **🌐 Edge & Ingress** | Edge & Ingress | CloudFront, WAF, IoT Core, Greengrass | Global CDN, rate limiting, gate controller connectivity |
+| **🔐 API & Gateway** | API & Gateway | Cognito, ALB, KMS, Secrets Manager | Auth, load balancing, encryption, secret management |
+| **⚙️ Compute & Logic** | Compute & Business Logic | Lambda (Entry/Exit), ECS Fargate (Booking/Payment) | Event-driven ticketing, booking orchestration, payment processing |
+| **📨 Messaging** | Messaging & Async Buffer | Kinesis Data Streams, SQS FIFO, SNS, DLQ, EventBridge | At-least-once ingestion, exactly-once payment, notifications |
+| **💾 Data** | Data Persistence | Aurora PostgreSQL, DynamoDB + DAX, ElastiCache Redis, S3 | Relational tickets/payments, high-speed spot inventory, distributed locks, receipts |
+| **📊 Observability** | Observability | CloudWatch, X-Ray | Logs, metrics, distributed tracing |
+| **🤖 MCP Server** | MCP Server | Agent Interface | AI-agent operable management interface |
 
 ---
 
@@ -42,7 +44,7 @@ The diagram uses **official AWS Architecture Icons** with a strict 5-tier layout
 
 The sequence diagram below shows the complete entry → park → exit → payment lifecycle with color-coded flows.
 
-![Parking Flow Sequence](parking-lot-sequence.drawio)
+![Parking Flow Sequence](diagrams/parking-lot-sequence.drawio)
 
 ---
 

@@ -1,11 +1,27 @@
-.code-review-graph/
-.code_review_graph/
-code-review-graph-cache/
-crg-cache/
-.cache/code-review-graph/
-.cache/crg/
-*.crg
-site/
-prompt.txt
-detailed_task.md
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Pytest
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Environment
+.env
+.venv/
+venv/
+site/

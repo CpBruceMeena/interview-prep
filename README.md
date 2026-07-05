@@ -68,11 +68,10 @@
 ║  ├── job-scheduling-system         DAG · Redis Leases · Cron         ║
 ║  └── ... (12 more)                                                   ║
 ║                                                                      ║
-║  🧠 rag-learning/              ← RAG Application Learning Resource   ║
-║  ├── 01_RAG_FUNDAMENTALS.md         Pipeline Architecture            ║
-║  ├── 03_FINE_TUNING.md              QLoRA · Cross-Encoder            ║
-║  ├── 07_HIGH_LEVEL_DESIGN.md        Production Scaling · CQRS        ║
-║  └── implementation/                Working Python RAG Chatbot       ║
+║  🧠 ai-engineering/           ← AI Engineering — RAG, MCP, Agents       ║
+║  ├── rag/                           RAG Knowledge Retrieval          ║
+║  ├── mcp/                           MCP Protocol · Server Code       ║
+║  └── agents/                        AI Agent Architecture            ║
 ║                                                                      ║
 ║  🛠️ tools-interview/           ← Infrastructure & Platform Tools    ║
 ║  ├── kafka/                         12 Q · ISR · EOS · Transactions ║
@@ -134,9 +133,9 @@
 
 ---
 
-## 🧠 **RAG Learning Module**
+## 🧠 **AI Engineering Module**
 
-> **Complete, production-ready RAG application** with working Python chatbot implementation.
+> **Complete, production-ready RAG application + MCP protocol deep-dive** with working Python implementations.
 
 ```ascii
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -154,13 +153,23 @@
 
 | # | Guide | Key Topics |
 |---|-------|-----------|
-| 1 | **[Fundamentals](rag-learning/01_RAG_FUNDAMENTALS.md)** | Pipeline architecture, Naive/Advanced/Modular RAG |
-| 2 | **[LM Studio](rag-learning/02_LM_STUDIO_INTEGRATION.md)** | Gemma 4B config, quantization, GPU acceleration |
-| 3 | **[Fine-Tuning](rag-learning/03_FINE_TUNING.md)** | Contrastive learning, cross-encoder reranking, QLoRA |
-| 4 | **[Interview Q&A](rag-learning/04_INTERVIEW_QUESTIONS.md)** | 8 deep-dive Staff questions on RAG architecture |
-| 5 | **[Code Design](rag-learning/05_CODE_BASE_DESIGN.md)** | SOLID, Strategy/Facade/Adapter patterns |
-| 6 | **[Low-Level Design](rag-learning/06_LOW_LEVEL_DESIGN.md)** | Class/sequence diagrams, data models |
-| 7 | **[High-Level Design](rag-learning/07_HIGH_LEVEL_DESIGN.md)** | Production scaling to 10M queries/day |
+| # | Guide | Key Topics |
+|---|-------|-----------|
+| 1 | **[Fundamentals](ai-engineering/rag/01_RAG_FUNDAMENTALS.md)** | Pipeline architecture, Naive/Advanced/Modular RAG |
+| 2 | **[LM Studio](ai-engineering/rag/02_LM_STUDIO_INTEGRATION.md)** | Gemma 4B config, quantization, GPU acceleration |
+| 3 | **[Fine-Tuning](ai-engineering/rag/03_FINE_TUNING.md)** | Contrastive learning, cross-encoder reranking, QLoRA |
+| 4 | **[Interview Q&A](ai-engineering/rag/04_INTERVIEW_QUESTIONS.md)** | 8 deep-dive Staff questions on RAG architecture |
+| 5 | **[Code Design](ai-engineering/rag/05_CODE_BASE_DESIGN.md)** | SOLID, Strategy/Facade/Adapter patterns |
+| 6 | **[Low-Level Design](ai-engineering/rag/06_LOW_LEVEL_DESIGN.md)** | Class/sequence diagrams, data models |
+| 7 | **[High-Level Design](ai-engineering/rag/07_HIGH_LEVEL_DESIGN.md)** | Production scaling to 10M queries/day |
+
+### 🔌 MCP Module — [MCP docs](ai-engineering/mcp/README.md)
+| # | Guide | Key Topics |
+|---|-------|-----------|
+| 8 | **[MCP Fundamentals](ai-engineering/mcp/08_MCP_FUNDAMENTALS.md)** | Architecture, protocol mechanics, setup guide |
+| 9 | **[MCP Interview Q&A](ai-engineering/mcp/09_MCP_INTERVIEW_QUESTIONS.md)** | Staff/Principal-level Q&A transcript |
+| 10 | **[MCP Implementation](ai-engineering/mcp/10_MCP_IMPLEMENTATION.md)** | Building custom MCP servers, RAG integration |
+| 11 | **[Production Architecture](ai-engineering/mcp/11_MCP_PRODUCTION_ARCHITECTURE.md)** | Production deployment, security, tradeoffs |
 
 <br>
 
@@ -269,7 +278,7 @@ cd low-level-design/parking-lot && python parking_lot.py
 cd low-level-design && for dir in */; do echo "=== $dir ===" && cd "$dir" && python *.py && cd - > /dev/null; done
 
 # 3. Verify the RAG pipeline
-cd rag-learning && python test_pipeline.py
+cd ai-engineering/rag && python test_pipeline.py
 
 # 4. Start with CS fundamentals
 cd cs-interview/operating-systems
@@ -359,6 +368,8 @@ PHASE 7 ─── ML/AI
 | CS Core Topics | **8** |
 | Language Deep-Dives | **2 (Python + Go)** |
 | RAG Guides | **7** |
+| MCP Guides | **4** |
+| Agent Guides | **1** |
 | Tool Topics | **9** |
 | AWS Topics | **6** |
 

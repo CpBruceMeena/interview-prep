@@ -190,15 +190,29 @@ nav:
       - HLD: low-level-design/search-platform/HIGH_LEVEL_DESIGN.md
       - Questions: low-level-design/search-platform/INTERVIEW_QUESTIONS.md
 
-  - 🧠 RAG Learning:
-    - Overview: rag-learning/README.md
-    - RAG Fundamentals: rag-learning/01_RAG_FUNDAMENTALS.md
-    - LM Studio Integration: rag-learning/02_LM_STUDIO_INTEGRATION.md
-    - Fine-Tuning Guide: rag-learning/03_FINE_TUNING.md
-    - Interview Questions: rag-learning/04_INTERVIEW_QUESTIONS.md
-    - Code Base Design: rag-learning/05_CODE_BASE_DESIGN.md
-    - Low-Level Design: rag-learning/06_LOW_LEVEL_DESIGN.md
-    - High-Level Design: rag-learning/07_HIGH_LEVEL_DESIGN.md
+  - 🧠 AI Engineering:
+    - Overview: ai-engineering/README.md
+    - 📚 RAG:
+      - Overview: ai-engineering/rag/README.md
+      - RAG Fundamentals: ai-engineering/rag/01_RAG_FUNDAMENTALS.md
+      - LM Studio Integration: ai-engineering/rag/02_LM_STUDIO_INTEGRATION.md
+      - Fine-Tuning Guide: ai-engineering/rag/03_FINE_TUNING.md
+      - RAG Interview Questions: ai-engineering/rag/04_INTERVIEW_QUESTIONS.md
+      - Code Base Design: ai-engineering/rag/05_CODE_BASE_DESIGN.md
+      - Low-Level Design: ai-engineering/rag/06_LOW_LEVEL_DESIGN.md
+      - High-Level Design: ai-engineering/rag/07_HIGH_LEVEL_DESIGN.md
+    - 🔌 MCP:
+      - Overview: ai-engineering/mcp/README.md
+      - MCP Fundamentals: ai-engineering/mcp/08_MCP_FUNDAMENTALS.md
+      - MCP Interview Questions: ai-engineering/mcp/09_MCP_INTERVIEW_QUESTIONS.md
+      - MCP Implementation & RAG: ai-engineering/mcp/10_MCP_IMPLEMENTATION.md
+      - MCP Production Architecture: ai-engineering/mcp/11_MCP_PRODUCTION_ARCHITECTURE.md
+    - 🤖 Agents:
+      - Overview: ai-engineering/agents/README.md
+      - Agent Fundamentals: ai-engineering/agents/01_AGENT_FUNDAMENTALS.md
+      - Agent Interview Questions: ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md
+      - Agent Implementation Guide: ai-engineering/agents/03_AGENT_IMPLEMENTATION_GUIDE.md
+      - Agent Production Architecture: ai-engineering/agents/04_AGENT_PRODUCTION_ARCHITECTURE.md
 
   - 🐍 Python:
     - Overview: python-interview/README.md
