@@ -775,9 +775,18 @@
     margin-top: 0.5rem;
 }
 
-/* Increase main content width since right sidebar is removed */
+/* Full-width layout — remove wasted side space, keep breathing room */
 :root {
-    --md-grid-max-width: 96rem;
+    --md-grid-max-width: 100%;
+}
+
+.md-grid {
+    max-width: 100% !important;
+    padding: 0 1.5rem;
+}
+
+.md-sidebar--primary {
+    margin-left: 0;
 }
 
 .md-content {
