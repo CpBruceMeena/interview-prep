@@ -213,6 +213,7 @@ nav:
       - Agent Interview Questions: ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md
       - Agent Implementation Guide: ai-engineering/agents/03_AGENT_IMPLEMENTATION_GUIDE.md
       - Agent Production Architecture: ai-engineering/agents/04_AGENT_PRODUCTION_ARCHITECTURE.md
+      - Implementation: ai-engineering/agents/implementation/index.md
 
   - 🐍 Python:
     - Overview: python-interview/README.md

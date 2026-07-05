@@ -1158,7 +1158,7 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
 
 /* ── Sidebar: Full-height flex with GitHub at bottom ────── */
 .md-sidebar--primary {
-    width: 16rem;
+    width: 20rem;
     height: 100vh;
     position: sticky;
     top: 0;
