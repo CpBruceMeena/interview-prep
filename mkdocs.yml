@@ -233,6 +233,12 @@ nav:
     - Interview Questions: golang-interview/INTERVIEW_QUESTIONS.md
     - Concurrency & Goroutines: golang-interview/CONCURRENCY_NOTES.md
 
+  - ☕ Java:
+    - Overview: java-interview/README.md
+    - Interview Questions: java-interview/INTERVIEW_QUESTIONS.md
+    - JVM Internals & GC: java-interview/JVM_INTERNALS_NOTES.md
+    - Spring Boot Deep-Dive: java-interview/SPRING_BOOT_NOTES.md
+
   - ☁️ AWS:
     - Overview: aws-interview/README.md
     - Compute: aws-interview/compute/INTERVIEW_QUESTIONS.md
@@ -260,9 +266,11 @@ nav:
     - Computer Networks: cs-interview/computer-networks/INTERVIEW_QUESTIONS.md
     - Database Systems: cs-interview/database-systems/INTERVIEW_QUESTIONS.md
     - Distributed Systems: cs-interview/distributed-systems/INTERVIEW_QUESTIONS.md
+    - Distributed Transactions: cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS.md
     - Concurrency & Parallelism: cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md
     - Data Structures & Algorithms: cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS.md
     - Software Architecture: cs-interview/software-architecture/INTERVIEW_QUESTIONS.md
+    - Design Patterns: cs-interview/software-architecture/DESIGN_PATTERNS.md
     - Security: cs-interview/security/INTERVIEW_QUESTIONS.md
 
 watch:
