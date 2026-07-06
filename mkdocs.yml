@@ -124,6 +124,7 @@ nav:
       - Questions: low-level-design/parking-lot/INTERVIEW_QUESTIONS.md
     - Chess Game:
       - Code: low-level-design/chess-game/CODE.md
+      - Schema: low-level-design/chess-game/DB_SCHEMA.md
       - HLD: low-level-design/chess-game/HIGH_LEVEL_DESIGN.md
       - Questions: low-level-design/chess-game/INTERVIEW_QUESTIONS.md
     - Tic-Tac-Toe:
@@ -174,6 +175,7 @@ nav:
       - Questions: low-level-design/car-rental-platform/INTERVIEW_QUESTIONS.md
     - ATM/Banking:
       - Code: low-level-design/atm-banking-system/CODE.md
+      - Schema: low-level-design/atm-banking-system/DB_SCHEMA.md
       - HLD: low-level-design/atm-banking-system/HIGH_LEVEL_DESIGN.md
       - Questions: low-level-design/atm-banking-system/INTERVIEW_QUESTIONS.md
     - Inventory Management:
@@ -253,7 +255,9 @@ nav:
     - Kafka: tools-interview/kafka/INTERVIEW_QUESTIONS.md
     - Redis: tools-interview/redis/INTERVIEW_QUESTIONS.md
     - Elasticsearch: tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md
-    - Docker & Kubernetes: tools-interview/docker-kubernetes/INTERVIEW_QUESTIONS.md
+    - Docker & Kubernetes:
+      - Questions: tools-interview/docker-kubernetes/INTERVIEW_QUESTIONS.md
+      - Versioning in Multi-Container: tools-interview/docker-kubernetes/VERSIONING_MULTI_CONTAINER.md
     - MongoDB: tools-interview/mongodb/INTERVIEW_QUESTIONS.md
     - Prometheus & Grafana: tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md
     - Terraform: tools-interview/terraform/INTERVIEW_QUESTIONS.md
