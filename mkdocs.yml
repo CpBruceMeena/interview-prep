@@ -273,6 +273,7 @@ nav:
     - Distributed Transactions: cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS.md
     - Concurrency & Parallelism: cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md
     - Data Structures & Algorithms: cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS.md
+    - Data Structures for Scale: cs-interview/data-structures-algorithms/DATA_STRUCTURES_FOR_SCALE.md
     - Software Architecture: cs-interview/software-architecture/INTERVIEW_QUESTIONS.md
     - Design Patterns: cs-interview/software-architecture/DESIGN_PATTERNS.md
     - Security: cs-interview/security/INTERVIEW_QUESTIONS.md

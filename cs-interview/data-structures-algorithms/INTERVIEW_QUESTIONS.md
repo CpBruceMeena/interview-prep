@@ -2,6 +2,8 @@
 
 > *10 questions covering probabilistic data structures, trees, hashing, and algorithmic patterns relevant to backend systems — every question expects principal engineer-level depth.*
 
+📘 **Companion resource:** For an expanded treatment of scale-oriented data structures (Cuckoo Filter, MinHash, Geohash, S2, H3, Quad Tree, R-Tree, Skip List, and deeper dives on Bloom, HyperLogLog, Count-Min Sketch, and Merkle Trees), see [DATA_STRUCTURES_FOR_SCALE.md](./DATA_STRUCTURES_FOR_SCALE.md).
+
 ---
 
 ## Table of Contents

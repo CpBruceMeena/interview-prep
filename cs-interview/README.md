@@ -27,7 +27,8 @@ cs-interview/
 │   └── INTERVIEW_QUESTIONS.md          (10 questions)
 │
 ├── data-structures-algorithms/         ← Bloom filters, sketches, Merkle trees
-│   └── INTERVIEW_QUESTIONS.md          (10 questions)
+│   ├── INTERVIEW_QUESTIONS.md          (10 questions)
+│   └── DATA_STRUCTURES_FOR_SCALE.md   (12 structures, 700+ lines)
 │
 ├── software-architecture/              ← Microservices, CQRS, event sourcing
 │   └── INTERVIEW_QUESTIONS.md          (12 questions)
