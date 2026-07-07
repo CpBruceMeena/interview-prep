@@ -158,6 +158,112 @@
 
 ---
 
+## 🗺️ Interview Roadmap — Recommended Study Order
+
+<div class="roadmap-section">
+<p>This roadmap outlines the <strong>optimal order</strong> to study for Staff/Principal backend engineering interviews. Follow the phases in sequence — each builds on the previous.</p>
+</div>
+
+<div class="roadmap-timeline">
+
+### Phase 1: CS Fundamentals (2-3 weeks)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 1 | **Operating Systems** | Foundation: processes, memory, scheduling, I/O | [OS Questions](cs-interview/operating-systems/INTERVIEW_QUESTIONS/) |
+| 2 | **Computer Networks** | TCP/IP, HTTP/2/3, TLS, QUIC, load balancing | [Networks Questions](cs-interview/computer-networks/INTERVIEW_QUESTIONS/) |
+| 3 | **Data Structures & Algorithms** | Bloom filters, tries, sketches, LRU cache | [DSA Questions](cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS/) + [Scale DSA](cs-interview/data-structures-algorithms/DATA_STRUCTURES_FOR_SCALE/) |
+| 4 | **Database Systems** | MVCC, B-Tree vs LSM, indexes, sharding, replication | [DB Questions](cs-interview/database-systems/INTERVIEW_QUESTIONS/) |
+
+### Phase 2: Language Deep-Dives (2-3 weeks — pick your stack)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 5 | **Python** | GIL, async/await, metaclasses, C extensions | [Python Q&A](python-interview/INTERVIEW_QUESTIONS/) + [Async](ai-engineering/agents/06_PYTHON_ASYNC_AWAIT/) |
+| 5 | **Golang** (alternative) | GMP scheduler, GC, channels, interfaces | [Go Q&A](golang-interview/INTERVIEW_QUESTIONS/) + [Concurrency](golang-interview/CONCURRENCY_NOTES/) |
+| 5 | **Java** (alternative) | JVM internals, GC tuning, Spring Boot | [Java Q&A](java-interview/INTERVIEW_QUESTIONS/) + [JVM](java-interview/JVM_INTERNALS_NOTES/) |
+
+### Phase 3: Low-Level Design (3-4 weeks)
+
+| # | Project | Skills Built | Resources |
+|---|---------|-------------|-----------|
+| 6 | **Parking Lot** | OOD basics, SOLID, Strategy/Factory patterns | [Code](low-level-design/parking-lot/CODE/) |
+| 7 | **Vending Machine** | State machines, finite automata | [Code](low-level-design/vending-machine/CODE/) |
+| 8 | **LRU Cache / Rate Limiter** | Data structures, concurrency | [Cache](low-level-design/lru-cache/CODE/) + [Rate Limiter](low-level-design/rate-limiter/CODE/) |
+| 9 | **Pub-Sub / Movie Booking** | Observer pattern, concurrency control | [Pub-Sub](low-level-design/pub-sub-system/CODE/) + [Booking](low-level-design/movie-ticket-booking/CODE/) |
+| 10 | **Splitwise / Library Mgmt** | Graph algorithms, facade pattern | [Splitwise](low-level-design/splitwise-expense-sharing/CODE/) + [Library](low-level-design/library-management/CODE/) |
+| 11 | **Cab Booking / Car Rental** | Geo queries, Kafka integration, availability | [Cab](low-level-design/cab-booking-uber/CODE/) + [Car Rental](low-level-design/car-rental-platform/CODE/) |
+| 12 | **ATM / Payment Processing** | State machines, fraud detection, idempotency | [ATM](low-level-design/atm-banking-system/CODE/) + [Payments](low-level-design/payment-processing-system/CODE/) |
+| 13 | **Chess Game** | Complex state, enums, validation | [Chess](low-level-design/chess-game/CODE/) |
+| 14 | **Notification Service** | High-throughput, multi-channel, cost-effective, scheduling | [HLD](low-level-design/notification-service/HIGH_LEVEL_DESIGN/) + [Code](low-level-design/notification-service/CODE/) |
+| 15 | **Job Scheduling (Airflow-like)** | Core-aware scheduling, DAG, recurring jobs, cron | [Design](low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN/) |
+| 16 | **Search Platform** | TF-IDF, inverted index, ranking | [Search](low-level-design/search-platform/CODE/) |
+
+### Phase 4: Distributed Systems & Architecture (2-3 weeks)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 17 | **Distributed Systems** | Raft, Paxos, CRDTs, gossip, CAP theorem | [DS Questions](cs-interview/distributed-systems/INTERVIEW_QUESTIONS/) + [Transactions](cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS/) |
+| 18 | **Concurrency & Parallelism** | Lock-free, race conditions, memory models | [Concurrency Q&A](cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS/) |
+| 19 | **Software Architecture** | CQRS, event sourcing, DDD, microservices | [Architecture Q&A](cs-interview/software-architecture/INTERVIEW_QUESTIONS/) + [Patterns](cs-interview/software-architecture/DESIGN_PATTERNS/) |
+| 20 | **Security** | JWT, OAuth2, OWASP, encryption, SSRF | [Security Q&A](cs-interview/security/INTERVIEW_QUESTIONS/) |
+
+### Phase 5: AI Engineering (2-3 weeks — high growth area)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 21 | **RAG Fundamentals** | Understand retrieval-augmented generation | [RAG Overview](ai-engineering/rag/01_RAG_FUNDAMENTALS/) |
+| 22 | **RAG Implementation** | ChromaDB, embeddings, FastAPI | [RAG Code](ai-engineering/rag/implementation/index/) |
+| 23 | **MCP Protocol** | Model Context Protocol, server/client | [MCP Fundamentals](ai-engineering/mcp/08_MCP_FUNDAMENTALS/) + [Servers](ai-engineering/mcp/servers/index/) |
+| 24 | **Agent Fundamentals** | ReAct, Plan-and-Execute, memory systems | [Agent Fundamentals](ai-engineering/agents/01_AGENT_FUNDAMENTALS/) |
+| 25 | **LangGraph** | Graph-based state machines for agents | [LangGraph Notes](ai-engineering/agents/05_LANGGRAPH_NOTES/) |
+| 26 | **Multi-LLM Architecture** | Routing, cost management, fallback across GPT/Claude/DeepSeek | [Multi-LLM Design](ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE/) |
+| 27 | **Agent Observability** | Monitoring, debugging, proactive alerts, data policies | [Observability](ai-engineering/agents/07_AGENT_OBSERVABILITY/) |
+| 28 | **Redis Lease & Search** | Distributed locking, autocorrect, Elasticsearch internals | [Redis & Search](ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH/) |
+| 29 | **Agent Deployment (ECS)** | Production infra, ECS, API flow, monitoring, cost | [Deployment Guide](ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS/) |
+| 30 | **Agent Interview Prep** | Staff-level agent questions and answers | [Agent Q&A](ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS/) |
+
+> 💡 **Tip:** Phase 5 is dense. Focus on **RAG → Agent Fundamentals → LangGraph → Multi-LLM** first if time is limited. Deployment and observability can be studied after the core concepts.
+
+### Phase 6: Cloud & Tools (1-2 weeks)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 31 | **AWS** | Compute, networking, storage, messaging, security | [AWS Overview](aws-interview/README/) |
+| 32 | **Kafka** | Event streaming, partitioning, replication, exactly-once | [Kafka Q&A](tools-interview/kafka/INTERVIEW_QUESTIONS/) |
+| 33 | **Redis** | Caching, distributed locks, data structures, persistence | [Redis Q&A](tools-interview/redis/INTERVIEW_QUESTIONS/) |
+| 34 | **Elasticsearch** | Inverted index, BM25, analysis pipeline, sharding | [ES Q&A](tools-interview/elasticsearch/INTERVIEW_QUESTIONS/) |
+| 35 | **Docker & Kubernetes** | Containerization, orchestration, versioning, multi-container | [K8s Q&A](tools-interview/docker-kubernetes/INTERVIEW_QUESTIONS/) + [Versioning](tools-interview/docker-kubernetes/VERSIONING_MULTI_CONTAINER/) |
+| 36 | **Monitoring & Infra** | Prometheus, Grafana, Terraform | [Prometheus](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS/) + [Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS/) |
+| 37 | **Nginx & Compression** | Reverse proxy, load balancing, Gzip/Zstd/Brotli | [Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS/) + [Compression](tools-interview/compression/INTERVIEW_QUESTIONS/) |
+
+</div>
+
+---
+
+### 📊 Estimated Timeline
+
+| Phase | Duration | Focus |
+|-------|----------|-------|
+| **Phase 1** | 2-3 weeks | CS Fundamentals — build the base |
+| **Phase 2** | 2-3 weeks | Language Deep-Dive — master your stack |
+| **Phase 3** | 3-4 weeks | Low-Level Design — 18+ projects |
+| **Phase 4** | 2-3 weeks | Distributed Systems — think at scale |
+| **Phase 5** | 2-3 weeks | AI Engineering — emerging hot topic |
+| **Phase 6** | 1-2 weeks | Cloud & Tools — fill gaps |
+| **Total** | **12-18 weeks** | Full interview preparation |
+
+### 💡 Study Tips
+
+- **Don't jump ahead** — Phase 1 fundamentals are asked in EVERY interview
+- **Pick ONE language** for Phase 2 (the one you'll interview in)
+- **Build, don't just read** — run the code for every LLD project
+- **Focus Phase 5** — AI agent questions are increasingly common at Staff/Principal level
+- **The rubric matters** — each question has an evaluation table showing what interviewers expect
+- **Use search** — press <kbd>Ctrl</kbd>+<kbd>K</kbd> to search across all 200+ questions instantly
+
+---
+
 ## <span id="modules-overview">📦 Modules Overview</span>
 
 <div class="module-grid">
@@ -340,3 +446,107 @@
 ---
 
 > *Built with ❤️ for backend engineers preparing for Senior/Staff/Principal-level interviews*
+
+---
+
+## 🗺️ Interview Roadmap — Recommended Study Order
+
+<div class="roadmap-section">
+<p>This roadmap outlines the <strong>optimal order</strong> to study for Staff/Principal backend engineering interviews. Follow the phases in sequence — each builds on the previous.</p>
+</div>
+
+<div class="roadmap-timeline">
+
+### Phase 1: CS Fundamentals (2-3 weeks)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 1 | **Operating Systems** | Foundation: processes, memory, scheduling, I/O | [OS Questions](cs-interview/operating-systems/INTERVIEW_QUESTIONS/) |
+| 2 | **Computer Networks** | TCP/IP, HTTP/2/3, TLS, QUIC, load balancing | [Networks Questions](cs-interview/computer-networks/INTERVIEW_QUESTIONS/) |
+| 3 | **Data Structures & Algorithms** | Bloom filters, tries, sketches, LRU cache | [DSA Questions](cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS/) + [Scale DSA](cs-interview/data-structures-algorithms/DATA_STRUCTURES_FOR_SCALE/) |
+| 4 | **Database Systems** | MVCC, B-Tree vs LSM, indexes, sharding, replication | [DB Questions](cs-interview/database-systems/INTERVIEW_QUESTIONS/) |
+
+### Phase 2: Language Deep-Dives (2-3 weeks — pick your stack)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 5 | **Python** | GIL, async/await, metaclasses, C extensions | [Python Q&A](python-interview/INTERVIEW_QUESTIONS/) + [Async](ai-engineering/agents/06_PYTHON_ASYNC_AWAIT/) |
+| 5 | **Golang** (alternative) | GMP scheduler, GC, channels, interfaces | [Go Q&A](golang-interview/INTERVIEW_QUESTIONS/) + [Concurrency](golang-interview/CONCURRENCY_NOTES/) |
+| 5 | **Java** (alternative) | JVM internals, GC tuning, Spring Boot | [Java Q&A](java-interview/INTERVIEW_QUESTIONS/) + [JVM](java-interview/JVM_INTERNALS_NOTES/) |
+
+### Phase 3: Low-Level Design (3-4 weeks)
+
+| # | Project | Skills Built | Resources |
+|---|---------|-------------|-----------|
+| 6 | **Parking Lot** | OOD basics, SOLID, Strategy/Factory patterns | [Code](low-level-design/parking-lot/CODE/) |
+| 7 | **Vending Machine** | State machines, finite automata | [Code](low-level-design/vending-machine/CODE/) |
+| 8 | **LRU Cache / Rate Limiter** | Data structures, concurrency | [Cache](low-level-design/lru-cache/CODE/) + [Rate Limiter](low-level-design/rate-limiter/CODE/) |
+| 9 | **Pub-Sub / Movie Booking** | Observer pattern, concurrency control | [Pub-Sub](low-level-design/pub-sub-system/CODE/) + [Booking](low-level-design/movie-ticket-booking/CODE/) |
+| 10 | **Splitwise / Library Mgmt** | Graph algorithms, facade pattern | [Splitwise](low-level-design/splitwise-expense-sharing/CODE/) + [Library](low-level-design/library-management/CODE/) |
+| 11 | **Cab Booking / Car Rental** | Geo queries, Kafka integration, availability | [Cab](low-level-design/cab-booking-uber/CODE/) + [Car Rental](low-level-design/car-rental-platform/CODE/) |
+| 12 | **ATM / Payment Processing** | State machines, fraud detection, idempotency | [ATM](low-level-design/atm-banking-system/CODE/) + [Payments](low-level-design/payment-processing-system/CODE/) |
+| 13 | **Chess Game** | Complex state, enums, validation | [Chess](low-level-design/chess-game/CODE/) |
+| 14 | **🔔 Notification Service** | High-throughput, multi-channel, cost-effective, scheduling | [HLD](low-level-design/notification-service/HIGH_LEVEL_DESIGN/) + [Code](low-level-design/notification-service/CODE/) |
+| 15 | **📅 Job Scheduling (Airflow-like)** | Core-aware scheduling, DAG, recurring jobs, cron | [Design](low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN/) |
+| 16 | **Search Platform** | TF-IDF, inverted index, ranking | [Search](low-level-design/search-platform/CODE/) |
+
+### Phase 4: Distributed Systems & Architecture (2-3 weeks)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 17 | **Distributed Systems** | Raft, Paxos, CRDTs, gossip, CAP theorem | [DS Questions](cs-interview/distributed-systems/INTERVIEW_QUESTIONS/) + [Transactions](cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS/) |
+| 18 | **Concurrency & Parallelism** | Lock-free, race conditions, memory models | [Concurrency Q&A](cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS/) |
+| 19 | **Software Architecture** | CQRS, event sourcing, DDD, microservices | [Architecture Q&A](cs-interview/software-architecture/INTERVIEW_QUESTIONS/) + [Patterns](cs-interview/software-architecture/DESIGN_PATTERNS/) |
+| 20 | **Security** | JWT, OAuth2, OWASP, encryption, SSRF | [Security Q&A](cs-interview/security/INTERVIEW_QUESTIONS/) |
+
+### Phase 5: AI Engineering (2-3 weeks — high growth area)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 21 | **RAG Fundamentals** | Understand retrieval-augmented generation | [RAG Overview](ai-engineering/rag/01_RAG_FUNDAMENTALS/) |
+| 22 | **RAG Implementation** | ChromaDB, embeddings, FastAPI | [RAG Code](ai-engineering/rag/implementation/index/) |
+| 23 | **MCP Protocol** | Model Context Protocol, server/client | [MCP Fundamentals](ai-engineering/mcp/08_MCP_FUNDAMENTALS/) + [Servers](ai-engineering/mcp/servers/index/) |
+| 24 | **Agent Fundamentals** | ReAct, Plan-and-Execute, memory systems | [Agent Fundamentals](ai-engineering/agents/01_AGENT_FUNDAMENTALS/) |
+| 25 | **🕸️ LangGraph** | Graph-based state machines for agents | [LangGraph Notes](ai-engineering/agents/05_LANGGRAPH_NOTES/) |
+| 26 | **Multi-LLM Architecture** | Routing, cost management, fallback across GPT/Claude/DeepSeek | [Multi-LLM Design](ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE/) |
+| 27 | **Agent Observability** | Monitoring, debugging, proactive alerts, data policies | [Observability](ai-engineering/agents/07_AGENT_OBSERVABILITY/) |
+| 28 | **🔐 Redis Lease & Search** | Distributed locking, autocorrect, Elasticsearch internals | [Redis & Search](ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH/) |
+| 29 | **Agent Deployment (ECS)** | Production infra, ECS, API flow, monitoring, cost | [Deployment Guide](ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS/) |
+| 30 | **Agent Interview Prep** | Staff-level agent questions and answers | [Agent Q&A](ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS/) |
+
+### Phase 6: Cloud & Tools (1-2 weeks)
+
+| # | Topic | Why | Resources |
+|---|-------|-----|-----------|
+| 31 | **AWS** | Compute, networking, storage, messaging, security | [AWS Overview](aws-interview/README/) |
+| 32 | **Kafka** | Event streaming, partitioning, replication, exactly-once | [Kafka Q&A](tools-interview/kafka/INTERVIEW_QUESTIONS/) |
+| 33 | **Redis** | Caching, distributed locks, data structures, persistence | [Redis Q&A](tools-interview/redis/INTERVIEW_QUESTIONS/) |
+| 34 | **Elasticsearch** | Inverted index, BM25, analysis pipeline, sharding | [ES Q&A](tools-interview/elasticsearch/INTERVIEW_QUESTIONS/) |
+| 35 | **Docker & Kubernetes** | Containerization, orchestration, versioning, multi-container | [K8s Q&A](tools-interview/docker-kubernetes/INTERVIEW_QUESTIONS/) + [Versioning](tools-interview/docker-kubernetes/VERSIONING_MULTI_CONTAINER/) |
+| 36 | **Monitoring & Infra** | Prometheus, Grafana, Terraform | [Prometheus](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS/) + [Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS/) |
+| 37 | **Nginx & Compression** | Reverse proxy, load balancing, Gzip/Zstd/Brotli | [Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS/) + [Compression](tools-interview/compression/INTERVIEW_QUESTIONS/) |
+
+</div>
+
+---
+
+### 📊 Estimated Timeline
+
+| Phase | Duration | Focus |
+|-------|----------|-------|
+| **Phase 1** | 2-3 weeks | CS Fundamentals — build the base |
+| **Phase 2** | 2-3 weeks | Language Deep-Dive — master your stack |
+| **Phase 3** | 3-4 weeks | Low-Level Design — 16+ projects |
+| **Phase 4** | 2-3 weeks | Distributed Systems — think at scale |
+| **Phase 5** | 2-3 weeks | AI Engineering — emerging hot topic |
+| **Phase 6** | 1-2 weeks | Cloud & Tools — fill gaps |
+| **Total** | **12-18 weeks** | Full interview preparation |
+
+### 💡 Tips
+
+- **Don't jump ahead** — Phase 1 fundamentals are asked in EVERY interview
+- **Pick ONE language** for Phase 2 (the one you'll interview in)
+- **Build, don't just read** — run the code for every LLD project
+- **Focus Phase 5** — AI agent questions are increasingly common at Staff/Principal level
+- **The rubric matters** — each question has an evaluation table showing what interviewers expect
+- **Use search** — press <kbd>Ctrl</kbd>+<kbd>K</kbd> to search across all 200+ questions instantly

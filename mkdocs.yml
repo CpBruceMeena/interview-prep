@@ -189,7 +189,12 @@ nav:
     - Job Scheduling:
       - Code: low-level-design/job-scheduling-system/CODE.md
       - HLD: low-level-design/job-scheduling-system/HIGH_LEVEL_DESIGN.md
+      - Airflow-Like Design: low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md
       - Questions: low-level-design/job-scheduling-system/INTERVIEW_QUESTIONS.md
+    - Notification Service:
+      - HLD: low-level-design/notification-service/HIGH_LEVEL_DESIGN.md
+      - Code: low-level-design/notification-service/CODE.md
+      - Questions: low-level-design/notification-service/INTERVIEW_QUESTIONS.md
     - Search Platform:
       - Code: low-level-design/search-platform/CODE.md
       - HLD: low-level-design/search-platform/HIGH_LEVEL_DESIGN.md
@@ -222,6 +227,13 @@ nav:
       - Agent Interview Questions: ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md
       - Agent Implementation Guide: ai-engineering/agents/03_AGENT_IMPLEMENTATION_GUIDE.md
       - Agent Production Architecture: ai-engineering/agents/04_AGENT_PRODUCTION_ARCHITECTURE.md
+      - LangGraph Notes: ai-engineering/agents/05_LANGGRAPH_NOTES.md
+      - Python Async/Await: ai-engineering/agents/06_PYTHON_ASYNC_AWAIT.md
+      - Agent Observability: ai-engineering/agents/07_AGENT_OBSERVABILITY.md
+      - Multi-LLM Architecture: ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE.md
+      - Agent Deployment (ECS): ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md
+      - System/User/Assistant Roles: ai-engineering/agents/10_SYSTEM_USER_ASSISTANT_ROLES.md
+      - Redis Lease & Search: ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH.md
       - Implementation Code: ai-engineering/agents/implementation/index.md
 
   - 🐍 Python:
