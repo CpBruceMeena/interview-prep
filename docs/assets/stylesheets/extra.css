@@ -1266,6 +1266,148 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
     display: none;
 }
 
+/* ===========================================================================
+   Interview Roadmap — Timeline Tables
+   =========================================================================== */
+
+.roadmap-section {
+    background: linear-gradient(135deg, rgba(139,92,246,0.06), rgba(37,99,235,0.04));
+    border: 1px solid rgba(139,92,246,0.12);
+    border-radius: 0.85rem;
+    padding: 1rem 1.3rem;
+    margin: 1rem 0 1.5rem;
+}
+
+.roadmap-section p {
+    margin: 0;
+    font-size: 0.9rem;
+    color: var(--md-default-fg-color);
+    line-height: 1.7;
+}
+
+.roadmap-timeline {
+    position: relative;
+    padding-left: 0;
+}
+
+/* Phase headings — h3 inside .roadmap-timeline */
+.roadmap-timeline h3 {
+    position: relative;
+    padding: 0.6rem 1rem 0.6rem 1.2rem;
+    margin: 2.2rem 0 1rem 0;
+    border-radius: 0.5rem;
+    font-size: 0.95rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    border-left: 4px solid var(--md-primary-fg-color);
+    background: linear-gradient(90deg, rgba(139,92,246,0.08), transparent);
+}
+
+/* Phase heading colors */
+.roadmap-timeline h3:nth-of-type(1) { border-left-color: #22c55e; background: linear-gradient(90deg, rgba(34,197,94,0.08), transparent); color: #4ade80; }
+.roadmap-timeline h3:nth-of-type(2) { border-left-color: #3b82f6; background: linear-gradient(90deg, rgba(59,130,246,0.08), transparent); color: #60a5fa; }
+.roadmap-timeline h3:nth-of-type(3) { border-left-color: #8b5cf6; background: linear-gradient(90deg, rgba(139,92,246,0.08), transparent); color: #a78bfa; }
+.roadmap-timeline h3:nth-of-type(4) { border-left-color: #f59e0b; background: linear-gradient(90deg, rgba(245,158,11,0.08), transparent); color: #fbbf24; }
+.roadmap-timeline h3:nth-of-type(5) { border-left-color: #ec4899; background: linear-gradient(90deg, rgba(236,72,153,0.08), transparent); color: #f472b6; }
+.roadmap-timeline h3:nth-of-type(6) { border-left-color: #06b6d4; background: linear-gradient(90deg, rgba(6,182,212,0.08), transparent); color: #22d3ee; }
+
+/* Tables inside the roadmap timeline */
+.roadmap-timeline table:not([class]) {
+    border-radius: 0.65rem;
+    overflow: hidden;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    margin: 0.8rem 0 1.6rem;
+    font-size: 0.72rem;
+}
+
+.roadmap-timeline table:not([class]) thead th {
+    background: linear-gradient(135deg, var(--md-primary-fg-color), var(--md-accent-fg-color));
+    color: var(--md-primary-bg-color);
+    font-weight: 700;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.6rem 0.8rem;
+    border: none;
+}
+
+.roadmap-timeline table:not([class]) tbody td {
+    padding: 0.55rem 0.8rem;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    vertical-align: top;
+}
+
+.roadmap-timeline table:not([class]) tbody tr {
+    transition: background 0.15s;
+}
+
+.roadmap-timeline table:not([class]) tbody tr:hover td {
+    background: linear-gradient(90deg, rgba(139,92,246,0.04), transparent);
+}
+
+.roadmap-timeline table:not([class]) tbody tr:last-child td {
+    border-bottom: none;
+}
+
+/* Column widths for roadmap tables */
+.roadmap-timeline table:not([class]) th:first-child,
+.roadmap-timeline table:not([class]) td:first-child {
+    width: 2.5rem;
+    text-align: center;
+    font-weight: 600;
+    color: var(--md-default-fg-color--light);
+}
+
+.roadmap-timeline table:not([class]) td:first-child {
+    font-size: 0.72rem;
+    color: var(--md-default-fg-color);
+    font-weight: 700;
+}
+
+.roadmap-timeline table:not([class]) th:last-child,
+.roadmap-timeline table:not([class]) td:last-child {
+    width: 35%;
+    font-size: 0.7rem;
+}
+
+.roadmap-timeline table:not([class]) td:nth-child(2) {
+    font-weight: 600;
+    color: var(--md-default-fg-color);
+    min-width: 140px;
+}
+
+.roadmap-timeline table:not([class]) td:nth-child(3) {
+    color: var(--md-default-fg-color--light);
+    font-size: 0.7rem;
+    line-height: 1.5;
+}
+
+/* Blockquote inside roadmap */
+.roadmap-timeline blockquote {
+    margin: 0.8rem 0 1.6rem;
+    padding: 0.7rem 1rem;
+    border-left: 3px solid #f59e0b;
+    background: rgba(245,158,11,0.06);
+    border-radius: 0.4rem;
+    font-size: 0.8rem;
+    font-style: normal;
+    color: #fbbf24;
+}
+
+.roadmap-timeline blockquote strong {
+    color: #fcd34d;
+}
+
+/* Estimated Timeline table (outside roadmap-timeline) */
+.md-typeset h3:has(+ table) + table:not([class]) thead th {
+    background: linear-gradient(135deg, #8b5cf6, #6366f1);
+}
+
+.md-typeset h3:has(+ table) + table:not([class]) tbody tr:last-child td {
+    background: linear-gradient(90deg, rgba(139,92,246,0.06), transparent);
+    font-weight: 700;
+}
+
 /* ── Feedback Widget ────────────────────────────────────────── */
 .feedback-widget {
     padding: 0.75rem 1rem;
