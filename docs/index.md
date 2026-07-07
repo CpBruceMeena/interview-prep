@@ -164,7 +164,7 @@
 <p>This roadmap outlines the <strong>optimal order</strong> to study for Staff/Principal backend engineering interviews. Follow the phases in sequence — each builds on the previous.</p>
 </div>
 
-<div class="roadmap-timeline">
+<div class="roadmap-timeline" markdown="1">
 
 ### Phase 1: CS Fundamentals (2-3 weeks)
 
