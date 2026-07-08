@@ -147,13 +147,19 @@ class ConsistentHashRing:
 ## Question 5: Thread Safety
 **Interviewer:** *"Make your cache thread-safe."*
 
+### 🎯 Answer (In-depth)
+
+There are **three tiers** of thread safety, depending on deployment:
+
+#### Tier 1 — Single-process, single-machine (Python RLock)
+
 ```python
 import threading
 
 class ThreadSafeCache:
-    def __init__(self, capacity):
-        self._lock = threading.RLock()  # Reentrant for recursive calls
-        self._cache = LRUCache(capacity)
+    def __init__(self, capacity, eviction_strategy):
+        self._lock = threading.RLock()  # Reentrant — allows same thread to re-acquire
+        self._cache = Cache(capacity, eviction_strategy)
     
     def get(self, key):
         with self._lock:
@@ -164,8 +170,60 @@ class ThreadSafeCache:
             self._cache.put(key, value)
 ```
 
-**For higher concurrency:** Use `ReadWriteLock` — multiple concurrent reads, exclusive writes.
-**For distributed:** Redis Redlock algorithm with TTL.
+**Why RLock over Lock?** Operations like `get()` with TTL check call `strategy.is_expired()` → `strategy.remove()`. If any of those methods need the lock (e.g., for internal consistency), RLock lets the same thread re-enter without deadlock.
+
+#### Tier 2 — Read-heavy workloads (ReadWriteLock)
+
+```python
+from readerwriterlock import rwlock
+
+class ThreadSafeCacheRW:
+    def __init__(self, capacity, eviction_strategy):
+        self._lock = rwlock.RWLockFair()  # Fair: no writer starvation
+        self._cache = Cache(capacity, eviction_strategy)
+    
+    def get(self, key):
+        with self._lock.gen_rlock():  # Multiple concurrent readers
+            return self._cache.get(key)
+    
+    def put(self, key, value):
+        with self._lock.gen_wlock():  # Exclusive write access
+            self._cache.put(key, value)
+```
+
+**Trade-off:** ReadWriteLock allows N concurrent reads but serialises writes. For a 90% read / 10% write workload, throughput can be 5-10× higher than a plain Lock.
+
+#### Tier 3 — Distributed (Redis Redlock)
+
+For caches spanning multiple machines:
+
+```python
+import redis
+
+class DistributedCacheLock:
+    def __init__(self, redis_client, lock_ttl_ms=1000):
+        self._redis = redis_client
+        self._lock_ttl = lock_ttl_ms
+    
+    def acquire_lock(self, key):
+        # SET key random_value NX PX 1000  — Redis SETNX with TTL
+        lock_key = f"lock:cache:{key}"
+        return self._redis.set(lock_key, self._local_id, 
+                               nx=True, px=self._lock_ttl)
+    
+    def release_lock(self, key):
+        # Lua script to ensure we only release locks we own
+        lock_key = f"lock:cache:{key}"
+        self._redis.eval("""
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        """, 1, lock_key, self._local_id)
+```
+
+**Redlock algorithm:** For strong consistency across 5 Redis nodes, acquire the lock from a majority (3/5). If a node crashes and restarts without persistence, the lock could be lost — add delayed restarts (TTL + a few seconds) to let locks expire.
 
 ---
 
@@ -178,6 +236,7 @@ class ThreadSafeCache:
 | **Persistence** | Periodic serialization to disk (RDB/AOF style) |
 | **Cache warming** | Pre-load top-K from persistent store |
 | **Admin API** | REST endpoints for stats, flush, resize |
+| **Thread safety** | RLock (single process) / Redlock (distributed) |
 
 ---
 
@@ -190,3 +249,16 @@ class ThreadSafeCache:
 | **Factory** | Cache creation | Config-driven setup |
 | **Template Method** | Cache.get/put | Consistent flow, customizable internals |
 | **Adapter** | Multi-level cache | Uniform interface across levels |
+| **Proxy / Guard** | ThreadSafeCache | Add thread safety transparently |
+
+---
+
+## 🧩 Staff-Level Evaluation Rubric
+
+| Criteria | Excellent | Good | Needs Work |
+|----------|-----------|------|------------|
+| **Data structures** | HashMap + DLL, explains why O(1) | Mentions HashMap + DLL | Only one data structure |
+| **Eviction strategies** | Implements 3+ (LRU, LFU, TTL), compares trade-offs | Implements 2 | Only LRU |
+| **Concurrency** | Discusses RLock, RWLock, and distributed Redlock | Mentions threading.Lock | No concurrency |
+| **Distributed scaling** | Consistent hashing, virtual nodes, lazy migration | Mentions sharding | No distributed design |
+| **Design patterns** | Strategy, Decorator, Proxy, SRP, OCP | 1-2 patterns | No patterns mentioned |

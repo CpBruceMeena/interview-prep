@@ -1,0 +1,184 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/24.0.0 Chrome/120.0.6099.109 Electron/28.1.0 Safari/537.36">
+  <diagram name="Movie Ticket Booking Class Diagram" id="movie-ticket-class-diagram">
+    <mxGraphModel dx="1400" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="title" value="Movie Ticket Booking (BookMyShow) — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="200" y="10" width="700" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Enums ==================== -->
+
+        <!-- SeatStatus -->
+        <mxCell id="seat_status" value="&lt;b&gt;&amp;lt;&amp;lt;Enum&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;SeatStatus&lt;/b&gt;&lt;hr&gt;AVAILABLE&lt;br&gt;BOOKED&lt;br&gt;BLOCKED" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2F1;strokeColor=#009688;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="30" y="80" width="130" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- BookingStatus -->
+        <mxCell id="booking_status" value="&lt;b&gt;&amp;lt;&amp;lt;Enum&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;BookingStatus&lt;/b&gt;&lt;hr&gt;PENDING&lt;br&gt;CONFIRMED&lt;br&gt;CANCELLED&lt;br&gt;REFUNDED" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2F1;strokeColor=#009688;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="30" y="210" width="130" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- City -->
+        <mxCell id="city_enum" value="&lt;b&gt;&amp;lt;&amp;lt;Enum&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;City&lt;/b&gt;&lt;hr&gt;MUMBAI&lt;br&gt;DELHI&lt;br&gt;BANGALORE&lt;br&gt;HYDERABAD" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2F1;strokeColor=#009688;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="30" y="360" width="130" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- Genre -->
+        <mxCell id="genre_enum" value="&lt;b&gt;&amp;lt;&amp;lt;Enum&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Genre&lt;/b&gt;&lt;hr&gt;ACTION&lt;br&gt;COMEDY&lt;br&gt;DRAMA&lt;br&gt;HORROR&lt;br&gt;SCI_FI&lt;br&gt;..." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2F1;strokeColor=#009688;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="30" y="510" width="130" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Movie ==================== -->
+        <mxCell id="movie" value="&lt;b&gt;Movie&lt;/b&gt;&lt;hr&gt;- _movie_id: str&lt;br&gt;- _title: str&lt;br&gt;- _genre: Genre&lt;br&gt;- _duration: int&lt;br&gt;- _language: str&lt;br&gt;- _rating: float&lt;hr&gt;+ movie_id (property)&lt;br&gt;+ title (property)&lt;br&gt;+ duration (property)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="250" y="80" width="180" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Seat ==================== -->
+        <mxCell id="seat" value="&lt;b&gt;Seat&lt;/b&gt;&lt;hr&gt;- _seat_id: str&lt;br&gt;- _row: str&lt;br&gt;- _number: int&lt;br&gt;- _category: str&lt;br&gt;- _status: SeatStatus&lt;hr&gt;+ seat_id (property)&lt;br&gt;+ category (property)&lt;br&gt;+ status (property/setter)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="500" y="80" width="170" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Screen ==================== -->
+        <mxCell id="screen" value="&lt;b&gt;Screen&lt;/b&gt;&lt;hr&gt;- _screen_id: str&lt;br&gt;- _name: str&lt;br&gt;- _seats: Dict[str, Seat]&lt;hr&gt;+ add_seat(seat)&lt;br&gt;+ get_seat(id) → Optional[Seat]&lt;br&gt;+ get_all_seats() → List[Seat]&lt;br&gt;+ get_available_seats() → List[Seat]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="250" y="280" width="200" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Theatre ==================== -->
+        <mxCell id="theatre" value="&lt;b&gt;Theatre&lt;/b&gt;&lt;hr&gt;- _theatre_id: str&lt;br&gt;- _name: str&lt;br&gt;- _city: City&lt;br&gt;- _address: str&lt;br&gt;- _screens: Dict[str, Screen]&lt;hr&gt;+ add_screen(screen)&lt;br&gt;+ get_screen(id) → Optional[Screen]&lt;br&gt;+ name (property)&lt;br&gt;+ city (property)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="250" y="480" width="200" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Show ==================== -->
+        <mxCell id="show" value="&lt;b&gt;Show&lt;/b&gt;&lt;hr&gt;- _show_id: str&lt;br&gt;- _movie: Movie&lt;br&gt;- _screen: Screen&lt;br&gt;- _theatre: Theatre&lt;br&gt;- _start_time: datetime&lt;br&gt;- _end_time: datetime&lt;br&gt;- _pricing: Dict[str, float]&lt;hr&gt;+ get_price(category) → float&lt;br&gt;+ set_pricing(category, price)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#388E3C;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="250" y="700" width="200" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== PricingStrategy (Abstract) ==================== -->
+        <mxCell id="pricing" value="&lt;b&gt;&amp;lt;&amp;lt;Abstract&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;PricingStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ calculate_price(base: float, show: Show, category: str) → float&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="540" y="440" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- StandardPricing -->
+        <mxCell id="std_price" value="&lt;b&gt;StandardPricing&lt;/b&gt;&lt;hr&gt;+ calculate_price(base, show, category) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="530" y="550" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- PeakPricing -->
+        <mxCell id="peak_price" value="&lt;b&gt;PeakPricing&lt;/b&gt;&lt;hr&gt;- peak_hours: Set[int]&lt;br&gt;- surcharge: float&lt;hr&gt;+ calculate_price(base, show, category) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="710" y="550" width="180" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- WeekendPricing -->
+        <mxCell id="wknd_price" value="&lt;b&gt;WeekendPricing&lt;/b&gt;&lt;hr&gt;- weekend_surcharge: float&lt;hr&gt;+ calculate_price(base, show, category) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="530" y="650" width="170" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Booking ==================== -->
+        <mxCell id="booking" value="&lt;b&gt;Booking&lt;/b&gt;&lt;hr&gt;- _booking_id: str&lt;br&gt;- _show: Show&lt;br&gt;- _user_id: str&lt;br&gt;- _seats: List[Seat]&lt;br&gt;- _total_amount: float&lt;br&gt;- _status: BookingStatus&lt;br&gt;- _created_at: datetime&lt;br&gt;- _lock: Lock&lt;hr&gt;+ confirm()&lt;br&gt;+ cancel()&lt;br&gt;+ total_amount (property)&lt;br&gt;+ status (property)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="500" y="730" width="200" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== BookingManager (Singleton) ==================== -->
+        <mxCell id="bm" value="&lt;b&gt;BookingManager&lt;/b&gt;&lt;br&gt;(Singleton)&lt;hr&gt;- _bookings: Dict[str, Booking]&lt;br&gt;- _pricing_strategy: PricingStrategy&lt;br&gt;- _lock: Lock&lt;hr&gt;+ create_booking(show, user, seats) → Booking&lt;br&gt;+ confirm_booking(id) → Booking&lt;br&gt;+ cancel_booking(id) → Booking&lt;br&gt;+ get_booking(id) → Optional[Booking]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="500" y="970" width="220" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== MovieSearchService ==================== -->
+        <mxCell id="search" value="&lt;b&gt;MovieSearchService&lt;/b&gt;&lt;hr&gt;- _movies: Dict[str, Movie]&lt;br&gt;- _shows: Dict[str, Show]&lt;hr&gt;+ search_by_city(city) → List[Show]&lt;br&gt;+ search_by_movie(id) → List[Show]&lt;br&gt;+ search_by_genre(genre, city?) → List[Show]&lt;br&gt;+ search_by_date(date, city?) → List[Show]&lt;br&gt;+ get_available_seats(show_id) → List[Seat]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="250" y="970" width="220" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Edges ==================== -->
+
+        <!-- Screen → Seat (composition) -->
+        <mxCell id="e_scr_seat" value="contains" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;fontSize=10;" edge="1" parent="1" source="screen" target="seat">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Theatre → Screen (composition) -->
+        <mxCell id="e_th_scr" value="contains" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;fontSize=10;" edge="1" parent="1" source="theatre" target="screen">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Show → Movie -->
+        <mxCell id="e_sh_mo" value="references" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#388E3C;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="show" target="movie">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Show → Theatre -->
+        <mxCell id="e_sh_th" value="scheduled at" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#388E3C;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="show" target="theatre">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- PricingStrategy → StandardPricing -->
+        <mxCell id="e_p_sp" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="pricing" target="std_price">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- PricingStrategy → PeakPricing -->
+        <mxCell id="e_p_pp" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="pricing" target="peak_price">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- PricingStrategy → WeekendPricing -->
+        <mxCell id="e_p_wp" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="pricing" target="wknd_price">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Booking → Show -->
+        <mxCell id="e_b_sh" value="for" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="booking" target="show">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- BookingManager → Booking (manages) -->
+        <mxCell id="e_bm_b" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;fontSize=10;" edge="1" parent="1" source="bm" target="booking">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- BookingManager → PricingStrategy (uses) -->
+        <mxCell id="e_bm_ps" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="bm" target="pricing">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- MovieSearchService → Movie -->
+        <mxCell id="e_s_m" value="indexes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="search" target="movie">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- MovieSearchService → Show -->
+        <mxCell id="e_s_sh" value="indexes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="search" target="show">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Theatre → City enum -->
+        <mxCell id="e_th_city" value="has" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="theatre" target="city_enum">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Seat → SeatStatus enum -->
+        <mxCell id="e_seat_status" value="has" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="seat" target="seat_status">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Booking → BookingStatus enum -->
+        <mxCell id="e_b_status" value="has" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="booking" target="booking_status">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Movie → Genre enum -->
+        <mxCell id="e_m_genre" value="has" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="movie" target="genre_enum">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="legend" value="&lt;b&gt;Legend&lt;/b&gt;&lt;br&gt;━━━ Solid: Composition / Inheritance&lt;br&gt;- - - Dashed: Association / Reference&lt;br&gt;&lt;br&gt;&lt;b&gt;Patterns Used:&lt;/b&gt;&lt;br&gt;• Strategy (PricingStrategy)&lt;br&gt;• Singleton (BookingManager)&lt;br&gt;• State (Seat/Booking status)&lt;br&gt;• Facade (MovieSearchService)&lt;br&gt;• SRP across all classes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEEEEE;strokeColor=#9E9E9E;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="280" width="230" height="140" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
