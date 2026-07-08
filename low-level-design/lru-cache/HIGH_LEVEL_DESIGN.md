@@ -59,6 +59,14 @@
 
 ---
 
+## 2.5 CLASS DIAGRAM
+
+![LRU Cache Class Diagram](lru-cache-class-diagram.svg)
+
+> **📥 Download:** [LRU Cache Architecture Diagram (draw.io)](lru-cache-class-diagram.drawio) — Open in [draw.io](https://app.diagrams.net/) to edit.
+
+---
+
 ## 3. KEY COMPONENTS & INTERVIEW Q&A
 
 ### Cache Node (Go/C++)
@@ -114,12 +122,30 @@ class ConsistentHashRing:
 
 **🔴 Interview Question:** *"How does cache rebalancing work when adding a new node?"*
 
-**✅ Answer:**
-1. New node joins → cluster manager detects via gossip
-2. Consistent hash ring updates → ~1/N of keys remap to new node
-3. **No mass invalidation:** Lazy migration — when a client requests a key that just moved, old node returns redirect (MOVED response like Redis Cluster)
-4. Client library caches ring state, updates after MOVED response
-5. Background process migrates hot keys proactively
+**✅ Answer (Detailed):**
+
+When a new cache node joins the cluster, rebalancing happens in **5 phases** to minimise disruption:
+
+1. **Membership detection** — The new node announces itself via gossip protocol. Within seconds, every node in the cluster knows about the addition. The cluster manager (Raft leader) confirms the join.
+
+2. **Consistent hash ring update** — The new node adds N virtual nodes (e.g., 150) to the ring. Each virtual node hashes to a position on the ring. Keys whose nearest clockwise node was previously shard X now map to the new node. Approximately **1/N of all keys** remap (where N is the new total node count).
+
+3. **Lazy key migration (no mass invalidation)** — Rather than invalidating all remapped keys upfront (which would cause a thundering herd against the DB), the system uses **lazy migration**:
+   - Client library caches the ring state locally.
+   - On a cache miss, the client sends the request to the *old* node.
+   - The old node detects the key no longer belongs to it and returns a **MOVED redirect** (identical to Redis Cluster's approach).
+   - Client updates its ring cache and retries against the correct node.
+
+4. **Proactive hot-key migration** — A background goroutine/thread walks the keyspace and migrates frequently-accessed ("hot") keys before they're requested. This avoids the MOVED redirect penalty for popular keys.
+
+5. **Rolling rebalancing completion** — The cluster operator monitors:
+   - Redirect rate (should decay to near-zero within minutes)
+   - Per-node memory utilisation (should converge to uniform)
+   - Client error rates (should remain flat)
+
+**Failure scenarios:**
+- **Node crashes during rebalance:** The cluster manager detects failure via gossip timeout. The rebalance pauses, the dead node's virtual nodes are removed from the ring, and its keys remap to remaining nodes.
+- **Network partition:** During a split, both sides continue operating. When the partition heals, the cluster manager reconciles via Raft — the side with the higher term wins and triggers a full rebalance if needed.
 
 ---
 

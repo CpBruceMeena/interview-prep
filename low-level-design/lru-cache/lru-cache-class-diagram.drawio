@@ -1,0 +1,137 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/24.0.0 Chrome/120.0.6099.109 Electron/28.1.0 Safari/537.36">
+  <diagram name="LRU Cache Class Diagram" id="lru-cache-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="title" value="LRU/LFU/TTL Cache — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Node ==================== -->
+        <mxCell id="node" value="&lt;b&gt;&amp;lt;&amp;lt;Generic&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Node&amp;lt;K, V&amp;gt;&lt;/b&gt;&lt;hr&gt;- key: K&lt;br&gt;- value: V&lt;br&gt;- prev: Optional&amp;lt;Node&amp;gt;&lt;br&gt;- next: Optional&amp;lt;Node&amp;gt;&lt;hr&gt;&lt;i&gt;+ __init__(key: K, value: V)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== EvictionStrategy (Abstract) ==================== -->
+        <mxCell id="strategy" value="&lt;b&gt;&amp;lt;&amp;lt;Abstract&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;EvictionStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ access(key: Any, node: Node)&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ add(key: Any, node: Node)&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ evict() → Any&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ remove(key: Any)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="50" y="250" width="220" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== LRUStrategy ==================== -->
+        <mxCell id="lru" value="&lt;b&gt;LRUStrategy&lt;/b&gt;&lt;hr&gt;- _head: Optional&amp;lt;Node&amp;gt;&lt;br&gt;- _tail: Optional&amp;lt;Node&amp;gt;&lt;br&gt;- _node_map: Dict[Any, Node]&lt;hr&gt;- _remove_node(node: Node)&lt;br&gt;- _add_to_front(node: Node)&lt;br&gt;+ access(key, node)&lt;br&gt;+ add(key, node)&lt;br&gt;+ evict() → Any&lt;br&gt;+ remove(key)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="260" width="200" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== LFUStrategy ==================== -->
+        <mxCell id="lfu" value="&lt;b&gt;LFUStrategy&lt;/b&gt;&lt;hr&gt;- _freq_map: Dict[int, set]&lt;br&gt;- _key_freq: Dict[Any, int]&lt;br&gt;- _min_freq: int&lt;hr&gt;+ access(key, node)&lt;br&gt;+ add(key, node)&lt;br&gt;+ evict() → Any&lt;br&gt;+ remove(key)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="590" y="260" width="200" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== TTLStrategy ==================== -->
+        <mxCell id="ttl" value="&lt;b&gt;TTLStrategy&lt;/b&gt;&lt;hr&gt;- _default_ttl: int&lt;br&gt;- _expiry_map: Dict[Any, float]&lt;hr&gt;+ access(key, node)&lt;br&gt;+ add(key, node)&lt;br&gt;+ evict() → Any&lt;br&gt;+ remove(key)&lt;br&gt;+ is_expired(key) → bool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="840" y="260" width="200" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Cache (Generic) ==================== -->
+        <mxCell id="cache" value="&lt;b&gt;&amp;lt;&amp;lt;Generic&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Cache&amp;lt;K, V&amp;gt;&lt;/b&gt;&lt;hr&gt;- _capacity: int&lt;br&gt;- _strategy: EvictionStrategy&lt;br&gt;- _cache: Dict[K, Node]&lt;hr&gt;+ get(key: K) → Optional[V]&lt;br&gt;+ put(key: K, value: V)&lt;br&gt;+ remove(key: K) → bool&lt;br&gt;+ clear()&lt;br&gt;+ size: int (property)&lt;br&gt;+ capacity: int (property)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="50" y="480" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== CacheStats ==================== -->
+        <mxCell id="stats" value="&lt;b&gt;CacheStats&lt;/b&gt;&lt;hr&gt;- _hits: int&lt;br&gt;- _misses: int&lt;br&gt;- _evictions: int&lt;hr&gt;+ record_hit()&lt;br&gt;+ record_miss()&lt;br&gt;+ record_eviction()&lt;br&gt;+ hit_rate: float (property)&lt;br&gt;+ report() → str" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="370" y="490" width="200" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== CacheWithStats ==================== -->
+        <mxCell id="decorator" value="&lt;b&gt;CacheWithStats&lt;/b&gt;&lt;hr&gt;- _cache: Cache&lt;br&gt;- _stats: CacheStats&lt;hr&gt;+ get(key) → Optional[V]&lt;br&gt;+ put(key, value)&lt;br&gt;+ remove(key) → bool&lt;br&gt;+ clear()&lt;br&gt;+ stats: CacheStats (property)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="650" y="490" width="200" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== ThreadSafeCache ==================== -->
+        <mxCell id="threadsafe" value="&lt;b&gt;ThreadSafeCache&lt;/b&gt;&lt;hr&gt;- _lock: RLock&lt;br&gt;- _cache: Cache&lt;hr&gt;+ get(key) → Optional[V]&lt;br&gt;+ put(key, value)&lt;br&gt;+ remove(key) → bool&lt;br&gt;+ clear()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2F1;strokeColor=#009688;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="650" y="690" width="200" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== Edges (Relationships) ==================== -->
+
+        <!-- Node → Cache (composition: Cache has Node) -->
+        <mxCell id="e_node_cache" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="node" target="cache">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="150" y="200" as="sourcePoint"/>
+            <mxPoint x="150" y="480" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Strategy → LRU (inheritance) -->
+        <mxCell id="e_s_lru" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="strategy" target="lru">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="270" y="315"/>
+              <mxPoint x="340" y="315"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Strategy → LFU (inheritance) -->
+        <mxCell id="e_s_lfu" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="strategy" target="lfu">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="270" y="340"/>
+              <mxPoint x="590" y="340"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Strategy → TTL (inheritance) -->
+        <mxCell id="e_s_ttl" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="strategy" target="ttl">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="270" y="365"/>
+              <mxPoint x="840" y="365"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Cache → Strategy (composition) -->
+        <mxCell id="e_cache_strategy" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="cache" target="strategy">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="170" y="380"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- CacheWithStats → Cache (decorator) -->
+        <mxCell id="e_decorator" value="&amp;lt;&amp;lt;decorates&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=2;dashed=1;fontSize=10;" edge="1" parent="1" source="decorator" target="cache">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="550" y="565"/>
+              <mxPoint x="290" y="565"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- CacheWithStats → CacheStats (composition) -->
+        <mxCell id="e_stats" value="tracks" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="decorator" target="stats">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ThreadSafeCache → Cache (wraps) -->
+        <mxCell id="e_threadsafe" value="wraps" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#009688;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="threadsafe" target="cache">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="550" y="755"/>
+              <mxPoint x="290" y="755"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="legend" value="&lt;b&gt;Legend&lt;/b&gt;&lt;br&gt;━━━ Solid: Inheritance (&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;)&lt;br&gt;- - - Dashed: Uses / Composes&lt;br&gt;&lt;br&gt;&lt;b&gt;Patterns Used:&lt;/b&gt;&lt;br&gt;• Strategy (EvictionStrategy)&lt;br&gt;• Decorator (CacheWithStats)&lt;br&gt;• Facade (Cache)&lt;br&gt;• SRP (CacheStats)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEEEEE;strokeColor=#9E9E9E;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="840" y="480" width="220" height="150" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
