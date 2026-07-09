@@ -675,79 +675,99 @@
     padding: 0 1rem;
 }
 
-/* ── Sidebar ── Narrower + Better Visual Hierarchy ─────── */
+/* ═══════════════════════════════════════════════════════════
+   SIDEBAR — Unified Redesign with SimpleBar
+   ═══════════════════════════════════════════════════════════ */
 
-/* Reinforce MkDocs Material's default: ensure nested nav sections start collapsed.
-   Sections expand with the theme's built-in max-height transition when toggled. */
+/* ── 1. Hide site name header (the "Interview Prep" title above Home) ── */
+/* Only target the specific site title class to avoid hiding section headers */
+.md-nav--primary .md-nav__title--site {
+    display: none !important;
+}
+
+/* ── 2. SimpleBar integration: style the sidebar scroll container ── */
+.md-sidebar--primary .md-sidebar__scrollwrap {
+    overflow: hidden;   /* SimpleBar manages its own scroll area */
+}
+
+/* SimpleBar track/thumb styling for dark theme */
+.simplebar-track.simplebar-vertical {
+    width: 6px !important;
+    right: 2px !important;
+}
+
+.simplebar-track.simplebar-vertical .simplebar-scrollbar::before {
+    background: rgba(139, 92, 246, 0.3) !important;
+    border-radius: 3px !important;
+    opacity: 1 !important;
+}
+
+.simplebar-track.simplebar-vertical .simplebar-scrollbar:hover::before {
+    background: rgba(139, 92, 246, 0.5) !important;
+}
+
+/* ── 3. Collapsible behavior ── */
 .md-nav--primary .md-nav__item--nested > .md-nav__toggle:not(:checked) ~ .md-nav {
     max-height: 0;
     overflow: hidden;
 }
 
-
-
-/* Section title — more prominent (only nested nav titles, not the site name) */
-.md-nav--primary .md-nav .md-nav__title {
-    font-size: 0.72rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--md-default-fg-color--light);
-    padding: 0.6rem 0.6rem 0.3rem;
-}
-
-/* Top-level nav items (section headers in sidebar) */
-.md-nav--primary .md-nav__item--nested > .md-nav__link {
-    font-size: 0.82rem;
-    font-weight: 600;
+/* ── 4. Base nav link styling (applied uniformly) ── */
+.md-nav--primary .md-nav__link {
+    font-size: 0.78rem;
+    font-weight: 500;
     color: var(--md-default-fg-color);
-    padding: 0.35rem 0.6rem;
-    border-radius: 0.4rem;
-    transition: background 0.15s;
+    padding: 0.3rem 0.6rem;
+    border-radius: 0.35rem;
+    transition: background 0.15s, color 0.15s;
+    line-height: 1.45;
+    text-decoration: none;
 }
 
-.md-nav--primary .md-nav__item--nested > .md-nav__link:hover {
+.md-nav--primary .md-nav__link:hover {
+    color: #c084fc;
     background: rgba(255,255,255,0.04);
 }
 
-/* Second-level nav items (subsections) */
-.md-nav--primary .md-nav__item--nested .md-nav__item--nested > .md-nav__link {
-    font-size: 0.76rem;
-    font-weight: 500;
-    padding: 0.2rem 0.6rem 0.2rem 1.2rem;
+/* ── 5. Level-specific indentation via nested nav padding ── */
+/* This is more resilient than per-level selectors — each nesting level
+   automatically adds the correct indentation */
+.md-nav--primary .md-nav__list .md-nav__list {
+    padding-left: 1rem;
 }
 
-/* Third-level nav items (leaf pages) */
-.md-nav--primary .md-nav__item--nested .md-nav__item--nested .md-nav__item > .md-nav__link {
-    font-size: 0.72rem;
-    font-weight: 400;
-    padding: 0.15rem 0.6rem 0.15rem 2rem;
-    color: var(--md-default-fg-color--light);
-}
-
-/* Active link styling */
-.md-sidebar--primary .md-nav__item--active > .md-nav__link {
-    color: #c084fc;
+/* Top-level items get slightly larger font */
+.md-nav--primary > .md-nav__list > .md-nav__item > .md-nav__link {
+    padding: 0.35rem 0.8rem;
+    font-size: 0.82rem;
     font-weight: 600;
-    background: rgba(139,92,246,0.08);
-    border-radius: 0.3rem;
 }
 
-.md-sidebar--primary .md-nav__link:hover {
-    color: #c084fc;
+/* Section titles */
+.md-nav--primary .md-nav__title {
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--md-default-fg-color--light);
+    padding: 0.45rem 0.8rem 0.2rem;
+    opacity: 0.7;
 }
 
-/* Make nav sections collapsible with visible chevron */
-.md-nav--primary .md-nav__item--nested .md-nav__icon {
-    transition: transform 0.2s ease, opacity 0.2s ease;
+/* ── 6. Consistent expand/collapse chevron for ALL nested items ── */
+.md-nav--primary .md-nav__item--nested > .md-nav__link .md-nav__icon {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    width: 1.1rem;
+    height: 1.1rem;
+    margin-right: 0.15rem;
     opacity: 0.3;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+    flex-shrink: 0;
 }
 
-.md-nav--primary .md-nav__item--nested .md-nav__icon svg {
-    transition: transform 0.2s ease;
-}
-
-/* Rotate icon when nav is expanded */
+/* Rotate chevron when expanded */
 .md-nav--primary .md-nav__item--nested .md-nav__toggle:checked ~ .md-nav__link .md-nav__icon svg {
     transform: rotate(90deg);
 }
@@ -758,6 +778,70 @@
 
 .md-nav--primary .md-nav__item--nested .md-nav__link:hover .md-nav__icon {
     opacity: 0.7;
+}
+
+/* Chevron SVG rotation */
+.md-nav--primary .md-nav__item--nested .md-nav__icon svg {
+    transition: transform 0.2s ease;
+    fill: currentColor;
+}
+
+/* ── 7. Active link styling with left accent border ── */
+.md-sidebar--primary .md-nav__item--active > .md-nav__link {
+    color: #c084fc;
+    font-weight: 600;
+    background: rgba(139,92,246,0.08);
+    border-radius: 0.3rem;
+    position: relative;
+}
+
+.md-sidebar--primary .md-nav__item--active > .md-nav__link::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0.15rem;
+    bottom: 0.15rem;
+    width: 3px;
+    background: linear-gradient(to bottom, #c084fc, #818cf8);
+    border-radius: 0 2px 2px 0;
+    opacity: 0.8;
+}
+
+/* ── 8. Sidebar layout refinements ── */
+.md-sidebar--primary {
+    width: 20rem;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.md-sidebar__scrollwrap {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.md-sidebar__inner {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.md-nav--primary {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+.md-nav--primary .md-nav__list {
+    flex: 1;
+    min-height: 0;
+    padding-bottom: 0.5rem;
 }
 
 /* ── Footer ───────────────────────────────────────────────── */
@@ -1163,51 +1247,6 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
 /* ── Header Source (GitHub top-right) — Hidden ────────────── */
 .md-header__source {
     display: none !important;
-}
-
-/* ── Sidebar: Full-height flex with GitHub at bottom ────── */
-.md-sidebar--primary {
-    width: 20rem;
-    height: 100vh;
-    position: sticky;
-    top: 0;
-    display: flex;
-    flex-direction: column;
-}
-
-.md-sidebar__scrollwrap {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-}
-
-.md-sidebar__inner {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-}
-
-.md-nav--primary {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
-}
-
-.md-nav--primary .md-nav__title:first-child {
-    flex-shrink: 0;
-}
-
-.md-nav--primary .md-nav__list {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding-bottom: 0.5rem;
 }
 
 /* Source (GitHub) — pushed to bottom, styled as a fixed button */

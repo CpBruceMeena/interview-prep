@@ -60,6 +60,7 @@ extra:
 
 extra_css:
   - assets/stylesheets/extra.css
+  - https://cdn.jsdelivr.net/npm/simplebar@6.2.7/dist/simplebar.min.css
 
 plugins:
   - search:
@@ -109,6 +110,7 @@ extra_javascript:
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
   - https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js
   - assets/javascripts/mermaid-init.js
+  - https://cdn.jsdelivr.net/npm/simplebar@6.2.7/dist/simplebar.min.js
 
 
 

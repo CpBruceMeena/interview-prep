@@ -664,24 +664,41 @@ class CircuitBreaker:
         self.reset_timeout = reset_timeout
         self.last_failure_time = 0
         self.state = CircuitState.CLOSED
+        self._probe_in_flight = False  # Tracks whether a HALF_OPEN probe is in progress
     
     def call(self, func, *args, **kwargs):
         if self.state == CircuitState.OPEN:
             if time.time() - self.last_failure_time > self.reset_timeout:
                 self.state = CircuitState.HALF_OPEN
+                self._probe_in_flight = False  # Reset probe flag
             else:
                 raise CircuitBreakerOpenError("Service temporarily unavailable")
+        
+        # ── HALF_OPEN guard: only one probe request at a time ──
+        if self.state == CircuitState.HALF_OPEN:
+            if self._probe_in_flight:
+                raise CircuitBreakerOpenError(
+                    "Circuit breaker is HALF_OPEN — "
+                    "a probe request is already in flight"
+                )
+            self._probe_in_flight = True
         
         try:
             result = func(*args, **kwargs)
             if self.state == CircuitState.HALF_OPEN:
+                # Probe succeeded — reset to CLOSED
                 self.state = CircuitState.CLOSED
                 self.failure_count = 0
+                self._probe_in_flight = False
             return result
         except Exception:
             self.failure_count += 1
             self.last_failure_time = time.time()
-            if self.failure_count >= self.failure_threshold:
+            if self.state == CircuitState.HALF_OPEN:
+                # Probe failed — back to OPEN immediately
+                self.state = CircuitState.OPEN
+                self._probe_in_flight = False
+            elif self.failure_count >= self.failure_threshold:
                 self.state = CircuitState.OPEN
             raise
 
