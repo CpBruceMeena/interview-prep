@@ -60,7 +60,6 @@ extra:
 
 extra_css:
   - assets/stylesheets/extra.css
-  - https://cdn.jsdelivr.net/npm/simplebar@6.2.7/dist/simplebar.min.css
 
 plugins:
   - search:
@@ -110,7 +109,6 @@ extra_javascript:
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
   - https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js
   - assets/javascripts/mermaid-init.js
-  - https://cdn.jsdelivr.net/npm/simplebar@6.2.7/dist/simplebar.min.js
 
 
 
@@ -283,6 +281,7 @@ nav:
       - Request/Response Cycle: ai-engineering/llm-internals/03_REQUEST_RESPONSE_CYCLE.md
       - Tokenization & Cost: ai-engineering/llm-internals/04_TOKENIZATION_AND_COST.md
       - Prompt Engineering: ai-engineering/llm-internals/05_SYSTEM_PROMPT_ENGINEERING.md
+      - How Claude Makes Code Changes: ai-engineering/llm-internals/06_HOW_CLAUDE_MAKES_CODE_CHANGES.md
 
   - 🐍 Python:
     - Overview: python-interview/README.md
