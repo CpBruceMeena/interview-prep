@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](payment-processing-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What payment methods? (Card, UPI, Wallet?) What gateways? (Stripe, PayPal?) What's the validation chain? Fraud detection? Refunds?

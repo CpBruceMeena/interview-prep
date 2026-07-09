@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](splitwise-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 How are expenses split? (Equal, exact amount, percentage?) Can users organize into groups? How to simplify debts?

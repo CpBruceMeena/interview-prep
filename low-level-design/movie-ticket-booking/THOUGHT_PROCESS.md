@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](movie-ticket-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What movies, shows, seats? Booking process? Payment integration? Cancellation policy? Concurrency (two users booking same seat)?

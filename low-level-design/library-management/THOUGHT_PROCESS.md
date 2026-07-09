@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](library-management-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 How many books can a member borrow? What are the fine rules? How long is the loan period? Different member types? Search capabilities?

@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](search-platform-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What's being searched? (Documents, products?) What ranking strategy? (TF-IDF, recency, popularity?) Fuzzy search? Autocomplete?

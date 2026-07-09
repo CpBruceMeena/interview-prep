@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](notification-service-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What channels? (Email, SMS, Push, Webhook.) Templates? Scheduling? Batching? Rate limits? Idempotency? Cost tracking?

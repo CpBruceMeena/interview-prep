@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](job-scheduling-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What types of jobs? (Email, data processing, file upload?) Priority system? Recurring jobs? Retry policy? Concurrency limits?

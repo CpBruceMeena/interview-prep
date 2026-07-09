@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](inventory-management-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What's being tracked? (Product stock at warehouses.) What operations? (Stock in/out, transfer, reorder.) What defines a reorder? Multiple warehouses?

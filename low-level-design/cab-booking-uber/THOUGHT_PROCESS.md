@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](cab-booking-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 How are riders matched to drivers? (Nearest, GeoRadius?) What cab types? Pricing model (base + per km)? Surge pricing? Location tracking?
