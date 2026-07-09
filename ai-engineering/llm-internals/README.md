@@ -13,6 +13,7 @@
 | 3 | [The Request/Response Cycle](03_REQUEST_RESPONSE_CYCLE.md) | Complete end-to-end flow: what data is sent, how the LLM processes it, how responses come back |
 | 4 | [Tokenization & Token Calculation](04_TOKENIZATION_AND_COST.md) | How tokens work — input, output, pricing, and optimization |
 | 5 | [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) | Crafting effective system prompts, role design, constraints |
+| 6 | [How Claude Makes Code Changes](06_HOW_CLAUDE_MAKES_CODE_CHANGES.md) | Step-by-step flow of code changes, debugging, and user input decisions |
 
 ---
 

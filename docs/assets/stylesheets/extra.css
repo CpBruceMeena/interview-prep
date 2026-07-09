@@ -676,34 +676,41 @@
 }
 
 /* ═══════════════════════════════════════════════════════════
-   SIDEBAR — Unified Redesign with SimpleBar
+   SIDEBAR — Unified design with native scrolling
    ═══════════════════════════════════════════════════════════ */
 
 /* ── 1. Hide site name header (the "Interview Prep" title above Home) ── */
-/* Only target the specific site title class to avoid hiding section headers */
-.md-nav--primary .md-nav__title--site {
+/* Target the first md-nav__title which is the site header (has for="__drawer"). */
+/* The theme renders it as plain .md-nav__title (NOT .md-nav__title--site) when */
+/* navigation.tabs is not the primary layout. */
+.md-nav--primary > .md-nav__title:first-child {
     display: none !important;
 }
 
-/* ── 2. SimpleBar integration: style the sidebar scroll container ── */
+/* ── 2. Native scrolling: remove SimpleBar, use overflow-y:auto ── */
 .md-sidebar--primary .md-sidebar__scrollwrap {
-    overflow: hidden;   /* SimpleBar manages its own scroll area */
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(139, 92, 246, 0.3) transparent;
 }
 
-/* SimpleBar track/thumb styling for dark theme */
-.simplebar-track.simplebar-vertical {
-    width: 6px !important;
-    right: 2px !important;
+/* WebKit scrollbar styling */
+.md-sidebar--primary .md-sidebar__scrollwrap::-webkit-scrollbar {
+    width: 5px;
 }
 
-.simplebar-track.simplebar-vertical .simplebar-scrollbar::before {
-    background: rgba(139, 92, 246, 0.3) !important;
-    border-radius: 3px !important;
-    opacity: 1 !important;
+.md-sidebar--primary .md-sidebar__scrollwrap::-webkit-scrollbar-track {
+    background: transparent;
 }
 
-.simplebar-track.simplebar-vertical .simplebar-scrollbar:hover::before {
-    background: rgba(139, 92, 246, 0.5) !important;
+.md-sidebar--primary .md-sidebar__scrollwrap::-webkit-scrollbar-thumb {
+    background: rgba(139, 92, 246, 0.3);
+    border-radius: 3px;
+}
+
+.md-sidebar--primary .md-sidebar__scrollwrap::-webkit-scrollbar-thumb:hover {
+    background: rgba(139, 92, 246, 0.5);
 }
 
 /* ── 3. Collapsible behavior ── */
@@ -730,8 +737,7 @@
 }
 
 /* ── 5. Level-specific indentation via nested nav padding ── */
-/* This is more resilient than per-level selectors — each nesting level
-   automatically adds the correct indentation */
+/* Each nesting level automatically adds the correct indentation */
 .md-nav--primary .md-nav__list .md-nav__list {
     padding-left: 1rem;
 }
@@ -743,7 +749,7 @@
     font-weight: 600;
 }
 
-/* Section titles */
+/* Section titles (non-link headers) */
 .md-nav--primary .md-nav__title {
     font-size: 0.66rem;
     font-weight: 700;
@@ -754,8 +760,44 @@
     opacity: 0.7;
 }
 
-/* ── 6. Consistent expand/collapse chevron for ALL nested items ── */
-.md-nav--primary .md-nav__item--nested > .md-nav__link .md-nav__icon {
+/* ── 6. Consistent expand/collapse chevron for ALL nested items ──
+   MkDocs Material renders two kinds of nested items:
+   A) Section items (top-level groups) use a DIV.md-nav__container
+      containing <a> link + <label> toggle with chevron inside.
+   B) Plain nested items use a single <label class="md-nav__link">
+      with the chevron span directly inside.
+   We handle BOTH cases below. */
+
+/* --- Case A: Section items via md-nav__container ---
+   Structure: div.md-nav__container > a.md-nav__link + label.md-nav__link > span.md-nav__icon
+   The chevron is inside the label, which is a sibling of the link. */
+.md-nav--primary .md-nav__item--section.md-nav__item--nested .md-nav__container > label.md-nav__link .md-nav__icon {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    width: 1.2rem;
+    height: 1.2rem;
+    opacity: 0.4;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+
+/* Override theme's default label padding for section items */
+.md-nav--primary .md-nav__item--section.md-nav__item--nested .md-nav__container > label.md-nav__link {
+    padding: 0;
+    min-width: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent !important;
+    cursor: pointer;
+}
+
+/* --- Case B: Plain nested items ---
+   Structure: label.md-nav__link > span.md-ellipsis + span.md-nav__icon
+   The chevron is inline with the link text. */
+.md-nav--primary .md-nav__item--nested:not(.md-nav__item--section) > .md-nav__link .md-nav__icon {
     display: inline-flex !important;
     align-items: center;
     justify-content: center;
@@ -767,7 +809,7 @@
     flex-shrink: 0;
 }
 
-/* Rotate chevron when expanded */
+/* Rotate chevron when expanded (works for both cases) */
 .md-nav--primary .md-nav__item--nested .md-nav__toggle:checked ~ .md-nav__link .md-nav__icon svg {
     transform: rotate(90deg);
 }
@@ -777,13 +819,18 @@
 }
 
 .md-nav--primary .md-nav__item--nested .md-nav__link:hover .md-nav__icon {
-    opacity: 0.7;
+    opacity: 0.8;
 }
 
-/* Chevron SVG rotation */
+/* Chevron SVG rotation base */
 .md-nav--primary .md-nav__item--nested .md-nav__icon svg {
     transition: transform 0.2s ease;
     fill: currentColor;
+}
+
+/* Ensure chevron labels in section items don't block link clicks */
+.md-nav--primary .md-nav__container > label.md-nav__link {
+    pointer-events: all !important;
 }
 
 /* ── 7. Active link styling with left accent border ── */
