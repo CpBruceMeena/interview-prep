@@ -524,7 +524,400 @@ async def test_rate_limiter():
 
 ---
 
-## 8. QUICK REFERENCE
+## 8. NESTED ASYNC FUNCTIONS — Async Inside Async (Deep Dive)
+
+One of the most common questions about async Python is: **"How do nested async functions work? What happens technically when I `await` inside an `async def` that's already inside another `async def`?"**
+
+Let's trace the exact execution path.
+
+### 8.1 The Stack of Coroutines
+
+```python
+async def inner():
+    # Level 3
+    await asyncio.sleep(0.1)
+    return "inner done"
+
+async def middle():
+    # Level 2
+    result = await inner()  # <--- Nested await!
+    return f"middle got: {result}"
+
+async def outer():
+    # Level 1
+    result = await middle()  # <--- Another nested await!
+    return f"outer got: {result}"
+
+# Entry point
+final = asyncio.run(outer())
+print(final)  # "outer got: middle got: inner done"
+```
+
+### 8.2 What Happens Step-by-Step (The Exact Execution Trace)
+
+```ascii
+Time ────────────────────────────────────────────────────────────────►
+
+asyncio.run(outer())
+  │
+  ├── 1. Creates a new event loop (if none exists)
+  ├── 2. Creates a Task for outer()
+  └── 3. Runs the event loop
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  TASK: outer() entered                                           │
+│                                                                  │
+│  ── Line: result = await middle() ──                             │
+│                                                                  │
+│  4. outer() creates middle() coroutine object                   │
+│  5. outer() calls middle().__await__() — THIS IS KEY            │
+│  6. middle() starts executing                                   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  SUB-TASK: middle() entered                                │  │
+│  │                                                            │  │
+│  │  ── Line: result = await inner() ──                       │  │
+│  │                                                            │  │
+│  │  7. middle() creates inner() coroutine object              │  │
+│  │  8. middle() calls inner().__await__()                     │  │
+│  │  9. inner() starts executing                               │  │
+│  │                                                            │  │
+│  │  ┌──────────────────────────────────────────────────┐    │  │
+│  │  │  SUB-SUB-TASK: inner() entered                     │    │  │
+│  │  │                                                    │    │  │
+│  │  │  ── Line: await asyncio.sleep(0.1) ──            │    │  │
+│  │  │                                                    │    │  │
+│  │  │  10. inner() calls asyncio.sleep(0.1)              │    │  │
+│  │  │  11. sleep() creates a Future that will be         │    │  │
+│  │  │      resolved in 100ms                            │    │  │
+│  │  │  12. inner() awaits the Future → SUSPENDS          │    │  │
+│  │  │  13. Control returns to middle()'s await          │    │  │
+│  │  │      → middle() also SUSPENDS                      │    │  │
+│  │  │  14. Control returns to outer()'s await           │    │  │
+│  │  │      → outer() also SUSPENDS                      │    │  │
+│  │  │  15. Control returns to the EVENT LOOP            │    │  │
+│  │  │                                                    │    │  │
+│  │  │  ── Event loop runs OTHER tasks for 100ms ──     │    │  │
+│  │  │                                                    │    │  │
+│  │  │  16. After 100ms, the Future is resolved           │    │  │
+│  │  │  17. Event loop schedules inner() to resume        │    │  │
+│  │  │  18. inner() resumes, gets None from sleep()       │    │  │
+│  │  │  19. inner() returns "inner done"                 │    │  │
+│  │  └──────────────────────────────────────────────────┘    │  │
+│  │                                                            │  │
+│  │  20. middle()'s await resumes with "inner done"           │  │
+│  │  21. middle() continues: f"middle got: inner done"        │  │
+│  │  22. middle() returns the string                          │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  23. outer()'s await resumes with the string                    │
+│  24. outer() continues: f"outer got: middle got: inner done"    │
+│  25. outer() returns the final result                           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 The Call Stack (How It Really Works)
+
+```ascii
+NORMAL FUNCTION CALLS:                      ASYNC AWAIT CHAIN:
+(Real stack frames, one per call)          (Coroutine objects, not stack frames)
+
+┌─────────────┐                            ┌─────────────────┐
+│  main()     │                            │  Event Loop     │
+│  calls a()  │                            │  (single thread)│
+├─────────────┤                            └────────┬────────┘
+│  a()        │                                     │
+│  calls b()  │                            ┌────────▼────────┐
+├─────────────┤                            │  Task for       │
+│  b()        │                            │  outer()        │
+│  calls c()  │                            │                 │
+├─────────────┤                            │  → awaits       │
+│  c()        │                            │    middle()     │
+│  does work  │                            └────────┬────────┘
+├─────────────┤                                     │
+│  returns    │                            ┌────────▼────────┐
+│  to b()     │                            │  Coroutine      │
+├─────────────┤                            │  middle()       │
+│  b()        │                            │                 │
+│  returns    │                            │  → awaits       │
+│  to a()     │                            │    inner()      │
+├─────────────┤                            └────────┬────────┘
+│  a()        │                                     │
+│  returns    │                            ┌────────▼────────┐
+│  to main()  │                            │  Coroutine      │
+└─────────────┘                            │  inner()        │
+                                           │                 │
+Thread has a REAL stack.                   │  → awaits       │
+Each frame uses actual memory.             │    sleep()      │
+                                           └────────┬────────┘
+                                                    │
+                                           ┌────────▼────────┐
+                                           │  Future         │
+                                           │  (sleep 100ms)  │
+                                           └─────────────────┘
+
+The coroutines are Python objects on the heap,
+NOT stack frames. They can be suspended and
+resumed without consuming stack space.
+```
+
+### 8.4 The Technical Mechanism: Generators + Yield
+
+Under the hood, `async`/`await` is implemented using **generators** with `yield`:
+
+```python
+# What you write:
+async def my_coro():
+    result = await other_coro()
+    return result
+
+# What Python roughly compiles it to:
+@types.coroutine
+def my_coro():
+    result = yield from other_coro().__await__()
+    return result
+
+# What __await__ returns:
+class Coroutine:
+    def __await__(self):
+        # This is what makes 'await' work!
+        # It returns an iterator that the event loop drives
+        return self._iterate()
+    
+    def _iterate(self):
+        # This generator yields control at each await point
+        try:
+            while True:
+                # Get the next future to wait on
+                future = self._get_next_step()
+                if future is None:
+                    break
+                # Yield the future to the event loop
+                yield future
+        except StopIteration as e:
+            # Return the final value
+            return e.value
+```
+
+### 8.5 The Event Loop's Perspective
+
+```python
+# Simplified event loop — this is what actually runs
+class EventLoop:
+    def __init__(self):
+        self._ready = []       # Tasks ready to run
+        self._waiting = {}      # Future → [tasks waiting on it]
+    
+    def run_until_complete(self, main_coro):
+        # Wrap coroutine in a Task
+        main_task = Task(main_coro, self)
+        self._ready.append(main_task)
+        
+        while self._ready or self._waiting:
+            # Run all ready tasks one step each
+            while self._ready:
+                task = self._ready.pop(0)
+                try:
+                    # Resume the task — it runs until the next await
+                    # If await encounters a Future, the task yields it
+                    yielded_future = task.step()
+                    
+                    if yielded_future is not None:
+                        # Task is waiting for this future
+                        self._waiting[id(yielded_future)] = task
+                        yielded_future.add_done_callback(
+                            lambda f: self._ready.append(
+                                self._waiting.pop(id(f))
+                            )
+                        )
+                except StopIteration as e:
+                    # Task completed — store its return value
+                    task.set_result(e.value)
+            
+            # No tasks ready — either done or all waiting
+            # This is where the loop would block on I/O (select/poll/epoll)
+            if not self._ready and self._waiting:
+                self._wait_for_io()  # Blocks until something is ready
+```
+
+### 8.6 What This Means for Deeply Nested Async
+
+```python
+# This works: infinitely nested async calls
+async def level_5():
+    return await level_4()
+
+async def level_4():
+    return await level_3()
+
+async def level_3():
+    return await level_2()
+
+async def level_2():
+    return await level_1()
+
+async def level_1():
+    await asyncio.sleep(0)
+    return "deep result"
+
+# ❗ This works because coroutines don't use the CALL STACK
+# They use HEAP-ALLOCATED coroutine objects.
+# You can nest 1000 levels without stack overflow (memory permitting).
+
+async def very_deep(n: int):
+    if n == 0:
+        return "base"
+    result = await very_deep(n - 1)  # Recursive async call!
+    return f"level {n}: {result}"
+
+# This works fine even with n=5000:
+result = asyncio.run(very_deep(5000))
+print(result)  # "level 5000: ... level 1: base"
+
+# Compare with sync recursion:
+def sync_deep(n: int):
+    if n == 0:
+        return "base"
+    result = sync_deep(n - 1)  # Uses REAL stack frames!
+    return f"level {n}: {result}"
+
+# This will stack overflow at ~1000 (depends on Python's recursion limit):
+# sync_deep(5000)  # RecursionError: maximum recursion depth exceeded
+```
+
+**Key insight:** `await` chains don't consume stack space. Each coroutine frame is a Python object on the heap, not a C stack frame. This means:
+
+| Property | Sync Functions | Async Coroutines |
+|----------|---------------|-----------------|
+| **Frame location** | C stack (limited, ~1MB total) | Python heap (can be GB) |
+| **Max recursion depth** | ~1000 (sys.getrecursionlimit()) | Limited only by memory |
+| **Suspend/Resume** | Not possible | Built-in via `await` |
+| **State preservation** | Automatic (stack frame) | Manual (coroutine object) |
+
+### 8.7 Nested Async in Agent Systems
+
+```python
+# Real-world example: an agent with deeply nested async calls
+
+class AIAgent:
+    async def handle_request(self, query: str) -> str:
+        """Entry point — called by the API server."""
+        context = await self._gather_context(query)
+        plan = await self._make_plan(context)
+        result = await self._execute_plan(plan)
+        return await self._format_response(result)
+    
+    async def _gather_context(self, query: str) -> dict:
+        """Collect all context needed — runs sub-tasks in parallel."""
+        user_task = self._get_user_context(query)
+        kb_task = self._search_knowledge_base(query)
+        hist_task = self._get_conversation_history(query)
+        
+        # Nested await + gather = 3 levels of async nesting
+        user, kb, hist = await asyncio.gather(
+            user_task, kb_task, hist_task
+        )
+        
+        return {"user": user, "kb": kb, "history": hist}
+    
+    async def _get_user_context(self, query: str) -> dict:
+        """Fetch user data — another nested call."""
+        user_id = await self._extract_user_id(query)
+        
+        # Even deeper nesting with parallel calls
+        profile, prefs, perms = await asyncio.gather(
+            self._db.get_user_profile(user_id),
+            self._db.get_user_preferences(user_id),
+            self._auth.get_permissions(user_id),
+        )
+        
+        return {"profile": profile, "prefs": prefs, "perms": perms}
+```
+
+**Nesting depth in this example:** `handle_request` → `_gather_context` → `_get_user_context` → `_db.get_user_profile` → (some DB driver's async call) → (socket I/O). That's **6 levels** of nested async, and it works perfectly because each level is a heap-allocated coroutine object.
+
+### 8.8 Performance Characteristics of Nested Async
+
+| Metric | Value | Explanation |
+|--------|-------|-------------|
+| **Coroutine creation** | ~0.5μs | Python object allocation (heap) |
+| **Await overhead** | ~0.2μs | Yield/resume cycle |
+| **Nested chain (10 levels)** | ~7μs | Total overhead for 10 awaits |
+| **Nested chain (100 levels)** | ~70μs | Still negligible for practical use |
+| **Memory per coroutine** | ~200 bytes | Coroutine object + frame |
+| **Memory for 10K coroutines** | ~2MB | Entirely feasible |
+
+### 8.9 Common Nested Async Patterns
+
+```python
+# Pattern 1: Sequential (natural await chain)
+async def sequential():
+    a = await step1()
+    b = await step2(a)    # Depends on step1
+    c = await step3(b)    # Depends on step2
+    return c
+
+# Pattern 2: Parallel within sequential (gather inside nested)
+async def parallel_nested():
+    # Step 1: do A and B in parallel
+    a, b = await asyncio.gather(get_a(), get_b())
+    
+    # Step 2: use results in parallel calls
+    results = await asyncio.gather(
+        process_a(a),
+        process_b(b),
+        compute_derived(a, b)  # Depends on both
+    )
+    return results
+
+# Pattern 3: Dynamic nesting (loop with awaits)
+async def dynamic_nesting(items: list):
+    """Process N items with varying numbers of steps per item."""
+    async def process_one(item):
+        # Each item might need different steps
+        if item.type == "simple":
+            return await quick_process(item)
+        elif item.type == "complex":
+            data = await fetch_details(item)
+            return await analyze(data)
+        else:
+            return await default_process(item)
+    
+    # Process all items concurrently
+    return await asyncio.gather(*[
+        process_one(item) for item in items
+    ])
+
+# Pattern 4: Cancellation propagation
+async def cancellable_deep():
+    """When cancelled, all nested awaits also get cancelled."""
+    try:
+        result = await asyncio.wait_for(
+            deep_operation(),
+            timeout=5.0
+        )
+        return result
+    except asyncio.TimeoutError:
+        # deep_operation was cancelled → all its nested awaits cancelled too
+        return "Timed out"
+```
+
+### 8.10 Key Takeaways for Nested Async
+
+| Takeaway | Why It Matters |
+|----------|---------------|
+| **Await chains don't stack overflow** | Coroutines are heap objects, not C stack frames |
+| **Depth is practically unlimited** | Limited by memory, not stack size |
+| **Each await is a suspension point** | The event loop can interleave other work
+| **Cancellation propagates through nesting** | Cancelling the outer task cancels all inner awaits |
+| **Exception handling works naturally** | try/except around the outer await catches inner exceptions |
+| **Parallelism within nesting works** | `asyncio.gather()` inside a nested await creates sub-tasks |
+| **Overhead is negligible** | ~0.2μs per await, ~200 bytes per coroutine |
+
+---
+
+## 9. QUICK REFERENCE
 
 ```python
 # ─── Key Functions ─────────────────────────────────

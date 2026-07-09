@@ -60,6 +60,7 @@ extra:
 
 extra_css:
   - assets/stylesheets/extra.css
+  - https://cdn.jsdelivr.net/npm/simplebar@6.2.7/dist/simplebar.min.css
 
 plugins:
   - search:
@@ -109,6 +110,7 @@ extra_javascript:
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
   - https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js
   - assets/javascripts/mermaid-init.js
+  - https://cdn.jsdelivr.net/npm/simplebar@6.2.7/dist/simplebar.min.js
 
 
 
@@ -252,10 +254,11 @@ nav:
       - Implementation: ai-engineering/rag/implementation/index.md
     - 🔌 MCP:
       - Overview: ai-engineering/mcp/README.md
-      - MCP Fundamentals: ai-engineering/mcp/08_MCP_FUNDAMENTALS.md
-      - MCP Interview Questions: ai-engineering/mcp/09_MCP_INTERVIEW_QUESTIONS.md
-      - MCP Implementation & RAG: ai-engineering/mcp/10_MCP_IMPLEMENTATION.md
-      - MCP Production Architecture: ai-engineering/mcp/11_MCP_PRODUCTION_ARCHITECTURE.md
+      - MCP Fundamentals: ai-engineering/mcp/01_MCP_FUNDAMENTALS.md
+      - MCP Interview Questions: ai-engineering/mcp/02_MCP_INTERVIEW_QUESTIONS.md
+      - MCP Implementation & RAG: ai-engineering/mcp/03_MCP_IMPLEMENTATION.md
+      - MCP Production Architecture: ai-engineering/mcp/04_MCP_PRODUCTION_ARCHITECTURE.md
+      - 🎯 MCP Explained (draw.io): ai-engineering/mcp/05_MCP_EXPLAINER_WITH_DRAWIO.md
       - Servers: ai-engineering/mcp/servers/index.md
       - Common Library: ai-engineering/mcp/common/index.md
       - Clients: ai-engineering/mcp/clients/index.md
@@ -273,6 +276,13 @@ nav:
       - System/User/Assistant Roles: ai-engineering/agents/10_SYSTEM_USER_ASSISTANT_ROLES.md
       - Redis Lease & Search: ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH.md
       - Implementation Code: ai-engineering/agents/implementation/index.md
+    - 🤖 LLM Internals:
+      - Overview: ai-engineering/llm-internals/README.md
+      - How Claude Works: ai-engineering/llm-internals/01_HOW_CLAUDE_WORKS.md
+      - Claude Code Interaction: ai-engineering/llm-internals/02_CLAUDE_CODE_INTERACTION.md
+      - Request/Response Cycle: ai-engineering/llm-internals/03_REQUEST_RESPONSE_CYCLE.md
+      - Tokenization & Cost: ai-engineering/llm-internals/04_TOKENIZATION_AND_COST.md
+      - Prompt Engineering: ai-engineering/llm-internals/05_SYSTEM_PROMPT_ENGINEERING.md
 
   - 🐍 Python:
     - Overview: python-interview/README.md
