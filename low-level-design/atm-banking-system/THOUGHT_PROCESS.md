@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](atm-banking-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What account types? (Savings, Checking, Credit?) What ATM operations? (Withdraw, deposit, transfer, balance inquiry?) Card authentication? PIN validation?

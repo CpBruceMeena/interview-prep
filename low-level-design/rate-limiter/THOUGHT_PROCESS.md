@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](rate-limiter-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What algorithms to support? (Token Bucket, Sliding Window, Fixed Window?) What's being rate-limited? (API endpoints, users, IPs?) What's the config format?

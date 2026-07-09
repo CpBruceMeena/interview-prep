@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](lru-cache-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What eviction strategy? (LRU, LFU, TTL?) Capacity limit? Thread safety? Statistics tracking? Generics support?

@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](car-rental-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 How is availability tracked? (Hourly granularity.) Lookahead period? (7 days.) Double-booking prevention? Pricing models? (Hourly, daily, weekly discounts.)

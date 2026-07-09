@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design, not just *what* the final code looks like.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](tic-tac-toe-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 **Before writing code, ask:** What kind of players? (Human vs Bot, Human vs Human). Board size? Win condition? Is AI needed?

@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](pub-sub-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 How are messages delivered? (Sync, async, reliable?) Is there ordering/priority? How do subscribers register? What happens if a subscriber fails?

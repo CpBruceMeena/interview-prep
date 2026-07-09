@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](chess-game-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What pieces? What moves? (Castling, en passant, promotion.) Check/checkmate logic? Move validation? Game state management?

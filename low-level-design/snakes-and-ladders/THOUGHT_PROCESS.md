@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](snakes-and-ladders-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 Board size? Number of players? Dice strategy (standard, double, crooked)? Snake/ladder positions? Win condition (exact roll)?

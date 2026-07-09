@@ -2,6 +2,14 @@
 
 > **Goal:** Learn *how* to think when designing a Low-Level Design.
 
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](vending-machine-class-diagram.drawio)
+
+---
+
 ## Phase 0: Requirements Gathering
 
 What products? What prices? What payment methods (cash/card/mobile)? How does change-making work? What are the machine's states?

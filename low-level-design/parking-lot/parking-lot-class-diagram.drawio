@@ -1,0 +1,142 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Parking Lot Class Diagram" id="parking-lot-class-diagram">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Parking Lot — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Vehicle (Abstract) -->
+        <mxCell id="vehicle_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Abstract&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Vehicle&lt;/b&gt;&lt;hr&gt;- _license_plate: str&lt;br&gt;- _vehicle_type: VehicleType&lt;hr&gt;&lt;i&gt;+ get_required_spot_type() → SpotType&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="180" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- Motorcycle -->
+        <mxCell id="motorcycle" value="&lt;b&gt;Motorcycle&lt;/b&gt;&lt;hr&gt;+ get_required_spot_type() → SpotType.MOTORCYCLE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="260" y="80" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Car -->
+        <mxCell id="car" value="&lt;b&gt;Car&lt;/b&gt;&lt;hr&gt;+ get_required_spot_type() → SpotType.COMPACT" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="460" y="80" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Truck -->
+        <mxCell id="truck" value="&lt;b&gt;Truck&lt;/b&gt;&lt;hr&gt;+ get_required_spot_type() → SpotType.LARGE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="660" y="80" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- VehicleFactory -->
+        <mxCell id="factory" value="&lt;b&gt;&amp;lt;&amp;lt;Factory&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;VehicleFactory&lt;/b&gt;&lt;hr&gt;+ create_vehicle(type, plate) → Vehicle&lt;br&gt;+ register_vehicle_type(type, class)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E53935;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="260" width="200" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- SpotAllocationMapping -->
+        <mxCell id="mapping" value="&lt;b&gt;&amp;lt;&amp;lt;static&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;SpotAllocationMapping&lt;/b&gt;&lt;hr&gt;+ get_allowed_spots(type) → Set[SpotType]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="260" width="200" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- ParkingSpot -->
+        <mxCell id="spot" value="&lt;b&gt;ParkingSpot&lt;/b&gt;&lt;hr&gt;- _spot_id: str&lt;br&gt;- _floor: int&lt;br&gt;- _spot_type: SpotType&lt;br&gt;- _is_available: bool&lt;br&gt;- _parked_vehicle: Optional[Vehicle]&lt;hr&gt;+ park(vehicle)&lt;br&gt;+ vacate() → Vehicle" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="400" width="200" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- ParkingFloor -->
+        <mxCell id="floor" value="&lt;b&gt;ParkingFloor&lt;/b&gt;&lt;hr&gt;- _floor_number: int&lt;br&gt;- _spots: Dict[str, ParkingSpot]&lt;hr&gt;+ add_spot(spot)&lt;br&gt;+ get_available_spots(type?) → List" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="400" width="200" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- FeeCalculator (ABC) -->
+        <mxCell id="fee_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Interface&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;FeeCalculator&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ calculate_fee(duration, type) → float&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1F5FE;strokeColor=#0288D1;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="400" width="180" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- HourlyFeeCalculator -->
+        <mxCell id="hourly" value="&lt;b&gt;HourlyFeeCalculator&lt;/b&gt;&lt;hr&gt;+ calculate_fee(duration, type) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1F5FE;strokeColor=#0288D1;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="520" width="180" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- DailyFeeCalculator -->
+        <mxCell id="daily" value="&lt;b&gt;DailyFeeCalculator&lt;/b&gt;&lt;hr&gt;+ calculate_fee(duration, type) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1F5FE;strokeColor=#0288D1;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="600" width="180" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- ParkingTicket -->
+        <mxCell id="ticket" value="&lt;b&gt;ParkingTicket&lt;/b&gt;&lt;hr&gt;- _ticket_id: str&lt;br&gt;- _entry_time: datetime&lt;br&gt;- _exit_time: Optional[datetime]&lt;br&gt;- _fee: Optional[float]&lt;br&gt;- _status: ParkingTicketStatus&lt;hr&gt;+ close(fee_calculator) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFECB3;strokeColor=#FFA000;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="610" width="210" height="145" as="geometry"/>
+        </mxCell>
+
+        <!-- TicketManager -->
+        <mxCell id="ticket_mgr" value="&lt;b&gt;TicketManager&lt;/b&gt;&lt;hr&gt;- _tickets: Dict[str, ParkingTicket]&lt;hr&gt;+ create_ticket(spot, vehicle) → ParkingTicket&lt;br&gt;+ get_ticket(ticket_id) → Optional" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFECB3;strokeColor=#FFA000;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="590" width="210" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- DisplayBoard -->
+        <mxCell id="display" value="&lt;b&gt;&amp;lt;&amp;lt;static&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;DisplayBoard&lt;/b&gt;&lt;hr&gt;+ display_available_spots(floors)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="730" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- ParkingLot (Facade) -->
+        <mxCell id="lot" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;ParkingLot&lt;/b&gt;&lt;hr&gt;- _name: str&lt;br&gt;- _floors: List[ParkingFloor]&lt;br&gt;- _ticket_manager: TicketManager&lt;br&gt;- _fee_calculator: FeeCalculator&lt;br&gt;- _display_board: DisplayBoard&lt;hr&gt;+ find_available_spot(vehicle)&lt;br&gt;+ park_vehicle(vehicle) → Ticket&lt;br&gt;+ unpark_vehicle(ticket_id) → float&lt;br&gt;+ show_available_spots()&lt;br&gt;+ set_fee_calculator(fee_calc)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="640" y="730" width="240" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- Enums box -->
+        <mxCell id="enums" value="&lt;b&gt;Enums&lt;/b&gt;&lt;hr&gt;&lt;b&gt;VehicleType&lt;/b&gt;: MOTORCYCLE, CAR, TRUCK&lt;br&gt;&lt;b&gt;SpotType&lt;/b&gt;: MOTORCYCLE, COMPACT, LARGE&lt;br&gt;&lt;b&gt;ParkingTicketStatus&lt;/b&gt;: ACTIVE, PAID, LOST" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="640" y="260" width="220" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Inheritance edges -->
+        <mxCell id="e_vehicle_mc" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="vehicle_abs" target="motorcycle">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_vehicle_car" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="vehicle_abs" target="car">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_vehicle_truck" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="vehicle_abs" target="truck">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- FeeCalculator inheritance -->
+        <mxCell id="e_fee_hourly" value="&amp;lt;&amp;lt;implements&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#0288D1;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="hourly" target="fee_abs">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_fee_daily" value="&amp;lt;&amp;lt;implements&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#0288D1;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="daily" target="fee_abs">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Composition: ParkingLot -> ParkingFloor -->
+        <mxCell id="e_lot_floor" value="&amp;lt;&amp;lt;has&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="lot" target="floor">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Composition: ParkingFloor -> ParkingSpot -->
+        <mxCell id="e_floor_spot" value="&amp;lt;&amp;lt;has&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="floor" target="spot">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Usage: ParkingLot -> TicketManager -->
+        <mxCell id="e_lot_ticket_mgr" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="lot" target="ticket_mgr">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Usage: ParkingLot -> FeeCalculator -->
+        <mxCell id="e_lot_fee" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="lot" target="fee_abs">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Usage: ParkingLot -> DisplayBoard -->
+        <mxCell id="e_lot_display" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="lot" target="display">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Usage: TicketManager -> ParkingTicket -->
+        <mxCell id="e_ticket_mgr_ticket" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;jettySize=auto;html=1;strokeColor=#FFA000;strokeWidth=1;fontSize=10;" edge="1" parent="1" source="ticket_mgr" target="ticket">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

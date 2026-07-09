@@ -5,6 +5,12 @@
 
 ---
 
+## 📊 Class Diagram
+
+![Class Diagram](parking-lot-class-diagram.drawio)
+
+---
+
 ## Table of Contents
 
 1. [Phase 0: Requirements Gathering](#phase-0-requirements-gathering)
@@ -16,6 +22,12 @@
 7. [Phase 6: Polymorphism & Inheritance](#phase-6-polymorphism--inheritance)
 8. [Phase 7: Design Patterns — When & Why](#phase-7-design-patterns--when--why)
 9. [Phase 8: Review & Refine Checklist](#phase-8-review--refine-checklist)
+
+---
+
+## 📊 Class Diagram
+
+![Class Diagram](parking-lot-class-diagram.drawio)
 
 ---
 
