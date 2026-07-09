@@ -1,0 +1,60 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Splitwise Class Diagram" id="splitwise-class-diagram">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Splitwise (Expense Sharing) — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- User (dataclass) -->
+        <mxCell id="user" value="&lt;b&gt;&amp;lt;&amp;lt;dataclass&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;User&lt;/b&gt;&lt;hr&gt;+ user_id: str&lt;br&gt;+ name: str&lt;br&gt;+ email: str&lt;br&gt;+ phone: str" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- Group -->
+        <mxCell id="group" value="&lt;b&gt;Group&lt;/b&gt;&lt;hr&gt;- _group_id: str&lt;br&gt;- _name: str&lt;br&gt;- _members: Dict[str, User]&lt;br&gt;- _expenses: List[Expense]&lt;hr&gt;+ add_member(user)&lt;br&gt;+ add_expense(expense)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="220" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- Expense -->
+        <mxCell id="expense" value="&lt;b&gt;Expense&lt;/b&gt;&lt;hr&gt;- _expense_id: str&lt;br&gt;- _description: str&lt;br&gt;- _amount: float&lt;br&gt;- _paid_by: User&lt;br&gt;- _participants: List[User]&lt;br&gt;- _split_type: SplitType&lt;br&gt;- _shares: Dict[str, float]&lt;hr&gt;+ get_share_for_user(id) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="260" width="240" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- SplitStrategy (Abstract) -->
+        <mxCell id="split_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;SplitStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ calculate_shares(amount, users, values) → Dict&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="520" width="220" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="equal" value="&lt;b&gt;EqualSplit&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="520" width="120" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="exact" value="&lt;b&gt;ExactSplit&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="470" y="520" width="120" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="percent" value="&lt;b&gt;PercentageSplit&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="620" y="520" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- BalanceCalculator (static) -->
+        <mxCell id="calc" value="&lt;b&gt;BalanceCalculator&lt;/b&gt;&lt;br&gt;(static methods)&lt;hr&gt;+ calculate_balances(expenses) → Dict&lt;br&gt;+ simplify_debts(balances) → List[Tuple]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="350" y="260" width="220" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- SplitwiseService (Facade) -->
+        <mxCell id="service" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;SplitwiseService&lt;/b&gt;&lt;hr&gt;- _users: Dict[str, User]&lt;br&gt;- _groups: Dict[str, Group]&lt;br&gt;- _expenses: Dict[str, Expense]&lt;hr&gt;+ add_user() → User&lt;br&gt;+ create_group() → Group&lt;br&gt;+ add_expense() → Expense&lt;br&gt;+ get_balance(user_id) → float&lt;br&gt;+ get_simplified_debts(group_id) → List" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="660" width="260" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="belongs to" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="group" target="user"/>
+        <mxCell id="e2" value="has" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FBC02D;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="group" target="expense"/>
+        <mxCell id="e3" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FBC02D;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="expense" target="split_abs"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="split_abs" target="equal"/>
+        <mxCell id="e5" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="split_abs" target="exact"/>
+        <mxCell id="e6" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="split_abs" target="percent"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

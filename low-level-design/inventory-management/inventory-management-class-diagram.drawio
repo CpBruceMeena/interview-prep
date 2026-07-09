@@ -1,0 +1,62 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Inventory Management Class Diagram" id="inventory-mgmt-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Inventory Management — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Product -->
+        <mxCell id="product" value="&lt;b&gt;Product&lt;/b&gt;&lt;hr&gt;- _product_id: str&lt;br&gt;- _sku: str&lt;br&gt;- _name: str&lt;br&gt;- _category: str&lt;br&gt;- _unit_price: float&lt;br&gt;- _reorder_level: int&lt;br&gt;- _reorder_quantity: int" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="220" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- Warehouse -->
+        <mxCell id="warehouse" value="&lt;b&gt;Warehouse&lt;/b&gt;&lt;hr&gt;- _warehouse_id: str&lt;br&gt;- _name: str&lt;br&gt;- _location: str&lt;br&gt;- _capacity: int" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="80" width="200" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- InventoryItem -->
+        <mxCell id="inv_item" value="&lt;b&gt;InventoryItem&lt;/b&gt;&lt;hr&gt;- _product: Product&lt;br&gt;- _warehouse: Warehouse&lt;br&gt;- _quantity: int&lt;br&gt;- _reserved_quantity: int&lt;hr&gt;+ add_stock(qty) → Movement&lt;br&gt;+ remove_stock(qty) → Movement&lt;br&gt;+ reserve(qty) → bool&lt;br&gt;+ available_quantity: int (property)&lt;br&gt;+ needs_reorder() → bool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="290" width="240" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- InventoryMovement -->
+        <mxCell id="movement" value="&lt;b&gt;InventoryMovement&lt;/b&gt;&lt;hr&gt;- _movement_id: str&lt;br&gt;- _product_id: str&lt;br&gt;- _warehouse_id: str&lt;br&gt;- _type: MovementType&lt;br&gt;- _quantity: int&lt;br&gt;- _timestamp: datetime" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="360" y="300" width="220" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- ReorderStrategy (Abstract) -->
+        <mxCell id="reorder_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;ReorderStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ should_reorder(item) → bool&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ get_reorder_qty(item) → int&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="540" width="220" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="simple_reorder" value="&lt;b&gt;SimpleReorderStrategy&lt;/b&gt;&lt;br&gt;(quantity &lt;= reorder_level)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="540" width="180" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="demand_reorder" value="&lt;b&gt;DemandBasedReorder&lt;/b&gt;&lt;br&gt;(avg daily consumption × 14)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="550" y="540" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- PurchaseOrder -->
+        <mxCell id="po" value="&lt;b&gt;PurchaseOrder&lt;/b&gt;&lt;hr&gt;- _order_id: str&lt;br&gt;- _product: Product&lt;br&gt;- _warehouse: Warehouse&lt;br&gt;- _quantity: int&lt;br&gt;- _status: OrderStatus&lt;hr&gt;+ confirm/receive/cancel()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="700" width="220" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- InventoryService (Facade) -->
+        <mxCell id="service" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;InventoryService&lt;/b&gt;&lt;hr&gt;- _products: Dict[str, Product]&lt;br&gt;- _warehouses: Dict[str, Warehouse]&lt;br&gt;- _inventory: Dict[str, Dict[str, InventoryItem]]&lt;br&gt;- _reorder_strategy: ReorderStrategy&lt;hr&gt;+ add_product() / add_stock()&lt;br&gt;+ remove_stock() / transfer_stock()&lt;br&gt;+ check_reorder() → List[PO]&lt;br&gt;+ get_inventory_value() → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="350" y="700" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="tracks" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FBC02D;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="inv_item" target="product"/>
+        <mxCell id="e2" value="at" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8BC34A;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="inv_item" target="warehouse"/>
+        <mxCell id="e3" value="records" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="inv_item" target="movement"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="reorder_abs" target="simple_reorder"/>
+        <mxCell id="e5" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="reorder_abs" target="demand_reorder"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="service" target="reorder_abs"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

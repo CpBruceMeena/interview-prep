@@ -1,0 +1,76 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Cab Booking Class Diagram" id="cab-booking-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Cab Booking (Uber) — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Location (Value Object) -->
+        <mxCell id="loc" value="&lt;b&gt;&amp;lt;&amp;lt;Value Object&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Location&lt;/b&gt;&lt;hr&gt;- _lat: float&lt;br&gt;- _lng: float&lt;hr&gt;+ distance_to(other) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- Rider -->
+        <mxCell id="rider" value="&lt;b&gt;Rider&lt;/b&gt;&lt;hr&gt;- _rider_id: str&lt;br&gt;- _name: str&lt;br&gt;- _phone: str" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="180" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Driver -->
+        <mxCell id="driver" value="&lt;b&gt;Driver&lt;/b&gt;&lt;hr&gt;- _driver_id: str&lt;br&gt;- _name: str&lt;br&gt;- _cab_type: CabType&lt;br&gt;- _status: CabStatus&lt;br&gt;- _current_location: Location&lt;br&gt;- _rating: float&lt;hr&gt;+ update_rating()&lt;br&gt;+ is_available() → bool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="260" width="220" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- GeoIndex -->
+        <mxCell id="geo" value="&lt;b&gt;GeoIndex&lt;/b&gt;&lt;hr&gt;(Simulated Redis GEO)&lt;hr&gt;- _drivers: Dict[str, Driver]&lt;br&gt;- _geohash_buckets: Dict&lt;hr&gt;+ add_driver(driver)&lt;br&gt;+ update_location(driver_id, loc)&lt;br&gt;+ geo_radius_search(center, radius) → List" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="260" width="220" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- Pricing Strategy -->
+        <mxCell id="price_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;PricingStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ calculate_fare(distance, duration) → float&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="500" width="210" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="standard_price" value="&lt;b&gt;StandardPricing&lt;/b&gt;&lt;br&gt;(base + per km + per min)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="310" y="500" width="180" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="surge_price" value="&lt;b&gt;SurgePricing&lt;/b&gt;&lt;br&gt;(multiplier × base)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="540" y="500" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- DriverMatchingStrategy -->
+        <mxCell id="match_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;DriverMatchingStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ find_driver(pickup, type, drivers, geo) → Driver&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#673AB7;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="650" width="240" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="nearest" value="&lt;b&gt;NearestDriverMatching&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D1C4E9;strokeColor=#673AB7;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="660" width="170" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="geo_radius" value="&lt;b&gt;GeoRadiusDriverMatching&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D1C4E9;strokeColor=#673AB7;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="660" width="190" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Trip -->
+        <mxCell id="trip" value="&lt;b&gt;Trip&lt;/b&gt;&lt;hr&gt;- _trip_id: str&lt;br&gt;- _rider: Rider&lt;br&gt;- _driver: Driver&lt;br&gt;- _pickup/dropoff: Location&lt;br&gt;- _fare: float&lt;br&gt;- _status: TripStatus&lt;hr&gt;+ start() / complete() / cancel()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="420" width="240" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- CabBookingService (Facade) -->
+        <mxCell id="service" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;CabBookingService&lt;/b&gt;&lt;hr&gt;- _riders/drivers/trips: Dict&lt;br&gt;- _geo_index: GeoIndex&lt;br&gt;- _matching_strategy: DriverMatchingStrategy&lt;hr&gt;+ register_driver() → Driver&lt;br&gt;+ update_driver_location()&lt;br&gt;+ request_ride() → Trip" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="800" width="260" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="has location" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="driver" target="loc"/>
+        <mxCell id="e2" value="indexes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="geo" target="driver"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="price_abs" target="standard_price"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="price_abs" target="surge_price"/>
+        <mxCell id="e5" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#673AB7;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="match_abs" target="nearest"/>
+        <mxCell id="e6" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#673AB7;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="match_abs" target="geo_radius"/>
+        <mxCell id="e7" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="service" target="geo"/>
+        <mxCell id="e8" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="service" target="match_abs"/>
+        <mxCell id="e9" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="service" target="price_abs"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

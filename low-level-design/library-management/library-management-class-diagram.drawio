@@ -1,0 +1,58 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Library Management Class Diagram" id="library-mgmt-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Library Management — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Book -->
+        <mxCell id="book" value="&lt;b&gt;Book&lt;/b&gt;&lt;hr&gt;- _isbn: str&lt;br&gt;- _title: str&lt;br&gt;- _author: str&lt;br&gt;- _total_copies: int&lt;br&gt;- _available_copies: int&lt;hr&gt;+ is_available() → bool&lt;br&gt;+ borrow_copy() → bool&lt;br&gt;+ return_copy()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="220" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- BookItem -->
+        <mxCell id="book_item" value="&lt;b&gt;BookItem (Physical Copy)&lt;/b&gt;&lt;hr&gt;- _barcode: str&lt;br&gt;- _book: Book&lt;br&gt;- _status: BookStatus&lt;br&gt;- _borrowed_by: Optional[str]&lt;br&gt;- _due_date: Optional[datetime]&lt;hr&gt;+ borrow(member_id, days)&lt;br&gt;+ return_book()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="80" width="220" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- Member -->
+        <mxCell id="member" value="&lt;b&gt;Member&lt;/b&gt;&lt;hr&gt;- _member_id: str&lt;br&gt;- _name: str&lt;br&gt;- _email: str&lt;br&gt;- _member_type: MemberType&lt;br&gt;- _borrowed_books: Dict[str, BookItem]&lt;br&gt;- _total_fine: float&lt;hr&gt;+ can_borrow() → bool&lt;br&gt;+ borrow_book(item)&lt;br&gt;+ return_book(barcode) → BookItem" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="310" width="240" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- FineCalculator (Abstract) -->
+        <mxCell id="fine_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;FineCalculator&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ calculate_fine(days, type) → float&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="570" width="200" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="standard_fine" value="&lt;b&gt;StandardFine&lt;/b&gt;&lt;br&gt;(daily rate × days)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="570" width="160" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="progressive_fine" value="&lt;b&gt;ProgressiveFine&lt;/b&gt;&lt;br&gt;(escalating rates)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="510" y="570" width="170" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Catalog -->
+        <mxCell id="catalog" value="&lt;b&gt;Catalog&lt;/b&gt;&lt;hr&gt;- _books: Dict[str, Book]&lt;br&gt;- _items: Dict[str, BookItem]&lt;hr&gt;+ search_by_title/author/isbn/category()&lt;br&gt;+ get_available_items(isbn) → List[BookItem]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="310" width="240" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- LendingService (Facade) -->
+        <mxCell id="lending" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;LendingService&lt;/b&gt;&lt;hr&gt;- _catalog: Catalog&lt;br&gt;- _members: Dict[str, Member]&lt;br&gt;- _fine_calc: FineCalculator&lt;hr&gt;+ register_member() → Member&lt;br&gt;+ borrow_book(member_id, isbn) → BookItem&lt;br&gt;+ return_book(member_id, barcode) → float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="700" width="260" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="has copies" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="book" target="book_item"/>
+        <mxCell id="e2" value="borrows" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FBC02D;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="member" target="book_item"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="fine_abs" target="standard_fine"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="fine_abs" target="progressive_fine"/>
+        <mxCell id="e5" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="catalog" target="book"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="lending" target="catalog"/>
+        <mxCell id="e7" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="lending" target="fine_abs"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

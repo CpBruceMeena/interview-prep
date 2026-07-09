@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 800" font-family="Menlo, monospace" font-size="11">
+  <rect x="0" y="0" width="1000" height="800" fill="#ffffff"/>
+  <text x="500" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#333">Chess Game — Class Diagram</text>
+
+  <!-- Piece (Abstract) -->
+  <rect x="50" y="60" width="220" height="140" rx="8" fill="#FFF9C4" stroke="#FBC02D" stroke-width="2"/>
+  <text x="160" y="80" text-anchor="middle" font-size="11" font-style="italic" fill="#F57F17">&lt;&lt;Abstract&gt;&gt;</text>
+  <text x="160" y="98" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Piece</text>
+  <line x1="50" y1="108" x2="270" y2="108" stroke="#FBC02D"/>
+  <text x="60" y="126" fill="#555">- _color: Color</text>
+  <text x="60" y="143" fill="#555">- _position: Tuple[int,int]</text>
+  <text x="60" y="160" fill="#555">- _has_moved: bool</text>
+  <line x1="50" y1="170" x2="270" y2="170" stroke="#FBC02D" stroke-dasharray="3,3"/>
+  <text x="60" y="190" font-style="italic" fill="#555">+ get_possible_moves(board)</text>
+
+  <!-- Piece Subclasses -->
+  <rect x="320" y="60" width="140" height="50" rx="8" fill="#FFF3E0" stroke="#FF9800" stroke-width="2"/>
+  <text x="390" y="85" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">King (+castling)</text>
+
+  <rect x="490" y="60" width="140" height="50" rx="8" fill="#FFF3E0" stroke="#FF9800" stroke-width="2"/>
+  <text x="560" y="85" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Queen</text>
+
+  <rect x="320" y="130" width="140" height="50" rx="8" fill="#FFF3E0" stroke="#FF9800" stroke-width="2"/>
+  <text x="390" y="155" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Rook</text>
+
+  <rect x="490" y="130" width="140" height="50" rx="8" fill="#FFF3E0" stroke="#FF9800" stroke-width="2"/>
+  <text x="560" y="155" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Bishop</text>
+
+  <rect x="320" y="200" width="140" height="50" rx="8" fill="#FFF3E0" stroke="#FF9800" stroke-width="2"/>
+  <text x="390" y="225" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Knight</text>
+
+  <rect x="490" y="200" width="140" height="50" rx="8" fill="#FFF3E0" stroke="#FF9800" stroke-width="2"/>
+  <text x="560" y="225" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">Pawn (+en passant)</text>
+
+  <!-- Board -->
+  <rect x="50" y="290" width="260" height="200" rx="8" fill="#E8F5E9" stroke="#4CAF50" stroke-width="2"/>
+  <text x="180" y="310" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Board</text>
+  <line x1="50" y1="320" x2="310" y2="320" stroke="#4CAF50"/>
+  <text x="60" y="340" fill="#555">- _grid: List[List[Optional[Piece]]]</text>
+  <text x="60" y="358" fill="#555">- _en_passant_target: Optional</text>
+  <line x1="50" y1="368" x2="310" y2="368" stroke="#4CAF50" stroke-dasharray="3,3"/>
+  <text x="60" y="388" fill="#555">+ get_piece_at(pos) → Piece</text>
+  <text x="60" y="406" fill="#555">+ move_piece(start, end) → Move</text>
+  <text x="60" y="424" fill="#555">+ undo_move(move)</text>
+  <text x="60" y="442" fill="#555">+ is_in_check/checkmate/stalemate</text>
+  <text x="60" y="460" fill="#555">+ find_king(color) → Piece</text>
+
+  <!-- Player -->
+  <rect x="50" y="550" width="180" height="80" rx="8" fill="#E8EAF6" stroke="#3F51B5" stroke-width="2"/>
+  <text x="140" y="570" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Player</text>
+  <line x1="50" y1="580" x2="230" y2="580" stroke="#3F51B5"/>
+  <text x="60" y="600" fill="#555">- _name: str</text>
+  <text x="60" y="617" fill="#555">- _color: Color</text>
+
+  <!-- MoveValidator -->
+  <rect x="280" y="550" width="220" height="80" rx="8" fill="#F3E5F5" stroke="#9C27B0" stroke-width="2"/>
+  <text x="390" y="570" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">MoveValidator</text>
+  <line x1="280" y1="580" x2="500" y2="580" stroke="#9C27B0" stroke-dasharray="3,3"/>
+  <text x="290" y="600" fill="#555">+ validate(player, start, end)</text>
+  <text x="290" y="618" fill="#555">  → bool</text>
+
+  <!-- ChessGame (Facade) -->
+  <rect x="50" y="680" width="280" height="190" rx="8" fill="#E3F2FD" stroke="#2196F3" stroke-width="2"/>
+  <text x="190" y="700" text-anchor="middle" font-size="11" font-style="italic" fill="#1565C0">&lt;&lt;Facade&gt;&gt;</text>
+  <text x="190" y="718" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">ChessGame</text>
+  <line x1="50" y1="728" x2="330" y2="728" stroke="#2196F3"/>
+  <text x="60" y="748" fill="#555">- _board: Board</text>
+  <text x="60" y="765" fill="#555">- _validator: MoveValidator</text>
+  <text x="60" y="782" fill="#555">- _player1, _player2: Player</text>
+  <text x="60" y="799" fill="#555">- _status: GameStatus</text>
+  <text x="60" y="816" fill="#555">- _move_history: List[Move]</text>
+  <line x1="50" y1="826" x2="330" y2="826" stroke="#2196F3" stroke-dasharray="3,3"/>
+  <text x="60" y="846" fill="#555">+ make_move(start, end) → bool</text>
+  <text x="60" y="863" fill="#555">+ resign()</text>
+
+  <!-- Inheritance arrows -->
+  <line x1="270" y1="90" x2="315" y2="85" stroke="#FF9800" stroke-width="2"/>
+  <polygon points="310,79 325,85 310,91" fill="#FF9800"/>
+  <line x1="270" y1="155" x2="315" y2="155" stroke="#FF9800" stroke-width="2"/>
+  <polygon points="310,149 325,155 310,161" fill="#FF9800"/>
+  <line x1="270" y1="225" x2="315" y2="225" stroke="#FF9800" stroke-width="2"/>
+  <polygon points="310,219 325,225 310,231" fill="#FF9800"/>
+</svg>

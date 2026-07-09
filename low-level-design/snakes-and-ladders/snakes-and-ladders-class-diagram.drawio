@@ -1,0 +1,72 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Snakes and Ladders Class Diagram" id="snakes-ladders-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Snakes and Ladders — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- DiceStrategy (Abstract) -->
+        <mxCell id="dice_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;DiceStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ roll() → int&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="180" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="standard_dice" value="&lt;b&gt;StandardDice&lt;/b&gt;&lt;br&gt;1-6 random" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="290" y="80" width="140" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="crooked_dice" value="&lt;b&gt;CrookedDice&lt;/b&gt;&lt;br&gt;Always even" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="470" y="80" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Board -->
+        <mxCell id="board" value="&lt;b&gt;Board&lt;/b&gt;&lt;hr&gt;- _size: int&lt;br&gt;- _cells: Dict[int, Cell]&lt;br&gt;- _snakes: Dict[int, int]&lt;br&gt;- _ladders: Dict[int, int]&lt;hr&gt;+ add_snake(head, tail)&lt;br&gt;+ add_ladder(bottom, top)&lt;br&gt;+ get_destination(pos) → int&lt;br&gt;+ display(players)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="240" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- Cell -->
+        <mxCell id="cell" value="&lt;b&gt;Cell&lt;/b&gt;&lt;hr&gt;- _position: int&lt;br&gt;- _cell_type: CellType&lt;br&gt;- _destination: Optional[int]&lt;br&gt;- _entity: Optional[str]&lt;hr&gt;+ set_snake(tail)&lt;br&gt;+ set_ladder(top)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="260" width="180" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- Player -->
+        <mxCell id="player" value="&lt;b&gt;Player&lt;/b&gt;&lt;hr&gt;- _name: str&lt;br&gt;- _position: int&lt;br&gt;- _finished: bool&lt;hr&gt;+ reset()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EAF6;strokeColor=#3F51B5;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="470" width="180" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- GameRules -->
+        <mxCell id="rules" value="&lt;b&gt;GameRules&lt;/b&gt;&lt;hr&gt;- _board_size: int&lt;br&gt;- _win_at_exact: bool&lt;hr&gt;+ check_win(pos) → bool&lt;br&gt;+ calculate_new_position(current, dice, board)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="290" y="460" width="200" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- GameObserver -->
+        <mxCell id="observer" value="&lt;b&gt;&amp;lt;&amp;lt;Observer&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;GameObserver&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ on_turn(player, dice, old, new, msg)&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ on_game_over(winner)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="460" width="220" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="console_logger" value="&lt;b&gt;ConsoleLogger&lt;/b&gt;&lt;br&gt;&lt;i&gt;Implements GameObserver&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="830" y="470" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- SnakeAndLadderGame (Facade) -->
+        <mxCell id="game_facade" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;SnakeAndLadderGame&lt;/b&gt;&lt;hr&gt;- _board: Board&lt;br&gt;- _dice: DiceStrategy&lt;br&gt;- _rules: GameRules&lt;br&gt;- _players: List[Player]&lt;br&gt;- _observers: List[GameObserver]&lt;hr&gt;+ play_turn() → bool&lt;br&gt;+ play()&lt;br&gt;+ add_player(name) → Player&lt;br&gt;+ setup_default_board()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="650" width="260" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- Enums -->
+        <mxCell id="enums" value="&lt;b&gt;Enums&lt;/b&gt;&lt;hr&gt;&lt;b&gt;CellType&lt;/b&gt;: NORMAL, SNAKE_HEAD, SNAKE_TAIL, LADDER_BOTTOM, LADDER_TOP&lt;br&gt;&lt;b&gt;GameStatus&lt;/b&gt;: NOT_STARTED, IN_PROGRESS, FINISHED" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="620" width="300" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="dice_abs" target="standard_dice"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="dice_abs" target="crooked_dice"/>
+        <mxCell id="e3" value="contains" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="board" target="cell"/>
+        <mxCell id="e4" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game_facade" target="board"/>
+        <mxCell id="e5" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game_facade" target="dice_abs"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game_facade" target="rules"/>
+        <mxCell id="e7" value="notifies" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game_facade" target="observer"/>
+        <mxCell id="e8" value="implements" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="console_logger" target="observer"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

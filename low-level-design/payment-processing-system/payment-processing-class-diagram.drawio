@@ -1,0 +1,66 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Payment Processing Class Diagram" id="payment-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Payment Processing — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Customer / Merchant -->
+        <mxCell id="customer" value="&lt;b&gt;Customer&lt;/b&gt;&lt;hr&gt;- _customer_id: str&lt;br&gt;- _name: str&lt;br&gt;- _email: str&lt;br&gt;- _payment_methods: List[PaymentMethodInfo]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="merchant" value="&lt;b&gt;Merchant&lt;/b&gt;&lt;hr&gt;- _merchant_id: str&lt;br&gt;- _name: str&lt;br&gt;- _fee_percentage: float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="200" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Payment (Aggregate Root) -->
+        <mxCell id="payment" value="&lt;b&gt;Payment&lt;/b&gt;&lt;hr&gt;- _payment_id: str&lt;br&gt;- _amount: float&lt;br&gt;- _currency: Currency&lt;br&gt;- _customer: Customer&lt;br&gt;- _merchant: Merchant&lt;br&gt;- _status: PaymentStatus&lt;br&gt;- _refunded_amount: float&lt;hr&gt;+ can_refund(amount) → bool&lt;br&gt;+ process_refund(amount) → Refund" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="260" width="240" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- PaymentGateway (Abstract) -->
+        <mxCell id="gateway_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;PaymentGateway&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ charge(payment) → bool&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ refund_transaction(refund) → bool&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="520" width="220" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="stripe" value="&lt;b&gt;StripeGateway&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="520" width="130" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="paypal" value="&lt;b&gt;PayPalGateway&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="500" y="520" width="130" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Chain of Responsibility Validators -->
+        <mxCell id="validator_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Chain&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;PaymentValidator&lt;/b&gt;&lt;hr&gt;- _next: PaymentValidator&lt;br&gt;&lt;i&gt;+ validate(payment) → (bool, str)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="380" width="220" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="amount_val" value="&lt;b&gt;AmountValidator&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8BBD0;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="390" width="150" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="currency_val" value="&lt;b&gt;CurrencyValidator&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8BBD0;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="510" y="390" width="150" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- FraudCheck -->
+        <mxCell id="fraud_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;FraudCheck&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ check(payment) → (bool, str)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="350" y="260" width="200" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- PaymentService (Facade) -->
+        <mxCell id="service" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;PaymentService&lt;/b&gt;&lt;hr&gt;- _gateway: PaymentGateway&lt;br&gt;- _payments: Dict[str, Payment]&lt;br&gt;- _fraud_checks: List[FraudCheck]&lt;br&gt;- _validators: PaymentValidator (chain)&lt;hr&gt;+ create_payment() → Payment&lt;br&gt;+ process_payment(payment) → (bool, str)&lt;br&gt;+ refund_payment(id, amount) → Refund" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="680" width="260" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="gateway_abs" target="stripe"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="gateway_abs" target="paypal"/>
+        <mxCell id="e3" value="chain" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="validator_abs" target="amount_val"/>
+        <mxCell id="e4" value="next" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="amount_val" target="currency_val"/>
+        <mxCell id="e5" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="service" target="gateway_abs"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="service" target="validator_abs"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

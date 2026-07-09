@@ -1,0 +1,70 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Pub-Sub System Class Diagram" id="pub-sub-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Pub-Sub System — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Message -->
+        <mxCell id="msg" value="&lt;b&gt;Message&lt;/b&gt;&lt;hr&gt;- _message_id: str&lt;br&gt;- _topic: str&lt;br&gt;- _payload: Any&lt;br&gt;- _priority: MessagePriority&lt;br&gt;- _timestamp: datetime" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- MessageQueue -->
+        <mxCell id="queue" value="&lt;b&gt;MessageQueue&lt;/b&gt;&lt;hr&gt;- _queue: List[Message]&lt;br&gt;- _lock: Lock&lt;hr&gt;+ enqueue(msg)&lt;br&gt;+ dequeue() → Optional[Message]&lt;br&gt;+ size: int" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="200" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- Subscriber (Observer) -->
+        <mxCell id="sub_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Observer&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Subscriber&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ on_message(msg)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="270" width="180" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="console_sub" value="&lt;b&gt;ConsoleSubscriber&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="290" y="280" width="150" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="filter_sub" value="&lt;b&gt;FilteringSubscriber&lt;/b&gt;&lt;br&gt;(Decorator: wraps + filters)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="490" y="280" width="180" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Subscription -->
+        <mxCell id="subscription" value="&lt;b&gt;Subscription&lt;/b&gt;&lt;hr&gt;- _topic: str&lt;br&gt;- _subscriber: Subscriber&lt;br&gt;+ deliver(msg)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EAF6;strokeColor=#3F51B5;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="420" width="180" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- Topic -->
+        <mxCell id="topic" value="&lt;b&gt;Topic&lt;/b&gt;&lt;hr&gt;- _name: str&lt;br&gt;- _subscribers: Dict[str, Subscription]&lt;br&gt;- _message_queue: MessageQueue&lt;hr&gt;+ subscribe(subscriber)&lt;br&gt;+ unsubscribe(subscriber_id)&lt;br&gt;+ publish(msg)&lt;br&gt;+ deliver_all(strategy)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="420" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- MessageBroker (Facade) -->
+        <mxCell id="broker" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;MessageBroker&lt;/b&gt;&lt;hr&gt;- _topics: Dict[str, Topic]&lt;br&gt;- _delivery_strategy: DeliveryStrategy&lt;hr&gt;+ create_topic(name)&lt;br&gt;+ subscribe(topic, subscriber)&lt;br&gt;+ publish(topic, payload)&lt;br&gt;+ flush()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="600" width="260" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- DeliveryStrategy -->
+        <mxCell id="delivery_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;DeliveryStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ deliver(sub, msg) → bool&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="400" y="650" width="200" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="direct_delivery" value="&lt;b&gt;DirectDelivery&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="660" y="640" width="130" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="async_delivery" value="&lt;b&gt;AsyncDelivery&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="660" y="710" width="130" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="contains" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="topic" target="queue"/>
+        <mxCell id="e2" value="contains" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#3F51B5;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="topic" target="subscription"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="sub_abs" target="console_sub"/>
+        <mxCell id="e4" value="wraps" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;dashed=1;fontSize=10;" edge="1" parent="1" source="filter_sub" target="console_sub"/>
+        <mxCell id="e5" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="broker" target="topic"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="broker" target="delivery_abs"/>
+        <mxCell id="e7" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="delivery_abs" target="direct_delivery"/>
+        <mxCell id="e8" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="delivery_abs" target="async_delivery"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

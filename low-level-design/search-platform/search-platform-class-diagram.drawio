@@ -1,0 +1,67 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Search Platform Class Diagram" id="search-class-diagram">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Search Platform — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="500" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Document (dataclass) -->
+        <mxCell id="doc" value="&lt;b&gt;&amp;lt;&amp;lt;dataclass&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Document&lt;/b&gt;&lt;hr&gt;+ doc_id: str&lt;br&gt;+ title: str&lt;br&gt;+ content: str&lt;br&gt;+ author: str&lt;br&gt;+ category: str&lt;br&gt;+ tags: List[str]&lt;br&gt;+ created_at: datetime&lt;br&gt;+ popularity: int&lt;br&gt;+ rating: float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="220" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- Tokenizer -->
+        <mxCell id="tokenizer" value="&lt;b&gt;Tokenizer&lt;/b&gt;&lt;hr&gt;- _stop_words: Set[str]&lt;hr&gt;+ tokenize(text) → List[str]&lt;br&gt;+ stem(token) → str" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="80" width="200" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- InvertedIndex -->
+        <mxCell id="index" value="&lt;b&gt;InvertedIndex&lt;/b&gt;&lt;hr&gt;- _index: Dict[str, Dict[str, int]]&lt;br&gt;- _documents: Dict[str, Document]&lt;br&gt;- _doc_count: int&lt;hr&gt;+ add_document(doc)&lt;br&gt;+ remove_document(doc_id)&lt;br&gt;+ search_token(token) → Dict&lt;br&gt;+ get_document(doc_id) → Document" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="320" width="240" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- QueryParser -->
+        <mxCell id="parser" value="&lt;b&gt;QueryParser&lt;/b&gt;&lt;br&gt;(static methods)&lt;hr&gt;+ parse(query) → (required, optional, excluded)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="360" y="330" width="220" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- RankingStrategy (Abstract) -->
+        <mxCell id="rank_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;RankingStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ rank(results, query, index) → List&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="560" width="210" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="tfidf" value="&lt;b&gt;TfIdfRanking&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="310" y="560" width="130" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="recency" value="&lt;b&gt;RecencyBoostRanking&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="480" y="560" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- FuzzyMatcher -->
+        <mxCell id="fuzzy_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;FuzzyMatcher&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ match(query, text) → bool&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="700" width="200" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="levenshtein" value="&lt;b&gt;LevenshteinMatcher&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8BBD0;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="310" y="700" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- SearchService (Facade) -->
+        <mxCell id="search" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;SearchService&lt;/b&gt;&lt;hr&gt;- _index: InvertedIndex&lt;br&gt;- _ranking: RankingStrategy&lt;br&gt;- _fuzzy: FuzzyMatcher&lt;br&gt;- _parser: QueryParser&lt;hr&gt;+ index_document(doc)&lt;br&gt;+ search(query, limit) → List[Document]&lt;br&gt;+ suggest(prefix) → List[str]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="360" y="430" width="260" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="indexes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FBC02D;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="index" target="doc"/>
+        <mxCell id="e2" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FBC02D;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="index" target="tokenizer"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="rank_abs" target="tfidf"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="rank_abs" target="recency"/>
+        <mxCell id="e5" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="fuzzy_abs" target="levenshtein"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="search" target="index"/>
+        <mxCell id="e7" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="search" target="rank_abs"/>
+        <mxCell id="e8" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="search" target="fuzzy_abs"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
