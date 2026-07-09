@@ -737,4 +737,4 @@ async def test_rag_query_tool(server_session):
 
 ---
 
-> **Next:** [MCP Production Architecture](11_MCP_PRODUCTION_ARCHITECTURE.md) → Security, deployment, tradeoffs
+> **Next:** [MCP Production Architecture](04_MCP_PRODUCTION_ARCHITECTURE.md) → Security, deployment, tradeoffs

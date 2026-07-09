@@ -166,10 +166,11 @@
 ### 🔌 MCP Module — [MCP docs](ai-engineering/mcp/README.md)
 | # | Guide | Key Topics |
 |---|-------|-----------|
-| 8 | **[MCP Fundamentals](ai-engineering/mcp/08_MCP_FUNDAMENTALS.md)** | Architecture, protocol mechanics, setup guide |
-| 9 | **[MCP Interview Q&A](ai-engineering/mcp/09_MCP_INTERVIEW_QUESTIONS.md)** | Staff/Principal-level Q&A transcript |
-| 10 | **[MCP Implementation](ai-engineering/mcp/10_MCP_IMPLEMENTATION.md)** | Building custom MCP servers, RAG integration |
-| 11 | **[Production Architecture](ai-engineering/mcp/11_MCP_PRODUCTION_ARCHITECTURE.md)** | Production deployment, security, tradeoffs |
+| 1 | **[MCP Fundamentals](ai-engineering/mcp/01_MCP_FUNDAMENTALS.md)** | Architecture, protocol mechanics, setup guide |
+| 2 | **[MCP Explained (draw.io)](ai-engineering/mcp/05_MCP_EXPLAINER_WITH_DRAWIO.md)** | Step-by-step walkthrough with live diagramming example |
+| 3 | **[MCP Interview Q&A](ai-engineering/mcp/02_MCP_INTERVIEW_QUESTIONS.md)** | Staff/Principal-level Q&A transcript |
+| 4 | **[MCP Implementation](ai-engineering/mcp/03_MCP_IMPLEMENTATION.md)** | Building custom MCP servers, RAG integration |
+| 5 | **[Production Architecture](ai-engineering/mcp/04_MCP_PRODUCTION_ARCHITECTURE.md)** | Production deployment, security, tradeoffs |
 
 <br>
 

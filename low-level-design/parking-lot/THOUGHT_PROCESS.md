@@ -25,12 +25,6 @@
 
 ---
 
-## 📊 Class Diagram
-
-![Class Diagram](parking-lot-class-diagram.drawio)
-
----
-
 ## Phase 0: Requirements Gathering
 
 **Before you write a single line of code, ask these questions:**

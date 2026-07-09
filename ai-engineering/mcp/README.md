@@ -14,10 +14,11 @@
 
 | # | Document | Description |
 |---|----------|-------------|
-| 1 | [MCP Fundamentals](08_MCP_FUNDAMENTALS.md) | Architecture, protocol mechanics, setup guide |
-| 2 | [MCP Interview Questions](09_MCP_INTERVIEW_QUESTIONS.md) | Staff/Principal-level Q&A transcript |
-| 3 | [MCP Implementation & RAG](10_MCP_IMPLEMENTATION.md) | Building custom MCP servers, RAG integration |
-| 4 | [MCP Production Architecture](11_MCP_PRODUCTION_ARCHITECTURE.md) | Production deployment, security, tradeoffs |
+| 1 | [MCP Fundamentals](01_MCP_FUNDAMENTALS.md) | Architecture, protocol mechanics, setup guide |
+| 2 | [MCP Interview Questions](02_MCP_INTERVIEW_QUESTIONS.md) | Staff/Principal-level Q&A transcript |
+| 3 | [MCP Implementation & RAG](03_MCP_IMPLEMENTATION.md) | Building custom MCP servers, RAG integration |
+| 4 | [MCP Production Architecture](04_MCP_PRODUCTION_ARCHITECTURE.md) | Production deployment, security, tradeoffs |
+| 5 | [MCP Explained (draw.io)](05_MCP_EXPLAINER_WITH_DRAWIO.md) | Step-by-step walkthrough with live diagramming example |
 
 ## Server Implementations
 

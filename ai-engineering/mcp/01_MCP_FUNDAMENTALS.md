@@ -495,4 +495,4 @@ python server_http.py
 
 ---
 
-> **Next:** [MCP Interview Questions](09_MCP_INTERVIEW_QUESTIONS.md) → Staff/Principal-level Q&A transcript
+> **Next:** [MCP Interview Questions](02_MCP_INTERVIEW_QUESTIONS.md) → Staff/Principal-level Q&A transcript

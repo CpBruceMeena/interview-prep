@@ -214,7 +214,7 @@
 |---|-------|-----|-----------|
 | 21 | **RAG Fundamentals** | Understand retrieval-augmented generation | [RAG Overview](ai-engineering/rag/01_RAG_FUNDAMENTALS/) |
 | 22 | **RAG Implementation** | ChromaDB, embeddings, FastAPI | [RAG Code](ai-engineering/rag/implementation/index/) |
-| 23 | **MCP Protocol** | Model Context Protocol, server/client | [MCP Fundamentals](ai-engineering/mcp/08_MCP_FUNDAMENTALS/) + [Servers](ai-engineering/mcp/servers/index/) |
+| 23 | **MCP Protocol** | Model Context Protocol, server/client | [MCP Fundamentals](ai-engineering/mcp/01_MCP_FUNDAMENTALS/) + [Servers](ai-engineering/mcp/servers/index/) |
 | 24 | **Agent Fundamentals** | ReAct, Plan-and-Execute, memory systems | [Agent Fundamentals](ai-engineering/agents/01_AGENT_FUNDAMENTALS/) |
 | 25 | **LangGraph** | Graph-based state machines for agents | [LangGraph Notes](ai-engineering/agents/05_LANGGRAPH_NOTES/) |
 | 26 | **Multi-LLM Architecture** | Routing, cost management, fallback across GPT/Claude/DeepSeek | [Multi-LLM Design](ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE/) |
