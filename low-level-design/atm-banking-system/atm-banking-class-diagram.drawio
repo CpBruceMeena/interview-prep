@@ -1,0 +1,80 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="ATM Banking Class Diagram" id="atm-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="ATM / Banking System — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Account (Abstract) -->
+        <mxCell id="acct_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Abstract&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Account&lt;/b&gt;&lt;hr&gt;- _account_number: str&lt;br&gt;- _customer_id: str&lt;br&gt;- _account_type: AccountType&lt;br&gt;- _balance: float&lt;br&gt;- _transactions: List[Transaction]&lt;hr&gt;&lt;i&gt;+ can_withdraw(amount) → bool&lt;/i&gt;&lt;br&gt;+ deposit(amount) → Transaction&lt;br&gt;+ withdraw(amount) → Transaction" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="240" height="190" as="geometry"/>
+        </mxCell>
+        <mxCell id="savings" value="&lt;b&gt;SavingsAccount&lt;/b&gt;&lt;br&gt;min_balance: 500&lt;br&gt;withdrawal_limit: 5/month&lt;br&gt;+ apply_interest()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="80" width="180" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="checking" value="&lt;b&gt;CheckingAccount&lt;/b&gt;&lt;br&gt;overdraft_limit: 1000" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="200" width="180" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="credit" value="&lt;b&gt;CreditAccount&lt;/b&gt;&lt;br&gt;credit_limit, APR&lt;br&gt;+ make_payment()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="570" y="80" width="180" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- Transaction -->
+        <mxCell id="txn" value="&lt;b&gt;Transaction&lt;/b&gt;&lt;hr&gt;- _transaction_id: str&lt;br&gt;- _tx_type: TransactionType&lt;br&gt;- _amount: float&lt;br&gt;- _balance_after: float&lt;br&gt;- _timestamp: datetime" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="330" width="220" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- Card -->
+        <mxCell id="card" value="&lt;b&gt;Card&lt;/b&gt;&lt;hr&gt;- _card_number: str&lt;br&gt;- _pin: str (hashed)&lt;br&gt;- _customer_id: str&lt;br&gt;- _failed_attempts: int&lt;br&gt;- _is_blocked: bool&lt;hr&gt;+ validate_pin(pin) → bool&lt;br&gt;+ is_expired() → bool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="320" width="220" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- CashDispenser -->
+        <mxCell id="dispenser" value="&lt;b&gt;CashDispenser&lt;/b&gt;&lt;hr&gt;- _available_cash: float&lt;br&gt;- _denominations: Dict[int, int]&lt;hr&gt;+ can_dispense(amount) → bool&lt;br&gt;+ dispense(amount) → Dict" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="520" width="220" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- BankingService (Facade) -->
+        <mxCell id="bank" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;BankingService&lt;/b&gt;&lt;hr&gt;- _accounts: Dict[str, Account]&lt;br&gt;- _cards: Dict[str, Card]&lt;br&gt;- _atm: CashDispenser&lt;hr&gt;+ create_account() → Account&lt;br&gt;+ issue_card() → Card&lt;br&gt;+ authenticate(card, pin) → Account&lt;br&gt;+ withdraw/deposit/transfer()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="700" width="260" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- ATM (State) -->
+        <mxCell id="state_abs" value="&lt;b&gt;&amp;lt;&amp;lt;State&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;ATMState&lt;/b&gt;&lt;hr&gt;+ insert_card/enter_pin/&lt;br&gt;+ check_balance/withdraw/&lt;br&gt;+ deposit/eject_card" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="400" y="530" width="200" height="130" as="geometry"/>
+        </mxCell>
+        <mxCell id="idle" value="&lt;b&gt;IdleATMState&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="650" y="530" width="130" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="pin_entered" value="&lt;b&gt;PinEnteredState&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="650" y="600" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="ready" value="&lt;b&gt;ReadyATMState&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="650" y="670" width="130" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ATM (Machine) -->
+        <mxCell id="atm" value="&lt;b&gt;ATM&lt;/b&gt;&lt;hr&gt;- _bank: BankingService&lt;br&gt;- _state: ATMState&lt;br&gt;- _current_card: str&lt;br&gt;- _current_account: str" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="400" y="700" width="220" height="120" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="acct_abs" target="savings"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="acct_abs" target="checking"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="acct_abs" target="credit"/>
+        <mxCell id="e4" value="records" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="acct_abs" target="txn"/>
+        <mxCell id="e5" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="bank" target="acct_abs"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="bank" target="card"/>
+        <mxCell id="e7" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="bank" target="dispenser"/>
+        <mxCell id="e8" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="state_abs" target="idle"/>
+        <mxCell id="e9" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="state_abs" target="pin_entered"/>
+        <mxCell id="e10" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="state_abs" target="ready"/>
+        <mxCell id="e11" value="has state" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="atm" target="state_abs"/>
+        <mxCell id="e12" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="atm" target="bank"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

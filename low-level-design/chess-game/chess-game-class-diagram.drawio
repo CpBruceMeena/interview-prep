@@ -1,0 +1,75 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Chess Game Class Diagram" id="chess-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Chess Game — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="500" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Piece (Abstract) -->
+        <mxCell id="piece_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Abstract&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Piece&lt;/b&gt;&lt;hr&gt;- _color: Color&lt;br&gt;- _position: Tuple[int,int]&lt;br&gt;- _has_moved: bool&lt;hr&gt;&lt;i&gt;+ get_possible_moves(board) → List&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- Piece Subclasses -->
+        <mxCell id="king" value="&lt;b&gt;King&lt;/b&gt;&lt;br&gt;+ castling logic" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="70" width="120" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="queen" value="&lt;b&gt;Queen&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="460" y="70" width="120" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="rook" value="&lt;b&gt;Rook&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="150" width="120" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="bishop" value="&lt;b&gt;Bishop&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="460" y="150" width="120" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="knight" value="&lt;b&gt;Knight&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="230" width="120" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="pawn" value="&lt;b&gt;Pawn&lt;/b&gt;&lt;br&gt;+ en passant, promotion" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="460" y="230" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Board -->
+        <mxCell id="board" value="&lt;b&gt;Board&lt;/b&gt;&lt;hr&gt;- _grid: List[List[Optional[Piece]]]&lt;br&gt;- _en_passant_target: Optional[Tuple]&lt;hr&gt;+ get_piece_at(pos) → Piece&lt;br&gt;+ move_piece(start, end) → Move&lt;br&gt;+ undo_move(move)&lt;br&gt;+ is_in_check(color) → bool&lt;br&gt;+ is_checkmate(color) → bool&lt;br&gt;+ is_stalemate(color) → bool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="290" width="260" height="210" as="geometry"/>
+        </mxCell>
+
+        <!-- PieceFactory -->
+        <mxCell id="factory" value="&lt;b&gt;PieceFactory&lt;/b&gt;&lt;br&gt;+ create_piece(type, color, pos) → Piece" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="380" y="310" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Player -->
+        <mxCell id="player" value="&lt;b&gt;Player&lt;/b&gt;&lt;hr&gt;- _name: str&lt;br&gt;- _color: Color" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EAF6;strokeColor=#3F51B5;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="70" y="570" width="160" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- MoveValidator -->
+        <mxCell id="validator" value="&lt;b&gt;MoveValidator&lt;/b&gt;&lt;hr&gt;+ validate(player, start, end) → bool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="290" y="560" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- ChessGame (Facade) -->
+        <mxCell id="game" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;ChessGame&lt;/b&gt;&lt;hr&gt;- _board: Board&lt;br&gt;- _validator: MoveValidator&lt;br&gt;- _player1, _player2: Player&lt;br&gt;- _current_player: Player&lt;br&gt;- _status: GameStatus&lt;br&gt;- _move_history: List[Move]&lt;hr&gt;+ make_move(start, end) → bool&lt;br&gt;+ resign()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="690" width="260" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="piece_abs" target="king"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="piece_abs" target="queen"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="piece_abs" target="rook"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="piece_abs" target="bishop"/>
+        <mxCell id="e5" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="piece_abs" target="knight"/>
+        <mxCell id="e6" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="piece_abs" target="pawn"/>
+        <mxCell id="e7" value="creates" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="factory" target="piece_abs"/>
+        <mxCell id="e8" value="has pieces" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="board" target="piece_abs"/>
+        <mxCell id="e9" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game" target="board"/>
+        <mxCell id="e10" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game" target="validator"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

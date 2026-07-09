@@ -1,0 +1,57 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Tic-Tac-Toe Class Diagram" id="tic-tac-toe-class-diagram">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Tic-Tac-Toe — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="500" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Player (Abstract) -->
+        <mxCell id="player_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Abstract&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Player&lt;/b&gt;&lt;hr&gt;- _name: str&lt;br&gt;- _symbol: PlayerSymbol&lt;hr&gt;&lt;i&gt;+ get_move(board) → Tuple[int,int]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- HumanPlayer -->
+        <mxCell id="human" value="&lt;b&gt;HumanPlayer&lt;/b&gt;&lt;hr&gt;+ get_move(board) → Tuple[int,int]&lt;br&gt;&lt;i&gt;(reads from console)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="200" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- BotPlayer -->
+        <mxCell id="bot" value="&lt;b&gt;BotPlayer&lt;/b&gt;&lt;hr&gt;+ get_move(board) → Tuple[int,int]&lt;br&gt;&lt;i&gt;(minimax algorithm)&lt;/i&gt;&lt;br&gt;- _minimax(board, symbol, maximizing)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="580" y="80" width="220" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Board -->
+        <mxCell id="board" value="&lt;b&gt;Board&lt;/b&gt;&lt;hr&gt;- _grid: List[List[Optional[PlayerSymbol]]]&lt;br&gt;- _move_history: List[Tuple]&lt;hr&gt;+ is_valid_move(pos) → bool&lt;br&gt;+ place_move(pos, symbol)&lt;br&gt;+ undo_move(pos)&lt;br&gt;+ get_available_moves() → List&lt;br&gt;+ is_full() → bool&lt;br&gt;+ check_winner() → Optional[PlayerSymbol]&lt;br&gt;+ display()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="260" width="240" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- TicTacToeGame -->
+        <mxCell id="game" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;TicTacToeGame&lt;/b&gt;&lt;hr&gt;- _board: Board&lt;br&gt;- _player1, _player2: Player&lt;br&gt;- _current_player: Player&lt;br&gt;- _status: GameStatus&lt;hr&gt;+ play_turn()&lt;br&gt;+ play()&lt;br&gt;+ reset()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="370" y="290" width="220" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- Enums -->
+        <mxCell id="enums" value="&lt;b&gt;Enums&lt;/b&gt;&lt;hr&gt;&lt;b&gt;PlayerSymbol&lt;/b&gt;: X, O&lt;br&gt;&lt;b&gt;GameStatus&lt;/b&gt;: IN_PROGRESS, WIN, DRAW" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="680" y="290" width="200" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="player_abs" target="human">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="player_abs" target="bot">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game" target="board">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="game" target="player_abs">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

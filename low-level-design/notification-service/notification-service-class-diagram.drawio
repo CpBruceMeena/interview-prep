@@ -1,0 +1,68 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Notification Service Class Diagram" id="notification-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Notification Service — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Data Models (dataclasses) -->
+        <mxCell id="recipient" value="&lt;b&gt;&amp;lt;&amp;lt;dataclass&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Recipient&lt;/b&gt;&lt;br&gt;+ email/phone/push_token" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="180" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="request" value="&lt;b&gt;&amp;lt;&amp;lt;dataclass&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;NotificationRequest&lt;/b&gt;&lt;br&gt;+ notification_id: str&lt;br&gt;+ template_id: str&lt;br&gt;+ recipients: List[Recipient]&lt;br&gt;+ channels: List[Channel]&lt;br&gt;+ schedule_at: datetime&lt;br&gt;+ priority: NotificationPriority" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="80" width="220" height="170" as="geometry"/>
+        </mxCell>
+        <mxCell id="message" value="&lt;b&gt;&amp;lt;&amp;lt;dataclass&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;NotificationMessage&lt;/b&gt;&lt;br&gt;+ message_id: str&lt;br&gt;+ channel: Channel&lt;br&gt;+ recipient: str&lt;br&gt;+ content: str&lt;br&gt;+ status: MessageStatus&lt;br&gt;+ delivery_attempts: int" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="240" width="220" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- TemplateRenderer -->
+        <mxCell id="template" value="&lt;b&gt;TemplateRenderer&lt;/b&gt;&lt;hr&gt;- templates: Dict&lt;br&gt;+ render(template_id, channel, metadata)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="340" y="310" width="200" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- Provider (Abstract) -->
+        <mxCell id="provider_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Provider&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ send(message) → bool&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ cost_per_unit() → float&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="470" width="200" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="ses" value="&lt;b&gt;SESEmailProvider&lt;/b&gt;&lt;br&gt;$0.0001/email" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="470" width="150" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="sns" value="&lt;b&gt;SNSSMSProvider&lt;/b&gt;&lt;br&gt;$0.00645/SMS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="490" y="470" width="150" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="fcm" value="&lt;b&gt;FCMProvider&lt;/b&gt;&lt;br&gt;Free (push)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="680" y="470" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- MessageWorker -->
+        <mxCell id="worker" value="&lt;b&gt;MessageWorker&lt;/b&gt;&lt;hr&gt;- channel: NotificationChannel&lt;br&gt;- provider: Provider&lt;br&gt;- batch_size: int&lt;br&gt;- queue: AsyncQueue&lt;br&gt;- rate_limiter: TokenBucket&lt;hr&gt;+ run() (async loop)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="630" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- NotificationOrchestrator (Facade) -->
+        <mxCell id="orc" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;NotificationOrchestrator&lt;/b&gt;&lt;hr&gt;- store: NotificationStore&lt;br&gt;- template_engine: TemplateRenderer&lt;br&gt;- workers: Dict[Channel, MessageWorker]&lt;hr&gt;+ start()&lt;br&gt;+ submit(request) → dict (async)&lt;br&gt;+ get_status(id) → dict&lt;br&gt;+ process_scheduled()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="350" y="630" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- TokenBucket -->
+        <mxCell id="token_bucket" value="&lt;b&gt;TokenBucket&lt;/b&gt;&lt;hr&gt;- rate: float&lt;br&gt;- burst: int&lt;br&gt;- tokens: float&lt;hr&gt;+ acquire(tokens) (async)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="350" y="170" width="200" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="contains" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#8BC34A;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="request" target="recipient"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="provider_abs" target="ses"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="provider_abs" target="sns"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="provider_abs" target="fcm"/>
+        <mxCell id="e5" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="worker" target="provider_abs"/>
+        <mxCell id="e6" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="worker" target="token_bucket"/>
+        <mxCell id="e7" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="orc" target="worker"/>
+        <mxCell id="e8" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#1565C0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="orc" target="template"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,0 +1,60 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Rate Limiter Class Diagram" id="rate-limiter-class-diagram">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Rate Limiter — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="500" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- RateLimitRule -->
+        <mxCell id="rule" value="&lt;b&gt;RateLimitRule&lt;/b&gt;&lt;hr&gt;+ max_requests: int&lt;br&gt;+ window_seconds: int" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="90" as="geometry"/>
+        </mxCell>
+
+        <!-- RateLimitAlgorithm (Abstract) -->
+        <mxCell id="algo_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;RateLimitAlgorithm&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ allow_request(key, ts) → RateLimitResult&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ get_window_remaining(key) → int&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ reset_key(key)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="230" width="220" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- Concrete Algorithms -->
+        <mxCell id="token_bucket" value="&lt;b&gt;TokenBucket&lt;/b&gt;&lt;hr&gt;- _tokens: Dict[str, float]&lt;br&gt;- _last_refill: Dict[str, float]&lt;br&gt;- _refill_rate: float" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="230" width="180" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="sliding_window" value="&lt;b&gt;SlidingWindowLog&lt;/b&gt;&lt;hr&gt;- _logs: Dict[str, deque]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="530" y="230" width="180" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="fixed_window" value="&lt;b&gt;FixedWindowCounter&lt;/b&gt;&lt;hr&gt;- _counters: Dict[str, int]&lt;br&gt;- _window_start: Dict[str, float]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="380" width="180" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="sliding_counter" value="&lt;b&gt;SlidingWindowCounter&lt;/b&gt;&lt;hr&gt;- _counters: Dict[str, Dict[int, int]]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="530" y="390" width="180" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- RateLimiter -->
+        <mxCell id="limiter" value="&lt;b&gt;RateLimiter&lt;/b&gt;&lt;hr&gt;- _algorithm: RateLimitAlgorithm&lt;br&gt;- _lock: Lock&lt;hr&gt;+ allow_request(key) → RateLimitResult&lt;br&gt;+ get_remaining(key) → int&lt;br&gt;+ reset(key)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="530" width="220" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- RateLimitMiddleware -->
+        <mxCell id="middleware" value="&lt;b&gt;RateLimitMiddleware&lt;/b&gt;&lt;hr&gt;- _limiters: Dict[str, RateLimiter]&lt;hr&gt;+ add_rule(endpoint, rule, algo)&lt;br&gt;+ check_rate_limit(endpoint, user_id)&lt;br&gt;+ get_remaining(endpoint, user_id)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="350" y="530" width="220" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- RateLimiterFactory -->
+        <mxCell id="factory" value="&lt;b&gt;RateLimiterFactory&lt;/b&gt;&lt;br&gt;+ create(algo, rule) → RateLimiter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="660" y="550" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="algo_abs" target="token_bucket"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="algo_abs" target="sliding_window"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="algo_abs" target="fixed_window"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="algo_abs" target="sliding_counter"/>
+        <mxCell id="e5" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="limiter" target="algo_abs"/>
+        <mxCell id="e6" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="middleware" target="limiter"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

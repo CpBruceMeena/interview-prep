@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 750" font-family="Menlo, monospace" font-size="11">
+  <rect x="0" y="0" width="1000" height="750" fill="#ffffff"/>
+  <text x="500" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#333">Vending Machine — Class Diagram</text>
+
+  <!-- Product -->
+  <rect x="50" y="60" width="200" height="110" rx="8" fill="#E8F5E9" stroke="#4CAF50" stroke-width="2"/>
+  <text x="150" y="80" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Product</text>
+  <line x1="50" y1="90" x2="250" y2="90" stroke="#4CAF50"/>
+  <text x="60" y="108" fill="#555">- _product_id: str</text>
+  <text x="60" y="125" fill="#555">- _name: str</text>
+  <text x="60" y="142" fill="#555">- _price: float</text>
+  <text x="60" y="159" fill="#555">- _category: str</text>
+
+  <!-- Inventory -->
+  <rect x="320" y="60" width="220" height="140" rx="8" fill="#F1F8E9" stroke="#8BC34A" stroke-width="2"/>
+  <text x="430" y="80" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">Inventory</text>
+  <line x1="320" y1="90" x2="540" y2="90" stroke="#8BC34A"/>
+  <text x="330" y="108" fill="#555">- _products: Dict[str, Product]</text>
+  <text x="330" y="125" fill="#555">- _stock: Dict[str, int]</text>
+  <line x1="320" y1="135" x2="540" y2="135" stroke="#8BC34A" stroke-dasharray="3,3"/>
+  <text x="330" y="153" fill="#555">+ add_product()</text>
+  <text x="330" y="170" fill="#555">+ is_available() → bool</text>
+  <text x="330" y="187" fill="#555">+ dispense() → Product</text>
+
+  <!-- PaymentStrategy (Abstract) -->
+  <rect x="50" y="230" width="210" height="120" rx="8" fill="#FFF9C4" stroke="#FBC02D" stroke-width="2"/>
+  <text x="155" y="250" text-anchor="middle" font-size="11" font-style="italic" fill="#F57F17">&lt;&lt;Strategy&gt;&gt;</text>
+  <text x="155" y="268" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">PaymentStrategy</text>
+  <line x1="50" y1="278" x2="260" y2="278" stroke="#FBC02D"/>
+  <text x="60" y="298" font-style="italic" fill="#555">+ process_payment(amt) → bool</text>
+  <text x="60" y="318" font-style="italic" fill="#555">+ refund(amt) → bool</text>
+
+  <!-- CashPayment -->
+  <rect x="320" y="230" width="200" height="120" rx="8" fill="#FFF3E0" stroke="#FF9800" stroke-width="2"/>
+  <text x="420" y="250" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">CashPayment</text>
+  <line x1="320" y1="260" x2="520" y2="260" stroke="#FF9800"/>
+  <text x="330" y="280" fill="#555">- _inserted_amount: float</text>
+  <line x1="320" y1="290" x2="520" y2="290" stroke="#FF9800" stroke-dasharray="3,3"/>
+  <text x="330" y="310" fill="#555">+ insert_coin(coin)</text>
+  <text x="330" y="330" fill="#555">+ get_change() → float</text>
+
+  <!-- VendingState (Abstract) -->
+  <rect x="50" y="430" width="240" height="140" rx="8" fill="#F3E5F5" stroke="#9C27B0" stroke-width="2"/>
+  <text x="170" y="450" text-anchor="middle" font-size="11" font-style="italic" fill="#6A1B9A">&lt;&lt;State&gt;&gt;</text>
+  <text x="170" y="468" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">VendingState</text>
+  <line x1="50" y1="478" x2="290" y2="478" stroke="#9C27B0"/>
+  <text x="60" y="498" font-style="italic" fill="#555">+ select_product(id)</text>
+  <text x="60" y="518" font-style="italic" fill="#555">+ insert_coin(coin)</text>
+  <text x="60" y="538" font-style="italic" fill="#555">+ dispense_product()</text>
+  <text x="60" y="558" font-style="italic" fill="#555">+ cancel_transaction()</text>
+
+  <!-- States -->
+  <rect x="340" y="430" width="160" height="60" rx="8" fill="#E1BEE7" stroke="#9C27B0" stroke-width="2"/>
+  <text x="420" y="455" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">IdleState</text>
+  <text x="420" y="475" text-anchor="middle" font-size="10" fill="#555">Only: select_product</text>
+
+  <rect x="340" y="510" width="200" height="60" rx="8" fill="#E1BEE7" stroke="#9C27B0" stroke-width="2"/>
+  <text x="440" y="535" text-anchor="middle" font-size="12" font-weight="bold" fill="#333">WaitingForMoneyState</text>
+  <text x="440" y="555" text-anchor="middle" font-size="10" fill="#555">Only: insert_coin, cancel</text>
+
+  <!-- VendingMachine (Facade) -->
+  <rect x="50" y="650" width="280" height="180" rx="8" fill="#E3F2FD" stroke="#2196F3" stroke-width="2"/>
+  <text x="190" y="670" text-anchor="middle" font-size="11" font-style="italic" fill="#1565C0">&lt;&lt;Facade&gt;&gt;</text>
+  <text x="190" y="688" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">VendingMachine</text>
+  <line x1="50" y1="698" x2="330" y2="698" stroke="#2196F3"/>
+  <text x="60" y="718" fill="#555">- _inventory: Inventory</text>
+  <text x="60" y="735" fill="#555">- _state: VendingState</text>
+  <text x="60" y="752" fill="#555">- _selected_product: Product</text>
+  <text x="60" y="769" fill="#555">- _current_balance: float</text>
+  <line x1="50" y1="779" x2="330" y2="779" stroke="#2196F3" stroke-dasharray="3,3"/>
+  <text x="60" y="798" fill="#555">+ select_product() / insert_coin()</text>
+  <text x="60" y="815" fill="#555">+ dispense() / cancel()</text>
+
+  <!-- Arrows -->
+  <line x1="260" y1="260" x2="315" y2="270" stroke="#FF9800" stroke-width="2"/>
+  <polygon points="310,264 325,270 310,276" fill="#FF9800"/>
+
+  <line x1="290" y1="500" x2="335" y2="470" stroke="#9C27B0" stroke-width="2"/>
+  <polygon points="330,464 345,470 330,476" fill="#9C27B0"/>
+
+  <line x1="290" y1="520" x2="335" y2="540" stroke="#9C27B0" stroke-width="2"/>
+  <polygon points="330,534 345,540 330,546" fill="#9C27B0"/>
+</svg>

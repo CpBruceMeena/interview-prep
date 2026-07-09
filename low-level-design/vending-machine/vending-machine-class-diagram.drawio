@@ -1,0 +1,69 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Vending Machine Class Diagram" id="vending-machine-class-diagram">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Vending Machine — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Product -->
+        <mxCell id="product" value="&lt;b&gt;Product&lt;/b&gt;&lt;hr&gt;- _product_id: str&lt;br&gt;- _name: str&lt;br&gt;- _price: float&lt;br&gt;- _category: str" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="200" height="110" as="geometry"/>
+        </mxCell>
+
+        <!-- Inventory -->
+        <mxCell id="inventory" value="&lt;b&gt;Inventory&lt;/b&gt;&lt;hr&gt;- _products: Dict[str, Product]&lt;br&gt;- _stock: Dict[str, int]&lt;hr&gt;+ add_product(product, qty)&lt;br&gt;+ is_available(product_id) → bool&lt;br&gt;+ dispense(product_id) → Product&lt;br&gt;+ display_products()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#8BC34A;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="220" height="150" as="geometry"/>
+        </mxCell>
+
+        <!-- PaymentStrategy (Abstract) -->
+        <mxCell id="payment_strategy" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;PaymentStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ process_payment(amount) → bool&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ refund(amount) → bool&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="270" width="200" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="cash_payment" value="&lt;b&gt;CashPayment&lt;/b&gt;&lt;br&gt;- _inserted_amount: float&lt;br&gt;+ insert_coin(coin)&lt;br&gt;+ insert_note(note)&lt;br&gt;+ get_change()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="280" width="180" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="card_payment" value="&lt;b&gt;CardPayment&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="550" y="300" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- VendingMachine State Pattern -->
+        <mxCell id="state_abs" value="&lt;b&gt;&amp;lt;&amp;lt;State&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;VendingState&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ select_product(id)&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ insert_coin(coin)&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ insert_note(note)&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ dispense_product()&lt;/i&gt;&lt;br&gt;&lt;i&gt;+ cancel_transaction()&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="460" width="220" height="140" as="geometry"/>
+        </mxCell>
+        <mxCell id="idle_state" value="&lt;b&gt;IdleState&lt;/b&gt;&lt;br&gt;Only: select_product" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="330" y="460" width="150" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="waiting_state" value="&lt;b&gt;WaitingForMoneyState&lt;/b&gt;&lt;br&gt;Only: insert_coin, cancel" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="530" y="460" width="180" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="ready_state" value="&lt;b&gt;ReadyToDispenseState&lt;/b&gt;&lt;br&gt;Only: dispense, cancel" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="760" y="460" width="180" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- VendingMachine (Facade) -->
+        <mxCell id="facade" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;VendingMachine&lt;/b&gt;&lt;hr&gt;- _inventory: Inventory&lt;br&gt;- _display: VendingDisplay&lt;br&gt;- _state: VendingState&lt;br&gt;- _selected_product: Product&lt;br&gt;- _current_balance: float&lt;hr&gt;+ select_product(id)&lt;br&gt;+ insert_coin(coin)&lt;br&gt;+ dispense()&lt;br&gt;+ cancel()&lt;br&gt;+ show_products()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="200" y="650" width="260" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- VendingDisplay -->
+        <mxCell id="display" value="&lt;b&gt;VendingDisplay&lt;/b&gt;&lt;br&gt;(static display methods)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="580" y="700" width="180" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="inventory" target="product"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="payment_strategy" target="cash_payment"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="payment_strategy" target="card_payment"/>
+        <mxCell id="e4" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="state_abs" target="idle_state"/>
+        <mxCell id="e5" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="state_abs" target="waiting_state"/>
+        <mxCell id="e6" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="state_abs" target="ready_state"/>
+        <mxCell id="e7" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="facade" target="inventory"/>
+        <mxCell id="e8" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="facade" target="payment_strategy"/>
+        <mxCell id="e9" value="has state" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="facade" target="state_abs"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

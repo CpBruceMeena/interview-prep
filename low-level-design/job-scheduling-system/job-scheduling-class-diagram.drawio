@@ -1,0 +1,67 @@
+<mxfile host="Electron" agent="Codebuff">
+  <diagram name="Job Scheduling Class Diagram" id="job-scheduling-class-diagram">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="Job Scheduling System — Class Diagram" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="10" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Job (Abstract - Command Pattern) -->
+        <mxCell id="job_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Command&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;Job&lt;/b&gt;&lt;hr&gt;- _job_id: str&lt;br&gt;- _name: str&lt;br&gt;- _priority: JobPriority&lt;br&gt;- _status: JobStatus&lt;br&gt;- _retry_count: int&lt;br&gt;- _max_retries: int&lt;hr&gt;&lt;i&gt;+ execute() → bool&lt;/i&gt;&lt;br&gt;+ on_success()&lt;br&gt;+ on_failure(error)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#FBC02D;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="220" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- Concrete Jobs -->
+        <mxCell id="email_job" value="&lt;b&gt;EmailJob&lt;/b&gt;&lt;br&gt;Send email" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="80" width="140" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="data_job" value="&lt;b&gt;DataProcessingJob&lt;/b&gt;&lt;br&gt;Process data" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="160" width="140" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="report_job" value="&lt;b&gt;ReportGenerationJob&lt;/b&gt;&lt;br&gt;Generate report" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="320" y="240" width="150" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- JobExecutor -->
+        <mxCell id="executor" value="&lt;b&gt;JobExecutor&lt;/b&gt;&lt;hr&gt;- _max_concurrent: int&lt;br&gt;- _running: Dict[str, Job]&lt;hr&gt;+ execute(job) → bool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="320" width="220" height="130" as="geometry"/>
+        </mxCell>
+
+        <!-- SchedulingStrategy -->
+        <mxCell id="sched_abs" value="&lt;b&gt;&amp;lt;&amp;lt;Strategy&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;SchedulingStrategy&lt;/b&gt;&lt;hr&gt;&lt;i&gt;+ schedule(jobs) → List[Job]&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="510" width="200" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="priority_sched" value="&lt;b&gt;PriorityScheduler&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="520" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="fifo_sched" value="&lt;b&gt;FIFOScheduler&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1BEE7;strokeColor=#9C27B0;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="480" y="520" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- RecurringJob -->
+        <mxCell id="recurring" value="&lt;b&gt;RecurringJob&lt;/b&gt;&lt;hr&gt;- _job_factory: Callable&lt;br&gt;- _recurrence: RecurrenceType&lt;br&gt;- _next_run: datetime&lt;br&gt;- _is_active: bool&lt;hr&gt;+ create_job() → Job&lt;br&gt;+ update_next_run()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#E91E63;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="360" y="300" width="220" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- JobScheduler (Facade) -->
+        <mxCell id="scheduler" value="&lt;b&gt;&amp;lt;&amp;lt;Facade&amp;gt;&amp;gt;&lt;/b&gt;&lt;br&gt;&lt;b&gt;JobScheduler&lt;/b&gt;&lt;hr&gt;- _executor: JobExecutor&lt;br&gt;- _scheduler: SchedulingStrategy&lt;br&gt;- _pending: List[Job]&lt;br&gt;- _recurring: List[RecurringJob]&lt;hr&gt;+ add_job(job)&lt;br&gt;+ start() / stop()&lt;br&gt;+ cancel_job(job_id)&lt;br&gt;+ get_stats() → Dict" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#2196F3;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="50" y="660" width="260" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="job_abs" target="email_job"/>
+        <mxCell id="e2" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="job_abs" target="data_job"/>
+        <mxCell id="e3" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#FF9800;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="job_abs" target="report_job"/>
+        <mxCell id="e4" value="runs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#4CAF50;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="executor" target="job_abs"/>
+        <mxCell id="e5" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="sched_abs" target="priority_sched"/>
+        <mxCell id="e6" value="&amp;lt;&amp;lt;extends&amp;gt;&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9C27B0;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="sched_abs" target="fifo_sched"/>
+        <mxCell id="e7" value="creates" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#E91E63;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="recurring" target="job_abs"/>
+        <mxCell id="e8" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="scheduler" target="executor"/>
+        <mxCell id="e9" value="uses" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="scheduler" target="sched_abs"/>
+        <mxCell id="e10" value="manages" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2196F3;strokeWidth=1;dashed=1;fontSize=10;" edge="1" parent="1" source="scheduler" target="recurring"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
