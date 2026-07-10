@@ -314,9 +314,13 @@ nav:
     - Kafka: tools-interview/kafka/INTERVIEW_QUESTIONS.md
     - Redis: tools-interview/redis/INTERVIEW_QUESTIONS.md
     - Elasticsearch: tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md
-    - Docker & Kubernetes:
-      - Questions: tools-interview/docker-kubernetes/INTERVIEW_QUESTIONS.md
-      - Versioning in Multi-Container: tools-interview/docker-kubernetes/VERSIONING_MULTI_CONTAINER.md
+    - Docker:
+      - Interview Questions: tools-interview/docker/INTERVIEW_QUESTIONS.md
+    - Kubernetes:
+      - Interview Questions: tools-interview/kubernetes/INTERVIEW_QUESTIONS.md
+      - Pod Lifecycle & Monitoring: tools-interview/kubernetes/POD_LIFECYCLE_AND_MONITORING.md
+      - Production Control: tools-interview/kubernetes/PRODUCTION_CONTROL.md
+      - Multi-Container Versioning: tools-interview/kubernetes/VERSIONING_MULTI_CONTAINER.md
     - MongoDB: tools-interview/mongodb/INTERVIEW_QUESTIONS.md
     - Prometheus & Grafana: tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md
     - Terraform: tools-interview/terraform/INTERVIEW_QUESTIONS.md

@@ -12,7 +12,12 @@ tools-interview/
 ├── kafka/                ← 12 questions: log internals, ISR, rebalancing, exactly-once
 ├── redis/                ← 12 questions: data structures, persistence, clustering, sentinel
 ├── elasticsearch/        ← 8 questions: inverted index, sharding, query DSL, cluster mgmt
-├── docker-kubernetes/    ← 8 questions: container runtime, k8s scheduler, networking, RBAC
+├── docker/               ← 2 questions: container runtime, namespaces, cgroups, images
+├── kubernetes/           ← 6 questions: k8s scheduler, networking, RBAC, storage, controllers, production
+│   ├── INTERVIEW_QUESTIONS.md
+│   ├── POD_LIFECYCLE_AND_MONITORING.md   ← 15 sections: pod lifecycle, probes, QoS, monitoring stack, alerting, eBPF
+│   ├── PRODUCTION_CONTROL.md             ← 12 sections: GitOps, admission, deployment strategies, service mesh, CNI, DR
+│   └── VERSIONING_MULTI_CONTAINER.md     ← versioning, DB migrations, canary deployments
 ├── mongodb/              ← 6 questions: document model, replica sets, aggregation, transactions
 ├── prometheus-grafana/   ← 8 questions: TSDB internals, PromQL, alerting, Thanos/Mimir
 ├── nginx/                ← 10 questions: event loop, reverse proxy, TLS, clustering
