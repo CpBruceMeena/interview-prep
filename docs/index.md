@@ -233,7 +233,8 @@
 | 32 | **Kafka** | Event streaming, partitioning, replication, exactly-once | [Kafka Q&A](tools-interview/kafka/INTERVIEW_QUESTIONS/) |
 | 33 | **Redis** | Caching, distributed locks, data structures, persistence | [Redis Q&A](tools-interview/redis/INTERVIEW_QUESTIONS/) |
 | 34 | **Elasticsearch** | Inverted index, BM25, analysis pipeline, sharding | [ES Q&A](tools-interview/elasticsearch/INTERVIEW_QUESTIONS/) |
-| 35 | **Docker & Kubernetes** | Containerization, orchestration, versioning, multi-container | [K8s Q&A](tools-interview/docker-kubernetes/INTERVIEW_QUESTIONS/) + [Versioning](tools-interview/docker-kubernetes/VERSIONING_MULTI_CONTAINER/) |
+| 35 | **Docker** | Container runtime, namespaces, cgroups, image layering, multi-stage builds | [Docker Q&A](tools-interview/docker/INTERVIEW_QUESTIONS/) |
+| 36 | **Kubernetes** | Orchestration, scheduling, networking, RBAC, storage, production ops | [K8s Q&A](tools-interview/kubernetes/INTERVIEW_QUESTIONS/) + [Pod Lifecycle](tools-interview/kubernetes/POD_LIFECYCLE_AND_MONITORING/) + [Production Control](tools-interview/kubernetes/PRODUCTION_CONTROL/) + [Versioning](tools-interview/kubernetes/VERSIONING_MULTI_CONTAINER/) |
 | 36 | **Monitoring & Infra** | Prometheus, Grafana, Terraform | [Prometheus](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS/) + [Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS/) |
 | 37 | **Nginx & Compression** | Reverse proxy, load balancing, Gzip/Zstd/Brotli | [Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS/) + [Compression](tools-interview/compression/INTERVIEW_QUESTIONS/) |
 
