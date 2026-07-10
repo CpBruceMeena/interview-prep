@@ -7,7 +7,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](parking-lot-class-diagram.drawio)
+![](parking-lot-class-diagram.drawio)
 
 ---
 

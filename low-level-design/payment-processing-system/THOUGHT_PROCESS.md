@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](payment-processing-class-diagram.drawio)
+![](payment-processing-class-diagram.drawio)
 
 ---
 

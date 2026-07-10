@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](job-scheduling-class-diagram.drawio)
+![](job-scheduling-class-diagram.drawio)
 
 ---
 

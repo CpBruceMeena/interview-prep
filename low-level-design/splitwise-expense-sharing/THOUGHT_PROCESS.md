@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](splitwise-class-diagram.drawio)
+![](splitwise-class-diagram.drawio)
 
 ---
 

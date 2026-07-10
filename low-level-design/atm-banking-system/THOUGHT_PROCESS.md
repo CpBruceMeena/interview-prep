@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](atm-banking-class-diagram.drawio)
+![](atm-banking-class-diagram.drawio)
 
 ---
 

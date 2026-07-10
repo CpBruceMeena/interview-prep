@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](cab-booking-class-diagram.drawio)
+![](cab-booking-class-diagram.drawio)
 
 ---
 

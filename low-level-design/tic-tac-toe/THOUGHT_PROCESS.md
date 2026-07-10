@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](tic-tac-toe-class-diagram.drawio)
+![](tic-tac-toe-class-diagram.drawio)
 
 ---
 

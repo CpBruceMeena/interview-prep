@@ -22,13 +22,13 @@
 
 ## Server Implementations
 
-- **[servers/](servers/)** — MCP server code:
+- **[servers/](servers/index.md)** — MCP server code:
   - `calculator_server.py` — Simple math tools (tutorial)
   - `database_server.py` — PostgreSQL wrapper with rate limiting & auth
   - `rag_server.py` — RAG pipeline integration (uses `../rag/implementation/`)
-- **[common/](common/)** — Shared utilities: rate limiter, circuit breaker, auth
-- **[clients/](clients/)** — Python client and Claude Desktop config
-- **[tests/](tests/)** — Pytest test suite
+- **[common/](common/index.md)** — Shared utilities: rate limiter, circuit breaker, auth
+- **[clients/](clients/index.md)** — Python client and Claude Desktop config
+- **[tests/](tests/index.md)** — Pytest test suite
 
 ## Quick Start
 

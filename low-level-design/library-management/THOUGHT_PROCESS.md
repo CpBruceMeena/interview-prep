@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](library-management-class-diagram.drawio)
+![](library-management-class-diagram.drawio)
 
 ---
 

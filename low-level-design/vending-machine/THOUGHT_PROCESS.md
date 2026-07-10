@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](vending-machine-class-diagram.drawio)
+![](vending-machine-class-diagram.drawio)
 
 ---
 

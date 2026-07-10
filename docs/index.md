@@ -151,6 +151,12 @@
             <span class="skill-card-desc">Retrieval, embeddings, fine-tuning</span>
             <span class="skill-card-tag">7 guides</span>
         </a>
+        <a href="ai-engineering/harness-engineering/" class="skill-card highlight">
+            <span class="skill-card-icon">🔧</span>
+            <span class="skill-card-title">Harness & Loop Eng</span>
+            <span class="skill-card-desc">Scaffolding, guardrails, agent loops</span>
+            <span class="skill-card-tag">2 guides</span>
+        </a>
     </div>
 </div>
 
@@ -170,73 +176,75 @@
 
 | # | Topic | Why | Resources |
 |---|-------|-----|-----------|
-| 1 | **Operating Systems** | Foundation: processes, memory, scheduling, I/O | [OS Questions](cs-interview/operating-systems/INTERVIEW_QUESTIONS/) |
-| 2 | **Computer Networks** | TCP/IP, HTTP/2/3, TLS, QUIC, load balancing | [Networks Questions](cs-interview/computer-networks/INTERVIEW_QUESTIONS/) |
-| 3 | **Data Structures & Algorithms** | Bloom filters, tries, sketches, LRU cache | [DSA Questions](cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS/) + [Scale DSA](cs-interview/data-structures-algorithms/DATA_STRUCTURES_FOR_SCALE/) |
-| 4 | **Database Systems** | MVCC, B-Tree vs LSM, indexes, sharding, replication | [DB Questions](cs-interview/database-systems/INTERVIEW_QUESTIONS/) |
+| 1 | **Operating Systems** | Foundation: processes, memory, scheduling, I/O | [OS Questions](cs-interview/operating-systems/INTERVIEW_QUESTIONS.md) |
+| 2 | **Computer Networks** | TCP/IP, HTTP/2/3, TLS, QUIC, load balancing | [Networks Questions](cs-interview/computer-networks/INTERVIEW_QUESTIONS.md) |
+| 3 | **Data Structures & Algorithms** | Bloom filters, tries, sketches, LRU cache | [DSA Questions](cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS.md) + [Scale DSA](cs-interview/data-structures-algorithms/DATA_STRUCTURES_FOR_SCALE.md) |
+| 4 | **Database Systems** | MVCC, B-Tree vs LSM, indexes, sharding, replication | [DB Questions](cs-interview/database-systems/INTERVIEW_QUESTIONS.md) |
 
 ### Phase 2: Language Deep-Dives (2-3 weeks — pick your stack)
 
 | # | Topic | Why | Resources |
 |---|-------|-----|-----------|
-| 5 | **Python** | GIL, async/await, metaclasses, C extensions | [Python Q&A](python-interview/INTERVIEW_QUESTIONS/) + [Async](ai-engineering/agents/06_PYTHON_ASYNC_AWAIT/) |
-| 5 | **Golang** (alternative) | GMP scheduler, GC, channels, interfaces | [Go Q&A](golang-interview/INTERVIEW_QUESTIONS/) + [Concurrency](golang-interview/CONCURRENCY_NOTES/) |
-| 5 | **Java** (alternative) | JVM internals, GC tuning, Spring Boot | [Java Q&A](java-interview/INTERVIEW_QUESTIONS/) + [JVM](java-interview/JVM_INTERNALS_NOTES/) |
+| 5 | **Python** | GIL, async/await, metaclasses, C extensions | [Python Q&A](python-interview/INTERVIEW_QUESTIONS.md) + [Async](ai-engineering/agents/06_PYTHON_ASYNC_AWAIT.md) |
+| 5 | **Golang** (alternative) | GMP scheduler, GC, channels, interfaces | [Go Q&A](golang-interview/INTERVIEW_QUESTIONS.md) + [Concurrency](golang-interview/CONCURRENCY_NOTES.md) |
+| 5 | **Java** (alternative) | JVM internals, GC tuning, Spring Boot | [Java Q&A](java-interview/INTERVIEW_QUESTIONS.md) + [JVM](java-interview/JVM_INTERNALS_NOTES.md) |
 
 ### Phase 3: Low-Level Design (3-4 weeks)
 
 | # | Project | Skills Built | Resources |
 |---|---------|-------------|-----------|
-| 6 | **Parking Lot** | OOD basics, SOLID, Strategy/Factory patterns | [Code](low-level-design/parking-lot/CODE/) |
-| 7 | **Vending Machine** | State machines, finite automata | [Code](low-level-design/vending-machine/CODE/) |
-| 8 | **LRU Cache / Rate Limiter** | Data structures, concurrency | [Cache](low-level-design/lru-cache/CODE/) + [Rate Limiter](low-level-design/rate-limiter/CODE/) |
-| 9 | **Pub-Sub / Movie Booking** | Observer pattern, concurrency control | [Pub-Sub](low-level-design/pub-sub-system/CODE/) + [Booking](low-level-design/movie-ticket-booking/CODE/) |
-| 10 | **Splitwise / Library Mgmt** | Graph algorithms, facade pattern | [Splitwise](low-level-design/splitwise-expense-sharing/CODE/) + [Library](low-level-design/library-management/CODE/) |
-| 11 | **Cab Booking / Car Rental** | Geo queries, Kafka integration, availability | [Cab](low-level-design/cab-booking-uber/CODE/) + [Car Rental](low-level-design/car-rental-platform/CODE/) |
-| 12 | **ATM / Payment Processing** | State machines, fraud detection, idempotency | [ATM](low-level-design/atm-banking-system/CODE/) + [Payments](low-level-design/payment-processing-system/CODE/) |
-| 13 | **Chess Game** | Complex state, enums, validation | [Chess](low-level-design/chess-game/CODE/) |
-| 14 | **Notification Service** | High-throughput, multi-channel, cost-effective, scheduling | [HLD](low-level-design/notification-service/HIGH_LEVEL_DESIGN/) + [Code](low-level-design/notification-service/CODE/) |
-| 15 | **Job Scheduling (Airflow-like)** | Core-aware scheduling, DAG, recurring jobs, cron | [Design](low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN/) |
-| 16 | **Search Platform** | TF-IDF, inverted index, ranking | [Search](low-level-design/search-platform/CODE/) |
+| 6 | **Parking Lot** | OOD basics, SOLID, Strategy/Factory patterns | [Code](low-level-design/parking-lot/CODE.md) |
+| 7 | **Vending Machine** | State machines, finite automata | [Code](low-level-design/vending-machine/CODE.md) |
+| 8 | **LRU Cache / Rate Limiter** | Data structures, concurrency | [Cache](low-level-design/lru-cache/CODE.md) + [Rate Limiter](low-level-design/rate-limiter/CODE.md) |
+| 9 | **Pub-Sub / Movie Booking** | Observer pattern, concurrency control | [Pub-Sub](low-level-design/pub-sub-system/CODE.md) + [Booking](low-level-design/movie-ticket-booking/CODE.md) |
+| 10 | **Splitwise / Library Mgmt** | Graph algorithms, facade pattern | [Splitwise](low-level-design/splitwise-expense-sharing/CODE.md) + [Library](low-level-design/library-management/CODE.md) |
+| 11 | **Cab Booking / Car Rental** | Geo queries, Kafka integration, availability | [Cab](low-level-design/cab-booking-uber/CODE.md) + [Car Rental](low-level-design/car-rental-platform/CODE.md) |
+| 12 | **ATM / Payment Processing** | State machines, fraud detection, idempotency | [ATM](low-level-design/atm-banking-system/CODE.md) + [Payments](low-level-design/payment-processing-system/CODE.md) |
+| 13 | **Chess Game** | Complex state, enums, validation | [Chess](low-level-design/chess-game/CODE.md) |
+| 14 | **Notification Service** | High-throughput, multi-channel, cost-effective, scheduling | [HLD](low-level-design/notification-service/HIGH_LEVEL_DESIGN.md) + [Code](low-level-design/notification-service/CODE.md) |
+| 15 | **Job Scheduling (Airflow-like)** | Core-aware scheduling, DAG, recurring jobs, cron | [Design](low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md) |
+| 16 | **Search Platform** | TF-IDF, inverted index, ranking | [Search](low-level-design/search-platform/CODE.md) |
 
 ### Phase 4: Distributed Systems & Architecture (2-3 weeks)
 
 | # | Topic | Why | Resources |
 |---|-------|-----|-----------|
-| 17 | **Distributed Systems** | Raft, Paxos, CRDTs, gossip, CAP theorem | [DS Questions](cs-interview/distributed-systems/INTERVIEW_QUESTIONS/) + [Transactions](cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS/) |
-| 18 | **Concurrency & Parallelism** | Lock-free, race conditions, memory models | [Concurrency Q&A](cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS/) |
-| 19 | **Software Architecture** | CQRS, event sourcing, DDD, microservices | [Architecture Q&A](cs-interview/software-architecture/INTERVIEW_QUESTIONS/) + [Patterns](cs-interview/software-architecture/DESIGN_PATTERNS/) |
-| 20 | **Security** | JWT, OAuth2, OWASP, encryption, SSRF | [Security Q&A](cs-interview/security/INTERVIEW_QUESTIONS/) |
+| 17 | **Distributed Systems** | Raft, Paxos, CRDTs, gossip, CAP theorem | [DS Questions](cs-interview/distributed-systems/INTERVIEW_QUESTIONS.md) + [Transactions](cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS.md) |
+| 18 | **Concurrency & Parallelism** | Lock-free, race conditions, memory models | [Concurrency Q&A](cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md) |
+| 19 | **Software Architecture** | CQRS, event sourcing, DDD, microservices | [Architecture Q&A](cs-interview/software-architecture/INTERVIEW_QUESTIONS.md) + [Patterns](cs-interview/software-architecture/DESIGN_PATTERNS.md) |
+| 20 | **Security** | JWT, OAuth2, OWASP, encryption, SSRF | [Security Q&A](cs-interview/security/INTERVIEW_QUESTIONS.md) |
 
 ### Phase 5: AI Engineering (2-3 weeks — high growth area)
 
 | # | Topic | Why | Resources |
 |---|-------|-----|-----------|
-| 21 | **RAG Fundamentals** | Understand retrieval-augmented generation | [RAG Overview](ai-engineering/rag/01_RAG_FUNDAMENTALS/) |
-| 22 | **RAG Implementation** | ChromaDB, embeddings, FastAPI | [RAG Code](ai-engineering/rag/implementation/index/) |
-| 23 | **MCP Protocol** | Model Context Protocol, server/client | [MCP Fundamentals](ai-engineering/mcp/01_MCP_FUNDAMENTALS/) + [Servers](ai-engineering/mcp/servers/index/) |
-| 24 | **Agent Fundamentals** | ReAct, Plan-and-Execute, memory systems | [Agent Fundamentals](ai-engineering/agents/01_AGENT_FUNDAMENTALS/) |
-| 25 | **LangGraph** | Graph-based state machines for agents | [LangGraph Notes](ai-engineering/agents/05_LANGGRAPH_NOTES/) |
-| 26 | **Multi-LLM Architecture** | Routing, cost management, fallback across GPT/Claude/DeepSeek | [Multi-LLM Design](ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE/) |
-| 27 | **Agent Observability** | Monitoring, debugging, proactive alerts, data policies | [Observability](ai-engineering/agents/07_AGENT_OBSERVABILITY/) |
-| 28 | **Redis Lease & Search** | Distributed locking, autocorrect, Elasticsearch internals | [Redis & Search](ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH/) |
-| 29 | **Agent Deployment (ECS)** | Production infra, ECS, API flow, monitoring, cost | [Deployment Guide](ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS/) |
-| 30 | **Agent Interview Prep** | Staff-level agent questions and answers | [Agent Q&A](ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS/) |
+| 21 | **RAG Fundamentals** | Understand retrieval-augmented generation | [RAG Overview](ai-engineering/rag/01_RAG_FUNDAMENTALS.md) |
+| 22 | **RAG Implementation** | ChromaDB, embeddings, FastAPI | [RAG Code](ai-engineering/rag/implementation/index.md) |
+| 23 | **MCP Protocol** | Model Context Protocol, server/client | [MCP Fundamentals](ai-engineering/mcp/01_MCP_FUNDAMENTALS.md) + [Servers](ai-engineering/mcp/servers/index.md) |
+| 24 | **Agent Fundamentals** | ReAct, Plan-and-Execute, memory systems | [Agent Fundamentals](ai-engineering/agents/01_AGENT_FUNDAMENTALS.md) |
+| 25 | **LangGraph** | Graph-based state machines for agents | [LangGraph Notes](ai-engineering/agents/05_LANGGRAPH_NOTES.md) |
+| 26 | **Multi-LLM Architecture** | Routing, cost management, fallback across GPT/Claude/DeepSeek | [Multi-LLM Design](ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE.md) |
+| 27 | **Agent Observability** | Monitoring, debugging, proactive alerts, data policies | [Observability](ai-engineering/agents/07_AGENT_OBSERVABILITY.md) |
+| 28 | **Redis Lease & Search** | Distributed locking, autocorrect, Elasticsearch internals | [Redis & Search](ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH.md) |
+| 29 | **Agent Deployment (ECS)** | Production infra, ECS, API flow, monitoring, cost | [Deployment Guide](ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md) |
+| 30 | **Agent Interview Prep** | Staff-level agent questions and answers | [Agent Q&A](ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md) |
+| 31 | **Harness Engineering** | Evaluation/agent harnesses, guardrails, sandboxing, verification | [Harness Engineering](ai-engineering/harness-engineering/01_HARNESS_ENGINEERING.md) |
+| 32 | **Loop Engineering** | Agentic loops, ReAct, feedback cycles, termination logic | [Loop Engineering](ai-engineering/harness-engineering/02_LOOP_ENGINEERING.md) |
 
-> 💡 **Tip:** Phase 5 is dense. Focus on **RAG → Agent Fundamentals → LangGraph → Multi-LLM** first if time is limited. Deployment and observability can be studied after the core concepts.
+> 💡 **Tip:** Phase 5 is dense. Focus on **RAG → Agent Fundamentals → LangGraph → Multi-LLM → Harness & Loop** first if time is limited. Deployment and observability can be studied after the core concepts.
 
 ### Phase 6: Cloud & Tools (1-2 weeks)
 
 | # | Topic | Why | Resources |
 |---|-------|-----|-----------|
-| 31 | **AWS** | Compute, networking, storage, messaging, security | [AWS Overview](aws-interview/README/) |
-| 32 | **Kafka** | Event streaming, partitioning, replication, exactly-once | [Kafka Q&A](tools-interview/kafka/INTERVIEW_QUESTIONS/) |
-| 33 | **Redis** | Caching, distributed locks, data structures, persistence | [Redis Q&A](tools-interview/redis/INTERVIEW_QUESTIONS/) |
-| 34 | **Elasticsearch** | Inverted index, BM25, analysis pipeline, sharding | [ES Q&A](tools-interview/elasticsearch/INTERVIEW_QUESTIONS/) |
-| 35 | **Docker** | Container runtime, namespaces, cgroups, image layering, multi-stage builds | [Docker Q&A](tools-interview/docker/INTERVIEW_QUESTIONS/) |
-| 36 | **Kubernetes** | Orchestration, scheduling, networking, RBAC, storage, production ops | [K8s Q&A](tools-interview/kubernetes/INTERVIEW_QUESTIONS/) + [Pod Lifecycle](tools-interview/kubernetes/POD_LIFECYCLE_AND_MONITORING/) + [Production Control](tools-interview/kubernetes/PRODUCTION_CONTROL/) + [Versioning](tools-interview/kubernetes/VERSIONING_MULTI_CONTAINER/) |
-| 36 | **Monitoring & Infra** | Prometheus, Grafana, Terraform | [Prometheus](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS/) + [Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS/) |
-| 37 | **Nginx & Compression** | Reverse proxy, load balancing, Gzip/Zstd/Brotli | [Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS/) + [Compression](tools-interview/compression/INTERVIEW_QUESTIONS/) |
+| 31 | **AWS** | Compute, networking, storage, messaging, security | [AWS Overview](aws-interview/README.md) |
+| 32 | **Kafka** | Event streaming, partitioning, replication, exactly-once | [Kafka Q&A](tools-interview/kafka/INTERVIEW_QUESTIONS.md) |
+| 33 | **Redis** | Caching, distributed locks, data structures, persistence | [Redis Q&A](tools-interview/redis/INTERVIEW_QUESTIONS.md) |
+| 34 | **Elasticsearch** | Inverted index, BM25, analysis pipeline, sharding | [ES Q&A](tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md) |
+| 35 | **Docker** | Container runtime, namespaces, cgroups, image layering, multi-stage builds | [Docker Q&A](tools-interview/docker/INTERVIEW_QUESTIONS.md) |
+| 36 | **Kubernetes** | Orchestration, scheduling, networking, RBAC, storage, production ops | [K8s Q&A](tools-interview/kubernetes/INTERVIEW_QUESTIONS.md) + [Pod Lifecycle](tools-interview/kubernetes/POD_LIFECYCLE_AND_MONITORING.md) + [Production Control](tools-interview/kubernetes/PRODUCTION_CONTROL.md) + [Versioning](tools-interview/kubernetes/VERSIONING_MULTI_CONTAINER.md) |
+| 36 | **Monitoring & Infra** | Prometheus, Grafana, Terraform | [Prometheus](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md) + [Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS.md) |
+| 37 | **Nginx & Compression** | Reverse proxy, load balancing, Gzip/Zstd/Brotli | [Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS.md) + [Compression](tools-interview/compression/INTERVIEW_QUESTIONS.md) |
 
 </div>
 
@@ -252,7 +260,7 @@
 | **Phase 4** | 2-3 weeks | Distributed Systems — think at scale |
 | **Phase 5** | 2-3 weeks | AI Engineering — emerging hot topic |
 | **Phase 6** | 1-2 weeks | Cloud & Tools — fill gaps |
-| **Total** | **12-18 weeks** | Full interview preparation |
+| **Total** | **13-20 weeks** | Full interview preparation |
 
 ### 💡 Study Tips
 
@@ -291,8 +299,8 @@
         <span class="module-card-title">AI Engineering</span>
     </div>
     <div class="module-card-body">
-        <span class="module-card-count">3 modules + code</span>
-        <span class="module-card-desc">RAG chatbot, MCP protocol, AI agents. From fundamentals to production deployment.</span>
+        <span class="module-card-count">4 modules + code</span>
+        <span class="module-card-desc">RAG chatbot, MCP protocol, AI agents, Harness & Loop engineering. From fundamentals to production deployment.</span>
     </div>
     <div class="module-card-footer">
         <span class="module-card-tag">RAG</span>

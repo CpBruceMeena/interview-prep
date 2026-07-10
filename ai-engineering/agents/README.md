@@ -25,7 +25,7 @@ User Goal → Agent (Think → Act → Observe) → Tools/MCP → Result
 
 ## Implementation
 
-- **[implementation/](implementation/)** — Working Python agents:
+- **[implementation/](implementation/index.md)** — Working Python agents:
   - `simple_react_agent.py` — Basic ReAct loop with tool registry
   - `orchestrated_agent.py` — Orchestrator-Worker pattern with async execution
   - `agent_with_mcp.py` — Agent discovering/using tools via MCP protocol
@@ -33,7 +33,7 @@ User Goal → Agent (Think → Act → Observe) → Tools/MCP → Result
 
 ## Tests
 
-- **[tests/](tests/)** — Pytest test suite:
+- **[tests/](tests/index.md)** — Pytest test suite:
   - `test_simple_agent.py` — Agent loop, input/output guardrails, parsing
   - `test_orchestrated_agent.py` — Worker execution, multi-agent coordination
 

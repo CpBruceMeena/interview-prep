@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](pub-sub-class-diagram.drawio)
+![](pub-sub-class-diagram.drawio)
 
 ---
 
