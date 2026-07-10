@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](inventory-management-class-diagram.drawio)
+![](inventory-management-class-diagram.drawio)
 
 ---
 

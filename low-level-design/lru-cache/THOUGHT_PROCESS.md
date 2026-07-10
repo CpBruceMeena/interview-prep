@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](lru-cache-class-diagram.drawio)
+![](lru-cache-class-diagram.drawio)
 
 ---
 

@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](movie-ticket-class-diagram.drawio)
+![](movie-ticket-class-diagram.drawio)
 
 ---
 

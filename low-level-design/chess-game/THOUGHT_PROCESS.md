@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](chess-game-class-diagram.drawio)
+![](chess-game-class-diagram.drawio)
 
 ---
 

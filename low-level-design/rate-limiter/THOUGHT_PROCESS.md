@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](rate-limiter-class-diagram.drawio)
+![](rate-limiter-class-diagram.drawio)
 
 ---
 

@@ -52,6 +52,8 @@ jobs:
 
       - name: Build site
         run: mkdocs build
+        env:
+          GOOGLE_ANALYTICS_KEY: ${{ secrets.GOOGLE_ANALYTICS_KEY }}
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

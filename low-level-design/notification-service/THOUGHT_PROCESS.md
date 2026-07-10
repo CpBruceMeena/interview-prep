@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](notification-service-class-diagram.drawio)
+![](notification-service-class-diagram.drawio)
 
 ---
 

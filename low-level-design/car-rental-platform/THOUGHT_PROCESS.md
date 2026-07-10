@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](car-rental-class-diagram.drawio)
+![](car-rental-class-diagram.drawio)
 
 ---
 

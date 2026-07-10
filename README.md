@@ -68,10 +68,11 @@
 ║  ├── job-scheduling-system         DAG · Redis Leases · Cron         ║
 ║  └── ... (12 more)                                                   ║
 ║                                                                      ║
-║  🧠 ai-engineering/           ← AI Engineering — RAG, MCP, Agents       ║
+║  🧠 ai-engineering/           ← AI Engineering — RAG, MCP, Agents      ║
 ║  ├── rag/                           RAG Knowledge Retrieval          ║
 ║  ├── mcp/                           MCP Protocol · Server Code       ║
-║  └── agents/                        AI Agent Architecture            ║
+║  ├── agents/                        AI Agent Architecture            ║
+║  └── harness-engineering/           Harness & Loop Engineering       ║
 ║                                                                      ║
 ║  🛠️ tools-interview/           ← Infrastructure & Platform Tools    ║
 ║  ├── kafka/                         12 Q · ISR · EOS · Transactions ║
@@ -329,9 +330,9 @@ PHASE 6 ─── Architecture & Security
 └─────────────────────────────────────────────────────────────────────┘
          │
          ▼
-PHASE 7 ─── ML/AI
+PHASE 7 ─── AI Engineering
 ┌─────────────────────────────────────────────────────────────────────┐
-│ RAG Learning Module → Vector search, LLM integration, fine-tuning   │
+│ RAG · MCP · Agents → Harness & Loop Engineering (emerging topics)   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -370,7 +371,8 @@ PHASE 7 ─── ML/AI
 | Language Deep-Dives | **2 (Python + Go)** |
 | RAG Guides | **7** |
 | MCP Guides | **4** |
-| Agent Guides | **1** |
+| Agent Guides | **10+** |
+| Harness & Loop Guides | **2** |
 | Tool Topics | **9** |
 | AWS Topics | **6** |
 

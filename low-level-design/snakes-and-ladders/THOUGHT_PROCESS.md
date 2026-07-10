@@ -6,7 +6,7 @@
 
 ## 📊 Class Diagram
 
-![Class Diagram](snakes-and-ladders-class-diagram.drawio)
+![](snakes-and-ladders-class-diagram.drawio)
 
 ---
 

@@ -28,7 +28,7 @@ User Query → Retrieve (find relevant docs) → Augment (add context) → Gener
 
 ## Implementation
 
-- **[implementation/](implementation/)** — Working Python RAG chatbot (FastAPI, ChromaDB, LM Studio)
+- **[implementation/](implementation/index.md)** — Working Python RAG chatbot (FastAPI, ChromaDB, LM Studio)
 - **[test_pipeline.py](test_pipeline.py)** — End-to-end pipeline verification
 
 ## Quick Start

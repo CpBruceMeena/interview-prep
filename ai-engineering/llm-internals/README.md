@@ -14,6 +14,7 @@
 | 4 | [Tokenization & Token Calculation](04_TOKENIZATION_AND_COST.md) | How tokens work — input, output, pricing, and optimization |
 | 5 | [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) | Crafting effective system prompts, role design, constraints |
 | 6 | [How Claude Makes Code Changes](06_HOW_CLAUDE_MAKES_CODE_CHANGES.md) | Step-by-step flow of code changes, debugging, and user input decisions |
+| 7 | [Cost Optimization Best Practices](07_COST_OPTIMIZATION_BEST_PRACTICES.md) | Practical strategies to use LLMs effectively while minimizing costs |
 
 ---
 
@@ -91,7 +92,7 @@ Understanding LLM internals is critical for:
 | **New to LLMs?** | [How Claude Works](01_HOW_CLAUDE_WORKS.md) |
 | **Using Claude Code?** | [Claude Code/Editor Interaction](02_CLAUDE_CODE_INTERACTION.md) |
 | **Building agents?** | [Request/Response Cycle](03_REQUEST_RESPONSE_CYCLE.md) |
-| **Optimizing costs?** | [Tokenization & Cost](04_TOKENIZATION_AND_COST.md) |
+| **Optimizing costs?** | [Cost Optimization Best Practices](07_COST_OPTIMIZATION_BEST_PRACTICES.md) (start here) or [Tokenization & Cost](04_TOKENIZATION_AND_COST.md) (deep dive) |
 | **Writing prompts?** | [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) |
 
 ---
