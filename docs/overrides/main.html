@@ -50,6 +50,85 @@
       location$.subscribe(function() { setTimeout(fixSidebarLayout, 100); });
     }
   })();
+
+  // Shared helper: navigate to the site root
+  // e.g., /interview-prep/rate-limiter/ -> /interview-prep/
+  function goHome() {
+    var m = window.location.pathname.match(/^(\/[^\/]+)/);
+    window.location.href = m ? m[1] + '/' : '/';
+  }
+
+  // Make the sidebar site title navigate to the homepage on click
+  function setupSidebarHomeLink() {
+    var title = document.querySelector('.md-nav--primary > .md-nav__title:first-child');
+    if (!title) return;
+    title.onclick = function(e) {
+      e.preventDefault();
+      goHome();
+    };
+    title.style.cursor = 'pointer';
+  }
+
+  // Make the header title (top-left "Interview Prep") navigate to the homepage
+  function setupHeaderHomeLink() {
+    var headerTitle = document.querySelector('.md-header__title');
+    if (!headerTitle) return;
+    // Only attach if it's not already an <a> link (varies by theme config)
+    if (headerTitle.tagName !== 'A') {
+      headerTitle.onclick = goHome;
+      headerTitle.style.cursor = 'pointer';
+    }
+  }
+
+  // Strip emoji characters from back button titles in the mobile drawer
+  // so the section icon (🖥️, 🧠, etc.) doesn't clutter the back button.
+  function cleanBackButtonTitles() {
+    var backButtons = document.querySelectorAll('.md-nav--primary .md-nav .md-nav__title');
+    backButtons.forEach(function(title) {
+      // The text after the .md-nav__icon chevron is what we need to clean
+      var icon = title.querySelector('.md-nav__icon');
+      if (!icon) return;
+      // Get the text nodes after the icon — these come as trailing text
+      var textNodes = [];
+      var after = icon.nextSibling;
+      while (after) {
+        if (after.nodeType === 3) textNodes.push(after); // TEXT_NODE
+        after = after.nextSibling;
+      }
+      textNodes.forEach(function(node) {
+        node.textContent = node.textContent.replace(/\p{Emoji}/gu, '').replace(/\s+/g, ' ').trim();
+      });
+      // Also clean any child elements that might contain emoji (e.g., nav counters)
+      var children = title.children;
+      for (var i = 0; i < children.length; i++) {
+        var child = children[i];
+        if (child !== icon && child.childNodes) {
+          child.childNodes.forEach(function(node) {
+            if (node.nodeType === 3) {
+              node.textContent = node.textContent.replace(/\p{Emoji}/gu, '').replace(/\s+/g, ' ').trim();
+            }
+          });
+        }
+      }
+    });
+  }
+
+  // Run both setup functions
+  function setupNavLinks() {
+    setupSidebarHomeLink();
+    setupHeaderHomeLink();
+    cleanBackButtonTitles();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupNavLinks);
+  } else {
+    setupNavLinks();
+  }
+
+  if (typeof location$ !== 'undefined') {
+    location$.subscribe(function() { setTimeout(setupNavLinks, 100); });
+  }
   </script>
 {% endblock %}
 

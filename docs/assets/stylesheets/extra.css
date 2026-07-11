@@ -679,15 +679,21 @@
    SIDEBAR — Unified design with native scrolling
    ═══════════════════════════════════════════════════════════ */
 
-/* ── 1. Hide site name header (the "Interview Prep" title above Home) ── */
-/* Target the first md-nav__title which is the site header (has for="__drawer"). */
-/* The theme renders it as plain .md-nav__title (NOT .md-nav__title--site) when */
-/* navigation.tabs is not the primary layout. */
-.md-nav--primary > .md-nav__title:first-child {
-    display: none !important;
+/* ── 1. Hide site name header on DESKTOP only ── */
+/* On desktop, the header already shows the site name, so we hide it from
+   the sidebar to avoid redundancy. On mobile, it's shown as a clickable
+   home button (styled in mobile.css). */
+@media screen and (min-width: 76.25em) {
+    .md-nav--primary > .md-nav__title:first-child {
+        display: none !important;
+    }
 }
 
-/* ── 2. Native scrolling: remove SimpleBar, use overflow-y:auto ── */
+/* ── 2. Desktop-only: native scrolling, collapsible, layout refinements ── */
+/* Material for MkDocs switches from off-canvas drawer to sticky sidebar at 76.25em */
+@media screen and (min-width: 76.25em) {
+
+/* Native scrolling: remove SimpleBar, use overflow-y:auto */
 .md-sidebar--primary .md-sidebar__scrollwrap {
     overflow-x: hidden !important;
     overflow-y: auto !important;
@@ -713,11 +719,13 @@
     background: rgba(139, 92, 246, 0.5);
 }
 
-/* ── 3. Collapsible behavior ── */
+/* Collapsible behavior */
 .md-nav--primary .md-nav__item--nested > .md-nav__toggle:not(:checked) ~ .md-nav {
     max-height: 0;
     overflow: hidden;
 }
+
+} /* end @media (min-width: 76.25em) — scrolling, collapsible only */
 
 /* ── 4. Base nav link styling (applied uniformly) ── */
 .md-nav--primary .md-nav__link {
@@ -854,7 +862,8 @@
     opacity: 0.8;
 }
 
-/* ── 8. Sidebar layout refinements ── */
+/* ── 8. Sidebar layout refinements (desktop only) ── */
+@media screen and (min-width: 76.25em) {
 .md-sidebar--primary {
     width: 20rem;
     height: 100vh;
@@ -890,6 +899,21 @@
     min-height: 0;
     padding-bottom: 0.5rem;
 }
+
+/* Source (GitHub) at bottom of sidebar — prevent position:sticky from interfering with mobile drawer */
+.md-nav__source {
+    margin-top: auto;
+    order: 999;
+    padding: 0.65rem 0.6rem;
+    background: rgba(13, 17, 23, 0.95);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    position: sticky;
+    bottom: 0;
+}
+
+} /* end @media screen and (min-width: 76.25em) */
 
 /* ── Footer ───────────────────────────────────────────────── */
 .md-footer-meta {
@@ -1071,12 +1095,12 @@
 
 @media (max-width: 480px) {
     .hero-stat {
-        min-width: 65px;
-        padding: 0.4rem 0.6rem;
+        min-width: 60px;
+        padding: 0.35rem 0.5rem;
     }
 
     .hero-stat-number {
-        font-size: 1.1rem;
+        font-size: 1rem;
     }
 
     .hero-actions {
@@ -1089,7 +1113,7 @@
     }
 
     .tech-stack {
-        grid-template-columns: 1fr;
+        grid-template-columns: 1fr 1fr;
     }
 }
 
@@ -1296,18 +1320,7 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
     display: none !important;
 }
 
-/* Source (GitHub) — pushed to bottom, styled as a fixed button */
-.md-nav__source {
-    margin-top: auto;
-    order: 999;
-    padding: 0.65rem 0.6rem;
-    background: rgba(13, 17, 23, 0.95);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
-    position: sticky;
-    bottom: 0;
-}
+/* Source (GitHub) — moved into the desktop-only @media block above. */
 
 .md-source {
     display: flex;

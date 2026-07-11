@@ -12,17 +12,13 @@
   'use strict';
 
   document.addEventListener('click', function(e) {
-    // Find the clicked nav link
     var label = e.target.closest('.md-nav__link');
     if (!label) return;
 
     // ── ONLY intercept <label> elements (section headers) ──
     // Leaf pages use <a> links — never intercept those.
-    // Without this check, closest('.md-nav__item--nested') below
-    // would find the PARENT section and redirect to its first child.
     if (label.tagName === 'A') return;
 
-    // Only handle nested section headers (not leaf pages)
     var item = label.closest('.md-nav__item--nested');
     if (!item) return;
 
@@ -31,6 +27,10 @@
 
     // If clicking the chevron icon, let it toggle normally
     if (e.target.closest('.md-nav__icon')) return;
+
+    // ── On mobile/tablet, let taps just toggle expand/collapse ──
+    // 76.1875em matches Material's own mobile-to-desktop breakpoint (minus 1px).
+    if (window.matchMedia('(max-width: 76.1875em)').matches) return;
 
     // Find the first child link inside this section
     var nav = item.querySelector(':scope > .md-nav');
