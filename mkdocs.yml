@@ -60,6 +60,7 @@ extra:
 
 extra_css:
   - assets/stylesheets/extra.css
+  - assets/stylesheets/mobile.css
 
 plugins:
   - search:

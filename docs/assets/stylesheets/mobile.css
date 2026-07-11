@@ -1,0 +1,281 @@
+/* ===========================================================================
+   Interview Prep — Mobile-Only UI Fixes
+   ===========================================================================
+   This file contains all responsive/overrides for mobile and tablet viewports.
+   All rules are strictly scoped inside @media queries so desktop is untouched.
+   Loaded AFTER extra.css so these overrides take precedence.
+   =========================================================================== */
+
+/* ── Tablet / small desktop (768px and below) ── */
+@media (max-width: 768px) {
+
+    /* Module cards — tighter spacing */
+    .module-card {
+        padding: 1rem;
+    }
+    .module-card-header {
+        gap: 0.4rem;
+    }
+    .module-card-icon {
+        font-size: 1.4rem;
+    }
+    .module-card-title {
+        font-size: 0.9rem;
+    }
+
+    /* Usage cards — compact */
+    .usage-card {
+        padding: 0.85rem;
+    }
+
+    /* Tech stack — tighter grid */
+    .tech-stack {
+        gap: 0.6rem;
+    }
+    .tech-item {
+        padding: 0.75rem;
+    }
+    .tech-icon {
+        font-size: 1.4rem;
+    }
+
+    /* Content typography — scale down */
+    .md-typeset h1 {
+        font-size: 1.6rem !important;
+    }
+    .md-typeset h2 {
+        font-size: 1.2rem;
+    }
+    .md-typeset h3 {
+        font-size: 1rem;
+    }
+
+    /* Code blocks — smaller font */
+    .md-typeset pre > code {
+        font-size: 0.68rem;
+    }
+
+    /* Feedback widget — edge-to-edge */
+    .feedback-widget {
+        margin-left: -0.5rem;
+        margin-right: -0.5rem;
+        border-radius: 0.5rem;
+    }
+
+    /* Roadmap tables: horizontal scroll */
+    .roadmap-timeline {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        padding-bottom: 0.5rem;
+    }
+    .roadmap-timeline table:not([class]) {
+        min-width: 460px;
+    }
+}
+
+/* ── Phone (480px and below) ── */
+@media (max-width: 480px) {
+
+    /* Hero stats — compact */
+    .hero-stat {
+        min-width: 60px;
+        padding: 0.35rem 0.5rem;
+    }
+    .hero-stat-number {
+        font-size: 1rem;
+    }
+    .hero-stat-label {
+        font-size: 0.5rem;
+    }
+
+    /* Hero actions — stack vertically */
+    .hero-actions {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    .hero-button {
+        justify-content: center;
+        padding: 0.55rem 1.2rem;
+        font-size: 0.8rem;
+    }
+
+    /* Tech stack — 2-col grid */
+    .tech-stack {
+        grid-template-columns: 1fr 1fr;
+        gap: 0.5rem;
+    }
+    .tech-item {
+        padding: 0.65rem 0.5rem;
+    }
+    .tech-name {
+        font-size: 0.75rem;
+    }
+    .tech-desc {
+        font-size: 0.62rem;
+    }
+
+    /* Skill cards — compact */
+    .skill-card {
+        padding: 0.75rem 1rem;
+    }
+    .skill-card-title {
+        font-size: 0.82rem;
+    }
+    .skill-card-desc {
+        font-size: 0.68rem;
+    }
+
+    /* Roadmap tables: horizontal scroll */
+    .roadmap-timeline table:not([class]) {
+        min-width: 460px;
+    }
+    .roadmap-timeline {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        padding-bottom: 0.5rem;
+    }
+    .roadmap-section {
+        padding: 0.75rem 1rem;
+    }
+}
+
+/* ── Ultra-small screens (380px and below) ── */
+@media (max-width: 380px) {
+
+    .md-grid {
+        padding: 0 1rem;
+    }
+
+    .hero-stats {
+        gap: 0.35rem;
+    }
+    .hero-stat {
+        min-width: 50px;
+        padding: 0.3rem 0.4rem;
+    }
+    .hero-stat-number {
+        font-size: 0.9rem;
+    }
+    .hero-stat-label {
+        font-size: 0.45rem;
+    }
+
+    .skill-level-header {
+        padding-left: 3rem;
+        font-size: 0.75rem;
+    }
+    .skill-cards {
+        padding-left: 2.5rem;
+    }
+    .skill-timeline::before {
+        left: 1.2rem;
+    }
+}
+
+/* ── Mobile drawer: back button titles ── */
+/* In the mobile off-canvas drawer, when you navigate into a sub-section
+   (e.g., "Low-Level Design"), Material renders a .md-nav__title at the top
+   that acts as a back button. extra.css globally sets tiny uppercase text
+   with low opacity, making this button look like an empty box.
+   We override it here for mobile only (≤ 76.1875em). */
+@media (max-width: 76.1875em) {
+
+/* Targets back button titles inside nested .md-nav elements (not the top-level site name) */
+.md-nav--primary .md-nav .md-nav__title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--md-default-fg-color);
+    padding: 0.7rem 0.8rem;
+    opacity: 1;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 1.25rem;
+    line-height: normal;
+    height: auto;
+    min-height: 2.8rem;
+}
+
+/* Back button icon (chevron) — ensure visible and spaced from heading */
+/* Critical: Material uses position: absolute on mobile nav icons, which takes
+   them out of the flex flow and makes gap/margin useless. We must force
+   position: relative so the icon flows naturally as a flex child. */
+.md-nav--primary .md-nav .md-nav__title .md-nav__icon {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    width: 1.2rem;
+    height: 1.2rem;
+    opacity: 0.6;
+    flex-shrink: 0;
+    margin: 0 !important;
+    float: none !important;
+    position: relative !important;
+    left: auto !important;
+    top: auto !important;
+    transform: none !important;
+}
+
+} /* end @media max-width: 76.1875em */
+
+/* ── Mobile top padding: prevent content from touching browser chrome ── */
+@media (max-width: 76.1875em) {
+    .md-main__inner {
+        padding-top: 0.5rem;
+    }
+}
+
+/* ── Mobile drawer: render on top of the header ── */
+/* On mobile, the fixed header bar (z-index: 10) overlays the top of the
+   sidebar drawer by default. Bump the drawer's z-index above the header
+   so it slides in on top of everything — including the navbar — making
+   the site title and back button headings fully visible. */
+@media (max-width: 76.1875em) {
+    .md-sidebar--primary {
+        z-index: 20;
+    }
+}
+
+/* ── Sidebar site title on mobile — shown and clickable ── */
+@media (max-width: 76.1875em) {
+    .md-nav--primary > .md-nav__title:first-child {
+        display: flex !important;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem 0.8rem;
+        font-size: 0.95rem;
+        font-weight: 700;
+        text-transform: none;
+        letter-spacing: 0;
+        color: var(--md-default-fg-color);
+        opacity: 1;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+        cursor: pointer;
+        transition: background 0.15s;
+        line-height: normal;
+        min-height: 3rem;
+    }
+    .md-nav--primary > .md-nav__title:first-child:hover {
+        background: rgba(255,255,255,0.04);
+    }
+    .md-nav--primary > .md-nav__title:first-child:active {
+        background: rgba(255,255,255,0.06);
+    }
+    /* Hide the logo/book icon — only show the "Interview Prep" text */
+    .md-nav--primary > .md-nav__title:first-child .md-nav__button {
+        display: none !important;
+    }
+}
+
+/* ── Generic responsive table fallback (mobile only) ── */
+@media (max-width: 768px) {
+    .md-typeset table:not([class]) {
+        display: block;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        max-width: 100%;
+    }
+}

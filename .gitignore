@@ -20,6 +20,9 @@ build/
 .DS_Store
 Thumbs.db
 
+# Standalone prototype (not part of the MkDocs site)
+index.html
+
 # Environment
 .env
 .venv/

@@ -269,7 +269,7 @@
 - **Build, don't just read** — run the code for every LLD project
 - **Focus Phase 5** — AI agent questions are increasingly common at Staff/Principal level
 - **The rubric matters** — each question has an evaluation table showing what interviewers expect
-- **Use search** — press <kbd>Ctrl</kbd>+<kbd>K</kbd> to search across all 200+ questions instantly
+- **Use search** — press <kbd>Ctrl</kbd>+<kbd>K</kbd> / <kbd>Cmd</kbd>+<kbd>K</kbd> on desktop, or tap the 🔍 search icon in the header on mobile
 
 ---
 
@@ -385,7 +385,7 @@
     <div class="usage-card-icon">🔍</div>
     <div class="usage-card-content">
         <h4>Find Topics Fast</h4>
-        <p>Press <kbd>Ctrl</kbd>+<kbd>K</kbd> or <kbd>Cmd</kbd>+<kbd>K</kbd> to search across ALL 90+ questions instantly.</p>
+        <p>Press <kbd>Ctrl</kbd>+<kbd>K</kbd> / <kbd>Cmd</kbd>+<kbd>K</kbd> on desktop, or tap the 🔍 search icon in the header on mobile.</p>
     </div>
 </div>
 
