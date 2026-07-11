@@ -7,15 +7,16 @@
 ## Table of Contents
 
 1. [Core Concepts](#1-core-concepts)
-2. [Deployment Strategies](#2-deployment-strategies)
-3. [Frontend Deployment](#3-frontend-deployment)
-4. [Backend Deployment by Language](#4-backend-deployment-by-language)
-5. [Mobile Deployment](#5-mobile-deployment)
-6. [Monolith Architecture](#6-monolith-architecture)
-7. [Microservices Architecture](#7-microservices-architecture)
-8. [CI/CD Pipeline by Tool](#8-cicd-pipeline-by-tool)
-9. [Production Best Practices](#9-production-best-practices)
-10. [Interview Questions](#10-interview-questions)
+2. [End-to-End Flow: Repository → Production](#2-end-to-end-flow-repository--production)
+3. [Deployment Strategies](#3-deployment-strategies)
+4. [Frontend Deployment](#4-frontend-deployment)
+5. [Backend Deployment by Language](#5-backend-deployment-by-language)
+6. [Mobile Deployment](#6-mobile-deployment)
+7. [Monolith Architecture](#7-monolith-architecture)
+8. [Microservices Architecture](#8-microservices-architecture)
+9. [CI/CD Pipeline by Tool](#9-cicd-pipeline-by-tool)
+10. [Production Best Practices](#10-production-best-practices)
+11. [Interview Questions](#11-interview-questions)
 
 ---
 
@@ -50,7 +51,319 @@ Jenkinsfile                     # Jenkins
 
 ---
 
-## 2. Deployment Strategies
+## 2. End-to-End Flow: Repository → Production
+
+This section traces the complete journey of a code change — from a developer's first commit to running in production — across different project types and architectures.
+
+---
+
+### 2.1 The Complete Pipeline (Overview)
+
+Every deployment follows the same high-level flow regardless of tech stack:
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ Developer │───▶│   Git    │───▶│    CI    │───▶│  Build & │───▶│   CD /   │───▶│ Production│
+│  Commit   │    │  Repo    │    │  (Test)  │    │  Package  │    │  Deploy  │    │          │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+     │              │              │              │              │              │
+     │ push / PR    │ trigger      │ run tests    │ create       │ roll out    │ serve users
+     │              │ webhook      │ & lint       │ artifact     │ to env      │
+```
+
+**Each stage in detail:**
+
+| Stage | What Happens | Output |
+|-------|-------------|--------|
+| **1. Developer Commit** | Write code, run pre-commit hooks (lint, format) | Clean commit with passing pre-checks |
+| **2. Git Repo** | Push to remote (GitHub/GitLab/Bitbucket). Triggers webhook | Code stored with commit hash (e.g., `abc1234`) |
+| **3. CI (Test)** | Clone repo → Install deps → Lint → Unit tests → Integration tests | Test report + coverage |
+| **4. Build & Package** | Compile/transpile → Docker build / bundle → Push to registry | Artifact (Docker image, `.js` bundle, `.ipa`, `.aab`) |
+| **5. CD / Deploy** | Promote artifact through environments (dev → staging → canary → prod) | Running application |
+| **6. Production** | Serve traffic, monitor metrics, watch for alerts | Live service |
+
+---
+
+### 2.2 Branch Strategy & Environment Mapping
+
+How branches map to environments determines the deployment flow.
+
+```
+Branch                    Environment     Deploy Trigger
+──────────────────────────────────────────────────────────
+feature/xxx               None            CI only (tests + lint)
+                     
+develop / main ──────────▶ Dev / Staging   Auto-deploy on merge
+                     
+release/v1.2 ────────────▶ Staging         Manual approval gate
+                     
+tag: v1.2.0 ──────────────▶ Production      Tag triggers prod deploy
+```
+
+**Trunk-Based Development (CI/CD-friendly):**
+
+```
+Developer                 main                  Production
+─────────────────────────────────────────────────────────────
+                    ┌──────────┐              ┌──────────┐
+feature/short-lived ─▶│  main    │──(auto)────▶│  Prod    │
+  (PR + merge)      │  branch  │              │          │
+                    └──────────┘              └──────────┘
+                         │                        │
+                    Short-lived feature flags   Canary deploy
+                    keep incomplete code safe   monitors health
+```
+
+---
+
+### 2.3 Flow by Project Type
+
+#### Frontend (React / Next.js / Vue)
+
+```
+Developer                    GitHub                    CI (GitHub Actions)              CDN / Hosting
+────────────────────────────────────────────────────────────────────────────────────────────────────
+         │                      │                            │                              │
+         │-- git push -------▶  │                            │                              │
+         │                      │-- push webhook ---------▶  │                              │
+         │                      │                            │                              │
+         │                      │                            ├─ npm ci                      │
+         │                      │                            ├─ npm run lint                │
+         │                      │                            ├─ npm test -- --coverage      │
+         │                      │                            ├─ npm run build               │
+         │                      │                            │   (produces dist/)           │
+         │                      │                            ├─ Upload to S3                │
+         │                      │                            ├─ Invalidate CloudFront       │
+         │                      │                            │                              │
+         │                      │                            │──▶ Asset uploaded ──────────▶│
+         │                      │                            │                              │── User hits URL
+         │                      │                            │                              │── CDN serves new files
+         │                      │                            │                              │
+```
+
+**Real Example — Tracing a Commit:**
+
+```
+1. Developer runs: git add . && git commit -m "feat: add dark mode"
+2. Developer runs: git push origin feat/dark-mode
+3. GitHub creates PR #123
+4. CI triggers on push: runs lint + test + build
+5. Reviewer approves PR
+6. Developer clicks "Merge pull request"
+7. CI triggers on main branch:
+   - Runs all tests again
+   - Builds production bundle (dist/)
+   - Uploads to S3 bucket
+   - Invalidates CloudFront cache
+8. Production serves new dark mode feature
+```
+
+---
+
+#### Backend (Node.js / Python / Go / Java / Rust)
+
+```
+Developer                    GitHub                    CI (GitHub Actions)              Container Registry          Kubernetes
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+         │                      │                            │                              │                          │
+         │-- git push -------▶  │                            │                              │                          │
+         │                      │-- push webhook ---------▶  │                              │                          │
+         │                      │                            │                              │                          │
+         │                      │                            ├─ Install deps                │                          │
+         │                      │                            ├─ Run linter                  │                          │
+         │                      │                            ├─ Run unit tests              │                          │
+         │                      │                            ├─ Docker build               │                          │
+         │                      │                            ├─ Docker push ─────────────▶ │                          │
+         │                      │                            │                              │                          │
+         │                      │                            │──▶ Image stored ────────────▶│                          │
+         │                      │                            │                              │                          │
+         │                      │                            ├─ kubectl set image ──────────────────────────────────▶ │
+         │                      │                            │                              │                          │
+         │                      │                            │                              │                          ├─ Rolling update
+         │                      │                            │                              │                          ├─ Health check
+         │                      │                            │                              │                          ├─ Ready → serve
+         │                      │                            │                              │                          │
+```
+
+**Real Example — Tracing a Commit (Backend):**
+
+```
+1. Developer pushes to main on GitHub
+2. GitHub triggers GitHub Actions workflow:
+   Job 1 — Test:
+     - Checkout code
+     - Install dependencies
+     - Run linter (ruff/golangci-lint/eslint)
+     - Run unit tests with coverage
+     - Run integration tests (with test database)
+   Job 2 — Build & Push:
+     - needs: test
+     - Build Docker image with commit SHA tag: myapp:abc1234
+     - Push to Docker Hub / ECR / GHCR
+   Job 3 — Deploy:
+     - needs: build-and-push
+     - Update Kubernetes deployment:
+       kubectl set image deployment/myapp myapp=myapp:abc1234
+3. Kubernetes performs rolling update:
+   - Creates new pod with new image
+   - Waits for readiness probe to pass
+   - Terminates old pod
+4. Service is now running the new code
+```
+
+---
+
+#### Mobile (iOS / Android)
+
+```
+Developer                    GitHub                    CI (GitHub Actions / Bitrise)        App Store / Play Store
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+         │                      │                            │                                    │
+         │-- git push -------▶  │                            │                                    │
+         │                      │-- push webhook ---------▶  │                                    │
+         │                      │                            │                                    │
+         │                      │                            ├─ Install dependencies               │
+         │                      │                            ├─ Run linter + tests                │
+         │                      │                            ├─ Build (archive / bundle)          │
+         │                      │                            ├─ Sign with certificate             │
+         │                      │                            ├─ Upload to TestFlight / Play       │
+         │                      │                            │                                    │
+         │                      │                            │──▶ App uploaded ──────────────────▶│
+         │                      │                            │                                    ├─ Internal testing
+         │                      │                            │                                    ├─ Alpha / Closed beta
+         │                      │                            │                                    ├─ Open beta
+         │                      │                            │                                    ├─ Submit for review
+         │                      │                            │                                    ├─ Phased rollout
+         │                      │                            │                                    │
+```
+
+---
+
+### 2.4 Monolith Flow
+
+```
+┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
+│  Dev   │──▶│  PR    │──▶│  CI    │──▶│ Build  │──▶│ Stage  │──▶│  Prod  │──▶│  Live  │
+│ Commit │   │ Review │   │  Test  │   │ Image  │   │ Deploy │   │Deploy  │   │  Site  │
+└────────┘   └────────┘   └────────┘   └────────┘   └────────┘   └────────┘   └────────┘
+                                                           │            │
+                                                     Manual approval   Blue-Green
+```
+
+**Key characteristics:**
+- Single pipeline for the entire application
+- One artifact (one Docker image) that contains everything
+- Longer build + test time (15-30+ min for large monoliths)
+- Rollback means reverting the entire application
+- Database migrations must be backward-compatible
+
+---
+
+### 2.5 Microservices Flow
+
+```
+Service A (Python FastAPI):
+┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
+│  CI    │──▶│ Build  │──▶│ Push   │──▶│ Deploy │──▶│  Live  │
+│  Test  │   │ Image  │   │ ECR    │   │ K8s    │   │ Service│
+└────────┘   └────────┘   └────────┘   └────────┘   └────────┘
+
+Service B (Go):
+┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
+│  CI    │──▶│ Build  │──▶│ Push   │──▶│ Deploy │──▶│  Live  │
+│  Test  │   │ Image  │   │ ECR    │   │ K8s    │   │ Service│
+└────────┘   └────────┘   └────────┘   └────────┘   └────────┘
+
+Service C (Java Spring Boot):
+┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
+│  CI    │──▶│ Build  │──▶│ Push   │──▶│ Deploy │──▶│  Live  │
+│  Test  │   │ Image  │   │ ECR    │   │ K8s    │   │ Service│
+└────────┘   └────────┘   └────────┘   └────────┘   └────────┘
+
+Each service has its OWN independent pipeline. They deploy independently.
+```
+
+**Deploying a coordinated change across services:**
+
+```
+1. Developer commits changes to Service A and Service B in separate PRs
+2. Service A PR merges → CI builds → deploys Service A v2 (with backward-compatible API)
+3. Service B PR merges → CI builds → deploys Service B v2 (now calls Service A v2's new endpoint)
+4. Both services are updated without downtime because:
+   - Service A's new endpoint is additive (old + new both work)
+   - Service B's change only uses the new endpoint after Service A is confirmed healthy
+```
+
+---
+
+### 2.6 Deployment Pipeline Visualization — Full Detail
+
+Here is what a complete GitHub Actions → Kubernetes pipeline looks like step by step:
+
+```
+GitHub Repository                          GitHub Actions                         Kubernetes Cluster
+┌──────────────────────┐              ┌────────────────────────────┐         ┌──────────────────────────┐
+│                      │              │                            │         │                          │
+│  main branch         │──push────▶   │  Job 1: Test               │         │  ┌──────────────────┐    │
+│  ┌────────────────┐  │              │  ├── Checkout code         │         │  │  Namespace: prod  │    │
+│  │ backend/main.py │  │              │  ├── pip install          │         │  │                   │    │
+│  │ frontend/       │  │              │  ├── pytest               │         │  │  Service: myapp   │    │
+│  │ Dockerfile      │  │              │  └── Upload coverage      │         │  │  ┌─────────────┐  │    │
+│  │ deploy.yml      │  │              │                            │         │  │  │ Pod (v2)    │  │    │
+│  └────────────────┘  │              │  Job 2: Build & Push       │         │  │  │ image: v2   │  │    │
+│                      │              │  ├── Docker build -t v2    │         │  │  │ ready: yes   │  │    │
+│  PR #123             │              │  ├── Docker push to ECR    │         │  │  └─────────────┘  │    │
+│  feat/add-payment    │              │  └── Tag image: v2         │         │  │  ┌─────────────┐  │    │
+│  (awaiting review)   │              │                            │         │  │  │ Pod (v1)    │  │    │
+│                      │              │  Job 3: Deploy             │         │  │  │ image: v1   │  │    │
+│  ✓ lint passes       │              │  ├── kubectl set image     │──────▶  │  │  │ draining    │  │    │
+│  ✓ tests pass        │              │  ├── kubectl rollout status│         │  │  └─────────────┘  │    │
+│  ✓ 2 approvals       │              │  ├── kubectl get pods      │         │  │                   │    │
+│                      │              │  └── Health check: pass    │         │  │  Ingress ──▶ Users │    │
+└──────────────────────┘              └────────────────────────────┘         └──────────────────────────┘
+```
+
+---
+
+### 2.7 Artifact Promotion Across Environments
+
+Every artifact goes through a promotion pipeline where it is validated at each stage before progressing:
+
+```
+Commit: abc1234
+               
+Build: myapp:abc1234
+   │
+   ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Dev        │────▶│  Staging    │────▶│  Canary     │────▶│  Production │
+│             │     │             │     │             │     │             │
+│ Auto-deploy │     │ Auto-deploy │     │ 5% traffic  │     │ 100% traffic│
+│ on merge    │     │ smoke tests │     │ monitored   │     │ full rollout│
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+      │                    │                    │                    │
+      │                    │                    │                    │
+      ▼                    ▼                    ▼                    ▼
+  Unit tests           E2E tests           Metrics check        Alert threshold
+  Integration tests    Performance tests   Error budget         Monitoring
+```
+
+---
+
+### 2.8 Key Takeaway
+
+The end-to-end flow is the same pattern repeated across all project types:
+
+> **Code → Commit → CI (Test) → Build (Artifact) → CD (Promote) → Production (Serve)**
+
+The differences are only in the specific tools and artifacts:
+- Frontend: `npm build` → `dist/` → S3/CDN
+- Backend: `docker build` → image → Kubernetes
+- Mobile: `xcodebuild` → `.ipa` → TestFlight → App Store
+
+---
+
+## 3. Deployment Strategies
 
 | Strategy | Mechanism | Zero-Downtime | Rollback Speed | Risk |
 |----------|-----------|:---:|:---:|:---:|
@@ -102,7 +415,7 @@ if (featureFlags.isEnabled('new-checkout-flow')) {
 
 ---
 
-## 3. Frontend Deployment
+## 4. Frontend Deployment
 
 ### React / Next.js / Vue / Angular
 
@@ -165,7 +478,7 @@ jobs:
 
 ---
 
-## 4. Backend Deployment by Language
+## 5. Backend Deployment by Language
 
 ### 4.1 Node.js / TypeScript
 
@@ -312,7 +625,7 @@ CMD ["/myapp"]
 
 ---
 
-## 5. Mobile Deployment
+## 6. Mobile Deployment
 
 ### iOS (Swift / SwiftUI / UIKit)
 
@@ -368,7 +681,7 @@ end
 
 ---
 
-## 6. Monolith Architecture
+## 7. Monolith Architecture
 
 ### Characteristics
 
@@ -420,7 +733,7 @@ ALTER TABLE users DROP COLUMN email_verified_legacy;
 
 ---
 
-## 7. Microservices Architecture
+## 8. Microservices Architecture
 
 ### Characteristics
 
@@ -523,7 +836,7 @@ spec:
 
 ---
 
-## 8. CI/CD Pipeline by Tool
+## 9. CI/CD Pipeline by Tool
 
 ### GitHub Actions
 
@@ -680,7 +993,7 @@ pipeline {
 
 ---
 
-## 9. Production Best Practices
+## 10. Production Best Practices
 
 ### Security
 
@@ -728,7 +1041,7 @@ Deploy Gate Checks (automated):
 
 ---
 
-## 10. Interview Questions
+## 11. Interview Questions
 
 ### Beginner
 
