@@ -312,6 +312,7 @@ nav:
     - Terraform: tools-interview/terraform/INTERVIEW_QUESTIONS.md
     - Nginx: tools-interview/nginx/INTERVIEW_QUESTIONS.md
     - Compression: tools-interview/compression/INTERVIEW_QUESTIONS.md
+    - CI/CD Deployment: tools-interview/ci-cd-deployment/DEPLOYMENT_GUIDE.md
 
   - 🖥️ CS Core:
     - Overview: cs-interview/README.md
