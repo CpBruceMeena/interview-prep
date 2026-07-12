@@ -29,6 +29,12 @@
          └───────────────────────────────────────────┘
 ```
 
+<p align="center">
+  <img src="../../../assets/videos/langgraph-flow.gif" alt="Animated LangGraph Agent Flow Diagram" width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" />
+  <br/>
+  <em>🎬 Animated LangGraph agent flow — created with <a href="https://remotion.dev">Remotion</a>. Nodes appear sequentially with animated edges showing the routing logic (START → LLM → Tools/Error/END).</em>
+</p>
+
 ### 1.1 LangGraph vs LangChain vs Other Frameworks
 
 | Framework | Paradigm | State Management | Best For |

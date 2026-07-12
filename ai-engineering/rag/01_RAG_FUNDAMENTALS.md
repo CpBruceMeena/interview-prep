@@ -51,6 +51,12 @@
     └──────────┘   └────────────┘   └──────────┘
 ```
 
+<p align="center">
+  <img src="../../../assets/videos/rag-pipeline.gif" alt="Animated RAG Pipeline Diagram" width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" />
+  <br/>
+  <em>🎬 Animated RAG Pipeline — Data Ingestion → Vector Store → Query Pipeline → Prompt Assembly → LLM → Answer. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 3. COMPONENT DEEP DIVE

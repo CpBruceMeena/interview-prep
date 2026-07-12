@@ -652,6 +652,12 @@ Rider Requests Ride
     └── If no driver found → expand radius to 5km → 10km
 ```
 
+<p align="center">
+  <img src="../../../assets/videos/cab-booking-sequence.gif" alt="Animated Cab Booking Sequence Diagram" width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" />
+  <br/>
+  <em>🎬 Animated Cab Booking Sequence — Rider Request → Geo Matching → Driver Dispatch → Trip Creation → Kafka Event Pipeline. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## ▶️ How to Run

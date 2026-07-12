@@ -30,6 +30,12 @@ User Goal
 └─────────────────────────────────────────────────────┘
 ```
 
+<p align="center">
+  <img src="../../../assets/videos/agent-react-loop.gif" alt="Animated Agent ReAct Loop Diagram" width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" />
+  <br/>
+  <em>🎬 Animated Agent ReAct Loop — Perceive → Reason → Plan → Act → Observe cycle with tool call pipeline. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ### 1.1 Agent vs Workflow
 
 | Dimension | Workflow | Agent |
