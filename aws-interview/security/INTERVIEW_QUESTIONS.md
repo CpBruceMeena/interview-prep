@@ -139,6 +139,17 @@ aws sts assume-role \
 | **Cross-account access** | Designs trust policies with conditions (MFA, source IP, VPC endpoint) |
 | **STS assume-role** | Understands temporary credentials, session duration limits |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-iam-permission-boundary.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated IAM Permission Boundary Flow — policy evaluation chain: DENY always wins, boundaries cap max permissions — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 2. IAM: Least Privilege at Scale
@@ -305,6 +316,19 @@ aws rolesanywhere create-profile \
 # 4. Application-specific keys (per microservice)
 
 # Encrypt S3 object:
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-kms-envelope-encryption.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated KMS Envelope Encryption — CMK encrypts DEK, DEK encrypts data, encrypted DEK stored alongside ciphertext — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
 kms_key = 'arn:aws:kms:us-east-1:123456789:key/abc-123'
 response = kms.generate_data_key(KeyId=kms_key, KeySpec='AES_256')
 plaintext_dek = response['Plaintext']      # Use for encryption, then discard!
@@ -465,6 +489,19 @@ Cognito Identity Pools (CIP):
   - Used WITH User Pools (not instead of)
 
 # Typical flow:
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-cognito-auth-flow.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Cognito Authentication & Authorization Flow — User Pool → JWT → Identity Pool → AWS credentials → Resources — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
 # User → User Pool (authenticate) → JWT tokens
 # JWT → Identity Pool (exchange for AWS credentials)
 # AWS credentials → access S3, DynamoDB, API Gateway
@@ -1014,6 +1051,19 @@ Member Accounts (50 accounts, 3 regions each):
 #   - Enable CIS, PCI-DSS, AWS Foundational Best Practices standards
 
 # Centralized view:
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-guardduty-multi-account.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated GuardDuty Multi-Account Threat Detection — 50 member accounts report to delegated admin with auto-remediation — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
 # Security Hub → EventBridge → Auto-remediation
 ```
 

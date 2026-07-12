@@ -74,6 +74,18 @@ Bounded Contexts (grouped by ubiquitous language):
 
 **Shared Data — User Profiles Across Contexts:**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-microservices-decomposition.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Microservices Decomposition — Monolith → Bounded Contexts with Anti-Corruption Layer. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
+
 ```yaml
 The problem: Every context needs SOME user data, but they can't all
              share the User table.
@@ -203,6 +215,18 @@ Write Side (Command Model)                  Read Side (Query Model)
 ```
 
 **Command Model (Aggregate):**
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-cqrs-event-sourcing.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — CQRS + Event Sourcing — Command → Aggregate → Event Store → Projector → Materialized View. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 ```python
 @aggregate
@@ -400,6 +424,16 @@ When to use both:
 5. **Idempotency & Exactly-Once**: Idempotency key stored in DB (unique constraint). Retry: check key before processing. Exactly-once requires: idempotent producer + transactional outbox + dedup consumer.
 
 6. **Circuit Breaker & Bulkhead**: Circuit states: Closed (normal) → Open (fail threshold reached, reject immediately) → Half-Open (probing). Bulkhead: separate thread pools per dependency (one failing dependency doesn't exhaust all threads).
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-circuit-breaker.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Circuit Breaker Pattern — Closed → Open → Half-Open states protecting against cascading failures. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 7. **Graceful Degradation**: When a dependency fails, degrade functionality (use cached data, return stale results, disable non-critical features). Netflix Hystrix: fallback methods return default values.
 

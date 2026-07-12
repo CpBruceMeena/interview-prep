@@ -284,6 +284,19 @@ Cold start latency:
   C# + VPC:        ~3s (JIT + ENI)
 ```
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-lambda-lifecycle.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Lambda Cold Start & Execution Lifecycle — download → Firecracker µVM → runtime init → handler → warm reuse — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 **Cold Start Mitigation Strategies:**
 
 ```yaml

@@ -82,6 +82,19 @@ Cost comparison:
   Minimum: waitTimeSeconds = 1 (long polling starts at 1s)
 ```
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-sqs-long-polling.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated SQS Short Polling vs Long Polling — wasteful empty responses vs batched wait with 90% cost reduction — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 ## 3. SNS: Pub/Sub, Filter Policies
 
 **Q:** "You have an SNS topic publishing order events. Multiple subscribers need different subsets: the payment service needs only 'payment_captured' events, the inventory service needs 'order_placed', and the audit service needs all events. How do filter policies work?"
@@ -152,6 +165,19 @@ Failure isolation:
   - SNS message is delivered ONCE to each subscription
 ```
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-sns-fanout.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated SNS → SQS Fan-Out Pattern — single topic fans out to multiple queues with independent retry and failure isolation — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 ## 5. EventBridge: Event Bus, Rules, Pipes
 
 **Q:** "Design an event-driven microservices architecture using EventBridge as the central event bus. How do EventBridge Pipes differ from EventBridge Rules? How do you handle schema evolution?"
@@ -189,6 +215,19 @@ Rule example:
   Source: Bus → Pattern: {"source": ["order"], "detail-type": ["OrderPlaced"]}
   → Target: multiple targets (fan-out with different patterns)
 ```
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-eventbridge-routing.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated EventBridge Event Bus & Routing — content-based rules filter events and route to Lambda, SQS, and Step Functions — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
 
 ## 6. EventBridge Schema Registry & Events
 
@@ -252,6 +291,19 @@ Resharding:
   Limits: 2 splits/merges per 24h per shard
          Total shards per stream: default 500 (soft limit)
 ```
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-kinesis-shard-scaling.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Kinesis Shard Allocation & Resharding — partition key hashing, hot key throttling, and split to redistribute load — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
 
 ## 8. Kinesis Enhanced Fan-Out & EFO
 

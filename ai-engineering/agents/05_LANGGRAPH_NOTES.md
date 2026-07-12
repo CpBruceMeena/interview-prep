@@ -29,6 +29,15 @@
          └───────────────────────────────────────────┘
 ```
 
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/langgraph-flow.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated LangGraph agent flow — created with <a href="https://remotion.dev">Remotion</a>. Nodes appear sequentially with animated edges showing the routing logic (START → LLM → Tools/Error/END).</em>
+</p>
+
 ### 1.1 LangGraph vs LangChain vs Other Frameworks
 
 | Framework | Paradigm | State Management | Best For |

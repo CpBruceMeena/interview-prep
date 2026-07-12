@@ -1,0 +1,5 @@
+node_modules/
+dist/
+out/
+.remotion/
+*.mp4

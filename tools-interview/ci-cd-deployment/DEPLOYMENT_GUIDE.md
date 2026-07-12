@@ -73,6 +73,18 @@ Every deployment follows the same high-level flow regardless of tech stack:
 
 **Each stage in detail:**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/cicd-end-to-end-pipeline.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — CI/CD Pipeline — Code → Commit → CI (Test) → Build (Artifact) → CD (Promote) → Production (Serve). Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
+
 | Stage | What Happens | Output |
 |-------|-------------|--------|
 | **1. Developer Commit** | Write code, run pre-commit hooks (lint, format) | Clean commit with passing pre-checks |
@@ -143,6 +155,18 @@ Developer                    GitHub                    CI (GitHub Actions)      
 
 **Real Example — Tracing a Commit:**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/cicd-frontend-pipeline.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Frontend Deployment — Developer → GitHub → CI → Build → S3/CloudFront CDN. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
+
 ```
 1. Developer runs: git add . && git commit -m "feat: add dark mode"
 2. Developer runs: git push origin feat/dark-mode
@@ -186,6 +210,18 @@ Developer                    GitHub                    CI (GitHub Actions)      
 ```
 
 **Real Example — Tracing a Commit (Backend):**
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/cicd-backend-pipeline.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Backend Deployment — Dockerized service pipeline from commit to Kubernetes. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 ```
 1. Developer pushes to main on GitHub
@@ -352,6 +388,18 @@ Build: myapp:abc1234
 
 ### 2.8 Key Takeaway
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/cicd-artifact-promotion.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Artifact Promotion — Dev → Staging → Canary → Production with validation gates. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
+
 The end-to-end flow is the same pattern repeated across all project types:
 
 > **Code → Commit → CI (Test) → Build (Artifact) → CD (Promote) → Production (Serve)**
@@ -390,6 +438,18 @@ Rollback: Switch back to Blue.
 
 ### Canary Release
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/cicd-blue-green-deployment.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Blue-Green Deployment — Two identical environments with instant switch and rollback. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
+
 ```
 Users ─▶ Load Balancer ──── 90% ──▶ Old Version (v1)
                            └── 10% ──▶ New Version (v2)
@@ -399,6 +459,18 @@ If degraded → rollback instantly.
 ```
 
 ### Feature Flags (Feature Toggles)
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/cicd-canary-release.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Canary Release — Progressive traffic shift with metric-based gates. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 ```javascript
 // Code is deployed but feature is off
