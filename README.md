@@ -180,7 +180,7 @@
 ## 🛠️ **Tools & Platforms** — Staff-Level Interview Q&A
 
 <details>
-<summary><b>Click to expand — 9 deep-dive tool topics</b></summary>
+<summary><b>Click to expand — 11 deep-dive tool topics</b></summary>
 
 <br>
 
@@ -189,7 +189,9 @@
 | **[Kafka](tools-interview/kafka/INTERVIEW_QUESTIONS.md)** | 12 Q | Log internals, ISR, EOS, rebalancing, Streams |
 | **[Redis](tools-interview/redis/INTERVIEW_QUESTIONS.md)** | 12 Q | Data structures, persistence, sentinel, cluster |
 | **[Elasticsearch](tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md)** | 8 Q | Inverted index, sharding, query DSL |
-| **[Docker & K8s](tools-interview/docker-kubernetes/INTERVIEW_QUESTIONS.md)** | 8 Q | Container runtime, scheduler, networking, RBAC |
+| **[Docker](tools-interview/docker/INTERVIEW_QUESTIONS.md)** | 8 Q | Container runtime, networking, multi-stage builds |
+| **[Kubernetes](tools-interview/kubernetes/INTERVIEW_QUESTIONS.md)** | 12+ Q | Scheduler, RBAC, pod lifecycle, monitoring |
+| **[CI/CD & Deployment](tools-interview/ci-cd-deployment/DEPLOYMENT_GUIDE.md)** | Guide | Frontend, backend, mobile, monolith, microservices |
 | **[MongoDB](tools-interview/mongodb/INTERVIEW_QUESTIONS.md)** | 6 Q | Document model, replica sets, aggregation |
 | **[Prometheus & Grafana](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md)** | 8 Q | TSDB internals, PromQL, Thanos |
 | **[Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS.md)** | 8 Q | State management, modules, providers |
@@ -368,12 +370,14 @@ PHASE 7 ─── AI Engineering
 | LLD Projects | **18** |
 | Staff-Level Questions | **200+** |
 | CS Core Topics | **8** |
-| Language Deep-Dives | **2 (Python + Go)** |
+| Language Deep-Dives | **3 (Python + Go + Java)** |
 | RAG Guides | **7** |
-| MCP Guides | **4** |
-| Agent Guides | **10+** |
+| MCP Guides | **5** |
+| Agent Guides | **11** |
+| LLM Internals | **7** |
 | Harness & Loop Guides | **2** |
-| Tool Topics | **9** |
+| Tool Topics | **11** |
+| CI/CD & Deployment Guides | **1** |
 | AWS Topics | **6** |
 
 </div>
