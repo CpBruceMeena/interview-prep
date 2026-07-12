@@ -9,8 +9,11 @@ build/
 # Pytest
 .pytest_cache/
 
-# IDE
+# IDE — JetBrains
 .idea/
+*.iml
+
+# IDE — Other
 .vscode/
 *.swp
 *.swo
@@ -20,6 +23,10 @@ build/
 .DS_Store
 Thumbs.db
 
+# Runtime / Process artifacts
+*.pid
+*.log
+
 # Standalone prototype (not part of the MkDocs site)
 index.html
 
@@ -28,6 +35,11 @@ index.html
 .venv/
 venv/
 site/
+
+# Node (remotion-lld)
+node_modules/
+
+# Code review graph caches
 .code-review-graph/
 .code_review_graph/
 code-review-graph-cache/
