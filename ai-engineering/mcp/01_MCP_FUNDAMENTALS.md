@@ -52,9 +52,12 @@ MCP follows a **client-server architecture** with three distinct roles:
 ```
 
 <p align="center">
-  <img src="../../../assets/videos/mcp-protocol-flow.gif" alt="Animated MCP Protocol Flow Diagram" width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" />
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/mcp-protocol-flow.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
   <br/>
-  <em>🎬 Animated MCP Protocol Flow — User → MCP Host → Client → Server architecture with transport layer, capability negotiation, discovery, and execution lifecycle. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+  <em>🎬 Animated MCP Protocol Flow — User → MCP Host → Client → Server architecture with transport layer, capability negotiation, discovery, and execution lifecycle. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
 ### Role Breakdown

@@ -40,13 +40,23 @@ Request ──────────────▶│   Load       │──�
                                           └─────┬──────┘
                                                 │
                                           ┌─────▼──────┐
-                                          │  Config    │
-                                          │  Store     │
-                                          │  (Rules    │
-                                          │   per API, │
-                                          │   per Tier)│
-                                          └────────────┘
+                                          │  Config│  │  Store     │
+          │  (Rules    │
+          │   per API, │
+          │   per Tier)│
+          └────────────┘
 ```
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/rate-limiter-sequence.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Rate Limiter Sequence — Request → Token Check → Allow/Block → Response. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 

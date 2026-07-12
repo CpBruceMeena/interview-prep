@@ -196,6 +196,19 @@ s3://data-lake/ef56/2024/01/15/events-003.json
 # But: LIST consistency is STILL eventual
 ```
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-s3-consistency.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated S3 Strong Consistency Model — read-after-write, strong deletes, and LIST eventual consistency — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 **S3 Versioning:**
 
 ```yaml

@@ -206,6 +206,17 @@ Server states:
 
 **Leader Election — Step by Step:**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/ds-raft-leader-election.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Raft Leader Election — Term increment, randomized timeouts, majority vote, split-brain prevention. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 ```
 Initial state: 3 nodes, Node 1 is leader
 ┌─────────────────────────────────────┐
@@ -408,6 +419,18 @@ But each has its own database with its own ACID transaction.
 ```
 
 **2-Phase Commit (2PC) — The Coordinator Problem:**
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/ds-twopc-vs-saga.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — 2PC vs Saga — Coordinator crash blocks 2PC; Saga's compensating actions handle failure gracefully. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 ```
 Coordinator               Inventory               Payments               Shipping
@@ -874,6 +897,17 @@ When N=3 (Node 3 fails):
 
 **Consistent Hashing Ring:**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/ds-consistent-hashing.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Consistent Hashing on a Ring — Minimal key redistribution with virtual nodes for load balancing. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 ```
 The ring: hash space [0, 2^64-1] arranged in a circle
 
@@ -1147,6 +1181,18 @@ class SwimNode:
 ```
 
 **Why Indirect Probing Is Critical:**
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/ds-swim-gossip.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — SWIM Gossip Protocol — Ping → Indirect Probe → Suspect → Dead with O(log N) convergence. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 ```
 ┌─── Node A (pinger) ───┐       ┌─── Node B (target) ──┐

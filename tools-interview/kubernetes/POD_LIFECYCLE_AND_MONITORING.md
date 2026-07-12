@@ -63,6 +63,18 @@
 
 **Pod Conditions (Detailed Status):**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/k8s-pod-lifecycle.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Pod Lifecycle State Machine — Pending → Running → Succeeded/Failed with container states. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
+
 ```yaml
 # Conditions are individual status signals, each with True/False/Unknown
 # A pod can have multiple conditions simultaneously
@@ -106,6 +118,18 @@ conditions:
 ```
 
 **Common Waiting Reasons:**
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/k8s-container-states.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Container States — Waiting → Running → Terminated with common failure reasons. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 | Reason | Meaning | Diagnosis |
 |--------|---------|-----------|
@@ -1295,6 +1319,18 @@ spec:
 ```
 
 **Metrics-Server (Resource Metrics API):**
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/k8s-monitoring-stack.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — Kubernetes Monitoring Stack — kubelet → cAdvisor → Metrics Server → HPA/kubectl top. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 ```yaml
 # metrics-server: the simplest, most essential monitoring component

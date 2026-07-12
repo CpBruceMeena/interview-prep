@@ -104,6 +104,19 @@ Transit Gateway:
   - Supports: VPC, VPN, Direct Connect, Transit Gateway peering
 ```
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-vpc-peering-vs-tgw.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated VPC Peering vs Transit Gateway — 1:1 connection vs hub-and-spoke with transitive routing comparison — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -254,6 +267,19 @@ hc-us-east-1:    Route53 Health Check → ALB endpoint (/health)
 hc-eu-west-1:    Route53 Health Check → ALB endpoint (/health)
 hc-ap-southeast-1: Route53 Health Check → ALB endpoint (/health)
 ```
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-route53-dns-routing.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Route53 Multi-Region DNS Routing — latency-based routing with health check failover across 3 regions — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
 
 **Failover Timing Breakdown:**
 

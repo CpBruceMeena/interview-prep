@@ -199,6 +199,18 @@ HTTP/3 (QUIC — 1 connection, but independent streams):
 
 **The HTTP/2 HoL Blocking Problem — Deep Dive:**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/net-http2-vs-quic.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — HTTP/2 vs HTTP/3 (QUIC) — One lost packet blocks H2 entirely, QUIC isolates per-stream. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
+
 ```
 TCP is BYTE-ORIENTED, not MESSAGE-ORIENTED.
 
@@ -453,6 +465,17 @@ QUIC: DCID = 0xDEADBEEF (stable, not tied to IP)
 
 **TLS 1.2 vs 1.3 Handshake:**
 
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/net-tls-handshake.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — TLS 1.3 Handshake — 1-RTT handshake vs TLS 1.2's 2-RTT with 0-RTT resumption. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 ```
 TLS 1.2 (2 RTT):
 Client                      Server
@@ -642,6 +665,18 @@ Browser: https://saas.example.com
 ```
 
 **The Problem — Intermittent Failures:**
+
+### 🎬 Animated Sequence Diagram
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/net-dns-resolution.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Sequence — DNS Resolution Path — Browser → Stub → Root → TLD → Authoritative → IP Address. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+
 
 ```dns
 ; Query

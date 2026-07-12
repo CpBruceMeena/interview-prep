@@ -45,32 +45,16 @@ User submits notification request
 └────────────────────────────────────────────────────────────┘
 ```
 
----
+### 🎬 Animated Sequence Diagram
 
-## 2. COST-EFFICIENT ARCHITECTURE
-
-### 2.1 Why This Design is Cost-Effective
-
-| Component | Strategy | Cost Impact |
-|-----------|----------|-------------|
-| **PostgreSQL** | Single instance, partitioned tables | ~$50/month |
-| **Redis** | Small instance for queues only | ~$20/month |
-| **Worker pools** | Dynamic scaling, max 10 concurrent | Pay-per-use |
-| **Batching** | Batch emails (up to 1000 per API call) | 10-100x cheaper |
-| **Retry** | Exponential backoff, limit 3 retries | Avoids wasted calls |
-| **Deduplication** | In-memory + DB (prevents double-send) | Reduces waste |
-
-### 2.2 Monthly Cost Estimate (1M notifications)
-
-| Item | Cost |
-|------|------|
-| PostgreSQL (db.t4g.small) | $25 |
-| Redis (cache.t3.micro) | $18 |
-| EC2 for API + workers (t4g.medium × 2) | $50 |
-| SES (100K emails) | $10 |
-| SNS (10K SMS) | $20 |
-| SQS | $5 |
-| **Total** | **~$128/month** |
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/notification-service-sequence.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Notification Service Sequence — Submit → Queue → Workers → Channel Delivery → Status. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 
