@@ -16,6 +16,7 @@ async function renderAll() {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
   const compositionIds = [
+    // LLD sequences
     "parking-lot-sequence",
     "chess-game-sequence",
     "tic-tac-toe-sequence",
@@ -35,6 +36,53 @@ async function renderAll() {
     "job-scheduling-sequence",
     "notification-service-sequence",
     "search-platform-sequence",
+
+    // CI/CD sequences
+    "cicd-end-to-end-pipeline",
+    "cicd-blue-green-deployment",
+    "cicd-canary-release",
+    "cicd-artifact-promotion",
+    "cicd-frontend-pipeline",
+    "cicd-backend-pipeline",
+
+    // Kubernetes sequences
+    "k8s-pod-lifecycle",
+    "k8s-container-states",
+    "k8s-monitoring-stack",
+
+    // Networks sequences
+    "net-tls-handshake",
+    "net-dns-resolution",
+    "net-http2-vs-quic",
+
+    // Distributed Systems sequences
+    "ds-raft-leader-election",
+    "ds-twopc-vs-saga",
+    "ds-consistent-hashing",
+    "ds-swim-gossip",
+
+    // Architecture sequences
+    "arch-cqrs-event-sourcing",
+    "arch-circuit-breaker",
+    "arch-microservices-decomposition",
+
+    // AWS sequences
+    "aws-vpc-peering-vs-tgw",
+    "aws-route53-dns-routing",
+    "aws-s3-consistency",
+    "aws-lambda-lifecycle",
+    "aws-sqs-long-polling",
+    "aws-sns-fanout",
+    "aws-kinesis-shard-scaling",
+    "aws-eventbridge-routing",
+    "aws-iam-permission-boundary",
+    "aws-kms-envelope-encryption",
+    "aws-guardduty-multi-account",
+    "aws-cognito-auth-flow",
+
+    // ECS Agent sequences
+    "ecs-agent-deployment-flow",
+    "ecs-agent-request-flow",
   ];
 
   console.log(`🎬 Rendering ${compositionIds.length} videos...\n`);

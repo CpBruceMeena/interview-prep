@@ -2,8 +2,9 @@ import { Composition } from "remotion";
 import { SequenceDiagram } from "./SequenceDiagram";
 import { LLD_SEQUENCES } from "./sequences";
 import { ADVANCED_SEQUENCES } from "./sequences-advanced";
+import { ECS_AGENT_SEQUENCES } from "./sequences-agent-ecs";
 
-const ALL_SEQUENCES = [...LLD_SEQUENCES, ...ADVANCED_SEQUENCES];
+const ALL_SEQUENCES = [...LLD_SEQUENCES, ...ADVANCED_SEQUENCES, ...ECS_AGENT_SEQUENCES];
 
 export const RemotionRoot: React.FC = () => {
   return (
