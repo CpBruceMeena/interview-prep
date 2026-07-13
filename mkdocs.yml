@@ -254,7 +254,9 @@ nav:
       - Multi-LLM Architecture: ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE.md
       - Agent Deployment (ECS): ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md
       - System/User/Assistant Roles: ai-engineering/agents/10_SYSTEM_USER_ASSISTANT_ROLES.md
-      - Redis Lease & Search: ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH.md
+      - Redis Lease: ai-engineering/agents/11_REDIS_LEASE.md
+      - Search Autocorrect: ai-engineering/agents/12_SEARCH_AUTOCORRECT.md
+      - Elasticsearch Internals: ai-engineering/agents/13_ELASTICSEARCH_INTERNALS.md
       - Implementation Code: ai-engineering/agents/implementation/index.md
     - 🤖 LLM Internals:
       - Overview: ai-engineering/llm-internals/README.md
