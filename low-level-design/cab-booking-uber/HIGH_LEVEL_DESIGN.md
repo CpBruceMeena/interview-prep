@@ -78,7 +78,7 @@
 
 <p align="center">
   <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
-    <source src="../../../assets/videos/cab-booking-sequence.mp4" type="video/mp4" />
+    <source src="https://cpbrucemeena.github.io/interview-prep/assets/videos/cab-booking-sequence.mp4" type="video/mp4" />
     Your browser does not support the video tag.
   </video>
   <br/>
