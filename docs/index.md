@@ -225,11 +225,13 @@
 | 25 | **LangGraph** | Graph-based state machines for agents | [LangGraph Notes](ai-engineering/agents/05_LANGGRAPH_NOTES.md) |
 | 26 | **Multi-LLM Architecture** | Routing, cost management, fallback across GPT/Claude/DeepSeek | [Multi-LLM Design](ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE.md) |
 | 27 | **Agent Observability** | Monitoring, debugging, proactive alerts, data policies | [Observability](ai-engineering/agents/07_AGENT_OBSERVABILITY.md) |
-| 28 | **Redis Lease & Search** | Distributed locking, autocorrect, Elasticsearch internals | [Redis & Search](ai-engineering/agents/11_REDIS_LEASE_SEARCH_ELASTICSEARCH.md) |
-| 29 | **Agent Deployment (ECS)** | Production infra, ECS, API flow, monitoring, cost | [Deployment Guide](ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md) |
-| 30 | **Agent Interview Prep** | Staff-level agent questions and answers | [Agent Q&A](ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md) |
-| 31 | **Harness Engineering** | Evaluation/agent harnesses, guardrails, sandboxing, verification | [Harness Engineering](ai-engineering/harness-engineering/01_HARNESS_ENGINEERING.md) |
-| 32 | **Loop Engineering** | Agentic loops, ReAct, feedback cycles, termination logic | [Loop Engineering](ai-engineering/harness-engineering/02_LOOP_ENGINEERING.md) |
+| 28 | **Redis Lease** | Distributed locking with Redis TTL | [Redis Lease](ai-engineering/agents/11_REDIS_LEASE.md) |
+| 29 | **Search Autocorrect** | Misspelling handling, Levenshtein, Soundex, BK-tree | [Search Autocorrect](ai-engineering/agents/12_SEARCH_AUTOCORRECT.md) |
+| 30 | **Elasticsearch Internals** | Inverted index, BM25, analysis pipeline, sharding | [Elasticsearch](ai-engineering/agents/13_ELASTICSEARCH_INTERNALS.md) |
+| 31 | **Agent Deployment (ECS)** | Production infra, ECS, API flow, monitoring, cost | [Deployment Guide](ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md) |
+| 32 | **Agent Interview Prep** | Staff-level agent questions and answers | [Agent Q&A](ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md) |
+| 33 | **Harness Engineering** | Evaluation/agent harnesses, guardrails, sandboxing, verification | [Harness Engineering](ai-engineering/harness-engineering/01_HARNESS_ENGINEERING.md) |
+| 34 | **Loop Engineering** | Agentic loops, ReAct, feedback cycles, termination logic | [Loop Engineering](ai-engineering/harness-engineering/02_LOOP_ENGINEERING.md) |
 
 > 💡 **Tip:** Phase 5 is dense. Focus on **RAG → Agent Fundamentals → LangGraph → Multi-LLM → Harness & Loop** first if time is limited. Deployment and observability can be studied after the core concepts.
 
@@ -237,14 +239,14 @@
 
 | # | Topic | Why | Resources |
 |---|-------|-----|-----------|
-| 31 | **AWS** | Compute, networking, storage, messaging, security | [AWS Overview](aws-interview/README.md) |
-| 32 | **Kafka** | Event streaming, partitioning, replication, exactly-once | [Kafka Q&A](tools-interview/kafka/INTERVIEW_QUESTIONS.md) |
-| 33 | **Redis** | Caching, distributed locks, data structures, persistence | [Redis Q&A](tools-interview/redis/INTERVIEW_QUESTIONS.md) |
-| 34 | **Elasticsearch** | Inverted index, BM25, analysis pipeline, sharding | [ES Q&A](tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md) |
-| 35 | **Docker** | Container runtime, namespaces, cgroups, image layering, multi-stage builds | [Docker Q&A](tools-interview/docker/INTERVIEW_QUESTIONS.md) |
-| 36 | **Kubernetes** | Orchestration, scheduling, networking, RBAC, storage, production ops | [K8s Q&A](tools-interview/kubernetes/INTERVIEW_QUESTIONS.md) + [Pod Lifecycle](tools-interview/kubernetes/POD_LIFECYCLE_AND_MONITORING.md) + [Production Control](tools-interview/kubernetes/PRODUCTION_CONTROL.md) + [Versioning](tools-interview/kubernetes/VERSIONING_MULTI_CONTAINER.md) |
-| 36 | **Monitoring & Infra** | Prometheus, Grafana, Terraform | [Prometheus](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md) + [Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS.md) |
-| 37 | **Nginx & Compression** | Reverse proxy, load balancing, Gzip/Zstd/Brotli | [Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS.md) + [Compression](tools-interview/compression/INTERVIEW_QUESTIONS.md) |
+| 33 | **AWS** | Compute, networking, storage, messaging, security | [AWS Overview](aws-interview/README.md) |
+| 34 | **Kafka** | Event streaming, partitioning, replication, exactly-once | [Kafka Q&A](tools-interview/kafka/INTERVIEW_QUESTIONS.md) |
+| 35 | **Redis** | Caching, distributed locks, data structures, persistence | [Redis Q&A](tools-interview/redis/INTERVIEW_QUESTIONS.md) |
+| 36 | **Elasticsearch** | Inverted index, BM25, analysis pipeline, sharding | [ES Q&A](tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md) |
+| 37 | **Docker** | Container runtime, namespaces, cgroups, image layering, multi-stage builds | [Docker Q&A](tools-interview/docker/INTERVIEW_QUESTIONS.md) |
+| 38 | **Kubernetes** | Orchestration, scheduling, networking, RBAC, storage, production ops | [K8s Q&A](tools-interview/kubernetes/INTERVIEW_QUESTIONS.md) + [Pod Lifecycle](tools-interview/kubernetes/POD_LIFECYCLE_AND_MONITORING.md) + [Production Control](tools-interview/kubernetes/PRODUCTION_CONTROL.md) + [Versioning](tools-interview/kubernetes/VERSIONING_MULTI_CONTAINER.md) |
+| 38 | **Monitoring & Infra** | Prometheus, Grafana, Terraform | [Prometheus](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md) + [Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS.md) |
+| 39 | **Nginx & Compression** | Reverse proxy, load balancing, Gzip/Zstd/Brotli | [Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS.md) + [Compression](tools-interview/compression/INTERVIEW_QUESTIONS.md) |
 
 </div>
 

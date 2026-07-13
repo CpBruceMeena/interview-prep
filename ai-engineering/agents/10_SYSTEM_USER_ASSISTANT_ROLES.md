@@ -444,4 +444,4 @@ message = {
 
 ---
 
-> **Next:** [Redis Lease & Search Architecture](11_REDIS_LEASE_SEARCH_ELASTICSEARCH.md) → Distributed locking, search, autocorrect, and Elasticsearch
+> **Next:** [Redis Lease — Distributed Locking](11_REDIS_LEASE.md) → Distributed locking with Redis TTL
