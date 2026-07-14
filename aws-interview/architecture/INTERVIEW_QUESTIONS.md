@@ -159,6 +159,20 @@ Risk = Likelihood × Impact
 | **Operationalization** | Designs quarterly review cadence with self-assessment, peer review, remediation |
 | **Automation** | Uses WA Tool API, CI/CD integration, and custom lenses for scale |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-well-architected.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Well-Architected Framework Six Pillars — Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, and Sustainability — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
+
 ---
 
 ## 2. Multi-Region Architecture & Disaster Recovery
@@ -293,6 +307,20 @@ Data access patterns:
 | **Cross-region data** | Uses Aurora Global DB, DynamoDB Global Tables, ElastiCache Global Datastore |
 | **Active-active** | Understands conflict resolution (LWW, CRDTs, sharding) and idempotent writes |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-multi-region-dr.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Multi-Region Disaster Recovery — Aurora Global DB replication, Route53 failover, and RPO 1s/RTO 5min active-passive strategy — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
+
 ---
 
 ## 3. Cloud Migration Strategies: The 6 Rs
@@ -421,6 +449,20 @@ Wave 4 (Month 16-18): Retire 10 apps + migrate remaining 10
 | **Assessment process** | Uses discovery tools to catalog servers, dependencies, and utilization |
 | **Prioritization** | Creates wave plan (quick wins first, strategic refactors later) |
 | **Cost optimization** | Has post-migration optimization plan with quantifiable savings levers |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-cloud-migration-6rs.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Cloud Migration 6 Rs — Retire, Retain, Rehost, Replatform, Refactor, Repurchase with prioritization matrix — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
@@ -605,6 +647,20 @@ def lambda_handler(event, context):
 | **Anomaly detection** | Uses ML-based detection with automated remediation workflows |
 | **Tagging strategy** | Enforces required tags via SCP, automates cost allocation |
 | **Cost culture** | Implements team dashboards, weekly reviews, game days, SCP guardrails |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-cost-governance.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Cloud Cost Governance Framework — tagging, budgets, anomaly detection, rightsizing, and cost culture — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
@@ -897,6 +953,20 @@ ECS → external API: same $0.09/GB (no difference)
 | **Hybrid architecture** | Designs Lambda front-end + ECS back-end with SQS as buffer |
 | **Provisioned concurrency** | Knows when Provisioned Concurrency (Lambda) costs more than EC2 |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-serverless-vs-containers.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Serverless vs Containers Decision Framework — Lambda front-end + ECS back-end with SQS buffer — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
+
 ---
 
 ## 7. Cloud-Native Design Patterns: Strangler Fig, CQRS, Saga
@@ -1051,6 +1121,20 @@ Order Service         Payment Service        Inventory Service    Shipping Servi
 | **Strangler Fig** | Plans incremental migration with API Gateway routing, no downtime |
 | **CQRS** | Separates read/write paths, uses DynamoDB Streams for sync, knows when NOT to use it |
 | **Orchestration Saga** | Implements Step Functions state machine with compensation flows and idempotency keys |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-strangler-fig.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Strangler Fig Pattern — incremental monolith migration with API Gateway routing and anti-corruption layer — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
@@ -1285,6 +1369,20 @@ Recovery time (MTTR)    | <5 min        | Time to recover from failure
 | **Bulkhead isolation** | Separates thread pools for different service types to prevent cascading failure |
 | **Chaos Engineering** | Designs FIS experiments with stop conditions (error budget), Game Day scenarios |
 | **Post-incident culture** | Runs post-Game Day reviews with concrete action items and ownership |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/arch-resilience-chaos.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Resilience & Chaos Engineering — circuit breaker, bulkhead, retry backoff, and FIS Game Day scenario — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 

@@ -238,6 +238,17 @@ End-to-end encryption:
 | **Connection draining** | Explains ALB HTTP-aware draining vs NLB TCP-level draining |
 | **Combined architecture** | Can design NLB+ALB stack for static IP + stickiness |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-alb-vs-nlb.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated ALB vs NLB Load Balancer Deep Dive — L7 HTTP routing vs L4 TCP/UDP, WebSocket connections, TLS termination, and combined architecture — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 3. Route53: Routing Policies & Health Checks
@@ -580,6 +591,17 @@ def generate_signed_url(video_path):
 | **Origin Shield benefit** | Quantifies origin load reduction (80-90%) |
 | **Signed URLs** | Implements time-expiring, IP-restricted access |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-cloudfront-origin-shield.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated CloudFront CDN & Origin Shield — edge cache → regional cache → origin shield → origin, 95%+ cache hit rate, 80% origin load reduction — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 5. AWS Global Accelerator vs CloudFront
@@ -727,6 +749,17 @@ Use both when:
 | **TCP optimization** | Understands edge termination + backbone re-establishment |
 | **Traffic dials** | Uses traffic dials for zero-downtime failover |
 | **Use case selection** | Can clearly differentiate CF vs GA for given workload |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-global-accelerator.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Global Accelerator vs CloudFront — anycast routing, TCP optimization, traffic dials, and when to use each — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 
@@ -1002,6 +1035,17 @@ TGW: tgw-12345
 | **DX Gateway** | Connects DX to multiple VPCs/regions through single gateway |
 | **CloudHub** | Uses TGW VPN attachments for branch-to-branch routing |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-directconnect-vpn.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Direct Connect & Site-to-Site VPN — dedicated fiber vs IPSec tunnel, BGP routing, hybrid connectivity with active-active + failover — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 8. VPC Flow Logs & Network Traffic Analysis
@@ -1167,6 +1211,17 @@ s3://bucket/AWSLogs/.../us-east-1/2024/01/15/13/
 | **Exfiltration detection** | Can write Athena queries for beaconing, large transfers, unusual ports |
 | **Cost at scale** | Quantifies CloudWatch Logs vs S3 cost difference (5x-10x) |
 | **Partitioning** | Uses Hive partitions for efficient Athena querying |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-vpc-flow-logs.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated VPC Flow Logs & Network Traffic Analysis — ENI capture → S3 → Athena query → GuardDuty detection → auto-remediation — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 
@@ -1562,6 +1617,17 @@ Examples of NACL-only protections (not possible with SG):
 | **SG reference** | Uses security group references (not CIDRs) for instance-to-instance rules |
 | **Defense-in-depth** | Uses NACL for subnet-level explicit denies + SG for application rules |
 | **Troubleshooting** | Diagnoses connectivity by checking SG, NACL, and route table in order |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-sg-vs-nacl.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Security Groups vs Network ACLs — stateful SG vs stateless NACL, defense-in-depth with SG references and subnet-level protection — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 

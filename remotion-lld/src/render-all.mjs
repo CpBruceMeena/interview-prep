@@ -67,8 +67,27 @@ const COMPOSITION_IDS = [
   // ── AWS — Storage & Database ──
   "aws-s3-consistency",
 
+  // ── AWS — Architecture ──
+  "arch-well-architected",
+  "arch-multi-region-dr",
+  "arch-cloud-migration-6rs",
+  "arch-serverless-vs-containers",
+  "arch-strangler-fig",
+  "arch-cost-governance",
+  "arch-resilience-chaos",
+
   // ── AWS — Compute / Lambda ──
   "aws-lambda-lifecycle",
+
+  // ── AWS — Compute (new) ──
+  "aws-ec2-nitro-ena",
+  "aws-asg-lifecycle",
+  "aws-lambda-concurrency",
+  "aws-eks-architecture",
+  "aws-fargate-networking",
+  "aws-spot-interruption",
+  "aws-batch-job-scheduling",
+  "aws-cost-optimization-compute",
 
   // ── AWS — Messaging ──
   "aws-sqs-long-polling",
@@ -81,6 +100,28 @@ const COMPOSITION_IDS = [
   "aws-kms-envelope-encryption",
   "aws-guardduty-multi-account",
   "aws-cognito-auth-flow",
+
+  // ── Flowchart ──
+  "sample-flowchart",
+
+  // ── AWS — Networking (new) ──
+  "aws-alb-vs-nlb",
+  "aws-cloudfront-origin-shield",
+  "aws-global-accelerator",
+  "aws-directconnect-vpn",
+  "aws-vpc-flow-logs",
+  "aws-sg-vs-nacl",
+
+  // ── AWS — Storage & Database (new) ──
+  "aws-s3-lifecycle",
+  "aws-rds-multi-az",
+  "aws-aurora-serverless",
+  "aws-dynamodb-partitioning",
+  "aws-elasticache-redis",
+
+  // ── AWS — Security (new) ──
+  "aws-waf-managed-rules",
+  "aws-secrets-manager",
 ];
 
 async function renderAll() {
