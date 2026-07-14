@@ -160,6 +160,17 @@ s3://data-lake/ef56/2024/01/15/events-003.json
 | **Lifecycle rules** | Applies transitions at appropriate intervals, includes expiration |
 | **Multipart upload** | Uses parallel parts for large objects, knows 10,000 part limit |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-s3-lifecycle.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated S3 Storage Classes & Lifecycle Management — Standard → IA → Glacier → Deep Archive with automated tiering saves 80%+ — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 2. S3: Data Consistency, Versioning, Replication
@@ -440,6 +451,17 @@ RDS Proxy configuration:
 | **Connection pooling** | Uses RDS Proxy to reduce connection overhead by 90%+ |
 | **Scaling strategy** | Combines replicas for reads, proxy for connections, right-sizing for compute |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-rds-multi-az.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated RDS Multi-AZ & Read Replicas — synchronous standby for HA, async cross-region replicas for read scaling, and auto-failover — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 4. Aurora: Architecture, Storage, Serverless v2
@@ -596,6 +618,17 @@ Global cluster:
 | **Serverless v2** | Understands ACU model, instant scaling, pause/resume for dev |
 | **Global Database** | Designs multi-region architecture with sub-1s replication |
 | **Write amplification** | Quantifies Aurora's 2x vs traditional DB's 10x write amplification |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-aurora-serverless.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Aurora Serverless v2 — auto-scaling from 0.5-128 ACU in < 30 seconds, no cold start, shared storage with 6-replica quorum — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 
@@ -778,6 +811,17 @@ def get_item(id):
 | **Hot key handling** | Uses sharding, DAX, adaptive capacity, or hybrid fan-out |
 | **Single-table design** | Models access patterns with composite keys and GSIs |
 | **Fan-out trade-off** | Explains push vs pull for different scale users |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-dynamodb-partitioning.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated DynamoDB Partitioning & Hot Key Mitigation — hash keys, partition limits, hot key throttling, adaptive capacity, DAX, and write sharding — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 
@@ -1097,6 +1141,17 @@ Cost (node)            | 1x                  | 3x
 | **Sorted sets** | Uses ZADD/ZREVRANGE for real-time leaderboard |
 | **Persistence trade-offs** | Compares RDB (fast, up to 5min loss) vs AOF (durable, slower) |
 | **MemoryDB** | Knows when to choose durable Redis (MemoryDB) over cache-only (ElastiCache) |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-elasticache-redis.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated ElastiCache Redis — cache-aside, write-through, session store patterns, Redis Cluster sharding, and ElastiCache vs MemoryDB comparison — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 

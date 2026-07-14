@@ -810,6 +810,17 @@ ORDER BY requests DESC;
 | **False positives** | Creates path-based exemptions, analyzes logs for regressions |
 | **Security analytics** | Uses Athena for WAF log analysis and attack pattern detection |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-waf-managed-rules.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated AWS WAF Managed Rules & Rate Limiting — Core Rule Set, SQLi/XSS detection, rate-based rules, and multi-layer DDoS defense — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 6. Secrets Manager: Rotation & Vault Architecture
@@ -1011,6 +1022,17 @@ class SecretCache:
 | **Service comparison** | Compares Secrets Manager ($0.40/secret) vs Parameter Store (free) vs Vault (complexity) |
 | **Caching** | Caches secrets in memory to reduce API costs (10x reduction) |
 | **Monitoring** | Uses CloudTrail to audit secret access (who, when, which application) |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-secrets-manager.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Secrets Manager Rotation & Vault Architecture — KMS envelope encryption, Lambda-based rotation, cross-account access, and secret caching — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
 
 ---
 

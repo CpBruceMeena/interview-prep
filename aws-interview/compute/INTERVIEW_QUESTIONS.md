@@ -91,6 +91,20 @@ Instance storage (NVMe):
 | **ENA deep dive** | Explains SR-IOV, multi-queue, jumbo frames for 100Gbps |
 | **EFA for HPC** | Knows Elastic Fabric Adapter provides RDMA with OS bypass |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-ec2-nitro-ena.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated EC2 Nitro Hypervisor & ENA Enhanced Networking — SR-IOV, multi-queue, jumbo frames, and 100 Gbps throughput — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
+
 ---
 
 ## 2. EC2 Auto Scaling Groups: Policies & Lifecycle
@@ -240,6 +254,20 @@ def lambda_handler(event, context):
 | **Lifecycle hooks** | Understands Terminating:Wait state for graceful shutdown |
 | **ALB integration** | Knows target group health checks, connection draining, warm-up |
 | **Cooldown tuning** | Sets appropriate cooldown to avoid scaling flapping |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-asg-lifecycle.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated EC2 Auto Scaling Group Lifecycle — ALB target group, scaling policies, lifecycle hooks, and graceful shutdown — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
@@ -506,6 +534,20 @@ Comparison:
 | **Reserved vs provisioned** | Can explain guarantee vs pre-warming difference |
 | **SQS throttling** | Knows messages stay in queue, retry after visibility timeout |
 | **Memory scaling** | Understands CPU scales with memory allocation |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-lambda-concurrency.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Lambda Concurrency & Reservations Model — shared pool, reserved concurrency, provisioned concurrency, and SQS throttling safety — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
@@ -820,6 +862,20 @@ spec:
 | **IRSA** | Explains OIDC federation and per-pod IAM roles |
 | **Fargate limitations** | Knows DaemonSet, host networking, GPU, and PVC limitations |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-eks-architecture.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated EKS Architecture — managed control plane, VPC CNI, managed/self-managed node groups, Fargate profiles, and IRSA — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
+
 ---
 
 ## 7. Fargate: Serverless Containers & Networking
@@ -931,6 +987,20 @@ AWS Fargate Platform differences:
 | **Platform versions** | Knows 1.4+ supports EFS, 1.5+ supports EBS and GPU |
 | **NAT cost optimization** | Uses VPC endpoints to minimize NAT data processing |
 | **Security groups** | Applies per-task security groups for micro-segmentation |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-fargate-networking.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Fargate Networking — Hyperplane ENI, NAT Gateway, VPC Endpoints, and platform version comparison — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
@@ -1092,6 +1162,20 @@ Additional savings: Reserved + Spot mix
 | **Capacity pool diversification** | Diversifies across types, sizes, and AZs |
 | **Fleet allocation** | Uses capacityOptimized strategy for least interruption |
 | **Reserved + spot mix** | Combines reserved for baseline, spot for elasticity |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-spot-interruption.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Spot Instance Interruption Handling — 2-min termination notice, checkpoint to S3, fleet diversification, and 78% cost savings — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
@@ -1290,6 +1374,17 @@ genomics-fairshare:
 | **Fair share scheduling** | Implements resource sharing across teams/projects |
 | **Array jobs** | Uses array jobs for embarrassingly parallel workloads |
 
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-batch-job-scheduling.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated AWS Batch Job Scheduling — compute environments, array jobs, spot + on-demand mix, fair share, and job dependencies — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
 ---
 
 ## 10. Hybrid: EC2 Reserved, Savings Plans, Cost Optimization
@@ -1399,6 +1494,20 @@ lambda_optimization:
 | **Graviton migration** | Plans multi-arch builds for ARM migration |
 | **Spot + SP mix** | Uses SP for baseline, spot for elasticity |
 | **Cost attribution** | Uses tags, budgets, and Compute Optimizer for tracking |
+
+### 🎬 Animated Sequence Diagram
+
+<p align="center">
+  <video controls width="800" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/aws-cost-optimization-compute.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Compute Cost Optimization — Savings Plans, Spot Instances, Graviton migration, and rightsizing for 75% savings — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 
 ---
 
