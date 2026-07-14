@@ -59,14 +59,22 @@
 ║                    INTERVIEW PREP — ARCHITECTURE                     ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
-║  📦 low-level-design/         ← 18 LLD projects (Python, SOLID)      ║
+║  📦 python-low-level-design/  ← 18 LLD projects (Python, SOLID)      ║
 ║  ├── parking-lot                   OOD Basics · Strategy/Factory     ║
 ║  ├── chess-game                    Bitboard · WebSocket · Stockfish  ║
 ║  ├── splitwise-expense-sharing     Debt Graph · Min Transactions     ║
 ║  ├── cab-booking-uber              Redis GEO · Kalman Filter         ║
-║  ├── payment-processing-           Idempotency · Circuit Breaker     ║
+║  ├── payment-processing-system     Idempotency · Circuit Breaker     ║
 ║  ├── job-scheduling-system         DAG · Redis Leases · Cron         ║
 ║  └── ... (12 more)                                                   ║
+║  📦 java-low-level-design/    ← 3 LLD projects (Java, SOLID)         ║
+║  ├── elevator-system               Multi-car · State Machine         ║
+║  ├── hotel-booking-system          Room Inventory · Reservations     ║
+║  └── meeting-scheduler             Calendar · Conflict Detection    ║
+║  📦 golang-low-level-design/   ← 3 LLD projects (Go, CSP)            ║
+║  ├── web-crawler                   Concurrent · goroutines           ║
+║  ├── kv-store                      TTL · sync.RWMutex               ║
+║  └── task-queue                    Worker Pool · Channels            ║
 ║                                                                      ║
 ║  🧠 ai-engineering/           ← AI Engineering — RAG, MCP, Agents      ║
 ║  ├── rag/                           RAG Knowledge Retrieval          ║
@@ -109,24 +117,40 @@
 
 | # | Project | Domain | Key Patterns | HLD Focus |
 |---|---------|--------|-------------|-----------|
-| 1 | **[Parking Lot](low-level-design/parking-lot/)** | OOD Basics | Strategy, Factory, Singleton | 8-table DB schema, SKIP LOCKED concurrency, Redis cache, rate cards |
-| 2 | **[Chess Game](low-level-design/chess-game/)** | Game State | Factory, State, Memento | Bitboard, WebSocket, Stockfish AI |
-| 3 | **[Tic-Tac-Toe](low-level-design/tic-tac-toe/)** | Game AI | Strategy, State, Command | MCTS AI, N×N board scaling |
-| 4 | **[Snakes & Ladders](low-level-design/snakes-and-ladders/)** | Board Game | Strategy, Observer, State | Seeded PRNG, real-time multiplayer |
-| 5 | **[Vending Machine](low-level-design/vending-machine/)** | State Machine | State, Strategy, Factory | IoT telemetry, offline queue |
-| 6 | **[LRU/LFU/TTL Cache](low-level-design/lru-cache/)** | Data Structures | Strategy, Decorator | Consistent hashing, 3-tier caching |
-| 7 | **[Rate Limiter](low-level-design/rate-limiter/)** | API Gateway | Strategy, Factory, Decorator | L1 local + L2 Redis, Lua scripting |
-| 8 | **[Pub-Sub System](low-level-design/pub-sub-system/)** | Messaging | Observer, Strategy, Decorator | Kafka-style append-log, ISR replication |
-| 9 | **[Movie Ticket Booking](low-level-design/movie-ticket-booking/)** | Concurrency | Strategy, Singleton, Observer | CQRS, flash sales, thundering herd |
-| 10 | **[Splitwise](low-level-design/splitwise-expense-sharing/)** | Graphs | Strategy, Factory | Debt graph, min-transactions |
-| 11 | **[Cab Booking (Uber)](low-level-design/cab-booking-uber/)** | Real-time | Strategy, State, Observer, Pub-Sub | Redis GEO, Kafka pipeline, GeoRadius matching, hexagonal zones, surge pricing |
-| 12 | **[Library Management](low-level-design/library-management/)** | Catalog | Strategy, Observer, Facade | Elasticsearch fuzzy search |
-| 13 | **[Car Rental](low-level-design/car-rental-platform/)** | Fleet | Strategy, State, Decorator | Availability calendar, hourly booking, 7-day lookahead, PG exclusion constraints |
-| 14 | **[ATM/Banking](low-level-design/atm-banking-system/)** | Security | State, Strategy, Chain | HSM PIN, two-phase dispense |
-| 15 | **[Inventory Management](low-level-design/inventory-management/)** | Stock | Strategy, Observer, Facade | EOQ + safety stock, optimistic locking |
-| 16 | **[Payment Processing](low-level-design/payment-processing-system/)** | Payments | Strategy, Chain of Resp. | Idempotency keys, fraud ML pipeline |
-| 17 | **[Job Scheduling](low-level-design/job-scheduling-system/)** | Scheduling | Command, Strategy, Observer | DAG scheduling, Redis leases |
-| 18 | **[Search Platform](low-level-design/search-platform/)** | Indexing | Strategy, Facade, Decorator | BM25 ranking, spell correction |
+| 1 | **[Parking Lot](python-low-level-design/parking-lot/)** | OOD Basics | Strategy, Factory, Singleton | 8-table DB schema, SKIP LOCKED concurrency, Redis cache, rate cards |
+| 2 | **[Chess Game](python-low-level-design/chess-game/)** | Game State | Factory, State, Memento | Bitboard, WebSocket, Stockfish AI |
+| 3 | **[Tic-Tac-Toe](python-low-level-design/tic-tac-toe/)** | Game AI | Strategy, State, Command | MCTS AI, N×N board scaling |
+| 4 | **[Snakes & Ladders](python-low-level-design/snakes-and-ladders/)** | Board Game | Strategy, Observer, State | Seeded PRNG, real-time multiplayer |
+| 5 | **[Vending Machine](python-low-level-design/vending-machine/)** | State Machine | State, Strategy, Factory | IoT telemetry, offline queue |
+| 6 | **[LRU/LFU/TTL Cache](python-low-level-design/lru-cache/)** | Data Structures | Strategy, Decorator | Consistent hashing, 3-tier caching |
+| 7 | **[Rate Limiter](python-low-level-design/rate-limiter/)** | API Gateway | Strategy, Factory, Decorator | L1 local + L2 Redis, Lua scripting |
+| 8 | **[Pub-Sub System](python-low-level-design/pub-sub-system/)** | Messaging | Observer, Strategy, Decorator | Kafka-style append-log, ISR replication |
+| 9 | **[Movie Ticket Booking](python-low-level-design/movie-ticket-booking/)** | Concurrency | Strategy, Singleton, Observer | CQRS, flash sales, thundering herd |
+| 10 | **[Splitwise](python-low-level-design/splitwise-expense-sharing/)** | Graphs | Strategy, Factory | Debt graph, min-transactions |
+| 11 | **[Cab Booking (Uber)](python-low-level-design/cab-booking-uber/)** | Real-time | Strategy, State, Observer, Pub-Sub | Redis GEO, Kafka pipeline, GeoRadius matching, hexagonal zones, surge pricing |
+| 12 | **[Library Management](python-low-level-design/library-management/)** | Catalog | Strategy, Observer, Facade | Elasticsearch fuzzy search |
+| 13 | **[Car Rental](python-low-level-design/car-rental-platform/)** | Fleet | Strategy, State, Decorator | Availability calendar, hourly booking, 7-day lookahead, PG exclusion constraints |
+| 14 | **[ATM/Banking](python-low-level-design/atm-banking-system/)** | Security | State, Strategy, Chain | HSM PIN, two-phase dispense |
+| 15 | **[Inventory Management](python-low-level-design/inventory-management/)** | Stock | Strategy, Observer, Facade | EOQ + safety stock, optimistic locking |
+| 16 | **[Payment Processing](python-low-level-design/payment-processing-system/)** | Payments | Strategy, Chain of Resp. | Idempotency keys, fraud ML pipeline |
+| 17 | **[Job Scheduling](python-low-level-design/job-scheduling-system/)** | Scheduling | Command, Strategy, Observer | DAG scheduling, Redis leases |
+| 18 | **[Search Platform](python-low-level-design/search-platform/)** | Indexing | Strategy, Facade, Decorator | BM25 ranking, spell correction |
+
+### ☕ Java Low-Level Designs
+
+| # | Project | Domain | Key Patterns | HLD Focus |
+|---|---------|--------|-------------|-----------|
+| 1 | **[Elevator System](java-low-level-design/elevator-system/)** | State Machine | State, Strategy, Observer | Multi-car dispatching, SCAN algorithm, real-time monitoring |
+| 2 | **[Hotel Booking System](java-low-level-design/hotel-booking-system/)** | Reservations | Strategy, Factory, Observer | Room inventory, overbooking, cancellation policies |
+| 3 | **[Meeting Scheduler](java-low-level-design/meeting-scheduler/)** | Calendar | Strategy, Observer, Command | Conflict detection, recurring events, room booking |
+
+### 🦦 Golang Low-Level Designs
+
+| # | Project | Domain | Key Patterns | HLD Focus |
+|---|---------|--------|-------------|-----------|
+| 1 | **[Web Crawler](golang-low-level-design/web-crawler/)** | Concurrency | Worker Pool, Fan-Out/Fan-In | goroutines, channels, graceful shutdown, rate limiting |
+| 2 | **[In-Memory KV Store](golang-low-level-design/kv-store/)** | Data Structures | Strategy, Singleton | TTL, eviction policies, sync.RWMutex, snapshots |
+| 3 | **[Task Queue](golang-low-level-design/task-queue/)** | Async Processing | Worker Pool, Pipeline | Priority queue, retries, context cancellation |
 
 </details>
 
@@ -275,11 +299,17 @@
 ## 🚀 **Quick Start**
 
 ```bash
-# 1. Run any LLD project
-cd low-level-design/parking-lot && python parking_lot.py
+# 1. Run any Python LLD project
+cd python-low-level-design/parking-lot && python parking_lot.py
 
-# 2. Run ALL LLD projects
-cd low-level-design && for dir in */; do echo "=== $dir ===" && cd "$dir" && python *.py && cd - > /dev/null; done
+# 2. Run ALL Python LLD projects
+cd python-low-level-design && for dir in */; do echo "=== $dir ===" && cd "$dir" && python *.py && cd - > /dev/null; done
+
+# 3. Run any Java LLD project
+cd java-low-level-design/elevator-system && javac ElevatorSystem.java && java ElevatorSystem
+
+# 4. Run any Go LLD project
+cd golang-low-level-design/web-crawler && go run web_crawler.go
 
 # 3. Verify the RAG pipeline
 cd ai-engineering/rag && python test_pipeline.py
@@ -367,7 +397,9 @@ PHASE 7 ─── AI Engineering
 
 | Metric | Count |
 |--------|-------|
-| LLD Projects | **18** |
+| Python LLD Projects | **18** |
+| Java LLD Projects | **3** |
+| Golang LLD Projects | **3** |
 | Staff-Level Questions | **200+** |
 | CS Core Topics | **8** |
 | Language Deep-Dives | **3 (Python + Go + Java)** |

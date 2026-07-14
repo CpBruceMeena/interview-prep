@@ -1,6 +1,8 @@
-# 🏗️ Low Level Design Problems
+# 🐍 Python Low Level Design Problems
 
 A comprehensive collection of **18 Low-Level Design (LLD)** problems implemented in **Python**, following **SOLID principles** and **design patterns** — curated for **6+ years experienced backend developer** interviews.
+
+> 🆕 Also check out our [Java Low-Level Designs](../java-low-level-design/) and [Golang Low-Level Designs](../golang-low-level-design/)!
 
 ---
 
@@ -62,14 +64,14 @@ Each project is designed following **SOLID principles**:
 Each project is self-contained. Navigate to the project directory and run:
 
 ```bash
-cd low-level-design/<project-name>
+cd python-low-level-design/<project-name>
 python <project_file>.py
 ```
 
 Or run all projects from root:
 
 ```bash
-for dir in low-level-design/*/; do
+for dir in python-low-level-design/*/; do
     echo "=== Running $dir ==="
     cd "$dir" && python *.py && cd - > /dev/null
 done
