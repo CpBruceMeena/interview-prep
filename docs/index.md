@@ -11,8 +11,8 @@
         </p>
         <div class="hero-stats">
             <div class="hero-stat">
-                <span class="hero-stat-number">18</span>
-                <span class="hero-stat-label">LLD Projects</span>
+            <span class="hero-stat-number">24</span>
+            <span class="hero-stat-label">LLD Projects</span>
             </div>
             <div class="hero-stat">
                 <span class="hero-stat-number">200+</span>
@@ -55,7 +55,7 @@
             <span class="skill-card-title">Data Structures</span>
             <span class="skill-card-desc">Bloom filters, tries, sketches</span>
         </a>
-        <a href="low-level-design/parking-lot/INTERVIEW_QUESTIONS/" class="skill-card">
+        <a href="python-low-level-design/parking-lot/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🏗️</span>
             <span class="skill-card-title">OOD Basics</span>
             <span class="skill-card-desc">Parking Lot, Chess, Tic-Tac-Toe</span>
@@ -84,7 +84,7 @@
             <span class="skill-card-title">Networks</span>
             <span class="skill-card-desc">TCP, HTTP/2/3, QUIC, TLS</span>
         </a>
-        <a href="low-level-design/rate-limiter/INTERVIEW_QUESTIONS/" class="skill-card">
+        <a href="python-low-level-design/rate-limiter/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">🛡️</span>
             <span class="skill-card-title">API Design</span>
             <span class="skill-card-desc">Rate limiter, pub-sub, caching</span>
@@ -113,7 +113,7 @@
             <span class="skill-card-title">Security</span>
             <span class="skill-card-desc">JWT, OAuth2, OWASP, encryption</span>
         </a>
-        <a href="low-level-design/payment-processing-system/INTERVIEW_QUESTIONS/" class="skill-card">
+        <a href="python-low-level-design/payment-processing-system/INTERVIEW_QUESTIONS/" class="skill-card">
             <span class="skill-card-icon">💳</span>
             <span class="skill-card-title">Payments & ATMs</span>
             <span class="skill-card-desc">Idempotency, circuit breaker</span>
@@ -192,18 +192,23 @@
 ### Phase 3: Low-Level Design (3-4 weeks)
 
 | # | Project | Skills Built | Resources |
-|---|---------|-------------|-----------|
-| 6 | **Parking Lot** | OOD basics, SOLID, Strategy/Factory patterns | [Code](low-level-design/parking-lot/CODE.md) |
-| 7 | **Vending Machine** | State machines, finite automata | [Code](low-level-design/vending-machine/CODE.md) |
-| 8 | **LRU Cache / Rate Limiter** | Data structures, concurrency | [Cache](low-level-design/lru-cache/CODE.md) + [Rate Limiter](low-level-design/rate-limiter/CODE.md) |
-| 9 | **Pub-Sub / Movie Booking** | Observer pattern, concurrency control | [Pub-Sub](low-level-design/pub-sub-system/CODE.md) + [Booking](low-level-design/movie-ticket-booking/CODE.md) |
-| 10 | **Splitwise / Library Mgmt** | Graph algorithms, facade pattern | [Splitwise](low-level-design/splitwise-expense-sharing/CODE.md) + [Library](low-level-design/library-management/CODE.md) |
-| 11 | **Cab Booking / Car Rental** | Geo queries, Kafka integration, availability | [Cab](low-level-design/cab-booking-uber/CODE.md) + [Car Rental](low-level-design/car-rental-platform/CODE.md) |
-| 12 | **ATM / Payment Processing** | State machines, fraud detection, idempotency | [ATM](low-level-design/atm-banking-system/CODE.md) + [Payments](low-level-design/payment-processing-system/CODE.md) |
-| 13 | **Chess Game** | Complex state, enums, validation | [Chess](low-level-design/chess-game/CODE.md) |
-| 14 | **Notification Service** | High-throughput, multi-channel, cost-effective, scheduling | [HLD](low-level-design/notification-service/HIGH_LEVEL_DESIGN.md) + [Code](low-level-design/notification-service/CODE.md) |
-| 15 | **Job Scheduling (Airflow-like)** | Core-aware scheduling, DAG, recurring jobs, cron | [Design](low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md) |
-| 16 | **Search Platform** | TF-IDF, inverted index, ranking | [Search](low-level-design/search-platform/CODE.md) |
+| 6 | **Parking Lot** | OOD basics, SOLID, Strategy/Factory patterns | [Code](python-low-level-design/parking-lot/CODE.md) |
+| 7 | **Vending Machine** | State machines, finite automata | [Code](python-low-level-design/vending-machine/CODE.md) |
+| 8 | **LRU Cache / Rate Limiter** | Data structures, concurrency | [Cache](python-low-level-design/lru-cache/CODE.md) + [Rate Limiter](python-low-level-design/rate-limiter/CODE.md) |
+| 9 | **Pub-Sub / Movie Booking** | Observer pattern, concurrency control | [Pub-Sub](python-low-level-design/pub-sub-system/CODE.md) + [Booking](python-low-level-design/movie-ticket-booking/CODE.md) |
+| 10 | **Splitwise / Library Mgmt** | Graph algorithms, facade pattern | [Splitwise](python-low-level-design/splitwise-expense-sharing/CODE.md) + [Library](python-low-level-design/library-management/CODE.md) |
+| 11 | **Cab Booking / Car Rental** | Geo queries, Kafka integration, availability | [Cab](python-low-level-design/cab-booking-uber/CODE.md) + [Car Rental](python-low-level-design/car-rental-platform/CODE.md) |
+| 12 | **ATM / Payment Processing** | State machines, fraud detection, idempotency | [ATM](python-low-level-design/atm-banking-system/CODE.md) + [Payments](python-low-level-design/payment-processing-system/CODE.md) |
+| 13 | **Chess Game** | Complex state, enums, validation | [Chess](python-low-level-design/chess-game/CODE.md) |
+| 14 | **Notification Service** | High-throughput, multi-channel, cost-effective, scheduling | [HLD](python-low-level-design/notification-service/HIGH_LEVEL_DESIGN.md) + [Code](python-low-level-design/notification-service/CODE.md) |
+| 15 | **Job Scheduling (Airflow-like)** | Core-aware scheduling, DAG, recurring jobs, cron | [Design](python-low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md) |
+| 16 | **Search Platform** | TF-IDF, inverted index, ranking | [Search](python-low-level-design/search-platform/CODE.md) |
+| 17 | **Elevator System** | State machine, dispatching, SCAN algorithm | [Java Code](java-low-level-design/elevator-system/CODE.md) |
+| 18 | **Hotel Booking** | Inventory, pricing, reservations | [Java Code](java-low-level-design/hotel-booking-system/CODE.md) |
+| 19 | **Meeting Scheduler** | Calendar, conflict detection, rooms | [Java Code](java-low-level-design/meeting-scheduler/CODE.md) |
+| 20 | **Web Crawler** | Concurrency, worker pool, rate limiting | [Go Code](golang-low-level-design/web-crawler/CODE.md) |
+| 21 | **KV Store** | TTL, eviction policies, snapshots | [Go Code](golang-low-level-design/kv-store/CODE.md) |
+| 22 | **Task Queue** | Priority queue, retry, graceful shutdown | [Go Code](golang-low-level-design/task-queue/CODE.md) |
 
 ### Phase 4: Distributed Systems & Architecture (2-3 weeks)
 
@@ -279,10 +284,10 @@
 
 <div class="module-grid">
 
-<a href="low-level-design/" class="module-card">
+<a href="python-low-level-design/" class="module-card">
     <div class="module-card-header">
-        <span class="module-card-icon">🖥️</span>
-        <span class="module-card-title">Low-Level Design</span>
+        <span class="module-card-icon">🐍</span>
+        <span class="module-card-title">Python LLD</span>
     </div>
     <div class="module-card-body">
         <span class="module-card-count">18 projects</span>
@@ -292,6 +297,38 @@
         <span class="module-card-tag">OOD</span>
         <span class="module-card-tag">SOLID</span>
         <span class="module-card-tag">Patterns</span>
+    </div>
+</a>
+
+<a href="java-low-level-design/" class="module-card">
+    <div class="module-card-header">
+        <span class="module-card-icon">☕</span>
+        <span class="module-card-title">Java LLD</span>
+    </div>
+    <div class="module-card-body">
+        <span class="module-card-count">3 projects</span>
+        <span class="module-card-desc">Elevator System, Hotel Booking, Meeting Scheduler. OOP with Strategy, State, Observer patterns.</span>
+    </div>
+    <div class="module-card-footer">
+        <span class="module-card-tag">Java</span>
+        <span class="module-card-tag">OOP</span>
+        <span class="module-card-tag">Patterns</span>
+    </div>
+</a>
+
+<a href="golang-low-level-design/" class="module-card">
+    <div class="module-card-header">
+        <span class="module-card-icon">🦦</span>
+        <span class="module-card-title">Go LLD</span>
+    </div>
+    <div class="module-card-body">
+        <span class="module-card-count">3 projects</span>
+        <span class="module-card-desc">Web Crawler, KV Store, Task Queue. Concurrency with goroutines, channels, worker pools.</span>
+    </div>
+    <div class="module-card-footer">
+        <span class="module-card-tag">Go</span>
+        <span class="module-card-tag">CSP</span>
+        <span class="module-card-tag">goroutines</span>
     </div>
 </a>
 

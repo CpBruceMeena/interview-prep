@@ -2,8 +2,9 @@
 site_name: Interview Prep
 site_description: >-
   Comprehensive interview preparation for Staff/Principal backend engineers.
-  18 LLD projects with SOLID design patterns, RAG chatbot implementation,
-  language deep-dives (Python/Go), and 8 CS core topics with 90+ staff-level questions.
+  24 LLD projects across Python, Java, and Go with SOLID design patterns,
+  RAG chatbot implementation, language deep-dives (Python/Go/Java),
+  and 8 CS core topics with 90+ staff-level questions.
 site_url: https://cpbrucemeena.github.io/interview-prep/
 site_author: CpBruceMeena
 copyright: Built with ❤️ for backend engineers preparing for Senior/Staff/Principal-level interviews
@@ -116,109 +117,145 @@ extra_javascript:
 nav:
   - Home: index.md
 
-  - 🖥️ Low-Level Design:
-    - Overview: low-level-design/README.md
+  - 🐍 Python Low-Level Design:
+    - Overview: python-low-level-design/README.md
     - Parking Lot:
-      - Thought Process: low-level-design/parking-lot/THOUGHT_PROCESS.md
-      - Code: low-level-design/parking-lot/CODE.md
-      - Schema: low-level-design/parking-lot/DB_SCHEMA.md
-      - HLD: low-level-design/parking-lot/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/parking-lot/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/parking-lot/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/parking-lot/CODE.md
+      - Schema: python-low-level-design/parking-lot/DB_SCHEMA.md
+      - HLD: python-low-level-design/parking-lot/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/parking-lot/INTERVIEW_QUESTIONS.md
     - Chess Game:
-      - Thought Process: low-level-design/chess-game/THOUGHT_PROCESS.md
-      - Code: low-level-design/chess-game/CODE.md
-      - Schema: low-level-design/chess-game/DB_SCHEMA.md
-      - HLD: low-level-design/chess-game/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/chess-game/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/chess-game/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/chess-game/CODE.md
+      - Schema: python-low-level-design/chess-game/DB_SCHEMA.md
+      - HLD: python-low-level-design/chess-game/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/chess-game/INTERVIEW_QUESTIONS.md
     - Tic-Tac-Toe:
-      - Thought Process: low-level-design/tic-tac-toe/THOUGHT_PROCESS.md
-      - Code: low-level-design/tic-tac-toe/CODE.md
-      - HLD: low-level-design/tic-tac-toe/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/tic-tac-toe/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/tic-tac-toe/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/tic-tac-toe/CODE.md
+      - HLD: python-low-level-design/tic-tac-toe/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/tic-tac-toe/INTERVIEW_QUESTIONS.md
     - Snakes & Ladders:
-      - Thought Process: low-level-design/snakes-and-ladders/THOUGHT_PROCESS.md
-      - Code: low-level-design/snakes-and-ladders/CODE.md
-      - HLD: low-level-design/snakes-and-ladders/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/snakes-and-ladders/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/snakes-and-ladders/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/snakes-and-ladders/CODE.md
+      - HLD: python-low-level-design/snakes-and-ladders/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/snakes-and-ladders/INTERVIEW_QUESTIONS.md
     - Vending Machine:
-      - Thought Process: low-level-design/vending-machine/THOUGHT_PROCESS.md
-      - Code: low-level-design/vending-machine/CODE.md
-      - HLD: low-level-design/vending-machine/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/vending-machine/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/vending-machine/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/vending-machine/CODE.md
+      - HLD: python-low-level-design/vending-machine/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/vending-machine/INTERVIEW_QUESTIONS.md
     - LRU/LFU/TTL Cache:
-      - Thought Process: low-level-design/lru-cache/THOUGHT_PROCESS.md
-      - Code: low-level-design/lru-cache/CODE.md
-      - HLD: low-level-design/lru-cache/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/lru-cache/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/lru-cache/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/lru-cache/CODE.md
+      - HLD: python-low-level-design/lru-cache/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/lru-cache/INTERVIEW_QUESTIONS.md
     - Rate Limiter:
-      - Thought Process: low-level-design/rate-limiter/THOUGHT_PROCESS.md
-      - Code: low-level-design/rate-limiter/CODE.md
-      - HLD: low-level-design/rate-limiter/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/rate-limiter/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/rate-limiter/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/rate-limiter/CODE.md
+      - HLD: python-low-level-design/rate-limiter/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/rate-limiter/INTERVIEW_QUESTIONS.md
     - Pub-Sub System:
-      - Thought Process: low-level-design/pub-sub-system/THOUGHT_PROCESS.md
-      - Code: low-level-design/pub-sub-system/CODE.md
-      - HLD: low-level-design/pub-sub-system/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/pub-sub-system/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/pub-sub-system/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/pub-sub-system/CODE.md
+      - HLD: python-low-level-design/pub-sub-system/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/pub-sub-system/INTERVIEW_QUESTIONS.md
     - Movie Ticket Booking:
-      - Thought Process: low-level-design/movie-ticket-booking/THOUGHT_PROCESS.md
-      - Code: low-level-design/movie-ticket-booking/CODE.md
-      - HLD: low-level-design/movie-ticket-booking/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/movie-ticket-booking/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/movie-ticket-booking/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/movie-ticket-booking/CODE.md
+      - HLD: python-low-level-design/movie-ticket-booking/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/movie-ticket-booking/INTERVIEW_QUESTIONS.md
     - Splitwise:
-      - Thought Process: low-level-design/splitwise-expense-sharing/THOUGHT_PROCESS.md
-      - Code: low-level-design/splitwise-expense-sharing/CODE.md
-      - HLD: low-level-design/splitwise-expense-sharing/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/splitwise-expense-sharing/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/splitwise-expense-sharing/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/splitwise-expense-sharing/CODE.md
+      - HLD: python-low-level-design/splitwise-expense-sharing/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/splitwise-expense-sharing/INTERVIEW_QUESTIONS.md
     - Cab Booking (Uber):
-      - Thought Process: low-level-design/cab-booking-uber/THOUGHT_PROCESS.md
-      - Code: low-level-design/cab-booking-uber/CODE.md
-      - Schema: low-level-design/cab-booking-uber/DB_SCHEMA.md
-      - HLD: low-level-design/cab-booking-uber/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/cab-booking-uber/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/cab-booking-uber/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/cab-booking-uber/CODE.md
+      - Schema: python-low-level-design/cab-booking-uber/DB_SCHEMA.md
+      - HLD: python-low-level-design/cab-booking-uber/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/cab-booking-uber/INTERVIEW_QUESTIONS.md
     - Library Management:
-      - Thought Process: low-level-design/library-management/THOUGHT_PROCESS.md
-      - Code: low-level-design/library-management/CODE.md
-      - HLD: low-level-design/library-management/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/library-management/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/library-management/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/library-management/CODE.md
+      - HLD: python-low-level-design/library-management/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/library-management/INTERVIEW_QUESTIONS.md
     - Car Rental:
-      - Thought Process: low-level-design/car-rental-platform/THOUGHT_PROCESS.md
-      - Code: low-level-design/car-rental-platform/CODE.md
-      - Schema: low-level-design/car-rental-platform/DB_SCHEMA.md
-      - HLD: low-level-design/car-rental-platform/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/car-rental-platform/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/car-rental-platform/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/car-rental-platform/CODE.md
+      - Schema: python-low-level-design/car-rental-platform/DB_SCHEMA.md
+      - HLD: python-low-level-design/car-rental-platform/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/car-rental-platform/INTERVIEW_QUESTIONS.md
     - ATM/Banking:
-      - Thought Process: low-level-design/atm-banking-system/THOUGHT_PROCESS.md
-      - Code: low-level-design/atm-banking-system/CODE.md
-      - Schema: low-level-design/atm-banking-system/DB_SCHEMA.md
-      - HLD: low-level-design/atm-banking-system/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/atm-banking-system/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/atm-banking-system/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/atm-banking-system/CODE.md
+      - Schema: python-low-level-design/atm-banking-system/DB_SCHEMA.md
+      - HLD: python-low-level-design/atm-banking-system/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/atm-banking-system/INTERVIEW_QUESTIONS.md
     - Inventory Management:
-      - Thought Process: low-level-design/inventory-management/THOUGHT_PROCESS.md
-      - Code: low-level-design/inventory-management/CODE.md
-      - HLD: low-level-design/inventory-management/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/inventory-management/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/inventory-management/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/inventory-management/CODE.md
+      - HLD: python-low-level-design/inventory-management/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/inventory-management/INTERVIEW_QUESTIONS.md
     - Payment Processing:
-      - Thought Process: low-level-design/payment-processing-system/THOUGHT_PROCESS.md
-      - Code: low-level-design/payment-processing-system/CODE.md
-      - HLD: low-level-design/payment-processing-system/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/payment-processing-system/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/payment-processing-system/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/payment-processing-system/CODE.md
+      - HLD: python-low-level-design/payment-processing-system/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/payment-processing-system/INTERVIEW_QUESTIONS.md
     - Job Scheduling:
-      - Thought Process: low-level-design/job-scheduling-system/THOUGHT_PROCESS.md
-      - Code: low-level-design/job-scheduling-system/CODE.md
-      - HLD: low-level-design/job-scheduling-system/HIGH_LEVEL_DESIGN.md
-      - Airflow-Like Design: low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md
-      - Questions: low-level-design/job-scheduling-system/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/job-scheduling-system/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/job-scheduling-system/CODE.md
+      - HLD: python-low-level-design/job-scheduling-system/HIGH_LEVEL_DESIGN.md
+      - Airflow-Like Design: python-low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md
+      - Questions: python-low-level-design/job-scheduling-system/INTERVIEW_QUESTIONS.md
     - Notification Service:
-      - Thought Process: low-level-design/notification-service/THOUGHT_PROCESS.md
-      - Code: low-level-design/notification-service/CODE.md
-      - HLD: low-level-design/notification-service/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/notification-service/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/notification-service/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/notification-service/CODE.md
+      - HLD: python-low-level-design/notification-service/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/notification-service/INTERVIEW_QUESTIONS.md
     - Search Platform:
-      - Thought Process: low-level-design/search-platform/THOUGHT_PROCESS.md
-      - Code: low-level-design/search-platform/CODE.md
-      - HLD: low-level-design/search-platform/HIGH_LEVEL_DESIGN.md
-      - Questions: low-level-design/search-platform/INTERVIEW_QUESTIONS.md
+      - Thought Process: python-low-level-design/search-platform/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/search-platform/CODE.md
+      - HLD: python-low-level-design/search-platform/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/search-platform/INTERVIEW_QUESTIONS.md
+
+  - ☕ Java Low-Level Design:
+    - Overview: java-low-level-design/README.md
+    - Elevator System:
+      - Thought Process: java-low-level-design/elevator-system/THOUGHT_PROCESS.md
+      - Code: java-low-level-design/elevator-system/CODE.md
+      - HLD: java-low-level-design/elevator-system/HIGH_LEVEL_DESIGN.md
+      - Questions: java-low-level-design/elevator-system/INTERVIEW_QUESTIONS.md
+    - Hotel Booking System:
+      - Thought Process: java-low-level-design/hotel-booking-system/THOUGHT_PROCESS.md
+      - Code: java-low-level-design/hotel-booking-system/CODE.md
+      - HLD: java-low-level-design/hotel-booking-system/HIGH_LEVEL_DESIGN.md
+      - Questions: java-low-level-design/hotel-booking-system/INTERVIEW_QUESTIONS.md
+    - Meeting Scheduler:
+      - Thought Process: java-low-level-design/meeting-scheduler/THOUGHT_PROCESS.md
+      - Code: java-low-level-design/meeting-scheduler/CODE.md
+      - HLD: java-low-level-design/meeting-scheduler/HIGH_LEVEL_DESIGN.md
+      - Questions: java-low-level-design/meeting-scheduler/INTERVIEW_QUESTIONS.md
+
+  - 🦦 Go Low-Level Design:
+    - Overview: golang-low-level-design/README.md
+    - Web Crawler:
+      - Thought Process: golang-low-level-design/web-crawler/THOUGHT_PROCESS.md
+      - Code: golang-low-level-design/web-crawler/CODE.md
+      - HLD: golang-low-level-design/web-crawler/HIGH_LEVEL_DESIGN.md
+      - Questions: golang-low-level-design/web-crawler/INTERVIEW_QUESTIONS.md
+    - In-Memory KV Store:
+      - Thought Process: golang-low-level-design/kv-store/THOUGHT_PROCESS.md
+      - Code: golang-low-level-design/kv-store/CODE.md
+      - HLD: golang-low-level-design/kv-store/HIGH_LEVEL_DESIGN.md
+      - Questions: golang-low-level-design/kv-store/INTERVIEW_QUESTIONS.md
+    - Task Queue:
+      - Thought Process: golang-low-level-design/task-queue/THOUGHT_PROCESS.md
+      - Code: golang-low-level-design/task-queue/CODE.md
+      - HLD: golang-low-level-design/task-queue/HIGH_LEVEL_DESIGN.md
+      - Questions: golang-low-level-design/task-queue/INTERVIEW_QUESTIONS.md
 
   - 🧠 AI Engineering:
     - Overview: ai-engineering/README.md
