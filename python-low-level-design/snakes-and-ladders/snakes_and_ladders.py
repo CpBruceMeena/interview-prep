@@ -254,9 +254,9 @@ class GameRules:
 
         final_pos = board.get_destination(new_pos)
 
-        if final_pos > new_pos:
+        if final_pos < new_pos:
             message = f"🐍 Oops! Snake from {new_pos} to {final_pos}!"
-        elif final_pos < new_pos:
+        elif final_pos > new_pos:
             message = f"🪜 Great! Ladder from {new_pos} to {final_pos}!"
         else:
             message = ""

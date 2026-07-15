@@ -1,5 +1,18 @@
 # 🧠 Web Crawler — Thought Process
 
+## 📊 Class Diagram
+
+<p align="center">
+  <video controls width="900" style="border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);" loop playsinline preload="metadata">
+    <source src="../../../assets/videos/go-webcrawler-class-diagram.mp4" type="video/mp4" />
+    Your browser does not support the video tag.
+  </video>
+  <br/>
+  <em>🎬 Animated Class Diagram — Web Crawler: CSP + Fan-Out/Fan-In + Rate Limiting — Workers, Sitemaps, Robots.txt. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+</p>
+
+---
+
 ## Problem Breakdown
 
 ### Step 1: Core Components

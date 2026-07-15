@@ -1,6 +1,7 @@
 import { Composition } from "remotion";
 import { SequenceDiagram } from "./SequenceDiagram";
 import { FlowchartAnimation, FlowchartData } from "./FlowchartAnimation";
+import { ClassDiagramAnimation } from "./ClassDiagramAnimation";
 import { LLD_SEQUENCES } from "./sequences";
 import { ADVANCED_SEQUENCES } from "./sequences-advanced";
 import { ECS_AGENT_SEQUENCES } from "./sequences-agent-ecs";
@@ -9,6 +10,7 @@ import { AWS_COMPUTE_SEQUENCES } from "./sequences-aws-compute";
 import { AWS_NETWORKING_SEQUENCES } from "./sequences-aws-networking";
 import { AWS_STORAGE_DB_SEQUENCES } from "./sequences-aws-storage-db";
 import { AWS_SECURITY_ADDITIONAL_SEQUENCES } from "./sequences-aws-security-additional";
+import { ALL_CLASS_DIAGRAMS } from "./sequences-class-diagrams";
 
 const ALL_SEQUENCES = [
   ...LLD_SEQUENCES,
@@ -113,6 +115,18 @@ export const RemotionRoot: React.FC = () => {
         height={1080}
         defaultProps={{ flowchart: SAMPLE_FLOWCHART }}
       />
+      {ALL_CLASS_DIAGRAMS.map((diag) => (
+        <Composition
+          key={diag.id}
+          id={diag.id}
+          component={ClassDiagramAnimation}
+          durationInFrames={diag.durationInFrames}
+          fps={30}
+          width={1920}
+          height={1080}
+          defaultProps={{ diagram: diag }}
+        />
+      ))}
     </>
   );
 };
