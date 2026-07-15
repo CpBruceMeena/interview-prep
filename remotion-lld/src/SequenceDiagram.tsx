@@ -38,14 +38,19 @@ const THEME = {
   detailText: "#94a3b8",
 };
 
-const BOX_WIDTH = 180;
-const ARROW_START_Y = 180;
-const STEP_SPACING = 70;
+const BOX_WIDTH = 200;
+const ARROW_START_Y = 190;
+const BOTTOM_PADDING = 40;
 
 function getLayout(totalActors: number) {
   const totalWidth = totalActors * BOX_WIDTH;
   const startX = (1920 - totalWidth) / 2;
   return { startX, totalWidth };
+}
+
+function getStepSpacing(stepCount: number) {
+  const availableHeight = 1080 - ARROW_START_Y - BOTTOM_PADDING;
+  return Math.max(75, Math.min(140, Math.floor(availableHeight / stepCount)));
 }
 
 // ─── Actor Header ─────────────────────────────────────────
@@ -73,7 +78,7 @@ const ActorHeader: React.FC<{
     <div
       style={{
         position: "absolute",
-        top: 80,
+        top: 100,
         left: x - BOX_WIDTH / 2,
         width: BOX_WIDTH,
         height: 60,
@@ -118,12 +123,12 @@ const Lifeline: React.FC<{
     <div
       style={{
         position: "absolute",
-        top: ARROW_START_Y - 35,
+        top: ARROW_START_Y - 30,
         left: x - 1,
         width: 2,
         height: lifelineHeight,
         background: `linear-gradient(to bottom, ${THEME.primary}44, ${THEME.primary}22, ${THEME.primary}44)`,
-        opacity: 0.4,
+        opacity: 0.35,
       }}
     />
   );
@@ -135,12 +140,13 @@ const AnimatedArrow: React.FC<{
   step: StepData;
   stepIndex: number;
   totalActors: number;
-}> = ({ step, stepIndex, totalActors }) => {
+  stepSpacing: number;
+}> = ({ step, stepIndex, totalActors, stepSpacing }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
   const { startX } = getLayout(totalActors);
-  const arrowY = ARROW_START_Y + stepIndex * STEP_SPACING;
+  const arrowY = ARROW_START_Y + stepIndex * stepSpacing;
   const fromX = startX + step.from * BOX_WIDTH + BOX_WIDTH / 2;
   const toX = startX + step.to * BOX_WIDTH + BOX_WIDTH / 2;
   const midX = (fromX + toX) / 2;
@@ -156,7 +162,7 @@ const AnimatedArrow: React.FC<{
 
   const labelOpacity = interpolate(
     localFrame,
-    [10, 18],
+    [12, 20],
     [0, 1],
     { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
   );
@@ -165,6 +171,7 @@ const AnimatedArrow: React.FC<{
 
   const isSelfLoop = step.from === step.to;
   const isRight = fromX <= toX;
+  const arrowMidY = stepSpacing / 2;
 
   return (
     <div
@@ -173,90 +180,90 @@ const AnimatedArrow: React.FC<{
         top: arrowY,
         left: 0,
         width: 1920,
-        height: STEP_SPACING,
-        opacity: labelOpacity,
+        height: stepSpacing,
       }}
     >
-      {isSelfLoop ? (
-        <svg width={1920} height={STEP_SPACING} style={{ position: "absolute", top: 0, left: 0 }}>
-          <path
-            d={`M ${fromX} ${STEP_SPACING} C ${fromX + 80} ${-20}, ${fromX + 80} ${-20}, ${fromX} ${0}`}
-            fill="none"
-            stroke={THEME.arrowLine}
-            strokeWidth={2}
-            strokeDasharray={arrowProgress * 100}
-            opacity={arrowProgress}
-          />
-          <polygon
-            points={`${fromX - 6},${2} ${fromX + 6},${2} ${fromX},${-6}`}
-            fill={THEME.arrowHead}
-            opacity={arrowProgress}
-          />
-        </svg>
-      ) : (
-        <svg width={1920} height={STEP_SPACING} style={{ position: "absolute", top: 0, left: 0 }}>
-          <line
-            x1={fromX}
-            y1={STEP_SPACING / 2}
-            x2={fromX + (toX - fromX) * arrowProgress}
-            y2={STEP_SPACING / 2}
-            stroke={THEME.arrowLine}
-            strokeWidth={2.5}
-          />
-          {arrowProgress > 0.9 && (
-            <>
-              <line
-                x1={toX}
-                y1={STEP_SPACING / 2}
-                x2={fromX + (toX - fromX) * 0.9}
-                y2={STEP_SPACING / 2}
-                stroke={THEME.arrowLine}
-                strokeWidth={2.5}
+      <svg width={1920} height={stepSpacing} style={{ position: "absolute", top: 0, left: 0 }}>
+        {isSelfLoop ? (
+          <>
+            <path
+              d={`M ${fromX} ${arrowMidY + 10} C ${fromX + 80} ${-10}, ${fromX + 80} ${-10}, ${fromX} ${arrowMidY - 14}`}
+              fill="none"
+              stroke={THEME.arrowLine}
+              strokeWidth={2}
+              strokeDasharray={arrowProgress > 0.95 ? 'none' : `${arrowProgress * 80} 80`}
+              opacity={Math.min(1, arrowProgress * 1.5)}
+            />
+            {arrowProgress > 0.95 && (
+              <polygon
+                points={`${fromX - 6},${arrowMidY - 14} ${fromX + 6},${arrowMidY - 14} ${fromX},${arrowMidY - 22}`}
+                fill={THEME.arrowHead}
               />
+            )}
+          </>
+        ) : (
+          <>
+            {/* Arrow line — smoothly extends from source to target */}
+            <line
+              x1={fromX}
+              y1={arrowMidY}
+              x2={fromX + (toX - fromX) * Math.min(1, arrowProgress)}
+              y2={arrowMidY}
+              stroke={THEME.arrowLine}
+              strokeWidth={2.5}
+              strokeLinecap="round"
+            />
+            {/* Arrowhead — appears when line is nearly complete */}
+            {arrowProgress > 0.95 && (
               <polygon
                 points={
                   isRight
-                    ? `${toX - 8},${STEP_SPACING / 2 - 6} ${toX - 8},${STEP_SPACING / 2 + 6} ${toX + 4},${STEP_SPACING / 2}`
-                    : `${toX + 8},${STEP_SPACING / 2 - 6} ${toX + 8},${STEP_SPACING / 2 + 6} ${toX - 4},${STEP_SPACING / 2}`
+                    ? `${toX - 8},${arrowMidY - 6} ${toX - 8},${arrowMidY + 6} ${toX + 4},${arrowMidY}`
+                    : `${toX + 8},${arrowMidY - 6} ${toX + 8},${arrowMidY + 6} ${toX - 4},${arrowMidY}`
                 }
                 fill={THEME.arrowHead}
               />
-            </>
-          )}
-        </svg>
-      )}
+            )}
+          </>
+        )}
+      </svg>
 
+      {/* Label — centered above the arrow line */}
       <div
         style={{
           position: "absolute",
           top: 2,
-          left: midX - 10,
+          left: midX,
           transform: "translateX(-50%)",
           backgroundColor: THEME.labelBg,
           color: THEME.text,
-          padding: "3px 10px",
+          padding: "4px 12px",
           borderRadius: 6,
-          fontSize: 12,
+          fontSize: 13,
           fontWeight: 600,
           whiteSpace: "nowrap",
           border: `1px solid ${THEME.primary}55`,
           opacity: labelOpacity,
+          boxShadow: `0 2px 8px ${THEME.primary}22`,
+          zIndex: 10,
         }}
       >
         {step.label}
       </div>
 
+      {/* Detail — centered below the arrow line */}
       {step.detail && (
         <div
           style={{
             position: "absolute",
-            top: 24,
-            left: midX - 10,
+            top: arrowMidY + 8,
+            left: midX,
             transform: "translateX(-50%)",
             color: THEME.detailText,
-            fontSize: 10,
+            fontSize: 11,
             whiteSpace: "nowrap",
-            opacity: Math.max(0, labelOpacity - 0.3),
+            opacity: Math.max(0, labelOpacity - 0.2),
+            letterSpacing: 0.3,
           }}
         >
           {step.detail}
@@ -274,9 +281,11 @@ export const SequenceDiagram: React.FC<{
   const frame = useCurrentFrame();
   const { durationInFrames } = useVideoConfig();
 
+  const stepSpacing = getStepSpacing(sequence.steps.length);
+
   const lifelineHeight = Math.max(
     820,
-    sequence.steps.length * STEP_SPACING + 60
+    sequence.steps.length * stepSpacing + 60
   );
 
   const titleOpacity = interpolate(frame, [0, 15], [0, 1], {
@@ -319,7 +328,7 @@ export const SequenceDiagram: React.FC<{
       <div
         style={{
           position: "absolute",
-          top: 20,
+          top: 25,
           left: 0,
           right: 0,
           textAlign: "center",
@@ -342,7 +351,7 @@ export const SequenceDiagram: React.FC<{
           style={{
             color: THEME.detailText,
             fontSize: 14,
-            margin: "4px 0 0",
+            margin: "8px 0 0",
             opacity: subtitleOpacity,
           }}
         >
@@ -374,6 +383,7 @@ export const SequenceDiagram: React.FC<{
           step={step}
           stepIndex={i}
           totalActors={sequence.actors.length}
+          stepSpacing={stepSpacing}
         />
       ))}
 
