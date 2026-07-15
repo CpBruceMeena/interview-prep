@@ -101,6 +101,14 @@ const COMPOSITION_IDS = [
   "aws-guardduty-multi-account",
   "aws-cognito-auth-flow",
 
+  // ── Class Diagrams (Java/Go LLD) ──
+  "java-elevator-class-diagram",
+  "java-meeting-class-diagram",
+  "java-hotel-class-diagram",
+  "go-kvstore-class-diagram",
+  "go-taskqueue-class-diagram",
+  "go-webcrawler-class-diagram",
+
   // ── Flowchart ──
   "sample-flowchart",
 
