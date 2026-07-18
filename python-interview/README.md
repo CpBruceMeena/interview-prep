@@ -10,6 +10,8 @@
 | File | Content |
 |------|---------|
 | [`INTERVIEW_QUESTIONS.md`](./INTERVIEW_QUESTIONS.md) | 12 in-depth questions covering Python's core internals at staff level |
+| [`DJANGO_NOTES.md`](./DJANGO_NOTES.md) | Deep-dive into Django's ORM, request lifecycle, DRF, caching, async, and production patterns |
+| [`FASTAPI_NOTES.md`](./FASTAPI_NOTES.md) | Deep-dive into FastAPI's async patterns, Pydantic integration, DI system, WebSockets, and production deployment |
 
 ### Topics Covered
 

@@ -289,6 +289,7 @@ nav:
       - Python Async/Await: ai-engineering/agents/06_PYTHON_ASYNC_AWAIT.md
       - Agent Observability: ai-engineering/agents/07_AGENT_OBSERVABILITY.md
       - Multi-LLM Architecture: ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE.md
+      - Multi-LLM Production Ops: ai-engineering/agents/14_MULTI_LLM_PRODUCTION_OPS.md
       - Agent Deployment (ECS): ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md
       - System/User/Assistant Roles: ai-engineering/agents/10_SYSTEM_USER_ASSISTANT_ROLES.md
       - Redis Lease: ai-engineering/agents/11_REDIS_LEASE.md
@@ -313,6 +314,7 @@ nav:
     - Interview Questions: python-interview/INTERVIEW_QUESTIONS.md
     - Multithreading & Concurrency: python-interview/MULTITHREADING_NOTES.md
     - Django: python-interview/DJANGO_NOTES.md
+    - FastAPI: python-interview/FASTAPI_NOTES.md
 
   - 🐹 Golang:
     - Overview: golang-interview/README.md
