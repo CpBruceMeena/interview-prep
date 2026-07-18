@@ -22,6 +22,8 @@ User Goal → Agent (Think → Act → Observe) → Tools/MCP → Result
 | 2 | [Agent Interview Questions](02_AGENT_INTERVIEW_QUESTIONS.md) | 10 Staff/Principal-level Q&A with evaluation rubric |
 | 3 | [Agent Implementation Guide](03_AGENT_IMPLEMENTATION_GUIDE.md) | Building agents with runnable code, tool registries, MCP integration |
 | 4 | [Agent Production Architecture](04_AGENT_PRODUCTION_ARCHITECTURE.md) | Production deployment, guardrails, observability, cost management |
+| 5 | [Multi-LLM Architecture](08_MULTI_LLM_ARCHITECTURE.md) | Routing, cost management, fallback chains for multiple LLM providers |
+| 6 | [Multi-LLM Production Ops](14_MULTI_LLM_PRODUCTION_OPS.md) | Token monitoring, rate limiting, caching, retries, observability, A/B testing, alerting for multi-LLM deployments |
 
 ## Implementation
 
