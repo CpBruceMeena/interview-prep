@@ -30,8 +30,8 @@ cs-interview/
 │   ├── INTERVIEW_QUESTIONS.md          (10 questions)
 │   └── DATA_STRUCTURES_FOR_SCALE.md   (12 structures, 700+ lines)
 │
-├── software-architecture/              ← Microservices, CQRS, event sourcing
-│   └── INTERVIEW_QUESTIONS.md          (12 questions)
+├── software-architecture/              ← Microservices → Strangler Fig (all 12 topics)
+│   └── INTERVIEW_QUESTIONS.md          (fully expanded with code examples & evaluation rubrics)
 │
 └── security/                           ← OWASP, JWT, OAuth2, secrets management
     └── INTERVIEW_QUESTIONS.md          (10 questions)
