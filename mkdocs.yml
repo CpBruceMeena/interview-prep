@@ -304,6 +304,12 @@ nav:
       - Tokenization & Cost: ai-engineering/llm-internals/04_TOKENIZATION_AND_COST.md
       - Prompt Engineering: ai-engineering/llm-internals/05_SYSTEM_PROMPT_ENGINEERING.md
       - How Claude Makes Code Changes: ai-engineering/llm-internals/06_HOW_CLAUDE_MAKES_CODE_CHANGES.md
+    - 🧠 Agent Memory Systems:
+      - Overview: ai-engineering/agents/15_AGENT_MEMORY_SYSTEMS.md
+    - 🚀 Forward Deploy Engineer:
+      - Overview: ai-engineering/FORWARD_DEPLOY_ENGINEER_GUIDE.md
+    - 🎯 Preparation Strategy:
+      - AI Engineer & FDE Strategy: ai-engineering/AI_PREPARATION_STRATEGY.md
     - 🔧 Harness & Loop Engineering:
       - Overview: ai-engineering/harness-engineering/README.md
       - Harness Engineering: ai-engineering/harness-engineering/01_HARNESS_ENGINEERING.md
@@ -320,11 +326,13 @@ nav:
     - Overview: golang-interview/README.md
     - Interview Questions: golang-interview/INTERVIEW_QUESTIONS.md
     - Concurrency & Goroutines: golang-interview/CONCURRENCY_NOTES.md
+    - Pointers, Memory & Object Handling: golang-interview/POINTERS_MEMORY_NOTES.md
 
   - ☕ Java:
     - Overview: java-interview/README.md
     - Interview Questions: java-interview/INTERVIEW_QUESTIONS.md
     - JVM Internals & GC: java-interview/JVM_INTERNALS_NOTES.md
+    - Object Handling, References & Memory: java-interview/OBJECT_HANDLING_MEMORY_NOTES.md
     - Spring Boot Deep-Dive: java-interview/SPRING_BOOT_NOTES.md
 
   - ☁️ AWS:
