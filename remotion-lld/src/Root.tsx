@@ -11,6 +11,8 @@ import { AWS_NETWORKING_SEQUENCES } from "./sequences-aws-networking";
 import { AWS_STORAGE_DB_SEQUENCES } from "./sequences-aws-storage-db";
 import { AWS_SECURITY_ADDITIONAL_SEQUENCES } from "./sequences-aws-security-additional";
 import { ALL_CLASS_DIAGRAMS } from "./sequences-class-diagrams";
+import { SECURITY_SEQUENCES } from "./sequences-security";
+import { SECURITY_FLOWCHARTS } from "./flowcharts-security";
 
 const ALL_SEQUENCES = [
   ...LLD_SEQUENCES,
@@ -21,6 +23,7 @@ const ALL_SEQUENCES = [
   ...AWS_NETWORKING_SEQUENCES,
   ...AWS_STORAGE_DB_SEQUENCES,
   ...AWS_SECURITY_ADDITIONAL_SEQUENCES,
+  ...SECURITY_SEQUENCES,
 ];
 
 // ─── Sample Flowchart ──────────────────────────────────
@@ -115,6 +118,18 @@ export const RemotionRoot: React.FC = () => {
         height={1080}
         defaultProps={{ flowchart: SAMPLE_FLOWCHART }}
       />
+      {SECURITY_FLOWCHARTS.map((fc) => (
+        <Composition
+          key={fc.id}
+          id={fc.id}
+          component={FlowchartAnimation}
+          durationInFrames={fc.durationInFrames}
+          fps={30}
+          width={1920}
+          height={1080}
+          defaultProps={{ flowchart: fc }}
+        />
+      ))}
       {ALL_CLASS_DIAGRAMS.map((diag) => (
         <Composition
           key={diag.id}

@@ -130,6 +130,22 @@ const COMPOSITION_IDS = [
   // ── AWS — Security (new) ──
   "aws-waf-managed-rules",
   "aws-secrets-manager",
+
+  // ── Security — Backend Interview Topics ──
+  "sec-oauth2-pkce",
+  "sec-jwt-revocation",
+  "sec-ssrf-defense",
+  "sec-vault-dynamic",
+  "sec-csrf-defense",
+
+  // ── Security — New (SQLi & Encryption) ──
+  "sec-sqli-defense",
+  "sec-encryption-lifecycle",
+
+  // ── Security — Flowcharts ──
+  "sec-rate-limiting-flow",
+  "sec-supply-chain-flow",
+  "sec-cors-flow",
 ];
 
 async function renderAll() {
