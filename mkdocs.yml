@@ -269,6 +269,9 @@ nav:
       - Low-Level Design: ai-engineering/rag/06_LOW_LEVEL_DESIGN.md
       - High-Level Design: ai-engineering/rag/07_HIGH_LEVEL_DESIGN.md
       - Implementation: ai-engineering/rag/implementation/index.md
+    - 🏭 Production AI:
+      - Overview: ai-engineering/production-ai/index.md
+      - Interview Questions: ai-engineering/production-ai/INTERVIEW_QUESTIONS.md
     - 🔌 MCP:
       - Overview: ai-engineering/mcp/README.md
       - MCP Fundamentals: ai-engineering/mcp/01_MCP_FUNDAMENTALS.md
