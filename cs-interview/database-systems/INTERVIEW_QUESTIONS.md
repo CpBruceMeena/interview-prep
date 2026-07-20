@@ -654,8 +654,6 @@ LIMIT 50;
 
 ---
 
-> *The remaining 10 questions cover indexing strategies, replication, sharding, buffer pool internals, deadlock detection, concurrency control, materialized views, migrations, connection pooling, and distributed SQL — all at the same staff-level depth as the 4 questions above.*
-
 ## 5. Indexing Strategies: B-Tree vs Hash vs GiST vs GIN vs BRIN
 
 **Q:** "You have a PostgreSQL table with 100M rows containing the following query patterns: (A) exact-match lookups on user_id, (B) full-text search on document_body, (C) range queries on created_at, (D) JSONB queries on metadata. Choose the optimal index type for each."
@@ -797,5 +795,4 @@ Resharding (64 → 128 nodes):
 
 ---
 
-> *Each of these 10 topics deserves the same depth of code examples, diagrams, and evaluation rubrics as the 4 fully written questions above. The complete set is available in the companion guides linked in the cs-interview README.*
 

@@ -391,8 +391,6 @@ To Follower C: prevLogIndex=4, prevLogTerm=4, entries=[]
 
 ---
 
-> *The remaining 10 questions cover distributed transactions, vector clocks, consistent hashing, gossip protocols, distributed caching, leader election, CRDTs, Paxos, UUID generation, and BFT — all at the same staff-level depth as the 2 questions above.*
-
 ## 3. Distributed Transactions: 2PC vs 3PC vs Saga
 
 **Q:** "Design an order processing system that spans three microservices (Inventory, Payments, Shipping). The system must handle partial failures gracefully. Compare 2-Phase Commit, 3-Phase Commit, and the Saga pattern. Walk through the failure scenarios for each. Which would you use and why?"
