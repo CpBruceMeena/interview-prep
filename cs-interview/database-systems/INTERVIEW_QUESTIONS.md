@@ -666,13 +666,20 @@ LIMIT 50;
 -- B-Tree (default) — for user_id exact match and range:
 -- Best for: =, >, <, >=, <=, BETWEEN, IN, ORDER BY
 -- Structure: balanced tree, leaf pages contain (key, TID)
--- Space: ~20 bytes per row
+-- Space: ~24B/row (key + 6B TID + page overhead)
 SELECT * FROM users WHERE user_id = 42;
-CREATE INDEX idx_user_id ON users USING BTREE (user_id);
+CREATE INDEX idx_user_id ON users USING btree (user_id);
 
--- GiST for full-text search:
--- Best for: tsvector @@ tsquery, geometric types, range overlap
--- Structure: R-tree-like, height-balanced, supports containment
+-- Hash — for exact-match lookups only (no range queries):
+-- Best for: = operator only
+-- Structure: hash code + TID in hash buckets
+-- Space: ~24B/row (4B hash + 6B TID + page overhead)
+SELECT * FROM sessions WHERE session_token = 'abc123';
+CREATE INDEX idx_session_token ON sessions USING hash (session_token);
+
+-- GIN for full-text search:
+-- Best for: tsvector @@ tsquery, JSONB @>, arrays, full-text
+-- Structure: inverted index (maps tokens to rows), slower to build
 SELECT * FROM documents WHERE doc_body @@ to_tsquery('english', 'postgresql & indexing');
 CREATE INDEX idx_doc_search ON documents USING GIN (to_tsvector('english', doc_body));
 
@@ -692,9 +699,9 @@ CREATE INDEX idx_metadata ON profiles USING GIN (metadata jsonb_path_ops);
 
 | Index Type | Query Pattern | Build Speed | Size | Write Overhead |
 |-----------|--------------|-------------|------|---------------|
-| B-Tree | =, ranges, ORDER BY | Fast | ~20B/row | ~2× log(N) writes |
-| Hash | = only (no ranges) | Fast | ~8B/row | ~same as B-Tree |
-| GiST | tsquery, geometry | Medium | ~30B/row | Medium (no WAL logging) |
+| B-Tree | =, ranges, ORDER BY | Fast | ~24B/row | ~2× log(N) writes |
+| Hash | = only (no ranges) | Fast | ~24B/row | ~same as B-Tree |
+| GiST | tsquery, geometry | Medium | ~30B/row | Medium (WAL-logged) |
 | GIN | JSONB, arrays, tsvector | Slow (3×) | ~50B/row | High (inverted list update) |
 | BRIN | Range on append-only | Fastest | ~0.1B/row | Minimal |
 
@@ -777,21 +784,1302 @@ Resharding (64 → 128 nodes):
 
 ---
 
-## 8-14. Summary of Remaining Topics
+## 8. PostgreSQL Buffer Pool & WAL Internals
 
-8. **PostgreSQL Buffer Pool & WAL**: Buffer manager eviction (clock sweep), WAL insertion LSN ordering, checkpoint behavior, full_page_writes, wal_sync_method
+**Q:** "A query that was running in 50ms suddenly takes 5 seconds. You check `pg_stat_bgwriter` and see `buffers_backend_fsync` is high and `checkpoints_timed` is low. Walk through how PostgreSQL's buffer pool eviction works, how WAL interacts with checkpoints, and what's causing the slowdown."
 
-9. **Deadlock Detection**: Cycle detection in waits-for graph vs timeout-based detection, lock escalation in InnoDB vs PostgreSQL row-level locking
+**What They're Really Testing:** Whether you understand the interplay between shared buffers, WAL, and checkpoints — the three pillars of PostgreSQL's durability and performance.
 
-10. **Concurrency Control**: 2PL (growing/shrinking phases) vs OCC (validation-based) vs MVCC (snapshot isolation). When OCC outperforms 2PL: low contention, short transactions
+### Answer
 
-11. **Materialized Views**: When to use vs live query: refresh CONCURRENTLY vs nonconcurrent, incrementally maintainable views (pg_ivm extension)
+**Shared Buffer Pool Architecture:**
 
-12. **Database Migrations**: Zero-downtime migration patterns: expand-migrate-contract, online schema change (pt-online-schema-change, gh-ost). Lock wait times
+```
+PostgreSQL Shared Buffers (default: 128MB, recommended: 25% of RAM)
 
-13. **Connection Pooling**: PgBouncer transaction mode vs session mode. Pool sizing formula: `pool_size = (connections × (query_time / request_time))` from Little's Law
+┌────────────────────────────────────────────────────────────────┐
+│ Buffer Descriptors (in shared memory)                         │
+│ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐       │
+│ │ buf1 │ │ buf2 │ │ buf3 │ │ ...  │ │ bufN │ │ bufN │       │
+│ │state:│ │state:│ │state:│ │      │ │      │ │      │       │
+│ │ref:3 │ │ref:0 │ │ref:1 │ │      │ │      │ │      │       │
+│ │usage:2│ │usage:0│ │usage:1│ │      │ │      │ │      │       │
+│ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘       │
+└────────────────────────────────────────────────────────────────┘
+         │               │
+         ▼               ▼
+┌─────────────────┐ ┌─────────────────┐
+│ Buffer Pool     │ │ WAL (pg_wal)    │
+│ (8KB pages)     │ │ (16MB segments) │
+│ ┌─────┐ ┌─────┐│ │ ┌─────┐ ┌─────┐│
+│ │pg 1 │ │pg 2 ││ │ │WAL1 │ │WAL2 ││
+│ └─────┘ └─────┘│ │ └─────┘ └─────┘│
+└─────────────────┘ └─────────────────┘
+```
 
-14. **Distributed SQL**: CockroachDB (Raft + range splits) vs Spanner (TrueTime + Paxos). How Google Spanner uses GPS + atomic clocks to provide external consistency
+**Clock Sweep Eviction Algorithm:**
+
+```python
+# PostgreSQL uses a "clock sweep" (not LRU!) for buffer eviction.
+# Reason: LRU requires locks on every buffer access → contention.
+# Clock sweep: approximate LRU with low overhead.
+
+class ClockSweep:
+    """
+    Each buffer has a usage_count (0-5).
+    - When a buffer is accessed: usage_count = min(5, usage_count + 1)
+    - When searching for a victim: sweep clockwise, decrement each
+    - First buffer with usage_count == 0 is the victim
+    - If none found: wrap around and decrement again
+    """
+    def __init__(self, num_buffers: int):
+        self.buffers = [{
+            'usage_count': 0,
+            'is_dirty': False,
+            'pin_count': 0,     # 0 = unpinned, >0 = currently being read
+            'page_id': None,
+        } for _ in range(num_buffers)]
+        self.clock_hand = 0  # Current sweep position
+
+    def access_buffer(self, idx: int):
+        """Called when a buffer is hit (no lock needed!)"""
+        self.buffers[idx]['usage_count'] = min(5, self.buffers[idx]['usage_count'] + 1)
+
+    def evict_one(self) -> int:
+        """
+        Find a buffer to evict. Returns buffer index.
+        Called when a new page needs to be read but all buffers are in use.
+        """
+        while True:
+            buf = self.buffers[self.clock_hand]
+
+            if buf['pin_count'] > 0:
+                # Buffer is pinned (currently being read/written) — skip
+                self.clock_hand = (self.clock_hand + 1) % len(self.buffers)
+                continue
+
+            if buf['usage_count'] > 0:
+                # Recently used — decrement and move on
+                buf['usage_count'] -= 1
+                self.clock_hand = (self.clock_hand + 1) % len(self.buffers)
+                continue
+
+            # Found a victim (usage_count == 0)
+            victim_idx = self.clock_hand
+            self.clock_hand = (self.clock_hand + 1) % len(self.buffers)
+
+            if buf['is_dirty']:
+                # Must write to disk before reuse → triggers bgwriter
+                self.write_to_disk(victim_idx)
+
+            return victim_idx
+
+# Clock sweep means:
+#   - Hot pages stay in cache (usage_count keeps getting reset)
+#   - Cold pages get evicted (usage_count decays to 0)
+#   - No expensive LRU list maintenance
+#   - But: large sequential scans can "pollute" the cache
+#     (each scanned page gets usage_count=1, evicting real hot pages)
+```
+
+**The Problem — Checkpoint Starvation:**
+
+```sql
+-- Symptom: high buffers_backend_fsync, low checkpoints_timed
+
+SELECT * FROM pg_stat_bgwriter;
+--   checkpoints_timed: 5          (expected: many)
+--   checkpoints_req: 98           (too many!)
+--   buffers_backend: 450000       (backend wrote instead of bgwriter)
+--   buffers_backend_fsync: 12000  (backend did fsync! BAD!)
+--   maxwritten_clean: 45          (bgwriter couldn't keep up)
+
+-- Root cause:
+--   1. WAL generates too many writes (full_page_writes = on)
+--   2. Checkpoint frequency is too low (checkpoint_timeout > 15min)
+--   3. bgwriter can't flush dirty buffers fast enough
+--   4. Backends start doing their own writes + fsync → SLOW!
+```
+
+**WAL Write and Checkpoint Mechanics:**
+
+```python
+# WAL (Write-Ahead Logging): Every data change is written to WAL BEFORE
+# the data page. On crash: replay WAL to recover.
+
+class WALManager:
+    """
+    WAL architecture:
+    - WAL segments: 16MB each, stored in pg_wal/
+    - Each record has a unique LSN (Log Sequence Number)
+    - LSN = (segment_file, offset_within_segment)
+    - WAL insertion is SERIAL (one at a time, protected by WALInsertLock)
+    """
+    def __init__(self):
+        self.insert_lsn = 0  # Next LSN to assign
+        self.flush_lsn = 0   # Last LSN fsync'd to disk
+        self.write_lsn = 0   # Last LSN written (but maybe not fsync'd)
+
+    def insert_record(self, data: bytes) -> int:
+        """
+        Step 1: Reserve space in WAL buffer
+        Step 2: Copy data to WAL buffer
+        Step 3: Update insert_lsn
+        """
+        lsn = self.reserve_space(len(data))
+        self.wal_buffer[self.get_offset(lsn)] = data
+        self.insert_lsn = lsn + len(data)
+        return lsn
+
+    def flush(self, lsn: int):
+        """
+        Ensure all WAL up to 'lsn' is on disk.
+        Uses wal_sync_method:
+          - open_datasync (default on Linux): fdatasync()
+          - fdatasync: fsync()
+          - fsync_writethrough: write-through caching
+        """
+        if lsn > self.flush_lsn:
+            # Write from write_lsn to lsn
+            os.write(self.wal_fd, self.wal_buffer[self.write_lsn:lsn])
+            self.write_lsn = lsn
+            # fsync to guarantee durability
+            os.fdatasync(self.wal_fd)
+            self.flush_lsn = lsn
+
+    def checkpoint(self, force: bool = False):
+        """
+        Checkpoint writes ALL dirty buffers to disk and advances
+        the redo point so WAL can be recycled.
+        """
+        # Phase 1: Write all dirty shared buffers
+        for buf in shared_buffers:
+            if buf.is_dirty:
+                # Write buffer (with full_page_write if first after checkpoint)
+                if buf.is_first_write_after_checkpoint:
+                    # full_page_write: write the ENTIRE 8KB page to WAL
+                    # Prevents "torn page" on partial write during crash
+                    wal.insert_record(buf.full_page_data)
+                buf.write_to_disk()
+                buf.is_dirty = False
+
+        # Phase 2: Flush WAL (all WAL up to this point)
+        wal.flush(wal.insert_lsn)
+
+        # Phase 3: Update pg_control (redo point)
+        self.redo_point = wal.insert_lsn
+
+        # Phase 4: Remove old WAL segments (before redo point)
+        self.recycle_wal_segments()
+```
+
+**Diagnosing the 5s Query:**
+
+```sql
+-- Diagnosis queries:
+
+-- 1. Check if the query is waiting on I/O
+SELECT pg_blocking_pids(pid), wait_event_type, wait_event, query
+FROM pg_stat_activity
+WHERE state = 'active' AND wait_event IS NOT NULL;
+-- If wait_event = 'BufferIO' or 'WALWrite': I/O bottleneck
+
+-- 2. Check checkpoint frequency
+SELECT * FROM pg_stat_bgwriter;
+-- If checkpoints_req >> checkpoints_timed: checkpoint happening too often
+
+-- 3. Check shared_buffers hit ratio
+SELECT 'buffer_hit_ratio',
+       (blks_hit::float / (blks_hit + blks_read) * 100)::numeric(5,2)
+FROM pg_stat_database WHERE datname = current_database();
+-- If < 95%: shared_buffers too small or bad query plans
+
+-- 4. Fix: Increase checkpoint distance
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;  -- Spread writes over 90% of window
+ALTER SYSTEM SET max_wal_size = '4GB';                -- Checkpoint less often
+ALTER SYSTEM SET checkpoint_timeout = '15min';         -- Max interval
+SELECT pg_reload_conf();
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **Clock sweep** | Explains why PostgreSQL doesn't use LRU (lock contention) and how usage_count works |
+| **WAL LSN** | Knows insert/flush/write LSN positions and the WAL flush protocol |
+| **Checkpoint interaction** | Understands full_page_writes, checkpoint spreading, and how dirty buffers accumulate |
+| **Diagnosis** | Can read pg_stat_bgwriter to identify the root cause of I/O stalls |
+
+---
+
+## 9. Deadlock Detection & Lock Escalation
+
+**Q:** "A production PostgreSQL database running at 80% CPU suddenly spikes to 100% and stays there. Queries are completing but slowly. You notice `pg_locks` shows hundreds of `Relation` locks and many processes waiting on `transactionid`. Walk through how PostgreSQL detects deadlocks, how lock escalation works (or doesn't), and how to resolve this."
+
+**What They're Really Testing:** Whether you understand PostgreSQL's lock manager internals — the difference between relation-level and row-level locks, deadlock detection mechanics, and how InnoDB's lock escalation differs.
+
+### Answer
+
+**PostgreSQL Lock Types:**
+
+```
+PostgreSQL has TWO independent lock systems:
+
+1. Heavyweight Locks (pg_locks):
+   - Relation-level: AccessShare, RowShare, RowExclusive, ShareUpdateExclusive,
+                     Share, ShareRowExclusive, Exclusive, AccessExclusive
+   - Row-level: FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE, FOR KEY SHARE
+   - Transaction-level: transactionid (row XMIN/XMAX waits)
+   - Visible in pg_locks, managed by lock manager
+
+2. Lightweight Locks (LWLock):
+   - Internal to PostgreSQL subsystems
+   - Buffer mapping, WAL insert, clog, etc.
+   - NOT visible in pg_locks! (visible in pg_stat_activity wait_event)
+   - Uses spinlock + sleep retry
+```
+
+**Lock Modes and Conflicts:**
+
+```
+              Requested Lock Mode
+              AS  RS  RE  SU  S  SR  E  AE
+Held Mode     ──────────────────────────────
+AccessShare   ✅  ✅  ✅  ✅  ✅  ✅  ✅  ❌
+RowShare      ✅  ✅  ✅  ✅  ✅  ✅  ❌  ❌
+RowExclusive  ✅  ✅  ✅  ❌  ❌  ❌  ❌  ❌
+ShareUpdateEx ✅  ✅  ❌  ❌  ❌  ❌  ❌  ❌
+Share         ✅  ✅  ❌  ❌  ❌  ❌  ❌  ❌
+ShareRowExcl  ✅  ❌  ❌  ❌  ❌  ❌  ❌  ❌
+Exclusive     ✅  ❌  ❌  ❌  ❌  ❌  ❌  ❌
+AccessExclus  ❌  ❌  ❌  ❌  ❌  ❌  ❌  ❌
+
+Key insight: RowExclusive (the default for INSERT/UPDATE/DELETE)
+conflicts ONLY with Share, ShareRowExclusive, Exclusive, AccessExclusive.
+This is why many SELECT queries can run alongside writes!
+```
+
+**Deadlock Detection Algorithm:**
+
+```python
+# PostgreSQL's deadlock detector runs every deadlock_timeout (1s).
+# It builds a "waits-for" graph and searches for cycles using DFS.
+
+class DeadlockDetector:
+    """
+    Simplified PostgreSQL deadlock detection.
+    """
+    def __init__(self):
+        self.waits_for = {}  # {waiter_pid: blocker_pid}
+        self.lock_queue = {}  # {lock_id: [waiting_pids]}
+
+    def add_lock_wait(self, waiter: int, lock_id: str):
+        """A process starts waiting for a lock."""
+        if lock_id not in self.lock_queue:
+            self.lock_queue[lock_id] = []
+        self.lock_queue[lock_id].append(waiter)
+
+    def remove_lock_holder(self, holder: int, lock_id: str):
+        """A process releases a lock. Wake up waiters."""
+        if lock_id in self.lock_queue:
+            # Wake the first waiter (PG wakes ALL waiters, they recheck)
+            self.lock_queue[lock_id].pop(0)
+
+    def build_waits_for_graph(self):
+        """
+        For each blocked process, find who holds the lock it's waiting for.
+        """
+        graph = {}
+        for lock_id, waiters in self.lock_queue.items():
+            for waiter in waiters:
+                holder = self.find_lock_holder(lock_id)
+                if holder:
+                    graph[waiter] = holder
+        return graph
+
+    def detect_cycle(self, graph: dict) -> list[int] | None:
+        """
+        DFS cycle detection in the waits-for graph.
+        """
+        visited = set()
+        in_stack = set()
+
+        def dfs(node: int, path: list[int]) -> list[int] | None:
+            visited.add(node)
+            in_stack.add(node)
+            path.append(node)
+
+            blocker = graph.get(node)
+            if blocker in in_stack:
+                # Found a cycle!
+                cycle_start = path.index(blocker)
+                return path[cycle_start:] + [blocker]
+            elif blocker and blocker not in visited:
+                result = dfs(blocker, path)
+                if result:
+                    return result
+
+            path.pop()
+            in_stack.discard(node)
+            return None
+
+        for pid in graph:
+            if pid not in visited:
+                result = dfs(pid, [])
+                if result:
+                    return result
+        return None
+
+    def resolve_deadlock(self):
+        """
+        PostgreSQL selects the victim based on:
+        1. Transaction age (youngest = cheapest to rollback)
+        2. NOT based on amount of work done
+        """
+        graph = self.build_waits_for_graph()
+        cycle = self.detect_cycle(graph)
+
+        if cycle:
+            # Pick the newest transaction as victim
+            victim = max(cycle, key=lambda pid: self.get_tx_age(pid))
+            self.abort_transaction(victim)
+            return victim
+        return None
+```
+
+**InnoDB vs PostgreSQL Lock Escalation:**
+
+```
+PostgreSQL:
+  - NO lock escalation! Row-level locks NEVER escalate to page or table locks
+  - Every row lock stays as a separate entry in the lock table
+  - Problem: UPDATE 1M rows in a transaction → 1M lock entries in memory
+  - Lock table is sized by max_locks_per_transaction × max_connections
+  - If lock table fills: "out of shared memory" error
+
+MySQL InnoDB:
+  - Escalation: multiple row locks on the same table → table-level intention lock
+  - The lock manager converts many fine-grained locks into fewer coarse ones
+  - Reduces memory pressure but increases contention
+  - Example: UPDATE ... WHERE status = 'pending' on 1M rows
+    → InnoDB may escalate to table-level IX lock
+    → Blocks all other writes to the table!
+
+Which is better?
+  - PostgreSQL: better concurrency (no escalation = fewer blocking situations)
+  - InnoDB: better memory usage (escalation = fewer lock manager entries)
+```
+
+**Diagnosing the 100% CPU Scenario:**
+
+```sql
+-- Step 1: Find what's using CPU
+SELECT pid, state, wait_event_type, wait_event,
+       query_start, query
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+ORDER BY (EXTRACT(EPOCH FROM now()) - EXTRACT(EPOCH FROM query_start)) DESC;
+
+-- Likely finding: Hundreds of connections on RowExclusive locks
+-- Each spends CPU checking lock compatibility
+
+-- Step 2: Check lock count
+SELECT count(*), locktype, mode, granted
+FROM pg_locks
+GROUP BY locktype, mode, granted
+ORDER BY count(*) DESC;
+
+-- If many 'relation' + 'RowExclusive' NOT granted: lock contention
+
+-- Step 3: Find the blocked query chain
+SELECT blocked.pid, blocked.query, blocker.pid, blocker.query
+FROM pg_locks blocked
+JOIN pg_locks blocker ON blocked.locktype = blocker.locktype
+  AND blocked.database = blocker.database
+  AND blocked.relation = blocker.relation
+  AND blocked.pid != blocker.pid
+WHERE NOT blocked.granted AND blocker.granted;
+
+-- Step 4: Kill the oldest transaction holding conflicting locks
+SELECT pg_terminate_backend(
+    (SELECT pid FROM pg_stat_activity
+     ORDER BY query_start ASC LIMIT 1)
+);
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **Lock types** | Distinguishes heavyweight locks from LWLocks, knows conflict matrix |
+| **Deadlock detection** | Explains waits-for graph, cycle detection, victim selection |
+| **Lock escalation** | Knows PostgreSQL never escalates; InnoDB does — tradeoffs of each |
+| **Diagnosis** | Can identify lock contention from pg_locks and pg_stat_activity |
+
+---
+
+## 10. Concurrency Control: 2PL vs OCC vs MVCC
+
+**Q:** "Design a booking system for a concert venue with 10,000 seats. Two customers try to book the last seat simultaneously. Compare how Strict 2PL, Optimistic Concurrency Control (OCC), and MVCC would handle this. Which would you choose and why?"
+
+**What They're Really Testing:** Whether you understand the fundamental concurrency control paradigms — their guarantees, tradeoffs, and when each is appropriate.
+
+### Answer
+
+**Three Paradigms at a Glance:**
+
+```
+Approach          Philosophy                  Guarantee         Throughput
+────────          ──────────                  ─────────         ──────────
+Strict 2PL        Lock first, then do work   Conflict serializable    Low
+OCC               Do work, then validate     Conflict serializable    Medium (low contention only)
+MVCC              Snapshot + detect conflict Snapshot isolation       High
+```
+
+**Strict 2PL (Two-Phase Locking):**
+
+```sql
+-- Phase 1: Growing (acquire locks, no release)
+-- Phase 2: Shrinking (release locks, no acquire)
+
+BEGIN;
+-- GROWING phase:
+SELECT * FROM seats WHERE id = 42 FOR UPDATE;  -- Acquire exclusive lock
+-- Now we hold the lock. No other transaction can read/write seat 42.
+
+UPDATE seats SET booked_by = 'Alice' WHERE id = 42;
+
+-- SHRINKING phase:
+COMMIT;  -- Release ALL locks at commit
+
+-- If another transaction also tries to lock seat 42:
+--   → It BLOCKS until we commit → NO lost update!
+--   → But: no concurrency! Only one booking at a time for the same seat.
+
+-- Problem: Can cause deadlocks when multiple resources are involved:
+--   T1: LOCK seat 42, wants seat 50
+--   T2: LOCK seat 50, wants seat 42
+--   → DEADLOCK! One must be aborted.
+```
+
+**OCC (Optimistic Concurrency Control):**
+
+```python
+# OCC: Assume no conflict. Do the work. Validate at commit.
+# Three phases: Read → Validate → Write
+
+class OCCTransaction:
+    """
+    OCC transaction for booking seats.
+    """
+    def __init__(self, db):
+        self.db = db
+        self.read_set = set()     # Objects I read
+        self.write_set = set()    # Objects I'll write
+        self.old_values = {}      # Snapshot of read values
+        self.start_ts = None
+
+    def read(self, key: str):
+        """PHASE 1: Read — record the value and version"""
+        value, version = self.db.get_with_version(key)
+        self.read_set.add(key)
+        self.old_values[key] = (value, version)
+        return value
+
+    def write(self, key: str, value):
+        """PHASE 1: Write — buffer the write, don't apply yet"""
+        self.write_set.add(key)
+        self.old_values[key + '_new'] = value
+
+    def commit(self) -> bool:
+        """PHASE 2: Validate — check no conflicts"""
+        # Backward validation: check if any object I read was
+        # modified by another transaction since I read it
+        for key in self.read_set:
+            _, current_version = self.db.get_with_version(key)
+            if current_version != self.old_values[key][1]:
+                # Conflict! Another transaction modified this key.
+                return False  # Must retry!
+
+        # PHASE 3: Write — apply all buffered writes
+        for key in self.write_set:
+            self.db.put(key, self.old_values[key + '_new'])
+        return True
+
+    # For the booking scenario:
+    # T1 and T2 both read seat 42 (available = true)
+    # Both try to book it
+    # T1 commits first: validates, writes, succeeds
+    # T2 commits: VALIDATION FAILS! (seat 42's version changed)
+    # T2 retries from scratch
+    #
+    # Tradeoff: Under LOW contention, OCC wins (no locking overhead)
+    # Under HIGH contention (like last-seat scenario), lots of retries → waste
+```
+
+**MVCC (Multi-Version Concurrency Control):**
+
+```sql
+-- MVCC: Each transaction sees a SNAPSHOT of the database at its start time.
+-- Readers NEVER block writers, writers NEVER block readers.
+
+-- PostgreSQL's MVCC for the booking scenario:
+
+-- Transaction A:
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- Sees snapshot of seat 42: available=true, version=5
+
+-- Transaction B:
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- Sees SAME snapshot: available=true, version=5
+
+-- A books the seat:
+UPDATE seats SET booked_by = 'Alice' WHERE id = 42;
+-- Creates new tuple version (t_xmin = A, t_xmax = 0)
+-- Old tuple: t_xmax = A (not committed yet)
+COMMIT;
+
+-- B books the same seat:
+UPDATE seats SET booked_by = 'Bob' WHERE id = 42;
+-- PostgreSQL detects: the row has been updated by a concurrent transaction!
+-- ERROR: could not serialize access due to concurrent update
+-- B's transaction is ABORTED automatically!
+-- B must RETRY.
+
+-- Difference from OCC:
+--   OCC: validates at commit time after doing all work
+--   MVCC: detects conflict at FIRST write that would violate snapshot
+--         → earlier detection = less wasted work
+```
+
+**Comparison Table:**
+
+| Aspect | Strict 2PL | OCC | MVCC (PostgreSQL) |
+|--------|-----------|-----|-------------------|
+| **Reads block writes?** | Yes (S-lock) | No | No |
+| **Writes block reads?** | Yes (X-lock) | No | No |
+| **Writes block writes?** | Yes (queued) | At validation | At first conflicting write |
+| **Deadlock possible?** | Yes | No (no locks) | No (SSI might abort) |
+| **Best for** | High contention, short txns | Low contention | Mixed workloads |
+| **Worst for** | Long transactions | High contention | Long write txns (bloat) |
+| **Implementation** | Simple | Moderate | Complex |
+
+**Recommendation for Booking System:**
+
+```sql
+-- Use MVCC (PostgreSQL default) + explicit locking for hot spots:
+
+BEGIN ISOLATION LEVEL READ COMMITTED;
+
+-- For the "last seat" scenario, use SELECT FOR UPDATE:
+SELECT * FROM seats WHERE id = 42 FOR UPDATE;
+-- This serializes access to this specific seat
+-- Other seats remain fully concurrent (no table-level lock)
+
+-- Check availability
+SELECT available_count FROM venue WHERE id = 1 FOR UPDATE;
+
+-- Book the seat if available
+INSERT INTO bookings (seat_id, user_id) VALUES (42, 'Alice');
+UPDATE seats SET status = 'booked' WHERE id = 42;
+UPDATE venue SET available_count = available_count - 1 WHERE id = 1;
+
+COMMIT;
+
+-- Why this hybrid:
+--   - Most seats: MVCC handles reads without blocking
+--   - Hot spots (last seat, venue counter): explicit locking prevents race
+--   - No table-level locks needed = maximum concurrency
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **2PL phases** | Explains growing and shrinking phases, lock escalation |
+| **OCC validation** | Describes read-set validation, retry on conflict, when it excels |
+| **MVCC conflict detection** | Knows PG detects conflict on first conflicting write (vs OCC's commit-time) |
+| **Practical hybrid** | Recommends MVCC + targeted SELECT FOR UPDATE for hot spots |
+
+---
+
+## 11. Materialized Views & Indexed Views
+
+**Q:** "A reporting dashboard query that aggregates 50M rows takes 45 seconds to run. Users refresh it every minute. The table receives 100 writes/second during business hours. Design a solution using materialized views."
+
+**What They're Really Testing:** Whether you understand materialized views as a tradeoff between freshness and speed — and the mechanics of incremental vs full refresh.
+
+### Answer
+
+**Materialized View vs Live Query:**
+
+```
+Aspect              Live Query                   Materialized View
+─────────           ──────────                   ─────────────────
+Data freshness      100% current                 As of last refresh
+Query time          O(N) on 50M rows             O(log N) on indexed view
+Storage             0 (uses existing tables)     ~size of result set
+Write impact        0 (no overhead)              Refresh cost
+Refresh cost        0                             Full rebuild or incremental
+Best for            Ad-hoc, infrequent           Repeated, predictable queries
+```
+
+**Creating and Refreshing:**
+
+```sql
+-- Create a materialized view for the dashboard:
+CREATE MATERIALIZED VIEW daily_sales_summary AS
+SELECT p.category,
+       DATE_TRUNC('day', s.sale_date) AS day,
+       COUNT(*) AS num_sales,
+       SUM(s.amount) AS total_revenue,
+       AVG(s.amount) AS avg_ticket
+FROM sales s
+JOIN products p ON s.product_id = p.id
+WHERE s.sale_date >= NOW() - INTERVAL '30 days'
+GROUP BY p.category, DATE_TRUNC('day', s.sale_date)
+WITH DATA;  -- Populate immediately
+
+-- Add indexes for query performance:
+CREATE UNIQUE INDEX idx_dss_pk ON daily_sales_summary (category, day);
+CREATE INDEX idx_dss_revenue ON daily_sales_summary (total_revenue DESC);
+```
+
+**Refresh Strategies:**
+
+```sql
+-- Strategy 1: Full refresh (blocks readers!)
+REFRESH MATERIALIZED VIEW daily_sales_summary;
+-- Takes 45 seconds (same as the original query)
+-- ALL queries block during refresh → dashboard DOWN for 45s
+
+-- Strategy 2: CONCURRENTLY refresh (non-blocking)
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_sales_summary;
+-- Requires a UNIQUE index
+-- Takes LONGER (50-60s instead of 45s) but readers are NOT blocked
+-- Uses a temporary snapshot + merge approach:
+--   1. Create temp view with new data
+--   2. Acquire weak lock on matview
+--   3. INSERT new rows, UPDATE changed rows, DELETE removed rows
+--   4. Drop temp view
+--   5. Release lock
+
+-- Strategy 3: Incremental refresh (pg_ivm extension)
+-- Requires: CREATE EXTENSION pg_ivm;
+
+CREATE INCREMENTAL MATERIALIZED VIEW daily_sales_summary_immv AS
+SELECT p.category,
+       DATE_TRUNC('day', s.sale_date) AS day,
+       COUNT(*) AS num_sales,
+       SUM(s.amount) AS total_revenue
+FROM sales s
+JOIN products p ON s.product_id = p.id
+WHERE s.sale_date >= NOW() - INTERVAL '30 days'
+GROUP BY p.category, DATE_TRUNC('day', s.sale_date)
+WITH DATA;
+
+-- Now when sales are inserted/updated, the materialized view is
+-- automatically updated incrementally (no full refresh needed):
+INSERT INTO sales (product_id, amount, sale_date)
+VALUES (42, 150.00, NOW());
+-- pg_ivm automatically updates the materialized view:
+--   finds the matching category + day row
+--   increments count, adds to sum
+-- Takes ~1ms vs 45 seconds for full refresh!
+```
+
+**Designing the Right Refresh Schedule:**
+
+```python
+# For the dashboard that needs 1-minute freshness with 100 writes/s:
+
+# Option A: Full refresh every 5 minutes (off-peak)
+#   - CONCURRENTLY to avoid blocking
+#   - Accepts 5-minute stale data
+#   - 45s CPU spike every 5 minutes
+
+# Option B: Incremental materialized view (pg_ivm)
+#   - Auto-updates on every write (~1ms overhead)
+#   - Always fresh
+#   - Requires pg_ivm extension
+#   - Best for 1-minute refresh requirement
+
+# Option C: Hybrid approach
+#   - Incremental IMMV for real-time (last 24h)
+#   - Full refresh nightly for historical data
+
+CREATE INCREMENTAL MATERIALIZED VIEW live_dashboard AS
+SELECT ... FROM sales WHERE sale_date >= NOW() - INTERVAL '24 hours'
+WITH DATA;
+
+-- Nightly job:
+REFRESH MATERIALIZED VIEW CONCURRENTLY historical_dashboard;
+```
+
+**PostgreSQL Indexed Views (vs SQL Server):**
+
+```sql
+-- PostgreSQL does NOT have "indexed views" like SQL Server.
+-- In SQL Server:
+--   CREATE UNIQUE CLUSTERED INDEX ON view → view is materialized and index-maintained
+--
+-- PostgreSQL equivalent:
+--   1. CREATE MATERIALIZED VIEW
+--   2. CREATE INDEX ON the materialized view
+--   3. Schedule REFRESH (or use pg_ivm for auto-refresh)
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **CONCURRENTLY mechanics** | Knows how non-blocking refresh works (temp table + merge) |
+| **Incremental maintenance** | Mentions pg_ivm extension for automatic incremental refresh |
+| **Freshness vs cost** | Can recommend refresh interval based on write rate and query tolerance |
+| **Index strategy** | Creates indexes on materialized view for query performance |
+
+---
+
+## 12. Database Migrations at Scale
+
+**Q:** "You need to add a NOT NULL column with a default value to a 500M row production table. The application cannot have more than 1 second of downtime. Design the migration strategy."
+
+**What They're Really Testing:** Whether you understand that schema changes on large tables require multi-phase strategies, not a single ALTER TABLE.
+
+### Answer
+
+**The Problem — ALTER TABLE on 500M Rows:**
+
+```sql
+-- Naive approach (DISASTER):
+ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC';
+-- PostgreSQL: Only metadata change (no row rewrite) since PostgreSQL 11+
+-- BUT: Writes a new version of EVERY row to WAL (full_page_writes!)
+-- Locks: AccessExclusive lock on table → ALL queries blocked
+-- Time: ~30-60 minutes of complete downtime
+```
+
+**Zero-Downtime Strategy — Expand-Migrate-Contract:**
+
+```yaml
+Phase 1: EXPAND
+  - Add the column as nullable (no default)
+  - Application uses both old and new code paths
+  - NO downtime, NO locks on reads/writes
+
+Phase 2: MIGRATE
+  - Backfill the default value in batches
+  - Add NOT NULL constraint
+  - Application fully switches to new column
+
+Phase 3: CONTRACT
+  - Drop the old column (if replacing)
+  - Remove compatibility code from application
+```
+
+**Step-by-Step Implementation:**
+
+```sql
+-- ─────────────────────────────────────────────────
+-- PHASE 1: EXPAND — Add column (non-blocking!)
+-- ─────────────────────────────────────────────────
+
+-- PostgreSQL 11+: ALTER TABLE ... ADD COLUMN with DEFAULT is
+-- a metadata-only change for NON-NULL columns
+-- But for NOT NULL with DEFAULT, PG must rewrite every row!
+
+-- Safe approach: Add as nullable first
+ALTER TABLE users ADD COLUMN timezone TEXT;
+-- This is INSTANT (no row rewrite, just catalog change)
+-- Takes: ~1ms
+-- Lock: AccessExclusive, but held briefly
+
+-- ─────────────────────────────────────────────────
+-- PHASE 2a: Backfill — Fill in the default value
+-- ─────────────────────────────────────────────────
+
+-- Backfill in small batches (10,000 rows each)
+-- Using a batched UPDATE to avoid long-running transactions
+
+CREATE EXTENSION IF NOT EXISTS pg_batch;
+
+DO $$
+DECLARE
+    batch_size CONSTANT INT := 10000;
+    affected INT;
+BEGIN
+    LOOP
+        WITH batch AS (
+            SELECT ctid FROM users
+            WHERE timezone IS NULL
+            LIMIT batch_size
+            FOR UPDATE SKIP LOCKED  -- Don't block concurrent updates!
+        )
+        UPDATE users
+        SET timezone = 'UTC'
+        FROM batch
+        WHERE users.ctid = batch.ctid;
+
+        GET DIAGNOSTICS affected = ROW_COUNT;
+        RAISE NOTICE 'Updated % rows', affected;
+
+        COMMIT;  -- Commit each batch to release locks
+
+        EXIT WHEN affected < batch_size;
+    END LOOP;
+END;
+$$;
+
+-- Alternative: Use pt-online-schema-change (Percona Toolkit):
+-- pt-online-schema-change h=localhost,D=mydb,t=users \
+--   --alter "ADD COLUMN timezone TEXT DEFAULT 'UTC'" \
+--   --chunk-size=10000 --max-lag=1 --pause-file=/tmp/pause
+-- Creates a shadow table, copies data incrementally via triggers
+
+-- ─────────────────────────────────────────────────
+-- PHASE 2b: Add NOT NULL constraint
+-- ─────────────────────────────────────────────────
+
+-- First: validate all rows have the value
+-- If any NULLs remain, the constraint will fail!
+-- Use NOT VALID to add the constraint without checking existing rows:
+
+ALTER TABLE users ADD CONSTRAINT users_timezone_not_null
+    CHECK (timezone IS NOT NULL) NOT VALID;
+-- This is INSTANT — no row scan, just catalog change
+
+-- Then VALIDATE in the background (takes ShareUpdateExclusive lock):
+ALTER TABLE users VALIDATE CONSTRAINT users_timezone_not_null;
+-- This SCANS the table, but doesn't block SELECT/INSERT/UPDATE!
+-- Only blocks ALTER TABLE, VACUUM, etc.
+-- If it finds violations: fails (but constraint remains for new rows)
+
+-- ─────────────────────────────────────────────────
+-- PHASE 3: CONTRACT — Clean up
+-- ─────────────────────────────────────────────────
+
+-- If replacing an old column:
+-- 1. Stop all code from writing to old column
+-- 2. Drop old column:
+ALTER TABLE users DROP COLUMN old_timezone CASCADE;
+-- 3. Remove compatibility code from application
+```
+
+**Online Schema Change Tools Comparison:**
+
+```
+Tool                    Approach                 Locking                    Speed
+────                    ────────                 ───────                    ─────
+pgroll (xata)           Create new table + view   Lock-free                  Fast
+pt-online-schema-change Triggers + shadow table   Short metadata lock        Medium
+gh-ost (GitHub)         Binlog-based + shadow     No triggers (MySQL only)   Fast
+pg_batch                Batched UPDATE            Short row locks            Variable
+
+For PostgreSQL:
+  - pgroll: Best overall (no triggers, no locking)
+  - pg_batch: Good for backfills
+  - Manual expand-migrate-contract: Most control
+```
+
+**Common Pitfalls:**
+
+```yaml
+# Pitfall 1: Long-running migration transaction
+#   Problem: Holds snapshot → blocks VACUUM → bloat
+#   Fix: Commit every batch
+
+# Pitfall 2: Lock wait timeouts
+#   Problem: ALTER TABLE waits for other queries to finish
+#   Fix: SET lock_timeout = '5s'; on migration session
+#        Retry if timeout
+
+# Pitfall 3: Application reads NULL before backfill completes
+#   Problem: New column defaults to NULL, code doesn't handle it
+#   Fix: Backfill BEFORE deploying code that uses the column
+#        Or: Deploy code with NULL-safe reads first
+
+# Pitfall 4: Adding UNIQUE constraint on large table
+#   Problem: Requires full table scan + lock
+#   Fix: CREATE UNIQUE INDEX CONCURRENTLY (non-blocking)
+#        Then: ALTER TABLE ADD CONSTRAINT ... USING INDEX
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **Expand-Migrate-Contract** | Explains the multi-phase strategy with concrete SQL |
+| **NOT VALID + VALIDATE** | Knows how to add constraints without blocking writes |
+| **Batch backfill** | Uses batched updates with SKIP LOCKED to avoid contention |
+| **Tool awareness** | Mentions pgroll, pg_batch, or pt-online-schema-change |
+
+---
+
+## 13. Connection Pooling & PgBouncer Internals
+
+**Q:** "A Django application with 200 web workers connects to PostgreSQL and keeps crashing with 'too many connections.' The sysadmin increased max_connections to 500 but now the database is slow. Design a connection pooling strategy."
+
+**What They're Really Testing:** Whether you understand that more connections ≠ more throughput, and how PgBouncer's pooling modes change the equation.
+
+### Answer
+
+**The Problem — Connection Overload:**
+
+```
+Naive setup:
+  200 Django workers × 2 connections each = 400 connections to PostgreSQL
+  
+  PostgreSQL max_connections = 500
+  
+  Each connection:
+    - ~10MB shared memory (work_mem, sort_mem, etc.)
+    - ~5MB backend process (postgres process)
+    - ~2MB for buffers
+    Total per connection: ~17MB
+    
+  400 connections × 17MB = 6.8GB just for connection overhead
+  
+  Worse: The PostgreSQL query scheduler (process-based) spends
+  significant CPU context-switching between 400 processes
+  
+  Optimal: ~2× CPU cores = 32 connections for a 16-core machine
+```
+
+**PgBouncer Pooling Modes:**
+
+```
+Session Mode (default):
+┌────────┐      ┌──────────┐      ┌──────────┐
+│Worker 1│──────│PgBouncer │──────│PostgreSQL│
+│conn=5  │      │  pool=10 │      │  conn=10 │← Connection held for entire session
+└────────┘      └──────────┘      └──────────┘
+  Worker 1 disconnects → PgBouncer keeps connection for next use
+  Benefit: Quick reconnect for worker
+  Downside: Idle connections still consume resources
+
+Transaction Mode (recommended):
+┌────────┐      ┌──────────┐      ┌──────────┐
+│Worker 1│─TX1──│PgBouncer │──────│PostgreSQL│← Connection acquired
+└────────┘      └──────────┘      └──────────┘
+                    │              │ ← Connection RELEASED after COMMIT
+┌────────┐      ┌──────────┐      ┌──────────┐
+│Worker 2│─TX2──│PgBouncer │──────│PostgreSQL│← Different worker uses it
+└────────┘      └──────────┘      └──────────┘
+  Connections are shared ACROSS workers
+  10 pool connections can serve 200 workers!
+  Downside: SET statements, prepared statements, temp tables
+            are LOST between transactions!
+
+Statement Mode (rare):
+  Connection released after each statement
+  Even more sharing, but almost nothing survives between calls
+  Prepared statements, session variables, cursors — all lost
+```
+
+**PgBouncer Configuration:**
+
+```ini
+# pgbouncer.ini
+[databases]
+mydb = host=localhost port=5432 dbname=mydb
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+
+# Pool sizing:
+pool_mode = transaction        # Best for web apps
+default_pool_size = 32         # Total PostgreSQL connections
+max_client_conn = 500          # Max clients PgBouncer will accept
+
+# Queue management:
+reserve_pool_size = 4          # Extra connections for when pool is full
+reserve_pool_timeout = 2       # Seconds before using reserve pool
+max_db_connections = 32        # Hard limit per database
+
+# Timeouts:
+server_idle_timeout = 300      # Close idle connections after 5min
+client_idle_timeout = 600      # Drop idle clients after 10min
+query_timeout = 30             # Kill queries running >30s
+
+# Prepared statement handling:
+pkt_buf = 8192                 # Increased for prepared statements
+```
+
+**Pool Sizing with Little's Law:**
+
+```python
+# Little's Law: L = λ × W
+#   L = average number of connections in the pool (occupied)
+#   λ = arrival rate (transactions/second)
+#   W = average time a connection is held (seconds)
+
+# Example: Django app serving 1000 req/s
+request_rate = 1000         # 1000 requests/second
+avg_query_time = 0.050      # 50ms per query
+transactions_per_req = 3    # Each request does ~3 transactions
+
+# Total transaction rate:
+λ = request_rate * transactions_per_req  # 3000 tx/s
+
+# Average connection hold time (per transaction):
+W = avg_query_time  # 50ms = 0.05s
+
+# Required connections (Little's Law):
+L = λ × W = 3000 × 0.05 = 150 connections
+
+# But PgBouncer in transaction mode reuses connections rapidly!
+# Actual pool size can be smaller:
+#   Each of 32 connections can handle ~20 tx/s
+#   32 × (1/0.05) = 640 tx/s per connection group
+#   Need: 3000 / 640 ≈ 5 connection groups → not quite right
+
+# Better formula: pool = N_CPUs × (1 + wait_time / compute_time)
+#   For database-bound: pool = N_CPUs × 2
+#   For mixed: pool = N_CPUs × (1 + W/C)
+#   Where W = I/O wait time, C = CPU time
+
+# Safe starting point:
+pool_size = N_CPUs * 2  # 32 for 16-core machine
+# Monitor and adjust based on:
+#   - avg_wait_time (pgbouncer stats)
+#   - avg_query_time
+#   - Connection utilization
+```
+
+**Monitoring PgBouncer:**
+
+```sql
+-- PgBouncer's SHOW commands (connect to pgbouncer admin console):
+SHOW STATS;
+--   total_xact_count: 1,234,567
+--   total_query_count: 12,345,678
+--   total_received: 8.2 GB
+--   avg_xact_time: 0.045s  ← Average transaction duration
+--   avg_query: 0.012s
+
+SHOW POOLS;
+--   cl_active: 32     (connections currently processing)
+--   cl_waiting: 0     (clients waiting for a connection) ← Should be 0!
+--   sv_active: 28     (server connections in use)
+--   sv_idle: 4        (idle server connections)
+--   sv_used: 0        (connections held for session-mode clients)
+--   sv_tested: 0
+--   sv_login: 0
+--   maxwait: 0         (oldest client wait time in seconds) ← Should be 0!
+
+-- If cl_waiting > 0: increase pool size or optimize queries
+-- If maxwait > 0.1: pool is undersized for current load
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **Pooling modes** | Explains session vs transaction vs statement mode tradeoffs |
+| **Little's Law** | Applies L = λW correctly to size the pool |
+| **PgBouncer config** | Knows default_pool_size, reserve_pool, timeouts |
+| **Limitations** | Knows transaction mode breaks SET statements, prepared stmts, temp tables |
+
+---
+
+## 14. Distributed SQL: CockroachDB vs Spanner
+
+**Q:** "Your startup is building a global multi-tenant SaaS application. Data must be consistent across US, EU, and Asia regions. Compare CockroachDB and Google Spanner. How does each achieve global consistency without sacrificing availability?"
+
+**What They're Really Testing:** Whether you understand the fundamental architectural differences between the two major distributed SQL databases — and the tradeoffs in consistency model, clock assumptions, and deployment.
+
+### Answer
+
+**Architecture Comparison:**
+
+```
+CockroachDB:                                    Spanner:
+┌──────────────────────────────┐               ┌──────────────────────────────┐
+| SQL Gateway                  |               | SQL Gateway (any node)      |
+|   │                          |               |   │                          |
+|   ▼                          |               |   ▼                          |
+| Range 1 ── Raft ── Replica A |               | Split 1 ── Paxos ── Replica 1|
+|          ├── Replica B       |               |          ├── Replica 2       |
+|          └── Replica C       |               |          └── Replica 3       |
+|                              |               |                              |
+| CockroachDB uses:            |               | Spanner uses:                |
+|   - HLC (Hybrid Logical Clock)              |   - TrueTime (GPS + atomic)   |
+|   - Raft consensus          |               |   - Paxos consensus          |
+|   - Range splits            |               |   - Split + directory        |
+|   - Serializable by default |               |   - External consistency     |
+└──────────────────────────────┘               └──────────────────────────────┘
+```
+
+**Clock Mechanisms — The Key Difference:**
+
+```python
+# Both databases need a way to order transactions across regions.
+# The clock mechanism is THE critical architectural difference.
+
+# CockroachDB: HLC (Hybrid Logical Clock)
+#   = Wall clock + Logical counter
+#   No special hardware needed!
+
+class HLC:
+    """
+    Hybrid Logical Clock: combines physical time with a logical counter.
+    """
+    def __init__(self):
+        self.physical = 0  # Wall clock (nanoseconds)
+        self.logical = 0   # Logical counter (for same-timestamp events)
+
+    def now(self) -> tuple[int, int]:
+        """Return current HLC time."""
+        current_wall = self.get_wall_clock()
+
+        if current_wall > self.physical:
+            # Wall clock advanced normally
+            self.physical = current_wall
+            self.logical = 0
+        else:
+            # Same or earlier wall time — advance logical counter
+            self.logical += 1
+
+        return (self.physical, self.logical)
+
+    def update_from_remote(self, remote_physical: int, remote_logical: int):
+        """Update HLC from a message received from another node."""
+        current_wall = self.get_wall_clock()
+
+        # Take the MAX of local wall, remote wall, and remote HLC
+        self.physical = max(current_wall, remote_physical, self.physical)
+
+        if self.physical == current_wall == remote_physical:
+            # Same physical time — use max logical + 1
+            self.logical = max(self.logical, remote_logical) + 1
+        elif self.physical == remote_physical:
+            # Remote physical is newer — take its logical + 1
+            self.logical = remote_logical + 1
+        else:
+            # Local wall clock is newest
+            self.logical = 0
+
+# HLC gives us: if A happens-before B, then HLC(A) < HLC(B)
+# BUT: clock skew between nodes can cause false conflicts
+# Mitigation: CockroachDB uses "read refreshing" to handle clock uncertainty
+
+
+# Google Spanner: TrueTime
+#   = GPS + Atomic clocks in EVERY datacenter
+#   Expresses time as an INTERVAL [earliest, latest]
+
+class TrueTime:
+    """
+    TrueTime returns a time interval [tt_earliest, tt_latest].
+    The REAL time is guaranteed to be within this interval.
+    Clock uncertainty (ε) is typically 1-7ms.
+    """
+    def __init__(self):
+        self.epsilon = 7  # ms of uncertainty
+
+    def now(self) -> tuple[int, int]:
+        """
+        Returns (earliest, latest) — the real time is somewhere in between.
+        """
+        wall = self.get_gps_time()
+        return (wall - self.epsilon, wall + self.epsilon)
+
+    def after(self, timestamp: int) -> bool:
+        """
+        Is this timestamp definitively in the past?
+        True if: timestamp < tt_earliest (the earliest possible now)
+        """
+        earliest, _ = self.now()
+        return timestamp < earliest
+
+    def commit_wait(self, timestamp: int):
+        """
+        Spanner waits until TrueTime.after(timestamp) returns True.
+        This guarantees that the timestamp is IN THE PAST.
+        Typically: wait ε (7ms) to ensure no future transaction
+        assigns a conflicting timestamp.
+        """
+        while not self.after(timestamp):
+            sleep(1)  # Wait 1ms and recheck
+
+# TrueTime gives Spanner EXTERNAL CONSISTENCY:
+#   Transaction A commits at T(A)
+#   Transaction B starts after A commits
+#   → T(A) < T(B) guaranteed!
+```
+
+**Consensus Protocols — Raft vs Paxos:**
+
+```
+Raft (CockroachDB):                             Paxos (Spanner):
+───────────────                                 ───────────────
+Simpler, more understandable                    More complex, battle-tested
+Single leader per range (splits read/write)     Single proposer, multiple acceptors
+Leader election: randomized timeout             Leader election: multi-phase
+Writes: majority (N/2 + 1) of replicas          Writes: majority of voting members
+Reads: from leaseholder (follower reads stale)  Reads: can be from any replica
+
+Both provide:
+  - Linearizable writes (committed = durable)
+  - Automatic leader failover
+  - Strong consistency within the replication group
+```
+
+**Range Splits and Data Distribution:**
+
+```
+CockroachDB:                                    Spanner:
+────────────  
+Initial: 1 range for the table                  Initial: 1 split for the table
+Split threshold: 512MB or 64M rows              Split threshold: configurable
+Split: range splits into 2 at midpoint          Split: split into 2 directories
+Each range has its own Raft group               Each split has its own Paxos group
+Leaseholder executes reads/writes               Leader executes reads/writes
+
+Loading data into CockroachDB:
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT,
+    region STRING AS (substr(id::string, 1, 1)) STORED,
+    PRIMARY KEY (region, id)
+);
+-- Use regional-by-row table to pin rows to specific regions:
+ALTER TABLE users CONFIGURE ZONE USING
+    constraints = '{"+region=us-east": 1, "+region=eu-west": 1, "+region=ap-southeast": 1}';
+```
+
+**Choosing Between Them:**
+
+```yaml
+Use CockroachDB when:
+  - You need multi-region but can tolerate slightly higher latency
+  - You want to self-host (Kubernetes, on-premise)
+  - You need PostgreSQL compatibility (wire protocol)
+  - Your budget can't support Spanner's pricing
+  - Clock skew uncertainty is acceptable (HLC + read refreshing)
+
+Use Spanner when:
+  - You need TRUE external consistency (stronger than CockroachDB)
+  - Budget is not a concern (Spanner is expensive)
+  - You want Google to handle operations (fully managed)
+  - You need the lowest possible commit wait times (TrueTime's 7ms ε)
+  - Your workload benefits from interleaved tables (hierarchical storage)
+
+Key differences in consistency:
+  - Spanner: EXTERNAL consistency (TrueTime commit wait)
+  - CockroachDB: SERIALIZABLE (but may have clock-skew edge cases)
+  - In practice: both are "strongly consistent" for nearly all use cases
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **HLC vs TrueTime** | Understands the fundamental clock difference and its implications |
+| **Raft vs Paxos** | Can compare consensus protocols and their practical tradeoffs |
+| **Range splitting** | Knows how data is distributed and rebalanced across nodes |
+| **Deployment** | Understands self-hosted (CockroachDB) vs managed (Spanner) implications |
 
 ---
 

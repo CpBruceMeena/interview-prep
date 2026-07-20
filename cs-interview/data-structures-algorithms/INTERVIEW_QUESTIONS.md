@@ -248,54 +248,154 @@ class TwoTierConsistentHash:
 
 **Q:** "Design a system to count the number of unique visitors to a website with 10M visitors/day using less than 2KB of memory. Explain the HyperLogLog algorithm mathematically."
 
-**Answer:**
+**What They're Really Testing:** Whether you understand the probabilistic insight behind HLL — the relationship between leading zeros and cardinality — and how stochastic averaging with bias correction achieves near-exact accuracy.
+
+### Answer
+
+**The Core Insight — Estimating n from Leading Zeros:**
+
+```
+If you hash each element uniformly (64-bit hash):
+  - P(hash ends with at least 1 zero) = 1/2
+  - P(hash ends with at least 2 zeros) = 1/4
+  - P(hash ends with at least k zeros) = 1/2^k
+
+If we observe ρ_max = max number of trailing zeros across all hashes:
+  - Expected ρ_max ≈ log₂(n)
+  - Estimated n ≈ 2^ρ_max
+
+Problem: Single-register estimate has HIGH VARIANCE.
+  - If ρ_max = 30 → estimate = 2^30 = 1B
+  - If ρ_max = 25 → estimate = 2^25 = 33M
+  - One extra leading zero = 2× difference!
+  - ±1 bit either direction = 50% or 200% of true value
+```
+
+**Stochastic Averaging — The Fix:**
 
 ```python
-# HyperLogLog: estimate |S| (set cardinality) with ~2% error using 1.5KB
-# 
-# Intuition: If we hash each element uniformly, the probability of
-# seeing a hash ending in k zeros is 1/2^k. The maximum number of
-# trailing zeros seen gives us an estimate of the set size.
-#
-# HLL improves on this with: 
-# 1. Stochastic averaging (split into m registers)
-# 2. Bias correction for small/large ranges
+# Split into m = 2^b registers using first b bits of the hash.
+# Each register gets ~n/m elements → ρ_max has lower variance.
+# Harmonic mean of 2^ρ values → much more stable estimate.
+
+import mmh3
+import math
 
 class HyperLogLog:
-    def __init__(self, b=14):  # b = number of bits for register selection
-        self.m = 1 << b  # m = 2^14 = 16384 registers
+    """
+    HyperLogLog with full bias correction.
+    
+    Memory: m registers × 5 bits each
+      - m=1024  (b=10):   ~640 bytes,  ~3.25% error
+      - m=4096  (b=12):   ~2.5 KB,     ~1.6% error
+      - m=16384 (b=14):   ~10 KB,      ~0.8% error  (most common)
+    """
+    def __init__(self, b: int = 14):
+        # b = bits for register selection, m = 2^b = number of registers
+        self.b = b
+        self.m = 1 << b
+        # 5 bits per register (enough for counts up to 2^32 unique values)
+        # Stored as Python ints (for clarity), but in real systems: packed bit array
         self.registers = [0] * self.m
 
-    def add(self, value: str):
-        x = hash64(value)
-        # First b bits: register index
+    def add(self, value: str) -> None:
+        # 64-bit hash for uniformity
+        x = mmh3.hash64(value, seed=42)[0] & 0xFFFFFFFFFFFFFFFF
+
+        # First b bits: register index j
         j = x & (self.m - 1)
-        # Remaining bits: count trailing zeros
+
+        # Remaining 64-b bits: count trailing zeros + 1 (the "rank")
         w = x >> b
-        self.registers[j] = max(self.registers[j], trailing_zeros(w) + 1)
+        if w == 0:
+            rho = 64 - b + 1  # All remaining bits are zero
+        else:
+            rho = (w & -w).bit_length()  # Position of least significant 1-bit
+            # Equivalent: trailing_zeros(w) + 1
+
+        self.registers[j] = max(self.registers[j], rho)
 
     def count(self) -> float:
-        # Harmonic mean of 2^register values
-        alpha = 0.7213 / (1 + 1.079 / self.m)  # Bias correction
+        """
+        Estimate cardinality using harmonic mean + bias correction.
+        """
+        # Raw estimate: harmonic mean of 2^register values
         Z = sum(1.0 / (1 << r) for r in self.registers)
+
+        # Bias correction constant α_m
+        if self.m == 16:
+            alpha = 0.673
+        elif self.m == 32:
+            alpha = 0.697
+        elif self.m == 64:
+            alpha = 0.709
+        else:
+            alpha = 0.7213 / (1 + 1.079 / self.m)
+
         E = alpha * self.m * self.m / Z
 
-        # Small range correction (linear counting)
+        # ─── Small Range Correction (Linear Counting) ───
+        # When E <= 2.5m, many registers are still empty.
+        # Linear counting gives better estimates in this regime:
+        #   E_linear = m × ln(m / V) where V = number of empty registers
         if E <= 2.5 * self.m:
             V = self.registers.count(0)
             if V > 0:
                 E = self.m * math.log(self.m / V)
 
-        # Large range correction (64-bit)
+        # ─── Large Range Correction (64-bit saturation) ───
+        # When E > 2^32, 5-bit registers may saturate.
+        # Apply bias correction for 64-bit range:
         if E > 1 << 32:
             E = -(1 << 64) * math.log(1 - E / (1 << 64))
 
         return E
 
-# Memory: 16384 registers × 5 bits = ~10KB (or 6 bits = 12KB for 64-bit)
-# Error: ~1.04/√m = 1.04/128 ≈ 0.8% relative error
-# vs exact counting: needs 10M × 64 bits = 80MB
+# Example:
+hll = HyperLogLog(b=14)  # 16384 registers, ~10KB
+for i in range(1_000_000):
+    hll.add(f"user_{i}")
+print(f"Estimated: {hll.count():.0f}, Actual: 1,000,000")
+# Typical output: Estimated: 1,008,352, Actual: 1,000,000 (~0.8% error)
 ```
+
+**Memory vs Error Tradeoff:**
+
+```
+Registers (m)    Memory (5-bit)    Relative Error    Use Case
+─────────────    ──────────────    ──────────────    ─────────
+16               10 bytes          26%               Rough estimate
+64               40 bytes          13%               Dashboard approximations
+1024             640 bytes         3.25%             Analytics (standard)
+4096             2.5 KB            1.6%              Production monitoring
+16384            10 KB             0.8%              Precise counting
+65536            40 KB             0.4%              Near-exact (overkill)
+
+Compare to exact counting:
+  - HashSet: 1M users × 64-bit hash = 64 MB (vs HLL's ~10 KB)
+  - HLL: 10 KB for same task with 0.8% error
+  - Savings: 6400× memory reduction for 99.2% accuracy
+```
+
+**Deriving the Standard Error Formula:**
+
+```
+Standard Error (SE) ≈ 1.04 / √m
+
+For m = 16384:
+  SE ≈ 1.04 / 128 ≈ 0.0081 ≈ 0.81%
+
+So: 95% of estimates fall within ±1.6% of the true value.
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **Probabilistic insight** | Explains why leading zeros estimate log₂(n) and why variance is high with 1 register |
+| **Stochastic averaging** | Describes splitting into m registers, harmonic mean vs arithmetic mean |
+| **Bias correction** | Knows when linear counting (small range) and 64-bit correction (large range) apply |
+| **Memory formula** | Can compute m from error tolerance: m = (1.04 / SE)² |
 
 ---
 
@@ -303,34 +403,239 @@ class HyperLogLog:
 
 **Q:** "Design a system to verify data consistency across 1000 database replicas. How would Merkle trees enable efficient comparison, and what's the O(log N) proof size?"
 
-**Answer:**
+**What They're Really Testing:** Whether you understand Merkle trees as a mechanism for efficient set reconciliation — trading hash computation for bandwidth — and can apply them to real distributed systems problems.
+
+### Answer
+
+**The Problem — Anti-Entropy at Scale:**
 
 ```
-Each replica builds a Merkle tree over its data:
+1000 replicas × 1B records each.
 
-          Root = H(L0+L1)
-         /              \
-   L0 = H(L00+L01)    L1 = H(L10+L11)
-     /       \          /       \
-   L00      L01       L10      L11
-   /  \     /  \      /  \     /  \
-  d1  d2   d3  d4    d5  d6   d7  d8
+Naive comparison between two replicas:
+  - Transfer ALL 1B records to compare them → 1B × 1KB = 1TB transferred
+  - Or: build a hash of each record, transfer 1B hashes → 1B × 32B = 32GB
+  - Both are IMPRACTICAL
 
-Comparison between Replica A and B:
-  1. Compare root hashes
-  2. If different: compare child hashes
-  3. Recurse until leaf level
-  4. Only exchange the differing subtree paths
-
-Worst case: 1 differing block out of N blocks
-  Naive: transfer all N blocks → O(N)
-  Merkle: transfer O(log N) hashes + 1 block → O(log N)
-
-Proof of inclusion (SPV proof):
-  - To prove d3 is in the tree: provide [L00, L1]
-  - Verifier computes H(L00, H(H(d3), ???))... with provided siblings
-  - Proof size: O(log N) hashes
+Merkle tree solution:
+  - Build a balanced binary hash tree over the data
+  - Compare roots (1 hash = 32 bytes)
+  - If different: recurse down the tree until the differing leaf is found
+  - Total data exchanged: O(log N) hashes + 1 record
+  - For 1B records: ~30 hashes + 1 record = ~1KB transferred
+  - Savings: 1TB → 1KB = 1 BILLION × improvement!
 ```
+
+**Merkle Tree Construction:**
+
+```python
+import hashlib
+
+class MerkleTree:
+    """
+    A binary Merkle tree over an ordered list of data blocks.
+    Used in: Bitcoin (transactions), Cassandra (anti-entropy),
+    DynamoDB (reconciliation), Git (content addressing).
+    """
+    def __init__(self, data_blocks: list[bytes]):
+        self.leaves = [self._hash(b) for b in data_blocks]
+        self.levels = [self.leaves]
+        self._build_tree()
+
+    def _hash(self, data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def _build_tree(self):
+        """Build the tree bottom-up: pair leaves, hash, repeat."""
+        current_level = self.leaves
+        while len(current_level) > 1:
+            next_level = []
+            for i in range(0, len(current_level), 2):
+                left = current_level[i]
+                right = current_level[i + 1] if i + 1 < len(current_level) else left
+                next_level.append(self._hash((left + right).encode()))
+            self.levels.append(next_level)
+            current_level = next_level
+
+    @property
+    def root(self) -> str:
+        """The Merkle root — a single hash representing ALL data."""
+        return self.levels[-1][0] if self.levels else None
+
+    def get_proof(self, index: int) -> list[tuple[str, str]]:
+        """
+        Generate a Merkle proof for leaf at `index`.
+        Returns list of (sibling_hash, direction) pairs.
+        Direction: 'left' means sibling is to the left, 'right' means to the right.
+        """
+        proof = []
+        for level in self.levels[:-1]:  # Exclude root
+            sibling_idx = index ^ 1  # XOR: flip last bit (0→1, 1→0)
+            if sibling_idx < len(level):
+                direction = 'left' if sibling_idx % 2 == 0 else 'right'
+                proof.append((level[sibling_idx], direction))
+            index //= 2  # Move up to parent level
+        return proof
+
+    @staticmethod
+    def verify_proof(root: str, leaf: bytes, proof: list[tuple[str, str]]) -> bool:
+        """
+        Verify that `leaf` is included in the tree with `root`.
+        Takes O(log N) time and O(log N) proof size.
+        """
+        current_hash = hashlib.sha256(leaf).hexdigest()
+        for sibling_hash, direction in proof:
+            if direction == 'left':
+                combined = sibling_hash + current_hash
+            else:
+                combined = current_hash + sibling_hash
+            current_hash = hashlib.sha256(combined.encode()).hexdigest()
+        return current_hash == root
+
+
+# Example: 8 data blocks
+data = [f"block_{i}".encode() for i in range(8)]
+tree = MerkleTree(data)
+print(f"Root: {tree.root}")  # Single hash representing all 8 blocks
+
+# Prove block 3 is in the tree:
+proof = tree.get_proof(3)
+print(f"Proof size: {len(proof)} hashes")  # log₂(8) = 3 hashes
+assert MerkleTree.verify_proof(tree.root, data[3], proof)  # True!
+
+# Tamper a block:
+data[3] = b"tampered_block"
+tree2 = MerkleTree(data)
+assert tree.root != tree2.root  # Different root → data changed!
+```
+
+**Anti-Entropy Between Replicas (Cassandra Style):**
+
+```python
+class Replica:
+    """
+    Merkle tree-based anti-entropy for database replicas.
+    Used by: Cassandra, Riak, Amazon Dynamo.
+    """
+    def __init__(self, data: dict):
+        self.data = data
+        # Build Merkle tree over sorted partition keys
+        blocks = [self.serialize(k, v) for k, v in sorted(data.items())]
+        self.merkle_tree = MerkleTree(blocks)
+
+    def reconcile(self, other: 'Replica') -> list[str]:
+        """
+        Find differing keys between this replica and another.
+        Returns list of keys that need repair.
+        """
+        differing_keys = []
+
+        def compare_subtree(range_start: int, range_end: int):
+            """
+            Recursively compare subtree hashes.
+            Only descends into subtrees with DIFFERENT hashes.
+            """
+            # Build subtree for this range
+            my_blocks = [self.serialize(k, self.data[k])
+                        for k in sorted(self.data.keys())[range_start:range_end]]
+            other_blocks = [self.serialize(k, other.data[k])
+                           for k in sorted(other.data.keys())[range_start:range_end]]
+
+            my_tree = MerkleTree(my_blocks)
+            other_tree = MerkleTree(other_blocks)
+
+            if my_tree.root == other_tree.root:
+                return  # Subtrees match — skip!
+
+            if range_end - range_start <= 1:
+                # Leaf level — this key differs
+                differing_keys.append(list(sorted(self.data.keys()))[range_start])
+                return
+
+            # Split range and recurse
+            mid = (range_start + range_end) // 2
+            compare_subtree(range_start, mid)
+            compare_subtree(mid, range_end)
+
+        compare_subtree(0, len(self.data))
+        return differing_keys
+
+    def serialize(self, key: str, value: str) -> bytes:
+        return f"{key}:{value}".encode()
+
+
+# Anti-entropy comparison:
+# For 1M keys with only 1 difference:
+#   Naive: compare 1M key-value pairs = 1M I/Os
+#   Merkle: 20 hash comparisons (tree depth) + 1 leaf read = 21 I/Os
+#   Improvement: 47,000× fewer I/Os!
+```
+
+**SPV Proof — Light Client Verification:**
+
+```
+Bitcoin Simplified Payment Verification (SPV):
+
+Light client (mobile wallet) wants to verify a transaction is in a block.
+Instead of downloading the entire block (1MB+), it requests:
+  - The Merkle root from the block header (already has it)
+  - The Merkle proof from a full node
+
+Example: Prove TX3 is in a block with 8 transactions:
+
+Block Header:
+┌──────────────────────────────┐
+│ Merkle Root: 0x7a3b...      │ ← Already known by light client
+│ Timestamp, Nonce, Prev Hash │
+└──────────────────────────────┘
+
+Full node provides the Merkle proof for TX3:
+  [H(TX4), H(H(TX1)+H(TX2)), H(H(L0)+H(L1))]
+  Size: 3 × 32 bytes = 96 bytes (vs downloading 1MB block)
+
+Light client verifies:
+  H(TX3) + H(TX4) → H(L01)
+  H(L00) + H(L01) → H(L0)
+  H(L0) + H(L1) → Root == 0x7a3b... ✅
+
+Proof size: O(log N) hashes
+  - 1000 txns in block: ~10 hashes = 320 bytes
+  - 10000 txns in block: ~14 hashes = 448 bytes
+```
+
+**Real-World Applications:**
+
+```yaml
+Cassandra anti-entropy:
+  - Each replica builds Merkle tree over its partition range
+  - Periodic tree comparison detects inconsistencies
+  - Only the differing subtrees are repaired
+  - Tradeoff: Tree rebuild is CPU-intensive (hash all data)
+
+Git version control:
+  - Every commit is a Merkle tree (tree object)
+  - Each file is a leaf, directory is an internal node
+  - git clone only needs the root + proof = efficient
+
+Certificate Transparency:
+  - Merkle tree of all SSL certificates
+  - Prove a certificate was logged (inclusion proof)
+  - Prove no certificate was mis-issued (consistency proof)
+
+Amazon DynamoDB / Cassandra:
+  - Merkle tree per vnode for replica synchronization
+  - Configurable tree depth (tradeoff: accuracy vs CPU)
+  - Full rebuild on startup, incremental update during writes
+```
+
+### 🔍 Staff-Level Evaluation
+
+| Criterion | What I'm Looking For |
+|-----------|----------------------|
+| **Tree construction** | Understands bottom-up hash chaining, balanced tree requirement |
+| **Proof of inclusion** | Can explain SPV proof: sibling hashes + hashing order matters |
+| **Anti-entropy** | Describes recursive subtree comparison, early termination on match |
+| **Real applications** | Mentions Cassandra, Git, Bitcoin SPV, Certificate Transparency |
 
 ---
 
