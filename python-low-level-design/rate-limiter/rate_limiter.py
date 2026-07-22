@@ -198,6 +198,68 @@ class SlidingWindowCounter(RateLimitAlgorithm):
         self._counters.pop(key, None)
 
 
+class LeakyBucket(RateLimitAlgorithm):
+    """Leaky Bucket algorithm - processes requests at a constant leak rate.
+
+    Requests are queued in a bucket. If the bucket (queue) is full, new
+    requests are denied. The bucket leaks (processes) requests at a fixed
+    rate, smoothing out bursts into a steady flow.
+    """
+
+    def __init__(self, rule: RateLimitRule):
+        self._rule = rule
+        self._queues: Dict[str, deque] = {}
+        self._last_leak: Dict[str, float] = {}
+        self._leak_rate = rule.max_requests / rule.window_seconds  # requests/sec
+
+    def _leak(self, key: str, timestamp: float) -> None:
+        """Process (leak) requests from the queue based on elapsed time"""
+        if key not in self._queues:
+            return
+
+        queue = self._queues[key]
+        last_leak = self._last_leak.get(key, timestamp)
+        elapsed = timestamp - last_leak
+
+        # How many requests to process since last leak
+        requests_to_process = int(elapsed * self._leak_rate)
+
+        for _ in range(min(requests_to_process, len(queue))):
+            queue.popleft()
+
+        # Only advance last_leak by the time actually consumed to preserve
+        # fractional carry (like TokenBucket preserves fractional tokens)
+        if requests_to_process > 0 and self._leak_rate > 0:
+            self._last_leak[key] = last_leak + (requests_to_process / self._leak_rate)
+        else:
+            self._last_leak[key] = last_leak
+
+    def allow_request(self, key: str, timestamp: float) -> RateLimitResult:
+        self._leak(key, timestamp)
+
+        if key not in self._queues:
+            self._queues[key] = deque()
+            self._last_leak[key] = timestamp
+
+        queue = self._queues[key]
+
+        if len(queue) < self._rule.max_requests:
+            queue.append(timestamp)
+            return RateLimitResult.ALLOWED
+        return RateLimitResult.DENIED
+
+    def get_window_remaining(self, key: str) -> int:
+        now = time.time()
+        self._leak(key, now)
+        if key not in self._queues:
+            return self._rule.max_requests
+        return self._rule.max_requests - len(self._queues[key])
+
+    def reset_key(self, key: str) -> None:
+        self._queues.pop(key, None)
+        self._last_leak.pop(key, None)
+
+
 # --- Rate Limiter Factory ---
 
 class RateLimiterFactory:
@@ -208,6 +270,7 @@ class RateLimiterFactory:
         "token_bucket": TokenBucket,
         "fixed_window": FixedWindowCounter,
         "sliding_window_counter": SlidingWindowCounter,
+        "leaky_bucket": LeakyBucket,
     }
 
     @classmethod
@@ -306,6 +369,17 @@ def demo():
     for i in range(5):
         result = limiter2.allow_request(user)
         remaining = limiter2.get_remaining(user)
+        print(f"  Request {i+1}: {result.value} (Remaining: {remaining})")
+        time.sleep(0.1)
+
+    # Leaky Bucket
+    print(f"\nLeaky Bucket: 4 requests/10s (1 req per 2.5s)")
+    rule3 = RateLimitRule(max_requests=4, window_seconds=10)
+    limiter3 = RateLimiter(LeakyBucket(rule3))
+
+    for i in range(6):
+        result = limiter3.allow_request(user)
+        remaining = limiter3.get_remaining(user)
         print(f"  Request {i+1}: {result.value} (Remaining: {remaining})")
         time.sleep(0.1)
 
