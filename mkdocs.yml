@@ -371,6 +371,7 @@ nav:
     - Operating Systems: cs-interview/operating-systems/INTERVIEW_QUESTIONS.md
     - Computer Networks: cs-interview/computer-networks/INTERVIEW_QUESTIONS.md
     - Database Systems: cs-interview/database-systems/INTERVIEW_QUESTIONS.md
+    - PostgreSQL Deep Dive: cs-interview/database-systems/POSTGRESQL_DEEP_DIVE.md
     - Distributed Systems: cs-interview/distributed-systems/INTERVIEW_QUESTIONS.md
     - Distributed Transactions: cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS.md
     - Concurrency & Parallelism: cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md
