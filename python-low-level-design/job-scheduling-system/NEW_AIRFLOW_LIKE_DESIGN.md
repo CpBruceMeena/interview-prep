@@ -164,6 +164,8 @@ class CoreManager:
             for i in range(self.total_cores)
         ]
         self.virtual_allocations = 0
+        # Track per-instance virtual allocation count for proper release
+        self._instance_virtual: Dict[str, int] = {}
         self._lock = asyncio.Lock()
     
     async def allocate_cores(self, instance_id: str, 
@@ -171,6 +173,14 @@ class CoreManager:
         """
         Allocate cores for a job instance.
         Returns True if successful, False if insufficient resources.
+        
+        ⚠️ The check combines physical + virtual capacity.
+           Using OR (individual check) would reject jobs that
+           could be satisfied by a mix of physical + virtual.
+           Example: 2 free physical + 3 free virtual = 5 total.
+           A job needing 4 cores should succeed, but
+           `4 <= 2 or 4 <= 3` → False (wrong!).
+           `4 <= 2 + 3` → True (correct!).
         """
         async with self._lock:
             # Count free physical cores
@@ -181,9 +191,12 @@ class CoreManager:
             # Count current virtual allocations
             virtual_free = self.max_virtual_cores - self.virtual_allocations
             
-            # Can we allocate?
-            if cores_needed <= free_physical or cores_needed <= virtual_free:
-                # Allocate physical cores first
+            # Can we allocate? Check COMBINED capacity, not individual!
+            # If either physical or virtual individually has enough,
+            # the combined always will too. But the reverse isn't true:
+            # combined might have enough when neither individual does.
+            if cores_needed <= free_physical + virtual_free:
+                # Allocate physical cores first (best effort)
                 allocated = 0
                 for core in self.cores:
                     if core.status == "free" and allocated < cores_needed:
@@ -192,10 +205,11 @@ class CoreManager:
                         core.allocated_at = datetime.utcnow()
                         allocated += 1
                 
-                # If not enough physical, use virtual
+                # If not enough physical, use virtual for the remainder
                 if allocated < cores_needed:
                     extra = cores_needed - allocated
                     self.virtual_allocations += extra
+                    self._instance_virtual[instance_id] = extra
                     allocated += extra
                 
                 return True
@@ -203,15 +217,28 @@ class CoreManager:
             return False
     
     async def release_cores(self, instance_id: str):
-        """Release cores allocated to a job instance."""
+        """
+        Release cores allocated to a job instance.
+        
+        ⚠️ Must decrement BOTH physical and virtual allocations.
+        allocate_cores() may have used virtual allocations for
+        the difference between cores_needed and free physical.
+        If we only free physical cores without decrementing
+        virtual_allocations, the pool leaks until saturation.
+        """
         async with self._lock:
-            released = 0
+            # Free physical cores
             for core in self.cores:
                 if core.allocated_to == instance_id:
                     core.status = "free"
                     core.allocated_to = None
                     core.allocated_at = None
-                    released += 1
+            
+            # Release virtual allocations tracked per-instance
+            virtual_to_release = self._instance_virtual.pop(instance_id, 0)
+            self.virtual_allocations = max(
+                0, self.virtual_allocations - virtual_to_release
+            )
     
     async def get_available_cores(self) -> dict:
         """Get current core availability."""
@@ -274,26 +301,45 @@ class SchedulerEngine:
         """
         Main scheduler loop.
         Runs every 15 seconds, checks for jobs that need to run.
+        
+        ⚠️ Error handling rules:
+        1. asyncio.CancelledError MUST propagate (not caught by bare except)
+        2. Individual job failures shouldn't break the loop
+        3. asyncio.sleep must run even after partial failures
         """
         while self._running:
             try:
                 now = datetime.utcnow()
                 
                 # Check all active schedules
+                # Use try/except per job so one failure doesn't block others
                 for job_id, scheduled in list(self.scheduled_jobs.items()):
-                    if scheduled.next_run and now >= scheduled.next_run:
-                        await self._trigger_job(job_id)
-                        
-                        # Calculate next run
-                        scheduled.next_run = self._calculate_next_run(
-                            scheduled.job, now
-                        )
-                
-                await asyncio.sleep(15)  # Check every 15 seconds
-                
+                    try:
+                        if scheduled.next_run and now >= scheduled.next_run:
+                            await self._trigger_job(job_id)
+                            
+                            # Calculate next run
+                            scheduled.next_run = self._calculate_next_run(
+                                scheduled.job, now
+                            )
+                    except asyncio.CancelledError:
+                        raise  # Always propagate cancellation!
+                    except Exception as e:
+                        print(f"Scheduler error for job {job_id}: {e}")
+                        # Individual job failure doesn't stop the loop
+            
+            except asyncio.CancelledError:
+                # Clean shutdown — re-raise after cleanup
+                print("Scheduler loop cancelled, shutting down")
+                self._running = False
+                raise
             except Exception as e:
-                print(f"Scheduler error: {e}")
-                await asyncio.sleep(60)
+                print(f"Scheduler loop error: {e}")
+                # Log and continue, don't crash the entire scheduler
+            finally:
+                # Always sleep between iterations, even after errors
+                if self._running:
+                    await asyncio.sleep(15)
     
     def register_job(self, job: Job):
         """Register a recurring job with the scheduler."""
@@ -488,85 +534,107 @@ import json
 from typing import Optional, List
 
 class JobStore:
-    """Persistent storage for jobs and instances."""
+    """
+    Persistent storage for jobs and instances.
+    
+    ⚠️ Uses a persistent connection opened during initialize().
+    Creating a new aiosqlite.connect() per query is expensive —
+    each connection opens a file handle and creates a new
+    SQLite transaction context. A persistent connection avoids
+    this overhead and is safe because aiosqlite connections
+    are async-context safe (only one coroutine executes at a time).
+    """
     
     def __init__(self, db_path: str = "jobs.db"):
         self.db_path = db_path
+        self._db: Optional[aiosqlite.Connection] = None
     
     async def initialize(self):
-        """Create tables."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.executescript("""
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    script_path TEXT,
-                    script_content TEXT NOT NULL,
-                    python_version TEXT DEFAULT '3.12',
-                    requirements TEXT DEFAULT '[]',
-                    cpu_cores_required INTEGER DEFAULT 1,
-                    memory_mb_required INTEGER DEFAULT 512,
-                    timeout_seconds INTEGER DEFAULT 3600,
-                    schedule_type TEXT DEFAULT 'once',
-                    schedule_expression TEXT,
-                    start_date TEXT,
-                    end_date TEXT,
-                    max_retries INTEGER DEFAULT 3,
-                    retry_delay_seconds INTEGER DEFAULT 60,
-                    priority INTEGER DEFAULT 1,
-                    tags TEXT DEFAULT '[]',
-                    created_by TEXT DEFAULT 'system',
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    depends_on TEXT DEFAULT '[]',
-                    is_active INTEGER DEFAULT 1
-                );
-                
-                CREATE TABLE IF NOT EXISTS job_instances (
-                    instance_id TEXT PRIMARY KEY,
-                    job_id TEXT NOT NULL,
-                    status TEXT DEFAULT 'pending',
-                    assigned_worker TEXT,
-                    cpu_cores_allocated INTEGER DEFAULT 1,
-                    memory_mb_allocated INTEGER DEFAULT 512,
-                    started_at TEXT,
-                    completed_at TEXT,
-                    exit_code INTEGER,
-                    output TEXT,
-                    error TEXT,
-                    retry_count INTEGER DEFAULT 0,
-                    scheduled_at TEXT,
-                    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
-                );
-                
-                CREATE INDEX IF NOT EXISTS idx_instances_job 
-                    ON job_instances(job_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_instances_status 
-                    ON job_instances(status);
-                CREATE INDEX IF NOT EXISTS idx_jobs_schedule 
-                    ON jobs(is_active, schedule_type);
-            """)
-            await db.commit()
+        """
+        Open persistent connection and create tables.
+        Called once at application startup.
+        """
+        self._db = await aiosqlite.connect(self.db_path)
+        self._db.row_factory = aiosqlite.Row  # Named tuple access
+        await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                script_path TEXT,
+                script_content TEXT NOT NULL,
+                python_version TEXT DEFAULT '3.12',
+                requirements TEXT DEFAULT '[]',
+                cpu_cores_required INTEGER DEFAULT 1,
+                memory_mb_required INTEGER DEFAULT 512,
+                timeout_seconds INTEGER DEFAULT 3600,
+                schedule_type TEXT DEFAULT 'once',
+                schedule_expression TEXT,
+                start_date TEXT,
+                end_date TEXT,
+                max_retries INTEGER DEFAULT 3,
+                retry_delay_seconds INTEGER DEFAULT 60,
+                priority INTEGER DEFAULT 1,
+                tags TEXT DEFAULT '[]',
+                created_by TEXT DEFAULT 'system',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                depends_on TEXT DEFAULT '[]',
+                is_active INTEGER DEFAULT 1
+            );
+            
+            CREATE TABLE IF NOT EXISTS job_instances (
+                instance_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                assigned_worker TEXT,
+                cpu_cores_allocated INTEGER DEFAULT 1,
+                memory_mb_allocated INTEGER DEFAULT 512,
+                started_at TEXT,
+                completed_at TEXT,
+                exit_code INTEGER,
+                output TEXT,
+                error TEXT,
+                retry_count INTEGER DEFAULT 0,
+                scheduled_at TEXT,
+                FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_instances_job 
+                ON job_instances(job_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_instances_status 
+                ON job_instances(status);
+            CREATE INDEX IF NOT EXISTS idx_jobs_schedule 
+                ON jobs(is_active, schedule_type);
+        """)
+        await self._db.commit()
     
     async def save_job(self, job: Job):
-        """Save or update a job."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO jobs 
-                (job_id, name, script_content, cpu_cores_required, 
-                 memory_mb_required, timeout_seconds, schedule_type,
-                 schedule_expression, max_retries, priority, tags,
-                 created_by, requirements, depends_on)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                job.job_id, job.name, job.script_content,
-                job.cpu_cores_required, job.memory_mb_required,
-                job.timeout_seconds, job.schedule_type.value,
-                job.schedule_expression, job.max_retries,
-                job.priority.value, json.dumps(job.tags),
-                job.created_by, json.dumps(job.requirements),
-                json.dumps(job.depends_on)
-            ))
-            await db.commit()
+        """Save or update a job using the persistent connection."""
+        if not self._db:
+            raise RuntimeError("JobStore not initialized. Call initialize() first.")
+        
+        await self._db.execute("""
+            INSERT OR REPLACE INTO jobs 
+            (job_id, name, script_content, cpu_cores_required, 
+             memory_mb_required, timeout_seconds, schedule_type,
+             schedule_expression, max_retries, priority, tags,
+             created_by, requirements, depends_on)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            job.job_id, job.name, job.script_content,
+            job.cpu_cores_required, job.memory_mb_required,
+            job.timeout_seconds, job.schedule_type.value,
+            job.schedule_expression, job.max_retries,
+            job.priority.value, json.dumps(job.tags),
+            job.created_by, json.dumps(job.requirements),
+            json.dumps(job.depends_on)
+        ))
+        await self._db.commit()
+    
+    async def close(self):
+        """Close the persistent database connection."""
+        if self._db:
+            await self._db.close()
+            self._db = None
 ```
 
 ### 2.6 REST API Layer
