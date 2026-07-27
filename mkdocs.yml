@@ -220,6 +220,11 @@ nav:
       - Code: python-low-level-design/search-platform/CODE.md
       - HLD: python-low-level-design/search-platform/HIGH_LEVEL_DESIGN.md
       - Questions: python-low-level-design/search-platform/INTERVIEW_QUESTIONS.md
+    - Big File Upload (TUS Protocol):
+      - Thought Process: python-low-level-design/big-file-upload/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/big-file-upload/CODE.md
+      - HLD: python-low-level-design/big-file-upload/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/big-file-upload/INTERVIEW_QUESTIONS.md
 
   - ☕ Java Low-Level Design:
     - Overview: java-low-level-design/README.md
@@ -322,6 +327,7 @@ nav:
     - Overview: python-interview/README.md
     - Interview Questions: python-interview/INTERVIEW_QUESTIONS.md
     - Multithreading & Concurrency: python-interview/MULTITHREADING_NOTES.md
+    - Async/Await & Asyncio: python-interview/ASYNCIO_NOTES.md
     - Django: python-interview/DJANGO_NOTES.md
     - FastAPI: python-interview/FASTAPI_NOTES.md
 
