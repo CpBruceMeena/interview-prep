@@ -630,6 +630,43 @@ class JobStore:
         ))
         await self._db.commit()
     
+    async def save_instance(self, instance: JobInstance):
+        """Save or update a job instance using the persistent connection."""
+        if not self._db:
+            raise RuntimeError("JobStore not initialized. Call initialize() first.")
+        
+        await self._db.execute("""
+            INSERT OR REPLACE INTO job_instances
+            (instance_id, job_id, status, assigned_worker,
+             cpu_cores_allocated, memory_mb_allocated,
+             started_at, completed_at, exit_code,
+             output, error, retry_count, scheduled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            instance.instance_id, instance.job_id,
+            instance.status.value, instance.assigned_worker,
+            instance.cpu_cores_allocated, instance.memory_mb_allocated,
+            instance.started_at.isoformat() if instance.started_at else None,
+            instance.completed_at.isoformat() if instance.completed_at else None,
+            instance.exit_code,
+            instance.output, instance.error,
+            instance.retry_count,
+            instance.scheduled_at.isoformat() if instance.scheduled_at else None,
+        ))
+        await self._db.commit()
+    
+    async def get_instances(self, job_id: str, limit: int = 10) -> List[JobInstance]:
+        """Get recent instances for a job."""
+        if not self._db:
+            raise RuntimeError("JobStore not initialized. Call initialize() first.")
+        
+        cursor = await self._db.execute(
+            "SELECT * FROM job_instances WHERE job_id = ? ORDER BY created_at DESC LIMIT ?",
+            (job_id, limit)
+        )
+        rows = await cursor.fetchall()
+        return [JobInstance(**dict(row)) for row in rows]
+    
     async def close(self):
         """Close the persistent database connection."""
         if self._db:
