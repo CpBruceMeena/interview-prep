@@ -2286,6 +2286,7 @@ class ConnectionPool:
     """Reuse connections for performance"""
     
     def __init__(self):
+        from typing import Optional  # <-- added for Optional[] annotation
         # aiohttp manages its own connection pool
         # Optional requires 'from typing import Optional' (added above)
         self._session: Optional[aiohttp.ClientSession] = None
@@ -3362,6 +3363,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 import asyncio
 import aiohttp
 from collections import deque
+from typing import Optional
 
 class HighThroughputAPIClient:
     """Async API client with rate limiting and backpressure"""
