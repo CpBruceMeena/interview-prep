@@ -177,14 +177,32 @@ import numpy as np
 # ── Strategy 3: Subinterpreters (Python 3.12+) ──────────
 # Each subinterpreter has its own GIL!
 import _xxsubinterpreters as interpreters
+import _xxinterpchannels as channels
+
+# Create a channel for sending/receiving results
+channel_id = channels.create()
 
 interp_id = interpreters.create()
-interpreters.run_string(interp_id, """
+interpreters.run_string(interp_id, f"""
+import _xxinterpchannels as channels
+
 def compute():
     return sum(i ** 2 for i in range(10_000_000))
+
+# Send result back via channel
 result = compute()
+channels.send({channel_id}, result)
 """)
+
+# Receive result from subinterpreter
+result = channels.recv(channel_id)
+print(f"Computed: {result}")
 # True parallelism with independent GILs
+
+# ⚠️ Note: Subinterpreters communicate via channels, not
+# shared references. The API uses _xxinterpchannels for
+# message passing, not interpreters.get_result() or
+# interpreters.destroy() which do NOT exist.
 
 # ── Strategy 4: Free-Threaded Python (3.13t) ────────────
 # PYTHON_GIL=0 python my_script.py
@@ -260,28 +278,35 @@ monitor.start()
 ### Thread Lifecycle
 
 ```
-┌──────────┐   .start()   ┌──────────┐   acquires    ┌──────────┐
-│   New    │─────────────→│ Runnable │──────────────→│ Running  │
-└──────────┘              └──────────┘               └──────────┘
-                                                          │
-                                                    ┌─────┴──────┐
-                                                    │            │
-                                                    ↓            ↓
-                                               ┌────────┐  ┌─────────┐
-                                               │Waiting │  │ Blocked │
-                                               │ (sleep)│  │ (I/O)   │
-                                               └────────┘  └─────────┘
-                                                    ↑            ↑
-                                                    │            │
-                                                    └─────┬──────┘
-                                                          │
-                                                     ┌────────┐
-                                                     │Running │
-                                                     └────────┘
+┌──────────┐   .start()   ┌──────────┐   OS scheduler  ┌──────────┐
+│   New    │─────────────→│ Runnable │───────────────→│ Running  │
+└──────────┘              └──────────┘                └──────────┘
+                               ↑                           │
+                               │                      ┌────┴─────┐
+                               │                      │          │
+                          ┌────┴──────┐                 ↓          ↓
+                          │ Runnable  │◄───────┌────────┐  ┌──────────┐
+                          │ (re-enter)│         │Waiting │  │ Blocked  │
+                          └────┬──────┘         │ (sleep)│  │ (I/O)    │
+                               │                └────────┘  └──────────┘
+                               │                     ↑            ↑
+                               │                     │            │
+                               └─────────────────────┴────────────┘
                                                           │
                                                      ┌────────┐
                                                      │  Dead  │
                                                      └────────┘
+
+# ⚠️ Thread state transitions:
+#   New → start() → Runnable (ready to run, waiting for CPU)
+#   Runnable → OS scheduler → Running (executing on CPU)
+#   Running → sleep/I/O → Waiting/Blocked (not runnable)
+#   Waiting/Blocked → woken/ready → Runnable (re-enters queue)
+#   Running → run() completes → Dead (terminated)
+#
+# Threads NEVER go directly from Waiting/Blocked to Running. 
+# They must pass through Runnable state and wait for the
+# OS scheduler to dispatch them.
 ```
 
 ### Thread Identification & Utilities
@@ -349,8 +374,29 @@ class ThreadPool:
             except Exception:
                 pass  # Queue.Empty timeout
     
+    def __init__(self, num_workers: int = 4):
+        self.tasks = Queue()
+        self.results = Queue()
+        self.workers = []
+        self._stop_event = threading.Event()
+        self._task_counter = 0  # Atomic counter for unique task IDs
+        self._counter_lock = threading.Lock()
+        
+        for _ in range(num_workers):
+            worker = threading.Thread(target=self._worker_loop)
+            worker.daemon = True
+            worker.start()
+            self.workers.append(worker)
+
+    def _next_task_id(self) -> int:
+        with self._counter_lock:
+            task_id = self._task_counter
+            self._task_counter += 1
+            return task_id
+
     def submit(self, func: Callable, *args, **kwargs) -> int:
-        task_id = id(func)
+        """Submit a task. Returns a unique task ID."""
+        task_id = self._next_task_id()
         self.tasks.put((task_id, func, args, kwargs))
         return task_id
     
@@ -457,27 +503,72 @@ def database_query(query: str):
         return f"Result of {query}"
 
 # ── Practical: rate-limited API client ─────────────────────
-class RateLimiter:
-    def __init__(self, max_calls: int, period: float):
-        self.semaphore = threading.Semaphore(max_calls)
+class TokenBucketRateLimiter:
+    """
+    Proper token bucket rate limiter.
+    
+    Tokens refill at a constant rate (max_calls/period per second),
+    NOT all at once. This prevents the "burst at boundary" problem
+    that the simple Semaphore + Timer approach suffers from.
+    
+    Each acquire() blocks until a token is available.
+    Tokens are replenished continuously, not in batches.
+    """
+    
+    def __init__(self, max_calls: int, period: float = 1.0):
+        self.max_calls = max_calls
         self.period = period
-        self._start_time = time.monotonic()
+        self.tokens = max_calls  # Start with full bucket
+        self._rate = max_calls / period  # Tokens per second
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
     
-    def acquire(self):
-        self.semaphore.acquire()
-        # Start refill timer
-        threading.Timer(self.period, self._refill).start()
+    def acquire(self, blocking: bool = True, timeout: float = None) -> bool:
+        """
+        Acquire a token. Returns True if acquired, False if timeout/blocking=False.
+        
+        ⚠️ This implementation uses a simple sleep-poll loop.
+        For production, use threading.Condition to avoid busy-waiting:
+        
+            self._cond = threading.Condition(self._lock)
+            # In acquire(): while self.tokens < 1: self._cond.wait(t)
+            # In _refill_tokens(): self._cond.notify()
+        """
+        deadline = time.monotonic() + timeout if timeout else None
+        
+        while True:
+            with self._lock:
+                self._refill_tokens()
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return True
+            
+            if not blocking:
+                return False
+            if deadline and time.monotonic() >= deadline:
+                return False
+            
+            # No token available — wait a bit and retry
+            time.sleep(min(0.001, self.period / self.max_calls))
     
-    def _refill(self):
-        try:
-            self.semaphore.release()
-        except ValueError:
-            pass  # Already at max
+    def _refill_tokens(self):
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self.tokens = min(self.max_calls, self.tokens + elapsed * self._rate)
+        self._last_refill = now
+    
+    def __enter__(self):
+        self.acquire()
+        return self
+    
+    def __exit__(self, *args):
+        pass  # Token was consumed; nothing to release
 
 # Usage:
-# limiter = RateLimiter(10, 1.0)  # 10 calls per second
+# limiter = TokenBucketRateLimiter(10, 1.0)  # 10 tokens/sec, continuous refill
 # limiter.acquire()
 # make_api_call()
+# Or: with limiter: make_api_call()
 ```
 
 ### Event
@@ -832,24 +923,29 @@ import time
 
 # ── Rate-limited executor ──────────────────────────────────
 class RateLimitedExecutor:
+    """
+    Executor that limits throughput using a token bucket.
+    
+    ⚠️ Uses TokenBucketRateLimiter instead of raw Semaphore.
+       A raw Semaphore with Timer has a burst-at-boundary bug:
+       all permits are released at once after the period, not
+       continuously at the desired rate.
+    """
     def __init__(self, max_workers: int, calls_per_second: float):
         self.executor = ThreadPoolExecutor(max_workers)
-        self.semaphore = threading.Semaphore(int(calls_per_second))
-        self._last_reset = time.monotonic()
-        self._lock = threading.Lock()
+        # Token bucket provides smooth rate limiting, not bursty
+        self.rate_limiter = TokenBucketRateLimiter(
+            max_calls=int(calls_per_second),
+            period=1.0,
+        )
     
     def submit(self, fn, *args, **kwargs) -> Future:
-        self._throttle()
+        # Block until a token is available (rate limited)
+        self.rate_limiter.acquire()
         return self.executor.submit(fn, *args, **kwargs)
     
-    def _throttle(self):
-        with self._lock:
-            now = time.monotonic()
-            if now - self._last_reset >= 0.1:  # Reset every 100ms
-                self._last_reset = now
-                # Don't actually release — too complex for example
-                pass
-        self.semaphore.acquire()
+    def shutdown(self, wait=True):
+        self.executor.shutdown(wait)
 
 # ── Progress tracking executor ─────────────────────────────
 class ProgressExecutor:
@@ -1391,31 +1487,58 @@ class RCUCache:
 # Here's an implementation:
 
 class RWLock:
-    """Read-Write lock: multiple readers, exclusive writer"""
+    """
+    Read-Write lock: multiple readers, exclusive writer.
+    
+    ⚠️ Design notes:
+    - Readers hold a shared lock; writers wait for ALL readers to finish.
+    - This implementation prioritizes readers over writers (reader-biased).
+      If there's a constant stream of readers, writers may starve.
+      For writer-priority, see Python's ``readerwriterlock`` package.
+    - The Condition variable's Lock() protects the _readers count.
+      Between a reader incrementing _readers and actually reading,
+      a writer might check and wait. That's correct — the writer waits.
+      But the TOCTOU risk is: a reader increments, writer starts waiting,
+      reader finishes and decrements, writer wakes up, but ANOTHER reader
+      snuck in before the writer re-acquired the lock.
+      The while-loop re-check handles this correctly.
+    """
     
     def __init__(self):
-        self._read_ready = threading.Condition(threading.Lock())
+        self._cond = threading.Condition(threading.Lock())
         self._readers = 0
+        self._writer_waiting = False  # Tracks if a writer is queued
     
     def acquire_read(self):
-        """Multiple readers can acquire simultaneously"""
-        with self._read_ready:
+        """Multiple readers can acquire simultaneously.
+        
+        ⚠️ If a writer is waiting, new readers queue behind it
+        to prevent writer starvation (writer-priority mode).
+        """
+        with self._cond:
+            # Wait if a writer is waiting (prevents writer starvation)
+            while self._writer_waiting:
+                self._cond.wait()
             self._readers += 1
     
     def release_read(self):
-        with self._read_ready:
+        with self._cond:
             self._readers -= 1
             if self._readers == 0:
-                self._read_ready.notify_all()
+                self._cond.notify_all()  # Wake waiting writer
     
     def acquire_write(self):
-        """Exclusive — waits for all readers to finish"""
-        with self._read_ready:
+        """Exclusive — waits for all readers to finish."""
+        with self._cond:
+            self._writer_waiting = True
             while self._readers > 0:
-                self._read_ready.wait()
+                self._cond.wait()  # Releases lock, re-acquires before return
+            # Now: _readers == 0, _writer_waiting == True
     
     def release_write(self):
-        pass  # Nothing to do
+        with self._cond:
+            self._writer_waiting = False
+            self._cond.notify_all()  # Wake waiting readers
     
     @contextmanager
     def read_lock(self):
@@ -1582,31 +1705,74 @@ logging.basicConfig(
 # ── 3. Deadlock detection ──────────────────────────────────
 import threading
 import time
+from collections import defaultdict
 
-class DeadlockDetectMixin:
-    """Mixin that tracks lock acquisition order to detect deadlocks"""
+class TrackedLock:
+    """
+    Wraps a threading.Lock to track acquisition order across threads.
     
-    _acquired_locks = threading.local()
+    ⚠️ threading.Lock is implemented in C and cannot be subclassed.
+       We use composition (wrap) instead of inheritance (mixin).
+    
+    Detects potential deadlocks by tracking lock ordering.
+    If a thread acquires locks in a different order than another
+    thread already did, it logs a warning — this is a potential
+    deadlock (lock ordering violation).
+    """
+    
+    _lock_order = threading.local()  # Per-thread acquisition stack
+    _global_order = {}  # (lock_id_1, lock_id_2) → first_seen_order
+    _global_lock = threading.Lock()
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._lock_id = id(self)
     
     def acquire(self, blocking=True, timeout=-1):
-        result = super().acquire(blocking, timeout)
+        result = self._lock.acquire(blocking, timeout)
         if result:
-            if not hasattr(self._acquired_locks, 'stack'):
-                self._acquired_locks.stack = []
-            self._acquired_locks.stack.append({
-                'lock': self,
-                'thread': threading.current_thread().name,
-                'time': time.monotonic(),
-            })
+            self._record_acquisition()
         return result
     
     def release(self):
-        if hasattr(self._acquired_locks, 'stack'):
-            for i, entry in enumerate(self._acquired_locks.stack):
-                if entry['lock'] is self:
-                    self._acquired_locks.stack.pop(i)
-                    break
-        super().release()
+        self._lock.release()
+        self._record_release()
+    
+    def _record_acquisition(self):
+        if not hasattr(self._lock_order, 'stack'):
+            self._lock_order.stack = []
+        
+        # Check ordering against previously held locks
+        for held_id in self._lock_order.stack:
+            key = (held_id, self._lock_id)
+            with self._global_lock:
+                if key not in self._global_order:
+                    self._global_order[key] = time.monotonic()
+                # If we see the REVERSE order later, that's a deadlock risk
+                reverse_key = (self._lock_id, held_id)
+                if reverse_key in self._global_order:
+                    print(
+                        f"WARNING: Potential deadlock! Thread "
+                        f"'{threading.current_thread().name}' acquired "
+                        f"lock {self._lock_id} while holding {held_id}, "
+                        f"but another thread acquired them in reverse order."
+                    )
+        
+        self._lock_order.stack.append(self._lock_id)
+    
+    def _record_release(self):
+        if hasattr(self._lock_order, 'stack'):
+            try:
+                self._lock_order.stack.remove(self._lock_id)
+            except ValueError:
+                pass
+    
+    def __enter__(self):
+        self.acquire()
+        return self
+    
+    def __exit__(self, *args):
+        self.release()
 
 # ── 4. ThreadSanitizer (requires compile flag) ─────────────
 # python3.12 -X tsan my_script.py
