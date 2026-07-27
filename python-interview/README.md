@@ -12,11 +12,12 @@
 | [`INTERVIEW_QUESTIONS.md`](./INTERVIEW_QUESTIONS.md) | 12 in-depth questions covering Python's core internals at staff level |
 | [`DJANGO_NOTES.md`](./DJANGO_NOTES.md) | Deep-dive into Django's ORM, request lifecycle, DRF, caching, async, and production patterns |
 | [`FASTAPI_NOTES.md`](./FASTAPI_NOTES.md) | Deep-dive into FastAPI's async patterns, Pydantic integration, DI system, WebSockets, and production deployment |
+| [`ASYNCIO_NOTES.md`](./ASYNCIO_NOTES.md) | Comprehensive guide to async/await, event loop internals, coroutines, tasks, streams, and production async patterns |
 
 ### Topics Covered
 
 - **GIL & Concurrency** — GIL internals, when to use threading vs asyncio vs multiprocessing, subinterpreters
-- **Async/Await** — Event loop internals, coroutine protocols, uvloop, structured concurrency
+- **Async/Await** — Event loop internals, coroutine protocols, uvloop, structured concurrency (see [`ASYNCIO_NOTES.md`](./ASYNCIO_NOTES.md) for the full dedicated guide)
 - **Metaclasses & Descriptors** — Class creation protocols, `__init_subclass__`, `__set_name__`, descriptor protocol
 - **Memory Management** — CPython allocator, reference cycles, GC generations, `__slots__`
 - **Type System** — `Protocol`, `@overload`, `TypeVar` with constraints, variance, `Self`
