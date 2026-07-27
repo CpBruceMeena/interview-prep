@@ -2281,6 +2281,7 @@ async def chunked_processing(items: list, chunk_size: int = 100):
 
 # ── Connection pooling ─────────────────────────────────────
 import aiohttp
+from typing import Optional
 
 class ConnectionPool:
     """Reuse connections for performance"""
