@@ -1815,6 +1815,8 @@ async def fetch_many():
             print(f"{result['full_name']}: {result['stargazers_count']} stars")
 
 # ── Rate-limited HTTP client ───────────────────────────────
+from typing import Optional
+
 class RateLimitedClient:
     """Async HTTP client with rate limiting"""
     
@@ -1823,7 +1825,9 @@ class RateLimitedClient:
         self._rate_limit = rate
         self._last_request = 0.0
         self._rate_lock = asyncio.Lock()
-        self._session: aiohttp.ClientSession | None = None
+        # Use Optional for 3.7+ compatibility. PEP 604 (X | None)
+        # requires Python 3.10+ or 'from __future__ import annotations'
+        self._session: Optional[aiohttp.ClientSession] = None
     
     async def __aenter__(self):
         self._session = aiohttp.ClientSession()
@@ -2177,12 +2181,34 @@ class WorkerPool:
         })
     
     async def shutdown(self):
-        """Gracefully shut down all workers"""
+        """
+        Gracefully shut down all workers.
+        
+        ⚠️ Order matters:
+        1. Put N sentinel Nones into the queue (one per worker)
+        2. queue.join() waits for ALL tasks (including sentinel processing
+           via task_done()) to complete
+        3. Only THEN gather workers — at this point workers have
+           received their None sentinel, called task_done(), and broken
+           out of their while loop
+        
+        The old order (gather THEN join) was WRONG because:
+        - gather() waits for workers to finish
+        - Workers finish by getting None and calling task_done()
+        - But join() AFTER gather() may see workers already done
+          and task_done() already called — which is fine for join()
+          but semantically incorrect: you want to ensure all tasks
+          are processed BEFORE declaring workers done
+        """
+        # 1. Signal all workers to shut down via sentinel
         for _ in range(self._num_workers):
             await self._queue.put(None)
         
-        await asyncio.gather(*self._workers)
+        # 2. Wait for ALL queued items (including sentinels) to be processed
         await self._queue.join()
+        
+        # 3. Now workers have exited their loops — wait for task completion
+        await asyncio.gather(*self._workers)
 
 # Usage:
 # pool = WorkerPool(4)
@@ -2255,13 +2281,15 @@ async def chunked_processing(items: list, chunk_size: int = 100):
 
 # ── Connection pooling ─────────────────────────────────────
 import aiohttp
+from typing import Optional
 
 class ConnectionPool:
     """Reuse connections for performance"""
     
     def __init__(self):
         # aiohttp manages its own connection pool
-        self._session: aiohttp.ClientSession | None = None
+        # Requires 'from typing import Optional' at module level (see imports)
+        self._session: Optional[aiohttp.ClientSession] = None
     
     async def get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -3335,6 +3363,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 import asyncio
 import aiohttp
 from collections import deque
+from typing import Optional
 
 class HighThroughputAPIClient:
     """Async API client with rate limiting and backpressure"""
@@ -3351,7 +3380,8 @@ class HighThroughputAPIClient:
         self._window = 1.0  # 1-second sliding window
         self._timestamps: deque[float] = deque()
         self._rate_lock = asyncio.Lock()
-        self._session: aiohttp.ClientSession | None = None
+        # Optional requires 'from typing import Optional' (added above)
+        self._session: Optional[aiohttp.ClientSession] = None
     
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(

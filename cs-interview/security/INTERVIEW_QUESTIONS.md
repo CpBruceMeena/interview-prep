@@ -4,6 +4,23 @@
 
 ---
 
+### OWASP Top 10 (2021) Mapping
+
+| Question # | Topic | OWASP Category | Rating |
+|-----------|-------|----------------|--------|
+| 1 | JWT Internals | A07:2021 — Identification & Auth Failures | ★★★★★ |
+| 2 | OAuth2 & OIDC | A07:2021 — Identification & Auth Failures | ★★★★★ |
+| 3 | SQL Injection | A03:2021 — Injection | ★★★★★ |
+| 4 | Encryption | A02:2021 — Cryptographic Failures | ★★★★★ |
+| 5 | Secrets Mgmt | A05:2021 — Security Misconfiguration | ★★★★☆ |
+| 6 | Rate Limiting | A01:2021 — Broken Access Control | ★★★★☆ |
+| 7 | Auth Methods | A07:2021 — Identification & Auth Failures | ★★★★★ |
+| 8 | CORS/CSRF | A01:2021 — Broken Access Control | ★★★★☆ |
+| 9 | Supply Chain | A06:2021 — Vulnerable Components | ★★★★★ |
+| 10 | SSRF | A10:2021 — SSRF | ★★★★★ |
+
+---
+
 ## Table of Contents
 
 1. [JWT Internals & Security Considerations](#1-jwt-internals-security-considerations)
@@ -53,14 +70,27 @@ Payload:
 // The payload is base64-encoded, not encrypted.
 
 // The security is in the SIGNATURE:
-// HMAC-SHA256(
-//   base64url(header) + "." + base64url(payload),
-//   secret_key  ← ONLY the server knows this!
-// )
+// RS256 (RSA Signature with SHA-256):
+//   sign(
+//     base64url(header) + "." + base64url(payload),
+//     private_key  ← ONLY the server knows this!
+//   )
+//   verify(
+//     base64url(header) + "." + base64url(payload),
+//     signature,
+//     public_key  ← Shared with services that need to verify
+//   )
 // → Signature = 3rd segment of the JWT
-// → Anyone can forge? NO (they need the secret key)
+// → Anyone can forge? NO (they need the private key)
 // → Anyone can tamper? NO (signature won't verify)
-
+// → Anyone can verify the signature? YES (public key is shared)
+//
+// ⚠️ WARNING: Algorithm confusion attack
+//   If the server uses RS256 but doesn't validate the 'alg' header,
+//   an attacker can change 'alg' to 'HS256' and sign with the
+//   PUBLIC key (which is... public!) to forge tokens.
+//   always specify the expected algorithm when decoding!
+//
 // So: JWT protects against TAMPERING, not against reading.
 // Don't put secrets in the JWT payload!
 ```
@@ -95,22 +125,63 @@ REFRESH_TOKEN_LIFETIME = 7 * 24 * 60 * 60  # 7 days
 # that key become invalid!
 
 class TokenVersionService:
-    def issue_token(self, user_id: int) -> str:
+    """
+    Version-based token revocation.
+    
+    Key insight: Each token embeds the user's current version counter.
+    When we increment the counter, ALL tokens issued before that
+    become invalid — instant revocation without a blocklist!
+    
+    ⚠️ This class handles REVOCATION only (user version).
+       KEY ROTATION is handled by KeyRotationService (separate concern).
+       The two services compose together at the call site.
+    """
+
+    def issue_token(self, user_id: int, signing_key: str, kid: str) -> str:
+        """Issue a JWT with the user's current version embedded."""
         version = self.get_user_version(user_id)  # from DB
+        now = datetime.utcnow()
         return jwt.encode({
             "sub": user_id,
             "ver": version,  # ← User's current token version
-            "exp": now + 15 * 60,
-        }, self.current_signing_key, algorithm="RS256")
+            "iat": now,
+            "exp": now + timedelta(minutes=15),
+        }, signing_key, algorithm="RS256",
+           headers={"kid": kid})  # ← Track which signing key was used
 
-    def verify_token(self, token: str) -> dict:
-        payload = jwt.decode(token, self.current_public_key,
+    def verify_token(self, token: str, public_keys: dict) -> dict:
+        """
+        Verify a JWT and check user version revocation.
+        
+        Args:
+            token: The JWT to verify
+            public_keys: Dict of {kid: public_key} from KeyRotationService
+        """
+        # 1. Extract kid from header to select the right verification key
+        headers = jwt.get_unverified_header(token)
+        kid = headers.get("kid")
+
+        if kid not in public_keys:
+            # Unknown kid → token was signed with a rotated-out key
+            raise RevokedToken("Signing key no longer valid (key rotated)")
+
+        public_key = public_keys[kid]
+        payload = jwt.decode(token, public_key,
                              algorithms=["RS256"])
+
+        # 2. Check user version for revocation
         expected_version = self.get_user_version(payload["sub"])
-        if payload["ver"] != expected_version:
+        if payload.get("ver") != expected_version:
             # Token has been revoked — user re-authenticated
-            raise RevokedToken()
+            raise RevokedToken("Token version mismatch — user session revoked")
         return payload
+
+    def increment_user_version(self, user_id: int):
+        """Atomically increment the user's token version."""
+        db.execute(
+            "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+            (user_id,)
+        )
 
     def revoke_all_sessions(self, user_id: int):
         # Just tick the version counter! All existing tokens become invalid
@@ -154,15 +225,21 @@ class KeyRotationService:
         new_kid = f"v3-2024"
         self.generate_key(new_kid)
         self.keys[new_kid] = {"private": ..., "public": ...,
-                              "created_at": "2024-07-01"}
+                              "created_at": datetime.fromisoformat("2024-07-01")}
         self.current_kid = new_kid
 
-        # Old keys are kept for GRACE PERIOD (tokens issued before rotation
-        # still need to be verified)
-        # Remove old keys after max_token_lifetime:
-        removal_date = now - timedelta(hours=1)  # max token lifetime
+        # Old keys are kept for GRACE PERIOD equal to the max token lifetime
+        # (tokens issued before rotation still need to be verified)
+        # Remove old keys only after ALL tokens they signed have expired
+        max_token_ttl = timedelta(hours=1)  # Max JWT lifetime
+
         for kid, key_data in list(self.keys.items()):
-            if key_data["created_at"] < removal_date:
+            if kid == self.current_kid:
+                continue  # Never delete the current key
+            # A key is safe to delete only if it was created more than
+            # max_token_ttl ago — all tokens signed with it have expired
+            key_age = datetime.utcnow() - key_data["created_at"]
+            if key_age > max_token_ttl + timedelta(hours=1):
                 del self.keys[kid]
 ```
 
@@ -214,10 +291,13 @@ Mobile App                 Backend              Google Auth Server
     │ 2. Generate PKCE params │                        │
     │    code_verifier = random(128 bytes)             │
     │    code_challenge = SHA256(code_verifier)         │
+    │    ⚠️ MUST set:         │                        │
+    │    code_challenge_method = 'S256' (not 'plain')  │
     │                         │                        │
     │ 3. Open Browser to Auth URL                      │
     │◄────────────────────────┤                        │
     │    + code_challenge     │                        │
+    │    + code_challenge_method=S256                   │
     │                         │                        │
     │ 4. User authenticates   │                        │
     │─────────────────────────────────────────────────►│
@@ -239,6 +319,13 @@ Mobile App                 Backend              Google Auth Server
     │ 9. API Response         │    refresh_token       │
     │◄────────────────────────┤    id_token (OIDC)     │
     │                         │                        │
+```
+
+```yaml
+# ⚠️ Critical: If you omit code_challenge_method=S256, the auth server
+# may default to 'plain', which means the verifier is sent in the clear
+# with no hashing. This completely defeats PKCE's security purpose!
+# Always explicitly set code_challenge_method=S256.
 ```
 
 **Why Implicit Grant Is Deprecated:**
@@ -294,10 +381,12 @@ The id_token JWT payload:
 ```python
 # Backend code for exchanging auth code:
 @router.post("/auth/google/callback")
-async def google_callback(code: str, verifier: str, state: str):
+async def google_callback(code: str, verifier: str, state: str, session: Session):
     # 1. Verify state matches (CSRF protection)
+    #    The 'state' parameter was generated and stored in the session
+    #    during step 1. If it doesn't match, this is a CSRF attack!
     if state != session.pop("oauth_state"):
-        raise HTTPException(400, "Invalid state")
+        raise HTTPException(400, "Invalid state — possible CSRF attack")
 
     # 2. Exchange code + verifier for tokens
     token_response = await http_client.post(
@@ -625,6 +714,7 @@ context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20')  # Strong only
 
 ```python
 from cryptography.fernet import Fernet
+import base64
 import os
 
 # ─── Layer 1: Application-Level (Field-Level Encryption) ───
@@ -635,19 +725,25 @@ class PHIEncryptor:
     """
     Encrypts individual PII/PHI fields.
     Each field gets its own Data Encryption Key (DEK).
+    
+    ⚠️ Fernet expects a 32-byte URL-safe base64-encoded key.
+       The raw DEK must be base64-encoded before passing to Fernet!
     """
     def __init__(self, master_key_provider):
         self.master_key_provider = master_key_provider
 
     def encrypt_ssn(self, ssn: str, patient_id: str) -> str:
         # Generate a unique DEK for this patient's SSN
-        dek = self.master_key_provider.generate_dek(f"ssn:{patient_id}")
-        f = Fernet(dek)
+        raw_dek = self.master_key_provider.generate_dek(f"ssn:{patient_id}")
+        # Fernet requires base64-encoded 32-byte key, not raw bytes!
+        encoded_dek = base64.urlsafe_b64encode(raw_dek)
+        f = Fernet(encoded_dek)
         return f.encrypt(ssn.encode()).decode()
 
     def decrypt_ssn(self, encrypted_ssn: str, patient_id: str) -> str:
-        dek = self.master_key_provider.get_dek(f"ssn:{patient_id}")
-        f = Fernet(dek)
+        raw_dek = self.master_key_provider.get_dek(f"ssn:{patient_id}")
+        encoded_dek = base64.urlsafe_b64encode(raw_dek)
+        f = Fernet(encoded_dek)
         return f.decrypt(encrypted_ssn.encode()).decode()
 
 # ─── Layer 2: Database-Level TDE ───
@@ -655,8 +751,16 @@ class PHIEncryptor:
 # Encrypts the entire database at the page level
 # Protects against: stolen database files, backup tapes
 
-# ALTER TABLESPACE pg_default ENCRYPTION INIT;
-# CREATE TABLESPACE encrypted_ts WITH (encryption = 'aes-256-cbc');
+# ⚠️ PostgreSQL does NOT have native TDE syntax like this!
+# Standard PostgreSQL does not support CREATE TABLESPACE ... ENCRYPTION.
+# TDE requires:
+#   - Cloud-specific: AWS RDS encryption, GCP CMEK, Azure TDE
+#   - Extensions: pg_tde (Percona/CyberTec), pgcrypto for field-level
+#   - Filesystem-level: LUKS/dm-crypt on the data directory
+#   - pg_tde example:
+#     SELECT pg_tde_add_key_provider_file('my-provider','/path/to/key');
+#     SELECT pg_tde_set_key_provider('my-provider');
+#     ALTER TABLE patients SET (encryption = 'tde');
 
 # ─── Layer 3: Storage-Level Encryption ───
 # AWS EBS encryption / GCP persistent disk encryption
@@ -683,10 +787,14 @@ class PHIEncryptor:
 #   3. Data stays encrypted — no need to re-encrypt terabytes
 
 from cryptography.fernet import Fernet
+import base64
 
 class EnvelopeEncryption:
     """
     Envelope Encryption with AWS KMS
+    
+    ⚠️ Fernet requires a base64-encoded key. KMS returns raw bytes.
+       We must convert the KMS output to base64 before using Fernet!
     """
     def __init__(self, kms_client, kms_key_id: str):
         self.kms = kms_client
@@ -698,11 +806,12 @@ class EnvelopeEncryption:
             KeyId=self.kek_id,
             KeySpec='AES_256'  # Returns: Plaintext + CiphertextBlob
         )
-        dek_plaintext = response['Plaintext']      # Unencrypted DEK (in memory only)
+        dek_plaintext = response['Plaintext']      # 32 raw bytes (in memory only)
         dek_ciphertext = response['CiphertextBlob'] # Encrypted DEK (safe to store)
 
-        # 2. Encrypt data with the DEK
-        f = Fernet(dek_plaintext)
+        # 2. Encode DEK as base64 (Fernet requirement) then encrypt data
+        encoded_dek = base64.urlsafe_b64encode(dek_plaintext)
+        f = Fernet(encoded_dek)
         ciphertext = f.encrypt(plaintext)
 
         # 3. Store: encrypted data + encrypted DEK
@@ -717,10 +826,11 @@ class EnvelopeEncryption:
         response = self.kms.decrypt(
             CiphertextBlob=encrypted_data['encrypted_dek']
         )
-        dek_plaintext = response['Plaintext']
+        dek_plaintext = response['Plaintext']  # 32 raw bytes
 
-        # 2. Decrypt data with the DEK
-        f = Fernet(dek_plaintext)
+        # 2. Encode DEK as base64 then decrypt data
+        encoded_dek = base64.urlsafe_b64encode(dek_plaintext)
+        f = Fernet(encoded_dek)
         return f.decrypt(encrypted_data['ciphertext'])
 
     # Key rotation:
@@ -845,7 +955,9 @@ class KeyRotationManager:
 #   Mitigation:
 #     - AMD SEV / Intel SGX for sensitive data
 #     - Memory encryption at the hardware level
-#     - LockBit / BitLocker with TPM binding
+#     - LUKS / BitLocker with TPM binding (full-disk encryption)
+#     - ⚠️ LockBit is ransomware, NOT a disk encryption tool!
+#       The correct Linux tool is LUKS (Linux Unified Key Setup).
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -915,7 +1027,21 @@ config.json:
 # Step 3: Application retrieves credentials at startup
 import hvac
 
-client = hvac.Client(url='https://vault.internal:8200', token=app_token)
+# ⚠️ NEVER use a static Vault token (app_token) — this defeats the purpose!
+# Instead, authenticate via:
+#   - Kubernetes auth: client.auth_kubernetes(role, jwt)
+#   - AWS IAM auth:    client.auth_aws(role, iam_request_url, iam_request_body)
+#   - AppRole:         client.auth_approle(role_id, secret_id)
+#
+# Static tokens are long-lived credentials that can leak.
+# Dynamic auth methods provide short-lived, auto-renewing tokens.
+
+# Example using Kubernetes auth (recommended for containerized workloads):
+client = hvac.Client(url='https://vault.internal:8200')
+client.auth_kubernetes(
+    role='my-app-role',
+    jwt=open('/var/run/secrets/kubernetes.io/serviceaccount/token').read()
+)
 
 # Request dynamic database credentials
 creds = client.secrets.database.generate_credentials(
@@ -984,9 +1110,23 @@ class VaultTLSManager:
         return result['data']['certificate'], result['data']['private_key']
 
     def renew_periodically(self):
+        """
+        Periodic renewal loop with error handling.
+        
+        If Vault is unreachable, retry with exponential backoff
+        instead of crashing — we'd rather serve a soon-to-expire
+        cert than no cert at all.
+        """
+        retry_delay = 12 * 3600  # Default: renew every 12 hours (before 24h TTL)
         while True:
-            self.cert, self.key = self.get_certificate('my-service')
-            time.sleep(12 * 3600)  # Renew every 12 hours (before 24h TTL)
+            try:
+                self.cert, self.key = self.get_certificate('my-service')
+                retry_delay = 12 * 3600  # Reset on success
+            except (hvac.exceptions.VaultError, requests.ConnectionError) as e:
+                logger.error(f"Vault renewal failed: {e}")
+                # Exponential backoff: 1min, 2min, 4min, ... up to 1 hour
+                retry_delay = min(retry_delay * 2, 3600) if retry_delay < 3600 else 3600
+            time.sleep(retry_delay)
 ```
 
 **Preventing Secrets in Logs:**
@@ -1116,24 +1256,53 @@ class SlidingWindowRateLimiter:
         self.redis = redis_client
 
     def is_allowed(self, key: str, max_requests: int, window_seconds: int = 60) -> bool:
+        """
+        Check if request is allowed using a sliding window.
+        
+        ⚠️ We use a Lua script for ATOMICITY.
+        The pipeline approach has a race condition:
+          1. zremrangebyscore removes old entries
+          2. zcard counts remaining entries
+          3. zadd adds current request
+        
+        Between 1 and 2, another concurrent request could add an entry,
+        making the count inaccurate. A Lua script prevents this by
+        executing all operations atomically.
+        """
         now = time.time()
         window_start = now - window_seconds
         redis_key = f"ratelimit:{key}"
 
-        pipe = self.redis.pipeline()
-        # Remove old entries outside the window
-        pipe.zremrangebyscore(redis_key, 0, window_start)
-        # Count remaining entries
-        pipe.zcard(redis_key)
-        # Add current request
-        pipe.zadd(redis_key, {str(now): now})
-        # Set expiry to auto-clean
-        pipe.expire(redis_key, window_seconds + 60)
-        results = pipe.execute()
+        # Atomic Lua script: remove old entries, count, add, set expiry
+        # Use a unique member (timestamp + random suffix) to prevent
+        # collisions when two requests arrive at the same microsecond
+        import uuid
+        unique_member = f"{now}:{uuid.uuid4().hex[:8]}"
 
-        request_count = results[1]  # zcard result
+        lua_script = """
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+            local count = redis.call('ZCARD', KEYS[1])
+            redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+            redis.call('EXPIRE', KEYS[1], ARGV[4])
+            return count
+        """
 
-        return request_count <= max_requests
+        request_count = self.redis.eval(
+            lua_script,
+            1,  # number of keys
+            redis_key,
+            window_start,  # ARGV[1]
+            now,           # ARGV[2]
+            unique_member, # ARGV[3] — unique per request
+            window_seconds + 60  # ARGV[4]
+        )
+
+        # Only allow if we're under the limit AFTER counting
+        # (the current request is NOT yet counted)
+        return request_count < max_requests
+
+        # ⚠️ NOTE: We use '< max_requests' not '<= max_requests'
+        # because we need to leave room for THIS request
 
     # Usage:
     # Rate limit: 100 requests per minute per user
@@ -1474,6 +1643,8 @@ async def webauthn_login_complete(email: str, credential: dict):
 | **Password leak risk** | Password stored (hashed) | Password stored (hashed) | No passwords at all! |
 | **Device support** | All browsers | All browsers | Modern browsers + devices |
 | **MFA integration** | Manual (app-level) | Manual (app-level) | Built-in (biometric required) |
+| **Credential stuffing** | Blocked by rate limiting + CAPTCHA | Blocked by rate limiting + CAPTCHA | Not possible (no passwords) |
+| **Token binding (DPoP)** | Not applicable (stateful) | Needs DPoP extension | Inherent (key bound to device) |
 
 **Recommendation for Fintech:**
 
@@ -1490,6 +1661,28 @@ Fallback: Short-lived sessions (with TOTP MFA)
   - For devices that don't support WebAuthn
   - Session-based (easy revocation for fraud)
   - Rotate session ID on privilege escalation
+
+Credential Stuffing Prevention:
+  - WebAuthn completely eliminates passwords → immune to stuffing
+  - Session fallback: rate-limit login attempts per IP + per user
+    (e.g., 5 attempts per minute → lockout + CAPTCHA)
+  - Use haveibeenpwned API to check passwords at registration
+  - Monitor for credential stuffing patterns: same password,
+    different usernames, from same IP range
+
+Step-Up Authentication:
+  - Low-risk actions (view balance): WebAuthn biometric is enough
+  - High-risk actions (transfer >$10K): RE-AUTHENTICATE with biometric
+  - Critical actions (add beneficiary): Require fresh biometric +
+    device-bound confirmation (e.g., "confirm on phone")
+  - This is called Step-Up or Incremental Authentication
+
+DPoP (Demonstration of Proof-of-Possession):
+  - Binds a JWT to a specific client instance using a public key
+  - The client proves possession of the private key on each request
+  - Prevents token theft: even if JWT is stolen, attacker can't
+    use it without the corresponding private key
+  - Reference: RFC 9449 — OAuth 2.0 DPoP
 
 Never: Long-lived JWTs alone
   - Fintech can't tolerate 15-minute revocation window
@@ -1602,6 +1795,33 @@ SameSite=None:
   - Vulnerable to CSRF if no other protection
 ```
 
+**Beyond CSRF: Other Critical HTTP Security Headers:**
+
+```yaml
+# A complete defense-in-depth strategy includes these headers:
+
+# 1. Content-Security-Policy (CSP): Prevents XSS by controlling which
+#    resources can be loaded and executed.
+#    Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-abc123'
+#    - 'self' is already inherited from default-src, but explicitly including
+#      script-src with a nonce allows safe inline scripts
+
+# 2. X-Content-Type-Options: Prevents MIME-type sniffing attacks.
+#    X-Content-Type-Options: nosniff
+
+# 3. X-Frame-Options: Prevents clickjacking by blocking iframe embedding.
+#    X-Frame-Options: DENY
+
+# 4. Strict-Transport-Security (HSTS): Forces HTTPS connections.
+#    Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+
+# 5. Permissions-Policy: Restricts browser API access (camera, mic, etc.)
+#    Permissions-Policy: camera=(), microphone=(), geolocation=()
+
+# 6. Referrer-Policy: Controls how much referrer info is sent.
+#    Referrer-Policy: strict-origin-when-cross-origin
+```
+
 **Step 3: Add CSRF Protection (Because SameSite=None is vulnerable):**
 
 ```python
@@ -1646,11 +1866,21 @@ class CSRFTokenMiddleware:
         return token
 
     async def verify_csrf(self, request: Request):
-        # Skip for safe methods
+        # Skip for safe methods (GET/HEAD/OPTIONS are read-only)
         if request.method in ("GET", "HEAD", "OPTIONS"):
             return True
 
         cookie_token = request.cookies.get("csrf_token")
+        header_token = request.headers.get("X-CSRF-Token")
+
+        if not cookie_token or not header_token:
+            raise HTTPException(403, "Missing CSRF token")
+
+        # Constant-time comparison to prevent timing attacks
+        if not secrets.compare_digest(cookie_token, header_token):
+            raise HTTPException(403, "CSRF token mismatch")
+
+        return True
         header_token = request.headers.get("X-CSRF-Token")
 
         if not cookie_token or not header_token:
@@ -1919,10 +2149,19 @@ spec:
 # This scopes all @mycompany/* packages to GitHub Packages only
 
 # pip: pip.conf
+# ⚠️ DANGER: extra-index-url creates dependency confusion risk!
+#   If both public PyPI and your private registry are searched,
+#   an attacker can publish a package with the same name on PyPI
+#   and pip will install the one with the HIGHER version number.
 [install]
-extra-index-url = https://my-private-pypi.com/simple
-# ⚠️ extra-index-url creates dependency confusion risk!
-# Better: use --index-url with a single registry
+# ❌ WRONG: this searches BOTH registries
+# extra-index-url = https://my-private-pypi.com/simple
+#
+# ✅ CORRECT: use --index-url with a SINGLE registry that proxies both
+# index-url = https://my-private-pypi.com/simple
+#
+# Or use --require-hashes to pin exact checksums:
+# my-internal-lib==1.0.0 --hash=sha256:abc123...
 
 # pip: requirements.txt with hashes
 # --require-hashes ensures EXACT package hashes, prevents substitution
@@ -1963,6 +2202,24 @@ repositories {
 | **SBOM knowledge** | Knows what SBOMs are, how to generate them (syft), and how to use them |
 | **Dependency confusion** | Understands the attack and how to prevent it (scoped packages, hashes) |
 | **Artifact signing** | Mentions cosign/sigstore for container image verification |
+
+### 🔐 Zero Trust Security Quick Reference
+
+```yaml
+# Zero Trust Architecture for Microservices:
+#   "Never trust, always verify"
+#
+# Key principles applied to this pipeline:
+#   1. Verify every artifact: Signature check before deployment
+#   2. Least privilege: Minimal IAM roles, network policies
+#   3. Assume breach: Short-lived creds, audit logging
+#   4. Micro-segmentation: Network policies between services
+#
+# For supply chain specifically:
+#   - Never trust upstream packages without verification
+#   - Verify signatures at every stage (dev → CI → deploy)
+#   - Continuously scan running containers for new CVEs
+```
 
 ---
 
@@ -2083,6 +2340,26 @@ class SSRFProtector:
     def fetch_safely(self, url: str) -> requests.Response:
         self.validate_url(url)
 
+        # ⚠️ DNS Rebinding Protection:
+        # After validate_url resolves the hostname, an attacker could change
+        # the DNS record to point to a private IP. We must re-resolve and
+        # re-validate when actually connecting.
+        #
+        # Strategy: Connect to the resolved IP directly, not the hostname.
+        parsed = urlparse(url)
+        resolved_ip = socket.gethostbyname(parsed.hostname)
+
+        # Re-validate the resolved IP (in case DNS rebinding happened)
+        ip_addr = ipaddress.ip_address(resolved_ip)
+        for blocked in self.BLOCKED_IP_RANGES:
+            if ip_addr in blocked:
+                raise SSRFException(f"Blocked IP after resolution: {resolved_ip}")
+
+        # Instead of passing the URL to requests (which re-resolves DNS),
+        # create a connection to the IP directly and send the Host header
+        # for virtual hosting
+        actual_url = url.replace(parsed.hostname, resolved_ip)
+
         # Use a session with redirect validation
         session = requests.Session()
 
@@ -2090,16 +2367,17 @@ class SSRFProtector:
             # Check redirect target before following
             if response.is_redirect:
                 redirect_url = response.headers["Location"]
+                # Re-validate each redirect target
                 self.validate_url(redirect_url)
 
         # Set strict timeouts (no hanging connections)
         response = session.get(
-            url,
+            actual_url,
+            headers={"Host": parsed.hostname},  # Original hostname for virtual hosting
             timeout=(3, 5),        # (connect timeout, read timeout)
             allow_redirects=True,
             hooks={'response': redirect_hook},
             # Don't send credentials to arbitrary URLs
-            # Don't include auth headers
         )
         return response
 
