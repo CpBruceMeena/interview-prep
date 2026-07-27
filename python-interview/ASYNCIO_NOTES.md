@@ -2286,9 +2286,8 @@ class ConnectionPool:
     """Reuse connections for performance"""
     
     def __init__(self):
-        from typing import Optional  # <-- added for Optional[] annotation
         # aiohttp manages its own connection pool
-        # Optional requires 'from typing import Optional' (added above)
+        # Requires 'from typing import Optional' at module level (see imports)
         self._session: Optional[aiohttp.ClientSession] = None
     
     async def get_session(self) -> aiohttp.ClientSession:
