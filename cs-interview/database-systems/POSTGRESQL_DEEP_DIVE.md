@@ -985,7 +985,7 @@ CREATE INDEX idx_events_range ON events USING brin (created_at, category_id)
 
 -- BRIN with minmax-multi (PG14+ — handles non-correlated data better):
 CREATE INDEX idx_locations ON venues USING brin (latitude, longitude)
-    WITH (pages_per_range = 32, pages_per_range = 32);
+    WITH (pages_per_range = 32);
 ```
 
 ### 7.5 Index Selection Guide
