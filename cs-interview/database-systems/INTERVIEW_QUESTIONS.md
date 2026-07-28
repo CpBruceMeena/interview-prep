@@ -541,7 +541,7 @@ Problems identified:
 2. ❌ Full table scan on orders (10M rows, 6M qualify → JOIN)
 3. ❌ Hash Right Join on 6M × 1M = expensive
 4. ❌ HashAggregate on 512K rows (temp file if memory insufficient)
-5. ✅ LIMIT 50 fetched early, but all computation done first!
+5. ❌ LIMIT 50 fetched early, but all computation done first!
 ```
 
 **Optimization Strategy:**
