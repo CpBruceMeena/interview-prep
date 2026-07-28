@@ -537,7 +537,7 @@ SELECT ...;
 
 ```
 Problems identified:
-1. ✅ Full table scan on users (10M rows, but 1M qualify → 10%)
+1. ❌ Full table scan on users (10M rows, but 1M qualify → 10%)
 2. ❌ Full table scan on orders (10M rows, 6M qualify → JOIN)
 3. ❌ Hash Right Join on 6M × 1M = expensive
 4. ❌ HashAggregate on 512K rows (temp file if memory insufficient)
@@ -656,7 +656,7 @@ LIMIT 50;
 
 ## 5. Indexing Strategies: B-Tree vs Hash vs GiST vs GIN vs BRIN
 
-**Q:** "You have a PostgreSQL table with 100M rows containing the following query patterns: (A) exact-match lookups on user_id, (B) full-text search on document_body, (C) range queries on created_at, (D) JSONB queries on metadata. Choose the optimal index type for each."
+**Q:** "You have a PostgreSQL table with 100M rows containing the following query patterns: (A) exact-match lookups on user_id, (B) full-text search on document_body, (C) range queries on created_at, (D) JSONB queries on metadata, (E) geospatial queries on a location column. Choose the optimal index type for each."
 
 **What They're Really Testing:** Whether you understand the internal data structures of each index type, not just their names.
 
@@ -689,6 +689,13 @@ CREATE INDEX idx_doc_search ON documents USING GIN (to_tsvector('english', doc_b
 -- Space: 1000× smaller than B-Tree for time-series data!
 SELECT * FROM events WHERE created_at BETWEEN '2024-01-01' AND '2024-01-02';
 CREATE INDEX idx_created ON events USING BRIN (created_at) WITH (pages_per_range = 32);
+
+-- GiST for geospatial and range queries:
+-- Best for: geometry/geography (points, polygons), range types (&&, @>), inet/cidr
+-- Structure: balanced tree with bounding predicates (R-Tree-like semantics)
+-- Space: ~30B/row (bounding box + TID)
+SELECT * FROM venues WHERE location <@ circle(point(40.7128, -74.0060), 5000);
+CREATE INDEX idx_location ON venues USING GIST (location);
 
 -- GIN for JSONB:
 -- Best for: @>, ?, ?|, ?& operators
