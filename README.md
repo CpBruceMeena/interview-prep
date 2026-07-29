@@ -76,6 +76,10 @@
 ║  ├── kv-store                      TTL · sync.RWMutex               ║
 ║  └── task-queue                    Worker Pool · Channels            ║
 ║                                                                      ║
+║  🐍 python-dsa/               ← 167 DSA Questions (20 Categories)       ║
+║     Arrays · Strings · Trees · Graphs · DP · Backtracking            ║
+║     Trie · Heaps · Bit Manip · Greedy · Design · Sliding Window      ║
+║                                                                      ║
 ║  🧠 ai-engineering/           ← AI Engineering — RAG, MCP, Agents      ║
 ║  ├── rag/                           RAG Knowledge Retrieval          ║
 ║  ├── mcp/                           MCP Protocol · Server Code       ║
@@ -305,7 +309,10 @@ cd python-low-level-design/parking-lot && python parking_lot.py
 # 2. Run ALL Python LLD projects
 cd python-low-level-design && for dir in */; do echo "=== $dir ===" && cd "$dir" && python *.py && cd - > /dev/null; done
 
-# 3. Run any Java LLD project
+# 3. Run Python DSA demos
+cd python-dsa && python main.py
+
+# 4. Run any Java LLD project
 cd java-low-level-design/elevator-system && javac ElevatorSystem.java && java ElevatorSystem
 
 # 4. Run any Go LLD project
@@ -397,6 +404,8 @@ PHASE 7 ─── AI Engineering
 
 | Metric | Count |
 |--------|-------|
+| Python DSA Questions | **167** |
+| Python DSA Categories | **20** |
 | Python LLD Projects | **18** |
 | Java LLD Projects | **3** |
 | Golang LLD Projects | **3** |
