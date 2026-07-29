@@ -8,26 +8,26 @@
 
 | # | Category | Questions | Key Topics |
 |---|----------|-----------|------------|
-| 01 | [Arrays](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/01_arrays/questions.py) | 10 | Two pointers, sliding window, prefix sum, Kadane's |
-| 02 | [Strings](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/02_strings/questions.py) | 10 | Palindromes, anagrams, pattern matching, atoi |
-| 03 | [Stacks](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/03_stacks/questions.py) | 8 | Monotonic stack, RPN, parentheses, histogram |
-| 04 | [Queues](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/04_queues/questions.py) | 6 | Sliding window max, circular queue, task scheduler |
-| 05 | [Hashing](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/05_hashing/questions.py) | 8 | Frequency maps, LRU cache, valid sudoku, top k |
-| 06 | [Linked Lists](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/06_linked_lists/questions.py) | 8 | Reverse, cycle detection, merge, palindrome |
-| 07 | [Trees](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/07_trees/questions.py) | 10 | BST, traversals, LCA, serialize, diameter |
-| 08 | [Graphs](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/08_graphs/questions.py) | 10 | BFS/DFS, Dijkstra, union find, topological sort |
-| 09 | [Dynamic Programming](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/09_dynamic_programming/questions.py) | 11 | Knapsack, LCS, LIS, edit distance, house robber |
-| 10 | [Sorting & Searching](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/10_sorting_searching/questions.py) | 12 | Quick/merge/heap sort, binary search variants |
-| 11 | [Backtracking](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/11_backtracking/questions.py) | 10 | N-Queens, subsets, permutations, Sudoku solver |
-| 12 | [Trie](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/12_trie/questions.py) | 7 | Prefix tree, word search II, autocomplete |
-| 13 | [Heaps](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/13_heaps/questions.py) | 9 | Median finder, merge k lists, sliding window median |
-| 14 | [Bit Manipulation](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/14_bit_manipulation/questions.py) | 10 | XOR tricks, Hamming weight, counting bits, max XOR |
-| 15 | [Advanced Strings](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/15_advanced_strings/questions.py) | 8 | KMP, Rabin-Karp, Z-Algorithm, Manacher's, suffix array |
-| 16 | [Advanced Trees](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/16_advanced_trees/questions.py) | 4 | AVL, Red-Black, B-Tree, B+ Tree implementations |
-| 17 | [Sliding Window](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/17_sliding_window/questions.py) | 8 | Variable/fixed window, substring concatenation |
-| 18 | [Greedy](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/18_greedy/questions.py) | 9 | Activity selection, Huffman coding, jump game |
-| 19 | [Math & Number Theory](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/19_math_number_theory/questions.py) | 10 | Sieve, GCD, modular exp, reservoir sampling |
-| 20 | [Design Problems](https://github.com/CpBruceMeena/interview-prep/blob/main/python-dsa/20_design_problems/questions.py) | 6 | Logger, rate limiter, elevator, pub-sub, thread pool |
+| 01 | [Arrays](01_arrays/) | 10 | Two pointers, sliding window, prefix sum, Kadane's |
+| 02 | [Strings](02_strings/) | 10 | Palindromes, anagrams, pattern matching, atoi |
+| 03 | [Stacks](03_stacks/) | 8 | Monotonic stack, RPN, parentheses, histogram |
+| 04 | [Queues](04_queues/) | 6 | Sliding window max, circular queue, task scheduler |
+| 05 | [Hashing](05_hashing/) | 8 | Frequency maps, LRU cache, valid sudoku, top k |
+| 06 | [Linked Lists](06_linked_lists/) | 8 | Reverse, cycle detection, merge, palindrome |
+| 07 | [Trees](07_trees/) | 10 | BST, traversals, LCA, serialize, diameter |
+| 08 | [Graphs](08_graphs/) | 10 | BFS/DFS, Dijkstra, union find, topological sort |
+| 09 | [Dynamic Programming](09_dynamic_programming/) | 11 | Knapsack, LCS, LIS, edit distance, house robber |
+| 10 | [Sorting & Searching](10_sorting_searching/) | 12 | Quick/merge/heap sort, binary search variants |
+| 11 | [Backtracking](11_backtracking/) | 10 | N-Queens, subsets, permutations, Sudoku solver |
+| 12 | [Trie](12_trie/) | 7 | Prefix tree, word search II, autocomplete |
+| 13 | [Heaps](13_heaps/) | 9 | Median finder, merge k lists, sliding window median |
+| 14 | [Bit Manipulation](14_bit_manipulation/) | 10 | XOR tricks, Hamming weight, counting bits, max XOR |
+| 15 | [Advanced Strings](15_advanced_strings/) | 8 | KMP, Rabin-Karp, Z-Algorithm, Manacher's, suffix array |
+| 16 | [Advanced Trees](16_advanced_trees/) | 4 | AVL, Red-Black, B-Tree, B+ Tree implementations |
+| 17 | [Sliding Window](17_sliding_window/) | 8 | Variable/fixed window, substring concatenation |
+| 18 | [Greedy](18_greedy/) | 9 | Activity selection, Huffman coding, jump game |
+| 19 | [Math & Number Theory](19_math_number_theory/) | 10 | Sieve, GCD, modular exp, reservoir sampling |
+| 20 | [Design Problems](20_design_problems/) | 6 | Logger, rate limiter, elevator, pub-sub, thread pool |
 
 ---
 

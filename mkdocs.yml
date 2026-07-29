@@ -374,6 +374,26 @@ nav:
 
   - 🐍 Python DSA (167 Questions):
     - Overview: python-dsa/index.md
+    - Arrays: python-dsa/01_arrays/
+    - Strings: python-dsa/02_strings/
+    - Stacks: python-dsa/03_stacks/
+    - Queues: python-dsa/04_queues/
+    - Hashing: python-dsa/05_hashing/
+    - Linked Lists: python-dsa/06_linked_lists/
+    - Trees: python-dsa/07_trees/
+    - Graphs: python-dsa/08_graphs/
+    - Dynamic Programming: python-dsa/09_dynamic_programming/
+    - Sorting & Searching: python-dsa/10_sorting_searching/
+    - Backtracking: python-dsa/11_backtracking/
+    - Trie: python-dsa/12_trie/
+    - Heaps: python-dsa/13_heaps/
+    - Bit Manipulation: python-dsa/14_bit_manipulation/
+    - Advanced Strings: python-dsa/15_advanced_strings/
+    - Advanced Trees: python-dsa/16_advanced_trees/
+    - Sliding Window: python-dsa/17_sliding_window/
+    - Greedy: python-dsa/18_greedy/
+    - Math & Number Theory: python-dsa/19_math_number_theory/
+    - Design Problems: python-dsa/20_design_problems/
 
   - 🖥️ CS Core:
     - Overview: cs-interview/README.md
