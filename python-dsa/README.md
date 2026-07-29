@@ -25,6 +25,9 @@
 | 15 | [Advanced Strings](./15_advanced_strings/questions.py) | KMP, Rabin-Karp, Z-Algorithm, Manacher's, suffix array | `questions.py` |
 | 16 | [Advanced Trees](./16_advanced_trees/questions.py) | AVL, Red-Black, B-Tree, B+ Tree, rotations | `questions.py` |
 | 17 | [Sliding Window](./17_sliding_window/questions.py) | Variable/fixed window, substring, subarray, two pointers | `questions.py` |
+| 18 | [Greedy](./18_greedy/questions.py) | Activity selection, Huffman, jump game, gas station, partition | `questions.py` |
+| 19 | [Math & Number Theory](./19_math_number_theory/questions.py) | Sieve, GCD/LCM, modular exp, prime factors, reservoir sampling | `questions.py` |
+| 20 | [Design Problems](./20_design_problems/questions.py) | Logger, rate limiter, elevator, pub-sub, thread pool, URL shortener | `questions.py` |
 
 ---
 

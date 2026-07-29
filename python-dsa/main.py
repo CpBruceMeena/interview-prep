@@ -37,6 +37,9 @@ CATEGORIES = [
     ("15_advanced_strings", "Advanced Strings"),
     ("16_advanced_trees", "Advanced Trees"),
     ("17_sliding_window", "Sliding Window"),
+    ("18_greedy", "Greedy"),
+    ("19_math_number_theory", "Math & Number Theory"),
+    ("20_design_problems", "Design Problems"),
 ]
 
 

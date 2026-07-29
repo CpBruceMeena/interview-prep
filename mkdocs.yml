@@ -372,6 +372,9 @@ nav:
     - Compression: tools-interview/compression/INTERVIEW_QUESTIONS.md
     - CI/CD Deployment: tools-interview/ci-cd-deployment/DEPLOYMENT_GUIDE.md
 
+  - 🐍 Python DSA (167 Questions):
+    - Overview: python-dsa/index.md
+
   - 🖥️ CS Core:
     - Overview: cs-interview/README.md
     - Operating Systems: cs-interview/operating-systems/INTERVIEW_QUESTIONS.md

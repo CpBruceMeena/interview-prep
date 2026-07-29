@@ -11,8 +11,12 @@
         </p>
         <div class="hero-stats">
             <div class="hero-stat">
-            <span class="hero-stat-number">24</span>
-            <span class="hero-stat-label">LLD Projects</span>
+                <span class="hero-stat-number">24</span>
+                <span class="hero-stat-label">LLD Projects</span>
+            </div>
+            <div class="hero-stat">
+                <span class="hero-stat-number">167+</span>
+                <span class="hero-stat-label">DSA Questions</span>
             </div>
             <div class="hero-stat">
                 <span class="hero-stat-number">200+</span>
@@ -21,10 +25,6 @@
             <div class="hero-stat">
                 <span class="hero-stat-number">8</span>
                 <span class="hero-stat-label">CS Core Topics</span>
-            </div>
-            <div class="hero-stat">
-                <span class="hero-stat-number">3+</span>
-                <span class="hero-stat-label">Language Deep-Dives</span>
             </div>
         </div>
         <div class="hero-actions">
