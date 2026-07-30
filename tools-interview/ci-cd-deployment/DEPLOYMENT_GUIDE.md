@@ -1117,27 +1117,733 @@ Deploy Gate Checks (automated):
 
 ### Beginner
 
-1. **Explain the difference between CI and CD.**
-2. **What is a deployment strategy? Name three types.**
-3. **How does blue-green deployment work?**
-4. **What is the purpose of a build artifact?**
+---
+
+#### 1. Explain the difference between CI and CD.
+
+**CI (Continuous Integration)** is the practice of merging developer code into a shared branch multiple times per day, with each merge automatically triggering a pipeline that runs linting, unit tests, and build verification. The goal is to detect integration bugs early — before they compound across long-lived branches.
+
+**CD has two flavors:**
+
+- **Continuous Delivery (CDel):** Every change that passes CI is automatically prepared and packaged for release. Promotion to production requires a *human approval gate*. This is the right model for regulated industries or high-risk changes.
+- **Continuous Deployment (CDep):** Every change that passes all automated gates is automatically deployed to production *without human intervention*. This requires extremely high automated test coverage and robust monitoring.
+
+**In practice at scale:** Most mature engineering organizations run Continuous *Delivery* to production (with automated gate checks like latency/error budgets replacing manual approval) and reserve Continuous *Deployment* for lower-risk services. The distinction matters less than the underlying principle: ship small, ship often, catch failures automatically.
+
+```
+CI → Build → Artifact
+                │
+                ├── Continuous Delivery:  Staging → [Human Gate] → Production
+                └── Continuous Deployment: Staging → [Automated Gate] → Production
+```
+
+---
+
+#### 2. What is a deployment strategy? Name three types.
+
+A **deployment strategy** defines *how* a new version of software is rolled out to replace the old version, specifically controlling the risk of failures affecting users and the speed and ease of rollback.
+
+**Three key strategies:**
+
+1. **Rolling Update** — Replace instances of the old version incrementally (e.g., 1 pod at a time in Kubernetes). Zero-downtime, but during rollout both versions run simultaneously, which can cause API incompatibility issues.
+
+2. **Blue-Green** — Two identical environments ("Blue" = live, "Green" = new). Deploy fully to Green, then switch the load balancer. Instant rollback by switching back to Blue. High infra cost (2x resources).
+
+3. **Canary Release** — Route a small percentage (e.g., 5–10%) of real user traffic to the new version. Monitor metrics; if healthy, progressively increase to 100%. Best risk-adjusted approach for stateless services.
+
+---
+
+#### 3. How does blue-green deployment work?
+
+**Concept:** You maintain two identical production environments: "Blue" (currently serving traffic) and "Green" (idle, staging the next release).
+
+**Sequence:**
+1. Deploy the new version to the **Green** environment (while Blue continues serving 100% of traffic).
+2. Run smoke tests, integration checks, and any validation against Green while it's dark (receiving no real user traffic).
+3. Once validated, update the **load balancer** (or DNS, or service mesh routing rule) to point all traffic to Green. Green is now live.
+4. Blue is kept warm for a configurable period (e.g., 30 minutes). If alerts fire post-switch, you revert the load balancer back to Blue — rollback in under 60 seconds.
+5. After confidence window, Blue becomes the next deployment target.
+
+**Advantages:** Near-instant rollback, full validation before traffic switch, no mixed-version traffic during rollout.
+
+**Trade-offs:** Requires 2x infrastructure cost, database schema must be compatible with both versions simultaneously, stateful sessions need sticky routing or external session store.
+
+---
+
+#### 4. What is the purpose of a build artifact?
+
+A **build artifact** is the immutable, versioned, self-contained output of the build stage that will be promoted through environments without being rebuilt.
+
+**Why it matters:**
+- **Immutability:** The exact same binary/image that passed tests in staging is what runs in production. "Build once, deploy many" guarantees environmental fidelity.
+- **Auditability:** Artifacts are tagged with commit SHAs and stored in a registry (ECR, GHCR, Nexus). You can always trace what is running in production back to the exact source commit.
+- **Speed:** Rebuilding from source per environment introduces variance (flaky dependency resolution, different build tool versions). Artifact promotion eliminates that.
+- **Rollback:** Rolling back is selecting a previous artifact tag, not re-running a build.
+
+**Examples by type:**
+| Stack | Artifact |
+|-------|---------|
+| Backend | Docker image (`myapp:abc1234`) |
+| Frontend | Bundled static assets (`dist/`, content-hashed) |
+| iOS | `.ipa` archive |
+| Android | `.aab` bundle |
+| Java | `.jar` / `.war` |
+| Go | Compiled binary |
+
+---
 
 ### Intermediate
 
-5. **Compare rolling update vs. blue-green deployment. When would you use each?**
-6. **How do you handle database migrations in a CI/CD pipeline?**
-7. **What is GitOps and how does ArgoCD implement it?**
-8. **How would you set up a canary release for a microservice?**
-9. **Explain the expand-contract pattern for zero-downtime migrations.**
+---
+
+#### 5. Compare rolling update vs. blue-green deployment. When would you use each?
+
+| Dimension | Rolling Update | Blue-Green |
+|-----------|---------------|------------|
+| **How it works** | Replace old instances one-by-one | Flip all traffic at once after full standby deploy |
+| **Zero-downtime** | ✅ Yes | ✅ Yes |
+| **Mixed versions** | ✅ Yes — old and new run concurrently | ❌ No — clean switch |
+| **Rollback speed** | Slow (re-roll the rolling update) | Instant (flip LB back) |
+| **Infrastructure cost** | Same — in-place replacement | 2x — two full environments |
+| **API compatibility required** | ✅ Critical — both versions serve traffic simultaneously | Lighter — only during validation window |
+
+**Use rolling update when:**
+- Running stateless, API-backward-compatible services
+- Infrastructure cost is a constraint
+- You have good readiness probes and pod disruption budgets configured
+- Kubernetes is your orchestrator (default strategy)
+
+**Use blue-green when:**
+- You need guaranteed instant rollback (payment processing, checkout flows)
+- You want to validate the full new environment under synthetic load before switching
+- You're deploying a schema-breaking change that requires a clean cutover
+- Regulatory requirements demand zero mixed-version exposure
+
+**Staff-level nuance:** For most stateless microservices at scale, rolling updates are the operational default because they're resource-efficient and Kubernetes handles them natively. Blue-green is reserved for high-stakes deployments or schema migrations. Canary (partial traffic split) is increasingly the preferred alternative to both — it gives you real-signal validation with controlled blast radius.
+
+---
+
+#### 6. How do you handle database migrations in a CI/CD pipeline?
+
+Database migrations are the hardest part of zero-downtime deployment because the database is shared and changes are not atomic with code deploys.
+
+**The golden rule: migrations must be backward-compatible with the previous version of the application.**
+
+**Expand-Contract Pattern (3-phase migration):**
+
+```
+Release N:    Add new column (nullable/with default). Old code ignores it.
+Release N+1:  Populate column. New code reads/writes it. Old code still works.
+Release N+2:  Remove old column or constraint once old code is fully retired.
+```
+
+**Pipeline integration:**
+```yaml
+# Pre-deploy hook — runs BEFORE traffic switch
+- name: Run migrations
+  run: |
+    alembic upgrade head      # Python
+    # or
+    python manage.py migrate  # Django
+    # or
+    flyway migrate            # Java
+```
+
+**Key practices at scale:**
+- **Never** run migrations as part of the application startup (causes race conditions across pods)
+- Run migrations as a **Kubernetes Job** or **init container** that completes before pods roll
+- Use **migration tools with locking** (Flyway, Liquibase, Alembic) to prevent concurrent runs
+- Maintain a **dry-run mode** (`--dry-run`, `alembic upgrade head --sql`) to review SQL before execution
+- **Separate DDL from DML**: `ALTER TABLE` statements are separate from data backfills (backfills run as background jobs)
+- For large tables (100M+ rows), use **online schema change tools** (pt-online-schema-change, gh-ost for MySQL; `CREATE INDEX CONCURRENTLY` for PostgreSQL)
+
+**Example: Zero-downtime column rename (PostgreSQL):**
+```sql
+-- Phase 1 (deploy v1): Add new column
+ALTER TABLE orders ADD COLUMN customer_id BIGINT;
+
+-- Phase 2 (backfill, background job): Copy data
+UPDATE orders SET customer_id = user_id WHERE customer_id IS NULL;
+
+-- Phase 3 (deploy v2): App writes to both columns
+-- (dual-write period)
+
+-- Phase 4 (deploy v3): App reads only from customer_id
+-- Remove old column
+ALTER TABLE orders DROP COLUMN user_id;
+```
+
+---
+
+#### 7. What is GitOps and how does ArgoCD implement it?
+
+**GitOps** is an operational model where the **Git repository is the single source of truth** for the desired state of infrastructure and deployments. Changes to the running system are made exclusively by committing to Git — never by running `kubectl apply` or `terraform apply` manually.
+
+**Core principles:**
+1. **Declarative:** Desired state is expressed as files (Kubernetes manifests, Helm charts, Kustomize overlays)
+2. **Versioned:** Git history is the audit log for all changes
+3. **Automated:** A reconciliation loop continuously compares desired (Git) vs. actual (cluster) state and converges them
+4. **Observable:** Drift between desired and actual state is immediately detectable
+
+**How ArgoCD implements GitOps:**
+```
+Developer commits Kubernetes manifest to Git
+          │
+          ▼
+    ArgoCD watches Git repo (polling or webhook)
+          │
+          ▼
+    ArgoCD detects diff: desired state ≠ cluster state
+          │
+          ▼
+    ArgoCD applies manifests to Kubernetes cluster
+          │
+          ▼
+    ArgoCD reports sync status: Healthy / Degraded / Out-of-sync
+```
+
+**Key ArgoCD concepts:**
+- **Application:** ArgoCD CRD that maps a Git path to a cluster namespace
+- **Sync:** The act of applying Git state to the cluster
+- **Health status:** ArgoCD evaluates if pods/services are actually healthy post-sync
+- **App-of-Apps pattern:** A parent ArgoCD application manages child applications — scales to 100s of services
+
+**Staff-level nuance:** GitOps solves the "config drift" problem — the gap between what you think is deployed and what's actually running. In traditional push-based CD, drift accumulates through hotfixes, manual interventions, and failed rollouts. ArgoCD's reconciliation loop continuously enforces the desired state, making the cluster self-healing.
+
+---
+
+#### 8. How would you set up a canary release for a microservice?
+
+**Goal:** Expose a new version to a small subset of real users, measure its behavior against production signals, and progressively expand or roll back.
+
+**Option 1: Kubernetes + Service Mesh (Istio) — recommended for microservices:**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: payment-service
+spec:
+  http:
+  - route:
+    - destination:
+        host: payment-service
+        subset: v1
+      weight: 90      # 90% → stable
+    - destination:
+        host: payment-service
+        subset: v2
+      weight: 10      # 10% → canary
+```
+
+**Progressive promotion schedule:**
+```
+Deploy → 5% → Monitor (15 min) → 25% → Monitor (30 min) → 50% → Monitor → 100%
+```
+
+**Automated gate (what to measure):**
+- P99 latency increase < 10% vs. baseline
+- Error rate (5xx) < 0.1%
+- Business-level metrics (payment success rate, conversion rate)
+- No new alerts firing in observability platform (Datadog, Grafana)
+
+**Option 2: Feature flags (for application-level canary):**
+```python
+if feature_flags.percentage_rollout('new-checkout', user_id=request.user_id, percent=10):
+    return new_checkout_flow()
+return old_checkout_flow()
+```
+
+**Automation with Argo Rollouts:**
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    canary:
+      steps:
+      - setWeight: 10
+      - pause: {duration: 15m}
+      - analysis:
+          templates:
+          - templateName: success-rate   # Prometheus query
+      - setWeight: 50
+      - pause: {duration: 30m}
+      - setWeight: 100
+```
+
+---
+
+#### 9. Explain the expand-contract pattern for zero-downtime migrations.
+
+The **expand-contract pattern** (also called "parallel change") is a technique for making breaking schema or API changes incrementally, across multiple deployments, without downtime.
+
+**The problem:** You cannot simultaneously change the database schema AND deploy new code atomically — deployments are rolling, so old and new code run concurrently against the same database.
+
+**Three phases:**
+
+```
+Phase 1 — EXPAND:
+  Add new column/endpoint (backward-compatible addition)
+  Old code: ignores new column (nullable/has default)
+  New code: writes to both old and new column
+
+Phase 2 — MIGRATE:
+  Backfill data into the new column/format
+  Run as background job, not in the deployment pipeline
+
+Phase 3 — CONTRACT:
+  Remove old column/endpoint once all consumers use the new one
+  Deploy code that only reads/writes the new column
+  Then drop the old column (DDL is safe now)
+```
+
+**Real example — renaming `user_id` to `customer_id`:**
+
+```sql
+-- Phase 1 (Expand): Add new column
+ALTER TABLE orders ADD COLUMN customer_id BIGINT;
+
+-- App code: write to both columns
+INSERT INTO orders (user_id, customer_id, ...) VALUES (42, 42, ...);
+```
+
+```sql
+-- Phase 2 (Migrate): Backfill
+UPDATE orders SET customer_id = user_id WHERE customer_id IS NULL;
+```
+
+```sql
+-- Phase 3 (Contract): Remove old column after all pods run new code
+ALTER TABLE orders DROP COLUMN user_id;
+```
+
+**The same pattern applies to API changes:**
+- **Expand:** Add new `/v2/checkout` endpoint alongside `/v1/checkout`
+- **Migrate:** Update all consumers to call `/v2`
+- **Contract:** Deprecate and remove `/v1`
+
+**Why this matters at staff level:** The expand-contract pattern is what makes it possible to deploy schema changes without maintenance windows. It requires discipline: each "contract" step must be a separate, independently deployed release. Teams that skip the contract phase accumulate schema debt.
+
+---
 
 ### Senior / Staff
 
-10. **Design a CI/CD pipeline for a 50-microservice system with polyglot services (Go, Python, Java). How do you handle cross-service contract testing?**
-11. **How do you ensure backward compatibility during a multi-service rollout?**
-12. **Design a deployment system that can handle 1,000+ deployments per day across 200 services.**
-13. **How do you implement progressive delivery with feature flags and canary releases in a service mesh?**
-14. **How would you migrate a monolith to microservices incrementally using CI/CD?**
-15. **How do you handle the "diamond dependency" problem in microservice deployments?**
+---
+
+#### 10. Design a CI/CD pipeline for a 50-microservice system with polyglot services (Go, Python, Java). How do you handle cross-service contract testing?
+
+**The core challenge:** 50 independent pipelines that must not be micromanaged individually, with cross-language builds and API compatibility guarantees across service boundaries.
+
+**Architecture Decision: Monorepo vs. Polyrepo**
+
+| | Monorepo | Polyrepo |
+|---|---|---|
+| **CI trigger** | Smart change detection (only build affected services) | Each repo has its own pipeline |
+| **Cross-service refactors** | Atomic commits across services | Requires coordinated PRs |
+| **Tooling** | Bazel, Nx, Turborepo, Pants | Standard per-service CI |
+
+For 50 services, I'd use a **polyrepo** approach with a shared **Platform Engineering** team owning standardized pipeline templates.
+
+**Pipeline Architecture:**
+
+```
+Each service repo has a standard .github/workflows/ci.yml (templated via reusable workflows):
+
+1. Detect language → select build strategy:
+   - Go:     golangci-lint → go test -race → docker build (scratch)
+   - Python: ruff → mypy → pytest → docker build (python:3.12-slim)
+   - Java:   maven/gradle lint → junit → docker build (eclipse-temurin:21-jre)
+
+2. Build Docker image tagged: {service}:{commit-sha}
+3. Push to shared ECR / GHCR
+4. Run contract tests
+5. Deploy to staging namespace
+6. Promote to production via GitOps (PR to manifests repo)
+```
+
+**Cross-Service Contract Testing with Pact:**
+
+```
+Consumer-Driven Contract Testing model:
+
+Payment Service (Consumer) defines expectations:
+  - "When I call /api/orders/{id}, I expect JSON: {id, status, amount}"
+
+Order Service (Producer) verifies those expectations:
+  - Pact Broker stores contracts
+  - Order Service CI runs: pact verify → confirms it satisfies all consumer contracts
+
+Flow:
+  Payment Service CI → generates pact file → uploads to Pact Broker
+  Order Service CI  → downloads pacts from Broker → runs provider verification
+  If verification fails → Order Service pipeline BLOCKS
+```
+
+**Pact Broker integration in GitHub Actions:**
+```yaml
+- name: Publish consumer contract
+  run: |
+    pact-broker publish ./pacts \
+      --broker-base-url $PACT_BROKER_URL \
+      --consumer-app-version $GITHUB_SHA
+
+- name: Can I Deploy? (check if safe to release)
+  run: |
+    pact-broker can-i-deploy \
+      --pacticipant payment-service \
+      --version $GITHUB_SHA \
+      --to-environment production
+```
+
+**Shared Platform components (managed by Platform Engineering):**
+- **Reusable GitHub Actions workflows** (language-specific build templates called via `uses:`)
+- **Shared base Dockerfiles** stored in `platform/docker/` repo
+- **Pact Broker** (central contract registry)
+- **Centralized observability** (all services emit to same Datadog/Grafana stack)
+- **Service catalog** (Backstage) tracking which version of each service is deployed where
+
+---
+
+#### 11. How do you ensure backward compatibility during a multi-service rollout?
+
+**The fundamental problem:** In a distributed system, you cannot atomically deploy two services simultaneously. One service will always deploy first, creating a window where v2 of Service A runs against v1 of Service B (or vice versa).
+
+**Strategy 1: Additive-Only API Changes (Robustness Principle)**
+- APIs must be **backward-compatible**: new fields are optional with defaults, old fields are never removed in the same release
+- **Never** change the meaning of an existing field — add a new field
+- Use versioned endpoints (`/v2/`) for breaking changes, keep `/v1/` alive during transition
+
+**Strategy 2: Tolerate Unknown Fields**
+- Consumers must be built with **tolerant reader** pattern: ignore fields they don't understand
+- Use `additionalProperties: true` in JSON Schema
+- In protobuf, unknown fields are preserved by default
+
+**Strategy 3: Deployment Ordering**
+```
+For a breaking change between Service A (producer) and Service B (consumer):
+
+1. Deploy Service A v2 — adds NEW endpoint/field (EXPAND phase)
+   Old consumers still work against old endpoint.
+
+2. Deploy Service B v2 — starts calling new endpoint.
+   If A is healthy → B upgrades work.
+
+3. Deploy Service A v3 — removes old endpoint (CONTRACT phase).
+   Only after all consumers are confirmed on v2.
+```
+
+**Strategy 4: API Versioning + Deprecation Pipeline**
+```
+Deprecation policy:
+  - Mark old endpoint deprecated in OpenAPI spec
+  - Emit deprecation warning metric (track consumers still calling it)
+  - Set sunset date (e.g., 30 days)
+  - Monitor: alert if deprecated endpoint traffic > 0 after sunset date
+  - Remove in next major release
+```
+
+**Strategy 5: Consumer-Driven Contract Tests (see Q10)**
+- These act as a compatibility gate: a producer cannot merge if it breaks any registered consumer contract
+
+**Strategy 6: Feature flags for coordinated rollout**
+```python
+# Service B only activates new behavior after flag is enabled
+if feature_flags.is_enabled('use-v2-order-api'):
+    response = order_service.get_order_v2(order_id)
+else:
+    response = order_service.get_order_v1(order_id)
+```
+This lets you deploy both services independently, then coordinate the flag flip centrally.
+
+---
+
+#### 12. Design a deployment system that can handle 1,000+ deployments per day across 200 services.
+
+**Scale context:** 1,000 deployments/day across 200 services = ~5 deployments/service/day = one deployment every 2–3 hours per service. This requires near-zero human intervention per deployment.
+
+**Core architecture:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Control Plane                                │
+│                                                                     │
+│  Git Push → Webhook → Deployment Orchestrator → Queue → Executors  │
+│                              │                                       │
+│                    ┌─────────┴──────────┐                           │
+│                    │  Deployment Queue  │  (per-service FIFO)       │
+│                    └────────────────────┘                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+
+**1. Parallelism with per-service serialization**
+- Deployments to *different* services are fully parallel
+- Deployments to the *same* service are serialized (queue) to prevent race conditions
+- Use a distributed lock (Redis/Etcd) per service: at most 1 active deployment per service
+
+**2. GitOps as the control plane (ArgoCD + Flux)**
+- Each service has a Kubernetes manifest in a manifests repo
+- CI pipeline creates a PR to update the image tag → auto-merge on CI pass → ArgoCD syncs
+- ArgoCD handles the actual apply, health check, and rollback
+- This decouples the deployment trigger from the execution — ArgoCD can retry, batch, or queue
+
+**3. Deployment pipeline stages (all automated):**
+```
+Commit → CI (2-5 min) → Artifact Push → Staging Deploy (auto) →
+Smoke Tests (2 min) → Canary 5% (15 min) →
+SLO Gates (automated) → Canary 100% → Done
+```
+Total elapsed time: ~25–35 minutes per deployment, fully automated.
+
+**4. SLO-based automatic promotion and rollback**
+```yaml
+# Argo Rollouts analysis template
+metrics:
+- name: success-rate
+  provider:
+    prometheus:
+      query: |
+        sum(rate(http_requests_total{status!~"5..",service="{{args.service}}"}[5m]))
+        /
+        sum(rate(http_requests_total{service="{{args.service}}"}[5m]))
+  successCondition: result[0] >= 0.995   # 99.5% success rate
+  failureLimit: 1
+```
+
+**5. Preventing deployment storms**
+- **Rate limiting:** Max N concurrent deployments cluster-wide (Kubernetes resource quotas)
+- **Time windows:** Optional quiet hours (block deployments 11pm–6am without on-call approval)
+- **Dependency graph:** If Service A deploys, hold Service B (its consumer) until A is healthy
+
+**6. Observability of the deployment system itself**
+- **DORA metrics dashboard:** Deployment frequency, lead time, MTTR, change failure rate
+- **Deployment timeline view:** See all 200 services' deployment status in one view
+- **Failure reason classification:** Automated labeling (test failure, timeout, rollback, OOM)
+
+**7. Self-service for developers**
+- Backstage plugin showing each service's deployment status, recent history, and DORA metrics
+- Slack bot: `/deploy payment-service to staging` triggers pipeline
+
+---
+
+#### 13. How do you implement progressive delivery with feature flags and canary releases in a service mesh?
+
+**Progressive delivery** is the union of infrastructure-level canary (traffic splitting at the load balancer/service mesh) and application-level feature flags — giving you two independent dimensions of control over rollout.
+
+**Layer 1: Service Mesh Canary (infrastructure level)**
+
+Using Istio VirtualService + Argo Rollouts:
+```yaml
+# Argo Rollouts controls traffic weights automatically
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+spec:
+  strategy:
+    canary:
+      trafficRouting:
+        istio:
+          virtualService:
+            name: checkout-vs
+      steps:
+      - setWeight: 5        # 5% → canary
+      - pause: {duration: 15m}
+      - analysis:
+          templates:
+          - templateName: error-rate-check
+      - setWeight: 25
+      - pause: {duration: 30m}
+      - setWeight: 100
+```
+
+**Layer 2: Feature Flags (application level)**
+
+Feature flags let you deploy code fully (100% of traffic hitting new pods) but keep the feature *behaviorally* off until explicitly enabled:
+
+```python
+# Flag evaluation happens at runtime, not deploy time
+def process_checkout(request):
+    if flags.variation('new-tax-calculation', user_id=request.user.id):
+        return new_tax_engine.calculate(request.cart)
+    return legacy_tax_engine.calculate(request.cart)
+```
+
+**Combining both layers for maximum control:**
+
+```
+Scenario: Rolling out a risky new recommendation engine
+
+Step 1: Deploy code (new pods running) → flag OFF (0% exposure)
+        → canary at 5% traffic, but feature flag = OFF for all
+
+Step 2: Enable flag for internal users only (LaunchDarkly targeting rule)
+        → staff dog-food the feature at 5% infra canary
+
+Step 3: Enable flag for 1% of users (random bucket)
+        → measure recommendation click-through and revenue per session
+
+Step 4: Expand flag to 10%, 25%, 50%, 100% on independent schedule
+        → infra canary finishes at Step 2 (stable pods serving traffic)
+        → feature rollout continues via flag config (zero redeploy)
+
+Rollback:
+  - Feature regression: flip flag OFF → instant, no redeploy
+  - Infrastructure regression: Argo Rollouts detects SLO breach → auto-rollback pods
+```
+
+**Metric-driven flag promotion (OpenFeature + Prometheus):**
+```yaml
+# Automated flag promotion rule
+flag: new-recommendation-engine
+auto_promote:
+  metric: revenue_per_session_increase
+  threshold: ">= 0.02"   # 2% revenue uplift
+  window: 24h
+  current_exposure: 10%
+  next_exposure: 25%
+```
+
+**Tools stack:**
+- **Flag service:** LaunchDarkly, Flagsmith, OpenFeature (vendor-neutral SDK)
+- **Traffic splitting:** Istio, Linkerd, AWS App Mesh
+- **Progressive rollout automation:** Argo Rollouts, Flagger
+- **Analysis:** Prometheus + Grafana, Datadog
+
+---
+
+#### 14. How would you migrate a monolith to microservices incrementally using CI/CD?
+
+**The Strangler Fig Pattern** is the industry-standard approach: you grow the new system around the old one, gradually strangling (replacing) it piece by piece. You never do a big-bang rewrite.
+
+**Phase 0: Instrument the Monolith**
+Before extracting anything, add observability:
+```
+- Distributed tracing (OpenTelemetry) across all monolith modules
+- Per-module SLOs (latency, error rate) — you need baselines
+- Domain boundary identification: map bounded contexts via code ownership + DB table access patterns
+```
+
+**Phase 1: Extract + Proxy (0% traffic to new service)**
+```
+Traffic → Monolith → [Strangler Proxy] → Monolith handles request
+                         │
+                         └── New Service (shadow mode, responses discarded)
+```
+- Build the new service, deploy it alongside the monolith
+- **Shadow traffic:** Route a copy of real requests to the new service, compare responses to the monolith — surface divergence without user impact
+- Fix divergence before cutting any traffic
+
+**Phase 2: Canary Cut (1% → 100%)**
+```
+Traffic → [Strangler Proxy]  ──── 99% → Monolith
+                              └──  1% → New Service
+```
+- Proxy (nginx, Envoy, or service mesh rule) splits traffic
+- Monitor new service SLOs vs. monolith SLOs
+- Gradually shift: 1% → 5% → 25% → 50% → 100%
+
+**Phase 3: Monolith calls New Service internally (for shared data)**
+- After full traffic cutover to new service, update monolith to call the new service via API rather than direct DB access
+- Enforce the domain boundary: monolith can no longer write to the extracted domain's tables
+
+**Phase 4: Database Separation**
+```
+Before: Monolith DB (everything in one schema)
+After:  Payment Service DB (payments schema)
+        Order Service DB   (orders schema)
+        Monolith DB        (remaining tables)
+```
+- Use dual-write + eventual consistency during transition
+- Synchronize data with CDC (Change Data Capture — Debezium + Kafka) before cutting the DB connection
+
+**CI/CD enablement throughout:**
+- New service gets its own independent pipeline from Day 1 — no coupling to monolith deploy
+- Strangler proxy config is in version control — traffic shifts are commits, fully auditable
+- Shadow testing in CI: run new service against production traffic snapshots
+
+**Common failure modes:**
+- Extracting services before domain boundaries are stable → constant cross-service coupling
+- Skipping shadow mode → discovering bugs in production
+- Shared DB for too long → services still coupled at storage layer
+
+---
+
+#### 15. How do you handle the "diamond dependency" problem in microservice deployments?
+
+**The diamond dependency problem** occurs when two services (B and C) both depend on a shared service (A), and a fourth service (D) depends on both B and C. When A changes in a breaking way, you must upgrade B and C atomically before D — but in a distributed system, you can't deploy atomically across multiple services.
+
+```
+        A (shared lib / shared service)
+       / \
+      B   C
+       \ /
+        D
+```
+
+**Example:** Service A is a user-profile service. B (notifications) and C (billing) both call A's `/profile` endpoint. D (dashboard) aggregates data from B and C. If A's `/profile` response changes, B and C must both update before D breaks.
+
+**Solution 1: Expand-Contract across the diamond**
+
+```
+Step 1: A deploys v2 endpoint (/profile/v2) alongside v1 — EXPAND
+Step 2: B deploys, switches to /profile/v2
+Step 3: C deploys, switches to /profile/v2
+Step 4: D deploys (if needed) — now all upstream services are on v2
+Step 5: A removes /profile/v1 — CONTRACT
+```
+
+**Solution 2: Consumer-Driven Contract Tests as a dependency gate**
+
+Using Pact:
+```
+B registers contract: "A's /profile returns {id, name, email}"
+C registers contract: "A's /profile returns {id, name, tier}"
+
+A's CI runs pact-broker can-i-deploy:
+  → Checks ALL registered consumers (B and C)
+  → Only passes if A v2 satisfies ALL consumer contracts
+  → If C hasn't updated its contract yet, A cannot deploy
+```
+
+**Solution 3: API Versioning + Deprecation SLA**
+
+```
+Policy: Old API versions supported for 30 days post-deprecation
+  → B and C have 30 days to migrate after A deprecates v1
+  → Dashboard (D) is shielded because it only calls B and C, not A directly
+  → Deprecation is tracked via metric: requests to /profile/v1 must reach 0 before removal
+```
+
+**Solution 4: Schema Registry (for event-driven diamonds)**
+
+If A communicates via events (Kafka) instead of HTTP:
+```
+A publishes to Kafka topic: user.profile.updated
+Schema registered in Confluent Schema Registry
+B and C are consumers
+
+Schema evolution rules:
+  - BACKWARD compatible changes only (add optional fields)
+  - Schema registry enforces compatibility on publish (CI fails if schema breaks consumers)
+  - Consumers can read both old and new schema during transition
+```
+
+**Solution 5: Dependency graph in deployment orchestrator**
+
+At scale, encode the diamond in the deployment system:
+```yaml
+# deployment-config.yaml
+service: shared-user-service
+version: v2.5.0
+dependents:
+  - notification-service   # must upgrade before A v1 is removed
+  - billing-service        # must upgrade before A v1 is removed
+sunset_date: 2026-09-01   # auto-enforced by deployment platform
+```
+The platform blocks the `contract` (removal) deploy of A until all dependents have confirmed migration.
+
+**Staff-level principle:** The diamond problem is fundamentally a **versioning and coordination problem**, not a deployment problem. The solution is making breaking changes safe by treating them as multi-phase, multi-release processes — never as single-step updates. Invest in tooling (Pact Broker, schema registry, deprecation tracking) that makes this coordination automatic rather than relying on human communication.
 
 ---
 
