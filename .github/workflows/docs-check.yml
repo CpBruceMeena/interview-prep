@@ -1,0 +1,57 @@
+# 🔍 Build the MkDocs site on every change.
+#
+# Runs `mkdocs build --strict`, which fails on broken nav entries, dead
+# internal links and missing files. This is the gate that keeps the published
+# site from silently losing pages.
+
+name: Docs Check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docs-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Strict build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-docs.txt
+
+      - name: Build site (strict)
+        run: mkdocs build --strict
+
+      - name: Check for dead in-page anchors
+        run: |
+          # --strict does not fail on unresolved heading anchors, so check
+          # them separately. scripts/fix_toc_anchors.py repairs most of these.
+          mkdocs build 2>&1 | tee build.log
+          if grep -q "but there is no such anchor" build.log; then
+            echo "::error::Dead in-page anchor links found. Run: python3 scripts/fix_toc_anchors.py"
+            grep "but there is no such anchor" build.log
+            exit 1
+          fi
+          echo "No dead anchors."

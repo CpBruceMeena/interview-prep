@@ -15,13 +15,13 @@
 
 1. [Phase 0: Requirements Gathering](#phase-0-requirements-gathering)
 2. [Phase 1: Identify the Nouns (Entities)](#phase-1-identify-the-nouns-entities)
-3. [Phase 2: Enums — Your First Building Block](#phase-2-enums--your-first-building-block)
+3. [Phase 2: Enums — Your First Building Block](#phase-2-enums-your-first-building-block)
 4. [Phase 3: Which Classes Need Methods? (dataclass vs `__init__`)](#phase-3-which-classes-need-methods-dataclass-vs-__init__)
 5. [Phase 4: Assigning Responsibilities (Which Function Goes Where)](#phase-4-assigning-responsibilities-which-function-goes-where)
-6. [Phase 5: Relationships & Composition](#phase-5-relationships--composition)
-7. [Phase 6: Polymorphism & Inheritance](#phase-6-polymorphism--inheritance)
-8. [Phase 7: Design Patterns — When & Why](#phase-7-design-patterns--when--why)
-9. [Phase 8: Review & Refine Checklist](#phase-8-review--refine-checklist)
+6. [Phase 5: Relationships & Composition](#phase-5-relationships-composition)
+7. [Phase 6: Polymorphism & Inheritance](#phase-6-polymorphism-inheritance)
+8. [Phase 7: Design Patterns — When & Why](#phase-7-design-patterns-when-why)
+9. [Phase 8: Review & Refine Checklist](#phase-8-review-refine-checklist)
 
 ---
 

@@ -1,0 +1,17 @@
+# Pinned toolchain for building the MkDocs site.
+#
+# CI and local builds install from this file so a theme or extension release
+# cannot change the rendered site without a commit here.
+#
+#   pip install -r requirements-docs.txt
+#   mkdocs serve
+
+mkdocs==1.6.1
+mkdocs-material==9.7.6
+mkdocs-material-extensions==1.3.1
+mkdocs-drawio==1.16.2
+
+# Pulled in transitively, pinned because they decide how markdown renders.
+Markdown==3.10.2
+pymdown-extensions==11.0.1
+Pygments==2.20.0

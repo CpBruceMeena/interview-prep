@@ -16,7 +16,7 @@
   
   <!-- Typing SVG by DenverCoder1 -->
   <a href="https://cpbrucemeena.github.io/interview-prep/">
-    <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=22&duration=3000&pause=500&color=8B5CF6&center=true&vCenter=true&width=600&lines=System+Design+%26+LLD+Mastery;18+Low-Level+Design+Projects;200%2B+Staff-Level+Questions;RAG+Chatbot+Implementation;Go+%26+Python+Runtime+Deep-Dives;CS+Core+Fundamentals" alt="Typing SVG" />
+    <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=22&duration=3000&pause=500&color=8B5CF6&center=true&vCenter=true&width=600&lines=System+Design+%26+LLD+Mastery;26+Low-Level+Design+Projects;200%2B+Staff-Level+Questions;RAG+Chatbot+Implementation;Go+%26+Python+Runtime+Deep-Dives;CS+Core+Fundamentals" alt="Typing SVG" />
   </a>
   
 </div>
@@ -32,7 +32,7 @@
   <table align="center">
     <tr>
       <td align="center" width="140">
-        <img src="https://img.shields.io/badge/18-LLD%20Projects-8b5cf6?style=for-the-badge&logo=python&logoColor=white" alt="18 LLD Projects"/><br>
+        <img src="https://img.shields.io/badge/26-LLD%20Projects-8b5cf6?style=for-the-badge&logo=python&logoColor=white" alt="26 LLD Projects"/><br>
         <sub><b>SOLID · Patterns · Python</b></sub>
       </td>
       <td align="center" width="140">
@@ -59,7 +59,7 @@
 ║                    INTERVIEW PREP — ARCHITECTURE                     ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
-║  📦 python-low-level-design/  ← 18 LLD projects (Python, SOLID)      ║
+║  📦 python-low-level-design/  ← 20 LLD projects (Python, SOLID)      ║
 ║  ├── parking-lot                   OOD Basics · Strategy/Factory     ║
 ║  ├── chess-game                    Bitboard · WebSocket · Stockfish  ║
 ║  ├── splitwise-expense-sharing     Debt Graph · Min Transactions     ║
@@ -76,7 +76,7 @@
 ║  ├── kv-store                      TTL · sync.RWMutex               ║
 ║  └── task-queue                    Worker Pool · Channels            ║
 ║                                                                      ║
-║  🐍 python-dsa/               ← 167 DSA Questions (20 Categories)       ║
+║  🐍 python-dsa/               ← 171 DSA Questions (20 Categories)       ║
 ║     Arrays · Strings · Trees · Graphs · DP · Backtracking            ║
 ║     Trie · Heaps · Bit Manip · Greedy · Design · Sliding Window      ║
 ║                                                                      ║
@@ -112,7 +112,7 @@
 
 ---
 
-## 🔥 **18 Low-Level Design Projects**
+## 🔥 **26 Low-Level Design Projects**
 
 <details open>
 <summary><b>Click to expand/collapse</b></summary>
@@ -139,6 +139,8 @@
 | 16 | **[Payment Processing](python-low-level-design/payment-processing-system/)** | Payments | Strategy, Chain of Resp. | Idempotency keys, fraud ML pipeline |
 | 17 | **[Job Scheduling](python-low-level-design/job-scheduling-system/)** | Scheduling | Command, Strategy, Observer | DAG scheduling, Redis leases |
 | 18 | **[Search Platform](python-low-level-design/search-platform/)** | Indexing | Strategy, Facade, Decorator | BM25 ranking, spell correction |
+| 19 | **[Notification Service](python-low-level-design/notification-service/)** | Messaging | Strategy, Observer, Template Method | Multi-channel fan-out, retries, delivery tracking |
+| 20 | **[Big File Upload](python-low-level-design/big-file-upload/)** | Storage | Strategy, Repository, State Machine | TUS resumable chunks, SHA-256 verification, pluggable S3/local backends |
 
 ### ☕ Java Low-Level Designs
 
@@ -404,9 +406,9 @@ PHASE 7 ─── AI Engineering
 
 | Metric | Count |
 |--------|-------|
-| Python DSA Questions | **167** |
+| Python DSA Questions | **171** |
 | Python DSA Categories | **20** |
-| Python LLD Projects | **18** |
+| Python LLD Projects | **20** |
 | Java LLD Projects | **3** |
 | Golang LLD Projects | **3** |
 | Staff-Level Questions | **200+** |

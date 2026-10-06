@@ -7,17 +7,17 @@
 ## Table of Contents
 
 1. [System Design: Multi-GB Upload Service](#1-system-design-multi-gb-upload-service)
-2. [Resumability & the TUS Protocol](#2-resumability--the-tus-protocol)
-3. [Chunking Strategy & Parallelism](#3-chunking-strategy--parallelism)
-4. [Security: Virus Scanning & File Validation](#4-security-virus-scanning--file-validation)
+2. [Resumability & the TUS Protocol](#2-resumability-the-tus-protocol)
+3. [Chunking Strategy & Parallelism](#3-chunking-strategy-parallelism)
+4. [Security: Virus Scanning & File Validation](#4-security-virus-scanning-file-validation)
 5. [Async Processing Pipeline](#5-async-processing-pipeline)
 6. [Database Schema for Upload Tracking](#6-database-schema-for-upload-tracking)
 7. [Pre-signed URLs vs Proxy Uploads](#7-pre-signed-urls-vs-proxy-uploads)
-8. [Handling Concurrent Uploads & Rate Limiting](#8-handling-concurrent-uploads--rate-limiting)
-9. [Checksum Verification & Data Integrity](#9-checksum-verification--data-integrity)
-10. [Garbage Collection & Lifecycle Management](#10-garbage-collection--lifecycle-management)
-11. [Download & CDN Delivery Strategy](#11-download--cdn-delivery-strategy)
-12. [Monitoring & Debugging Upload Failures](#12-monitoring--debugging-upload-failures)
+8. [Handling Concurrent Uploads & Rate Limiting](#8-handling-concurrent-uploads-rate-limiting)
+9. [Checksum Verification & Data Integrity](#9-checksum-verification-data-integrity)
+10. [Garbage Collection & Lifecycle Management](#10-garbage-collection-lifecycle-management)
+11. [Download & CDN Delivery Strategy](#11-download-cdn-delivery-strategy)
+12. [Monitoring & Debugging Upload Failures](#12-monitoring-debugging-upload-failures)
 
 ---
 

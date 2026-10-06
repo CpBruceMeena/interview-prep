@@ -8,14 +8,14 @@
 ## Table of Contents
 
 1. [Token Usage Monitoring](#1-token-usage-monitoring)
-2. [Rate Limiting & Concurrency Control](#2-rate-limiting--concurrency-control)
+2. [Rate Limiting & Concurrency Control](#2-rate-limiting-concurrency-control)
 3. [Response Caching Strategies](#3-response-caching-strategies)
-4. [Retry Policies & Exponential Backoff](#4-retry-policies--exponential-backoff)
-5. [Observability & Alerting](#5-observability--alerting)
-6. [Prompt Versioning & Management](#6-prompt-versioning--management)
+4. [Retry Policies & Exponential Backoff](#4-retry-policies-exponential-backoff)
+5. [Observability & Alerting](#5-observability-alerting)
+6. [Prompt Versioning & Management](#6-prompt-versioning-management)
 7. [A/B Testing Different Models](#7-ab-testing-different-models)
 8. [Tenant-Level Cost Allocation](#8-tenant-level-cost-allocation)
-9. [Logging & Distributed Tracing](#9-logging--distributed-tracing)
+9. [Logging & Distributed Tracing](#9-logging-distributed-tracing)
 10. [Production Dashboard](#10-production-dashboard)
 
 ---

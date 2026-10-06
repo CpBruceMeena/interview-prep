@@ -1,6 +1,6 @@
 # 🐍 Python Data Structures & Algorithms
 
-> A comprehensive collection of **167 DSA questions** with implementations, thought processes, and complexity analysis across **20 categories**.
+> A comprehensive collection of **171 DSA questions** with implementations, thought processes, and complexity analysis across **20 categories**.
 
 ---
 

@@ -6,7 +6,7 @@
 
 ## Table of Contents
 
-1. [Microservices Decomposition: Domain-Driven Design](#1-microservices-decomposition-domain-driven-design)
+1. [Microservices Decomposition: Domain-Driven Design](#1-microservices-decomposition)
 2. [CQRS & Event Sourcing](#2-cqrs-event-sourcing)
 3. [Event-Driven Architecture: Kafka Internals](#3-event-driven-architecture-kafka-internals)
 4. [API Gateway vs Service Mesh](#4-api-gateway-vs-service-mesh)

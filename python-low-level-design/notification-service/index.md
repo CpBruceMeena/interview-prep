@@ -1,4 +1,4 @@
-# Splitwise
+# Notification Service
 
 A low-level design worked end to end in Python — from the reasoning you'd show an interviewer through to the production architecture.
 
@@ -13,4 +13,4 @@ A low-level design worked end to end in Python — from the reasoning you'd show
 
 ---
 
-**Runnable source:** `splitwise_expense.py`
+**Runnable source:** `notification_service.py`

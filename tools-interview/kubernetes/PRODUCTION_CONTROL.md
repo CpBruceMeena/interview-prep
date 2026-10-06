@@ -10,17 +10,17 @@
 
 ## Table of Contents
 
-1. [GitOps: ArgoCD & Flux](#1-gitops-argocd--flux)
+1. [GitOps: ArgoCD & Flux](#1-gitops-argocd-flux)
 2. [Admission Controllers: Webhooks, OPA/Gatekeeper, Kyverno](#2-admission-controllers-webhooks-opagatekeeper-kyverno)
 3. [Deployment Strategies: Rolling, Blue-Green, Canary, A/B](#3-deployment-strategies-rolling-blue-green-canary-ab)
-4. [Progressive Delivery: Flagger & Argo Rollouts](#4-progressive-delivery-flagger--argo-rollouts)
+4. [Progressive Delivery: Flagger & Argo Rollouts](#4-progressive-delivery-flagger-argo-rollouts)
 5. [Multi-Tenancy: Namespaces, Resource Quotas, Network Policies](#5-multi-tenancy-namespaces-resource-quotas-network-policies)
-6. [Service Mesh: Istio, Linkerd & mTLS](#6-service-mesh-istio-linkerd--mtls)
+6. [Service Mesh: Istio, Linkerd & mTLS](#6-service-mesh-istio-linkerd-mtls)
 7. [Network Policies: Micro-Segmentation](#7-network-policies-micro-segmentation)
-8. [Cluster API & Multi-Cluster Management](#8-cluster-api--multi-cluster-management)
+8. [Cluster API & Multi-Cluster Management](#8-cluster-api-multi-cluster-management)
 9. [Pod Security: Kyverno Policies for Production](#9-pod-security-kyverno-policies-for-production)
 10. [CNI Deep Dive: Calico, Cilium, Flannel](#10-cni-deep-dive-calico-cilium-flannel)
-11. [Descheduler & Cluster Autoscaler](#11-descheduler--cluster-autoscaler)
+11. [Descheduler & Cluster Autoscaler](#11-descheduler-cluster-autoscaler)
 12. [Storage: CSI, Volume Snapshots, Backup Strategies](#12-storage-csi-volume-snapshots-backup-strategies)
 
 ---
