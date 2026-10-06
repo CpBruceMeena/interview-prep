@@ -1,502 +1,842 @@
 # ATM/Banking System — Implementation
 
-> Python implementation of the ATM/Banking System system following SOLID principles and design patterns.
+> Single-file Python implementation (stdlib only, 3.10+): an explicit ATM state machine, two-phase cash withdrawals (authorize → dispense → capture or reverse), idempotent bank operations, per-account locking, `Decimal` money and hashed PINs.
 
+---
+
+## ▶️ How to Run
+
+```bash
+cd python-low-level-design/atm-banking-system
+python3 atm_banking.py                  # deterministic demo
+python3 -m unittest test_atm_banking    # 26 tests, < 1 s
+```
+
+---
+
+## 🗺️ Map of the Code
+
+| Piece | Role | Why it is shaped this way |
+|-------|------|---------------------------|
+| `to_money`, `positive_money` | Money boundary | `Decimal` to the cent; `float` raises `TypeError` |
+| `Account` (ABC) → `SavingsAccount`, `CheckingAccount`, `CreditAccount` | Balance + held amount | Subclasses implement only `withdrawable()`: min balance, overdraft, credit limit |
+| `Transaction` + `TransactionStatus` | Ledger entry | `PENDING → COMPLETED` or `PENDING → REVERSED`; `move_to()` rejects anything else |
+| `Card` | PIN hash, attempts, block flag, expiry, daily limit | Salted PBKDF2, `hmac.compare_digest`, own lock |
+| `Bank` | Facade: accounts, cards, ledger | Per-account locks, request-id idempotency, daily limits |
+| `CashDispenser` | Notes per denomination | Min-notes bounded DP, not greedy |
+| `ATMState` → `IdleState`, `CardInsertedState`, `AuthenticatedState`, `OutOfServiceState` | Session state machine | Base class rejects everything; each state overrides only what it allows |
+| `ATM` | One physical machine | Holds the session (card, selected account) and the dispenser |
+
+---
+
+## 🔑 Key Design Decisions
+
+### 1. Two-phase withdrawal: never debit for cash that did not come out
+
+The original code debited the account *first* and then asked the dispenser, so "cannot dispense 150" left the customer 150 poorer with nothing in hand. `AuthenticatedState.withdraw` now does:
+
+```python
+plan = atm.dispenser.plan(amount)          # 1. can this machine pay it out? (no side effects)
+tx = bank.authorize_withdrawal(...)        # 2. hold funds + daily limit, tx PENDING
+try:
+    atm.dispenser.dispense(plan)           # 3. move notes
+except DispenseError:
+    bank.reverse(tx.tx_id)                 # 4a. nothing came out: release the hold
+    raise
+bank.capture(tx.tx_id)                     # 4b. cash is out: debit for real
+```
+
+`capture` and `reverse` are idempotent (a second call is a no-op) and mutually exclusive (capture after reverse raises `InvalidTransitionError`). That is what lets the ATM retry either one safely after a network error.
+
+### 2. Idempotency on every money-moving call
+
+`authorize_withdrawal`, `deposit` and `transfer` take a `request_id`. `Bank._idempotent`:
+
+1. Under `_requests_lock`, looks the id up. Completed → return the stored result (or raise `IdempotencyError` if the parameters differ). In flight → raise `IdempotencyError`. Unknown → mark in flight.
+2. Runs the operation outside that lock.
+3. Stores the result, or on failure removes the claim so a declined request can be retried.
+
+The demo sends the same transfer twice and money moves once; `test_same_request_id_from_two_threads_moves_money_once` fires 8 concurrent copies of one request.
+
+### 3. Locking
+
+- **One lock per account.** Check-and-hold (`Account._hold`) and check-and-debit run under it, so 16 threads withdrawing from one account cannot overdraw it.
+- **Transfers lock both accounts in account-number order**, so A→B and B→A running together cannot deadlock (tested).
+- **Daily limits are per card**, and one card can reach several accounts, so the per-card total has its own `_limits_lock`. It is reserved before the hold and given back if the hold fails or the withdrawal is reversed.
+- **Registries** (accounts, cards, transactions) share `_registry_lock` so `statement()` never iterates a dict another thread is inserting into.
+- Lock order is always account → registry; no code path takes them the other way.
+
+### 4. The state machine has no holes
+
+| State | Allowed | Notes |
+|-------|---------|-------|
+| `IDLE` | `insert_card` | Unknown, expired or blocked cards are rejected here and the ATM stays idle |
+| `CARD_INSERTED` | `enter_pin`, `eject_card` | Wrong PIN: stay, `WrongPinError(attempts_left)`. Third wrong PIN: card blocked **and retained**, back to `IDLE` |
+| `AUTHENTICATED` | `balance`, `withdraw`, `deposit`, `select_account`, `eject_card` | `select_account` only accepts the card holder's own accounts |
+| `OUT_OF_SERVICE` | nothing (operator `restock`) | Entered when the dispenser runs empty at session end, or via `take_offline()` |
+
+Everything not listed raises `InvalidOperationError` from the base class, instead of printing and carrying on. Holes this closed: any string was accepted as a card; a blocked card stayed in the machine taking PIN attempts instead of being retained; and `select_account` let a session switch to *any* account in the bank, not just the card holder's.
+
+### 5. Account rules in one method
+
+Each account type answers one question, `withdrawable()`:
+
+- Savings: `balance − held − min_balance`
+- Checking: `balance − held + overdraft_limit`
+- Credit: `credit_limit + balance − held` (balance is negative when the customer owes)
+
+The original credit path called `make_payment(-amount)` with no limit check at all, and computed available credit with `abs(balance)`, which made an overpayment *reduce* available credit.
+
+### 6. Dispenser: bounded DP, not greedy
+
+Greedy fails on real cassettes: 600 from `{500 × 1, 200 × 3}` takes the 500 and is stuck at 100, although `3 × 200` works. `CashDispenser.plan` runs a min-notes bounded knapsack over amounts in units of the gcd of denominations; for ATM amounts that is at most a few hundred states. The old version also kept a separate `_available_cash` counter that `load_cash` increased without adding any notes; total cash is now derived from the notes.
+
+### 7. PINs
+
+Salted PBKDF2 and `hmac.compare_digest`. Say in the interview that a 4-digit PIN has only 10,000 values, so any hash is brute-forceable offline; real issuers verify PINs inside an HSM (IBM 3624 offset or Visa PVV) and the database never holds anything a stolen dump can crack.
+
+---
+
+## 🧩 Where to Extend
+
+| Requirement | Change |
+|-------------|--------|
+| New account type (e.g. fixed deposit, no ATM withdrawals) | Subclass `Account`, return `ZERO` from `withdrawable()` |
+| Session timeout | `ATM.tick(now)` in every state; `CardInsertedState` / `AuthenticatedState` eject (or retain) after N seconds idle |
+| Partial dispense | `DispenseError` carries the notes actually presented; capture that amount and reverse the rest |
+| Fees | Record a separate `FEE` transaction in the same account lock as the capture |
+| Cash deposit verification | Deposit goes in `PENDING` until notes are counted; capture the counted amount |
+| PIN change | `CardInsertedState`/`AuthenticatedState.change_pin(old, new)`; reuse `Card.verify_pin` |
+| Multiple ATMs, real network | `Bank` becomes a remote service; `request_id` already makes retries safe |
+
+---
+
+## 📄 Full Source
+
+<!-- source: atm_banking.py -->
 ```python
 """
 ATM / Banking System - Low Level Design
 ------------------------------------------
-Design Principles: SOLID, Strategy Pattern, State Pattern
+Patterns: State (ATM session), Template method (Account.withdrawable),
+Facade (Bank), Factory (Bank.open_account).
+
+What this design gets right, and what interviewers probe:
+  * Money is Decimal. Floats are rejected.
+  * A cash withdrawal is two-phase: the bank AUTHORIZES (places a hold),
+    the ATM dispenses, then the bank CAPTURES the hold, or REVERSES it if the
+    dispenser fails. The account is never debited for cash that never came out.
+  * Every money-moving bank call takes a request_id. A retry with the same id
+    returns the original transaction instead of moving money twice.
+  * Each account has its own lock; a transfer takes both locks in a fixed
+    (account-number) order, so concurrent A->B and B->A cannot deadlock.
+  * The ATM is an explicit state machine. A wrong PIN keeps the card; the
+    third wrong PIN blocks and retains it; an out-of-service ATM accepts no card.
+  * PINs are stored as salted PBKDF2 hashes and compared in constant time.
 """
 
-from abc import ABC, abstractmethod
-from datetime import datetime, date
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
-import uuid
+from __future__ import annotations
 
+import hashlib
+import hmac
+import itertools
+import os
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from enum import Enum
+from math import gcd
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
+ZERO = Decimal("0.00")
+CENT = Decimal("0.01")
+MoneyLike = Union[Decimal, int, str]
+
+
+def to_money(value: MoneyLike) -> Decimal:
+    if isinstance(value, (float, bool)):
+        raise TypeError(f"money must be Decimal, int or str, not {type(value).__name__}")
+    amount = Decimal(value)
+    if not amount.is_finite() or amount != amount.quantize(CENT):
+        raise ValueError(f"invalid money amount: {value!r}")
+    return amount.quantize(CENT)
+
+
+def positive_money(value: MoneyLike) -> Decimal:
+    amount = to_money(value)
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    return amount
+
+
+# --- Errors ---
+
+class BankError(Exception):
+    pass
+
+
+class NotFoundError(BankError):
+    pass
+
+
+class InsufficientFundsError(BankError):
+    pass
+
+
+class LimitExceededError(BankError):
+    pass
+
+
+class CardError(BankError):
+    """Card unknown, expired or blocked."""
+
+
+class WrongPinError(CardError):
+    def __init__(self, attempts_left: int) -> None:
+        super().__init__(f"wrong PIN, {attempts_left} attempt(s) left")
+        self.attempts_left = attempts_left
+
+
+class CardBlockedError(CardError):
+    pass
+
+
+class IdempotencyError(BankError):
+    """request_id reused with different parameters, or still in flight."""
+
+
+class InvalidTransitionError(BankError):
+    pass
+
+
+class DispenseError(Exception):
+    """Dispenser cannot make the amount, or the hardware failed."""
+
+
+class InvalidOperationError(Exception):
+    """Operation not allowed in the ATM's current state."""
+
+
+# --- Accounts ---
 
 class AccountType(Enum):
     SAVINGS = "Savings"
     CHECKING = "Checking"
     CREDIT = "Credit"
-    LOAN = "Loan"
 
-
-class TransactionType(Enum):
-    DEPOSIT = "Deposit"
-    WITHDRAWAL = "Withdrawal"
-    TRANSFER = "Transfer"
-    PAYMENT = "Payment"
-    FEE = "Fee"
-    INTEREST = "Interest"
-
-
-class CardType(Enum):
-    DEBIT = "Debit"
-    CREDIT = "Credit"
-    ATM = "ATM"
-
-
-class TransactionStatus(Enum):
-    PENDING = "Pending"
-    COMPLETED = "Completed"
-    FAILED = "Failed"
-    REVERSED = "Reversed"
-
-
-# --- Bank Account (SRP) ---
 
 class Account(ABC):
-    def __init__(self, account_number: str, customer_id: str,
-                 account_type: AccountType, balance: float = 0.0):
-        self._account_number = account_number
-        self._customer_id = customer_id
-        self._account_type = account_type
+    """Balance plus held (authorized, not yet captured) amounts.
+
+    Subclasses differ only in how much may be withdrawn. All mutation goes
+    through Bank, which holds `self.lock` while it reads or writes.
+    """
+
+    def __init__(self, account_number: str, customer_id: str, balance: Decimal = ZERO) -> None:
+        self.account_number = account_number
+        self.customer_id = customer_id
+        self.lock = threading.Lock()
         self._balance = balance
-        self._is_active = True
-        self._transactions: List['Transaction'] = []
+        self._held = ZERO
 
     @property
-    def account_number(self) -> str:
-        return self._account_number
-
-    @property
-    def customer_id(self) -> str:
-        return self._customer_id
-
-    @property
+    @abstractmethod
     def account_type(self) -> AccountType:
-        return self._account_type
+        ...
+
+    @abstractmethod
+    def withdrawable(self) -> Decimal:
+        """Largest amount that may leave the account right now."""
 
     @property
-    def balance(self) -> float:
+    def balance(self) -> Decimal:
         return self._balance
 
     @property
-    def is_active(self) -> bool:
-        return self._is_active
+    def held(self) -> Decimal:
+        return self._held
 
-    @abstractmethod
-    def can_withdraw(self, amount: float) -> bool:
-        pass
+    # Called by Bank with self.lock held.
+    def _require(self, amount: Decimal) -> None:
+        if amount > self.withdrawable():
+            raise InsufficientFundsError(
+                f"{self.account_type.value} {self.account_number}: "
+                f"requested {amount}, available {self.withdrawable()}")
 
-    def deposit(self, amount: float) -> 'Transaction':
-        if amount <= 0:
-            raise ValueError("Deposit amount must be positive")
-        self._balance += amount
-        tx = Transaction.generate(self._account_number, TransactionType.DEPOSIT,
-                                   amount, self._balance)
-        self._transactions.append(tx)
-        return tx
+    def _hold(self, amount: Decimal) -> None:
+        self._require(amount)
+        self._held += amount
 
-    def withdraw(self, amount: float) -> 'Transaction':
-        if not self.can_withdraw(amount):
-            raise ValueError(f"Insufficient funds or limit exceeded")
+    def _release_hold(self, amount: Decimal) -> None:
+        self._held -= amount
+
+    def _capture_hold(self, amount: Decimal) -> None:
+        self._held -= amount
         self._balance -= amount
-        tx = Transaction.generate(self._account_number, TransactionType.WITHDRAWAL,
-                                   -amount, self._balance)
-        self._transactions.append(tx)
-        return tx
 
-    def add_transaction(self, tx: 'Transaction') -> None:
-        self._transactions.append(tx)
+    def _debit(self, amount: Decimal) -> None:
+        self._require(amount)
+        self._balance -= amount
 
-    def get_transactions(self, limit: int = 10) -> List['Transaction']:
-        return self._transactions[-limit:]
+    def _credit(self, amount: Decimal) -> None:
+        self._balance += amount
 
     def __str__(self) -> str:
-        return f"{self._account_type.value}[{self._account_number[-4:]}] ${self._balance:.2f}"
+        return f"{self.account_type.value}[{self.account_number}] {self._balance}"
 
 
 class SavingsAccount(Account):
-    def __init__(self, account_number: str, customer_id: str,
-                 balance: float = 0.0, interest_rate: float = 0.04):
-        super().__init__(account_number, customer_id, AccountType.SAVINGS, balance)
-        self._interest_rate = interest_rate
-        self._min_balance = 500.0
-        self._withdrawal_limit = 5  # per month
+    def __init__(self, account_number: str, customer_id: str, balance: Decimal = ZERO,
+                 min_balance: Decimal = Decimal("500.00")) -> None:
+        super().__init__(account_number, customer_id, balance)
+        self.min_balance = min_balance
 
     @property
-    def interest_rate(self) -> float:
-        return self._interest_rate
+    def account_type(self) -> AccountType:
+        return AccountType.SAVINGS
 
-    def can_withdraw(self, amount: float) -> bool:
-        return (self._balance - amount >= self._min_balance and
-                amount <= 50000.0)
-
-    def apply_interest(self) -> None:
-        interest = self._balance * self._interest_rate / 12
-        self._balance += interest
-        tx = Transaction(self._account_number, TransactionType.INTEREST,
-                          interest, self._balance, "Monthly interest")
-        self._transactions.append(tx)
+    def withdrawable(self) -> Decimal:
+        return max(ZERO, self._balance - self._held - self.min_balance)
 
 
 class CheckingAccount(Account):
-    def __init__(self, account_number: str, customer_id: str,
-                 balance: float = 0.0, overdraft_limit: float = 1000.0):
-        super().__init__(account_number, customer_id, AccountType.CHECKING, balance)
-        self._overdraft_limit = overdraft_limit
+    def __init__(self, account_number: str, customer_id: str, balance: Decimal = ZERO,
+                 overdraft_limit: Decimal = Decimal("1000.00")) -> None:
+        super().__init__(account_number, customer_id, balance)
+        self.overdraft_limit = overdraft_limit
 
-    def can_withdraw(self, amount: float) -> bool:
-        return self._balance - amount >= -self._overdraft_limit
+    @property
+    def account_type(self) -> AccountType:
+        return AccountType.CHECKING
+
+    def withdrawable(self) -> Decimal:
+        return max(ZERO, self._balance - self._held + self.overdraft_limit)
 
 
 class CreditAccount(Account):
+    """Balance is negative when the customer owes money."""
+
     def __init__(self, account_number: str, customer_id: str,
-                 credit_limit: float = 10000.0, apr: float = 0.24):
-        super().__init__(account_number, customer_id, AccountType.CREDIT, 0.0)
-        self._credit_limit = credit_limit
-        self._apr = apr
+                 credit_limit: Decimal = Decimal("10000.00")) -> None:
+        super().__init__(account_number, customer_id, ZERO)
+        self.credit_limit = credit_limit
 
     @property
-    def credit_limit(self) -> float:
-        return self._credit_limit
+    def account_type(self) -> AccountType:
+        return AccountType.CREDIT
 
-    @property
-    def available_credit(self) -> float:
-        return self._credit_limit - abs(self._balance)
-
-    def can_withdraw(self, amount: float) -> bool:
-        return self.available_credit >= amount
-
-    def make_payment(self, amount: float) -> 'Transaction':
-        # Payments reduce debt (balance is negative for credit)
-        self._balance += amount
-        tx = Transaction.generate(self._account_number, TransactionType.PAYMENT,
-                                   amount, self._balance)
-        self._transactions.append(tx)
-        return tx
+    def withdrawable(self) -> Decimal:
+        return max(ZERO, self.credit_limit + self._balance - self._held)
 
 
-# --- Transaction (SRP) ---
+# --- Transactions ---
 
+class TransactionType(Enum):
+    WITHDRAWAL = "Withdrawal"
+    DEPOSIT = "Deposit"
+    TRANSFER_OUT = "Transfer out"
+    TRANSFER_IN = "Transfer in"
+
+
+class TransactionStatus(Enum):
+    PENDING = "Pending"        # authorized, funds held
+    COMPLETED = "Completed"
+    REVERSED = "Reversed"      # hold released, no money moved
+
+
+_TRANSITIONS = {
+    TransactionStatus.PENDING: {TransactionStatus.COMPLETED, TransactionStatus.REVERSED},
+    TransactionStatus.COMPLETED: set(),
+    TransactionStatus.REVERSED: set(),
+}
+
+
+@dataclass
 class Transaction:
-    def __init__(self, account_number: str, tx_type: TransactionType,
-                 amount: float, balance_after: float,
-                 description: str = ""):
-        self._transaction_id = f"TXN-{uuid.uuid4().hex[:8].upper()}"
-        self._account_number = account_number
-        self._tx_type = tx_type
-        self._amount = amount
-        self._balance_after = balance_after
-        self._timestamp = datetime.now()
-        self._status = TransactionStatus.COMPLETED
-        self._description = description
+    tx_id: str
+    request_id: str
+    account_number: str
+    tx_type: TransactionType
+    amount: Decimal
+    status: TransactionStatus
+    business_date: date
+    card_number: Optional[str] = None
+    counterparty: Optional[str] = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    @classmethod
-    def generate(cls, account_number: str, tx_type: TransactionType,
-                  amount: float, balance_after: float) -> 'Transaction':
-        return cls(account_number, tx_type, amount, balance_after)
-
-    @property
-    def transaction_id(self) -> str:
-        return self._transaction_id
-
-    @property
-    def tx_type(self) -> TransactionType:
-        return self._tx_type
-
-    @property
-    def amount(self) -> float:
-        return self._amount
-
-    @property
-    def timestamp(self) -> datetime:
-        return self._timestamp
-
-    def __str__(self) -> str:
-        return (f"[{self._timestamp:%H:%M}] {self._tx_type.value}: "
-                f"${abs(self._amount):.2f} (Balance: ${self._balance_after:.2f})")
+    def move_to(self, status: TransactionStatus) -> None:
+        if status not in _TRANSITIONS[self.status]:
+            raise InvalidTransitionError(f"{self.tx_id}: {self.status.name} -> {status.name}")
+        self.status = status
 
 
-# --- Card / ATM Card ---
+# --- Cards ---
 
 class Card:
-    def __init__(self, card_number: str, pin: str, customer_id: str,
-                 account_number: str, card_type: CardType,
-                 expiry_date: date, cvv: str):
-        self._card_number = card_number
-        self._pin = pin
-        self._customer_id = customer_id
-        self._account_number = account_number
-        self._card_type = card_type
-        self._expiry = expiry_date
-        self._cvv = cvv
+    MAX_PIN_ATTEMPTS = 3
+    _PBKDF2_ROUNDS = 10_000      # demo value; real PIN checks happen inside an HSM
+
+    def __init__(self, card_number: str, customer_id: str, account_number: str, pin: str,
+                 expiry: date, daily_limit: Decimal) -> None:
+        self.card_number = card_number
+        self.customer_id = customer_id
+        self.account_number = account_number      # default account for this card
+        self.expiry = expiry
+        self.daily_limit = daily_limit
+        self.blocked = False
         self._failed_attempts = 0
-        self._is_blocked = False
+        self._salt = os.urandom(16)
+        self._pin_hash = self._hash(pin)
+        self._lock = threading.Lock()             # the same card can be cloned and used twice
 
-    @property
-    def card_number(self) -> str:
-        return self._card_number
+    def _hash(self, pin: str) -> bytes:
+        return hashlib.pbkdf2_hmac("sha256", pin.encode(), self._salt, self._PBKDF2_ROUNDS)
 
-    @property
-    def account_number(self) -> str:
-        return self._account_number
-
-    @property
-    def is_blocked(self) -> bool:
-        return self._is_blocked
-
-    def validate_pin(self, entered_pin: str) -> bool:
-        if self._is_blocked:
-            return False
-        if self._pin == entered_pin:
-            self._failed_attempts = 0
-            return True
-        self._failed_attempts += 1
-        if self._failed_attempts >= 3:
-            self._is_blocked = True
-        return False
-
-    def is_expired(self) -> bool:
-        return date.today() > self._expiry
+    def verify_pin(self, pin: str) -> None:
+        with self._lock:
+            if self.blocked:
+                raise CardBlockedError("card is blocked")
+            if hmac.compare_digest(self._hash(pin), self._pin_hash):
+                self._failed_attempts = 0
+                return
+            self._failed_attempts += 1
+            if self._failed_attempts >= self.MAX_PIN_ATTEMPTS:
+                self.blocked = True
+                raise CardBlockedError("too many wrong PINs; card blocked")
+            raise WrongPinError(self.MAX_PIN_ATTEMPTS - self._failed_attempts)
 
 
-# --- Cash Dispenser (SRP) ---
+# --- Bank (facade over accounts, cards and the ledger) ---
 
-class CashDispenser:
-    def __init__(self, initial_cash: float = 100000.0):
-        self._available_cash = initial_cash
-        self._denominations = {100: 200, 500: 100, 2000: 20}
-
-    def can_dispense(self, amount: float) -> bool:
-        return self._available_cash >= amount and self._can_make_amount(int(amount))
-
-    def _can_make_amount(self, amount: int) -> bool:
-        remaining = amount
-        for denom in sorted(self._denominations.keys(), reverse=True):
-            count = min(remaining // denom, self._denominations[denom])
-            remaining -= count * denom
-        return remaining == 0
-
-    def dispense(self, amount: float) -> Dict[int, int]:
-        if not self.can_dispense(amount):
-            raise ValueError("Cannot dispense requested amount")
-
-        dispensed = {}
-        remaining = int(amount)
-        for denom in sorted(self._denominations.keys(), reverse=True):
-            count = min(remaining // denom, self._denominations[denom])
-            if count > 0:
-                dispensed[denom] = count
-                self._denominations[denom] -= count
-                remaining -= count * denom
-                self._available_cash -= count * denom
-
-        return dispensed
-
-    def load_cash(self, amount: float) -> None:
-        self._available_cash += amount
+_IN_FLIGHT = object()
 
 
-# --- Bank Service (Facade) ---
-
-class BankingService:
-    def __init__(self):
+class Bank:
+    def __init__(self, clock: Callable[[], date] = date.today) -> None:
+        self._clock = clock
+        self._ids = itertools.count(1)
+        self._ids_lock = threading.Lock()
+        self._registry_lock = threading.Lock()       # guards the three registries below
         self._accounts: Dict[str, Account] = {}
         self._cards: Dict[str, Card] = {}
-        self._atm = CashDispenser()
+        self._transactions: Dict[str, Transaction] = {}
+        self._requests: Dict[str, object] = {}       # request_id -> (fingerprint, result) | _IN_FLIGHT
+        self._requests_lock = threading.Lock()
+        self._withdrawn_today: Dict[Tuple[str, date], Decimal] = {}   # (card, day) -> amount
+        self._limits_lock = threading.Lock()         # per card, so not covered by an account lock
 
-    def create_account(self, customer_id: str, account_type: AccountType,
-                       initial_deposit: float = 0.0) -> Account:
-        account_number = f"ACC-{uuid.uuid4().hex[:8].upper()}"
-        if account_type == AccountType.SAVINGS:
-            account = SavingsAccount(account_number, customer_id, initial_deposit)
-        elif account_type == AccountType.CHECKING:
-            account = CheckingAccount(account_number, customer_id, initial_deposit)
-        elif account_type == AccountType.CREDIT:
-            account = CreditAccount(account_number, customer_id)
+    def _next_id(self, prefix: str) -> str:
+        with self._ids_lock:
+            return f"{prefix}{next(self._ids):04d}"
+
+    # setup
+
+    def open_account(self, customer_id: str, account_type: AccountType,
+                     initial_deposit: MoneyLike = "0.00", **limits: Decimal) -> Account:
+        number = self._next_id("AC")
+        initial = to_money(initial_deposit)
+        if account_type is AccountType.SAVINGS:
+            account: Account = SavingsAccount(number, customer_id, initial, **limits)
+        elif account_type is AccountType.CHECKING:
+            account = CheckingAccount(number, customer_id, initial, **limits)
+        elif account_type is AccountType.CREDIT:
+            account = CreditAccount(number, customer_id, **limits)
         else:
-            raise ValueError(f"Unsupported account type: {account_type}")
-        self._accounts[account_number] = account
+            raise BankError(f"unsupported account type {account_type}")
+        with self._registry_lock:
+            self._accounts[number] = account
         return account
 
-    def get_account(self, account_number: str) -> Optional[Account]:
-        return self._accounts.get(account_number)
-
-    def issue_card(self, customer_id: str, account_number: str,
-                   pin: str, card_type: CardType) -> Card:
-        card_number = f"****-****-****-{uuid.uuid4().hex[:4].upper()}"
-        expiry = date(date.today().year + 5, date.today().month, 1)
-        cvv = str(uuid.uuid4().int)[:3]
-        card = Card(card_number, pin, customer_id, account_number,
-                     card_type, expiry, cvv)
-        self._cards[card_number] = card
+    def issue_card(self, account_number: str, pin: str,
+                   daily_limit: MoneyLike = "20000.00", valid_years: int = 5) -> Card:
+        account = self._account(account_number)
+        today = self._clock()
+        first_of_next_month = date(today.year + valid_years + today.month // 12,
+                                   today.month % 12 + 1, 1)
+        expiry = first_of_next_month - timedelta(days=1)    # valid through end of month
+        card = Card(self._next_id("CARD"), account.customer_id, account_number, pin,
+                    expiry, to_money(daily_limit))
+        with self._registry_lock:
+            self._cards[card.card_number] = card
         return card
 
-    def authenticate(self, card_number: str, pin: str) -> Optional[Account]:
-        card = self._cards.get(card_number)
-        if not card:
-            print("  Card not found")
-            return None
-        if card.is_expired():
-            print("  Card expired")
-            return None
-        if not card.validate_pin(pin):
-            attempts_left = 3 - card._failed_attempts
-            if card.is_blocked:
-                print("  ⛔ Card blocked - too many failed attempts")
-            else:
-                print(f"  Wrong PIN. {max(0, attempts_left)} attempts remaining")
-            return None
-        return self._accounts.get(card.account_number)
+    # cards & lookups
 
-    def withdraw(self, account_number: str, amount: float) -> Optional[Transaction]:
-        account = self._accounts.get(account_number)
-        if not account:
-            return None
+    def validate_card(self, card_number: str) -> Card:
+        with self._registry_lock:
+            card = self._cards.get(card_number)
+        if card is None:
+            raise CardError("unknown card")
+        if card.blocked:
+            raise CardBlockedError("card is blocked")
+        if self._clock() > card.expiry:
+            raise CardError("card expired")
+        return card
 
-        if isinstance(account, CreditAccount):
-            tx = account.make_payment(-amount)
-        else:
-            tx = account.withdraw(amount)
+    def verify_pin(self, card_number: str, pin: str) -> Card:
+        card = self.validate_card(card_number)
+        card.verify_pin(pin)
+        return card
 
-        if isinstance(self._atm, CashDispenser):
-            notes = self._atm.dispense(amount)
-            print(f"  Dispensed: {', '.join(f'{n}x${c}' for c, n in notes.items())}")
+    def accounts_of(self, customer_id: str) -> List[Account]:
+        with self._registry_lock:
+            return [a for a in self._accounts.values() if a.customer_id == customer_id]
 
+    def balance(self, account_number: str) -> Decimal:
+        account = self._account(account_number)
+        with account.lock:
+            return account.balance
+
+    def available(self, account_number: str) -> Decimal:
+        account = self._account(account_number)
+        with account.lock:
+            return account.withdrawable()
+
+    def transaction(self, tx_id: str) -> Transaction:
+        with self._registry_lock:
+            tx = self._transactions.get(tx_id)
+        if tx is None:
+            raise NotFoundError(f"unknown transaction {tx_id}")
         return tx
 
-    def deposit(self, account_number: str, amount: float) -> Optional[Transaction]:
-        account = self._accounts.get(account_number)
-        if account:
-            return account.deposit(amount)
-        return None
+    def statement(self, account_number: str, limit: int = 10) -> List[Transaction]:
+        with self._registry_lock:
+            txs = [t for t in self._transactions.values() if t.account_number == account_number]
+        return txs[-limit:]
 
-    def transfer(self, from_account: str, to_account: str,
-                 amount: float) -> List[Transaction]:
-        from_acct = self._accounts.get(from_account)
-        to_acct = self._accounts.get(to_account)
+    # money movement: phase 1 of a cash withdrawal
 
-        if not from_acct or not to_acct:
-            raise ValueError("Account not found")
+    def authorize_withdrawal(self, card_number: str, account_number: str, amount: MoneyLike,
+                             request_id: str) -> Transaction:
+        """Place a hold. Idempotent on request_id."""
+        value = positive_money(amount)
 
-        from_acct.withdraw(amount)
-        to_acct.deposit(amount)
+        def run() -> Transaction:
+            card = self.validate_card(card_number)
+            account = self._account(account_number)
+            if account.customer_id != card.customer_id:
+                raise CardError("card holder does not own this account")
+            key = (card_number, self._clock())
+            self._reserve_daily(key, value, card.daily_limit)
+            try:
+                with account.lock:
+                    account._hold(value)
+                    return self._record(request_id, account_number, TransactionType.WITHDRAWAL,
+                                        value, TransactionStatus.PENDING, card_number=card_number)
+            except BaseException:
+                self._reserve_daily(key, -value, card.daily_limit)
+                raise
 
-        print(f"  Transferred ${amount:.2f} from {from_account[-4:]} to {to_account[-4:]}")
-        return [from_acct.get_transactions(1)[0], to_acct.get_transactions(1)[0]]
+        return self._idempotent(request_id, ("withdraw", card_number, account_number, value), run)
+
+    # phase 2: capture after cash is out, or reverse if it never came out
+
+    def capture(self, tx_id: str) -> Transaction:
+        """Idempotent: capturing a completed transaction is a no-op."""
+        tx = self.transaction(tx_id)
+        account = self._account(tx.account_number)
+        with account.lock:
+            if tx.status is TransactionStatus.COMPLETED:
+                return tx
+            tx.move_to(TransactionStatus.COMPLETED)
+            account._capture_hold(tx.amount)
+            return tx
+
+    def reverse(self, tx_id: str) -> Transaction:
+        """Idempotent: reversing a reversed transaction is a no-op."""
+        tx = self.transaction(tx_id)
+        account = self._account(tx.account_number)
+        with account.lock:
+            if tx.status is TransactionStatus.REVERSED:
+                return tx
+            tx.move_to(TransactionStatus.REVERSED)
+            account._release_hold(tx.amount)
+        self._reserve_daily((tx.card_number, tx.business_date), -tx.amount, Decimal("Infinity"))
+        return tx
+
+    # single-phase operations
+
+    def deposit(self, account_number: str, amount: MoneyLike, request_id: str) -> Transaction:
+        value = positive_money(amount)
+
+        def run() -> Transaction:
+            account = self._account(account_number)
+            with account.lock:
+                account._credit(value)
+                return self._record(request_id, account_number, TransactionType.DEPOSIT,
+                                    value, TransactionStatus.COMPLETED)
+
+        return self._idempotent(request_id, ("deposit", account_number, value), run)
+
+    def transfer(self, from_number: str, to_number: str, amount: MoneyLike,
+                 request_id: str) -> Tuple[Transaction, Transaction]:
+        value = positive_money(amount)
+        if from_number == to_number:
+            raise BankError("cannot transfer to the same account")
+
+        def run() -> Tuple[Transaction, Transaction]:
+            source, target = self._account(from_number), self._account(to_number)
+            first, second = sorted((source, target), key=lambda a: a.account_number)
+            with first.lock, second.lock:          # global lock order: no deadlock
+                source._debit(value)
+                target._credit(value)
+                out = self._record(request_id, from_number, TransactionType.TRANSFER_OUT,
+                                   value, TransactionStatus.COMPLETED, counterparty=to_number)
+                into = self._record(request_id, to_number, TransactionType.TRANSFER_IN,
+                                    value, TransactionStatus.COMPLETED, counterparty=from_number)
+                return out, into
+
+        return self._idempotent(request_id, ("transfer", from_number, to_number, value), run)
+
+    # helpers
+
+    def _account(self, account_number: str) -> Account:
+        with self._registry_lock:
+            account = self._accounts.get(account_number)
+        if account is None:
+            raise NotFoundError(f"unknown account {account_number}")
+        return account
+
+    def _reserve_daily(self, key: Tuple[str, date], delta: Decimal, limit: Decimal) -> None:
+        """Atomically add delta to a card's withdrawn-today total, refusing to pass limit."""
+        with self._limits_lock:
+            used = self._withdrawn_today.get(key, ZERO)
+            if delta > 0 and used + delta > limit:
+                raise LimitExceededError(f"daily limit {limit}, already withdrawn {used}")
+            self._withdrawn_today[key] = used + delta
+
+    def _record(self, request_id: str, account_number: str, tx_type: TransactionType,
+                amount: Decimal, status: TransactionStatus, **extra: Optional[str]) -> Transaction:
+        tx = Transaction(self._next_id("TX"), request_id, account_number, tx_type, amount,
+                         status, self._clock(), **extra)
+        with self._registry_lock:
+            self._transactions[tx.tx_id] = tx
+        return tx
+
+    def _idempotent(self, request_id: str, fingerprint: tuple, run: Callable[[], object]):
+        """Claim request_id, run once, remember the result.
+
+        A failed run releases the claim, so a retry is evaluated afresh (a
+        decline is not cached). Production keeps these records with a TTL.
+        """
+        with self._requests_lock:
+            existing = self._requests.get(request_id)
+            if existing is _IN_FLIGHT:
+                raise IdempotencyError(f"request {request_id} is already in flight")
+            if existing is not None:
+                seen_fingerprint, result = existing
+                if seen_fingerprint != fingerprint:
+                    raise IdempotencyError(f"request {request_id} reused with different parameters")
+                return result
+            self._requests[request_id] = _IN_FLIGHT
+        try:
+            result = run()
+        except BaseException:
+            with self._requests_lock:
+                del self._requests[request_id]
+            raise
+        with self._requests_lock:
+            self._requests[request_id] = (fingerprint, result)
+        return result
 
 
-# --- ATM Machine (State Pattern) ---
+# --- Cash dispenser ---
+
+class CashDispenser:
+    """Notes by denomination. Plans with a bounded min-notes DP, because greedy
+    fails on real cassettes: 600 from {500 x1, 200 x3} has an answer (3 x 200)
+    that greedy (500 first, then stuck at 100) misses."""
+
+    def __init__(self, notes: Dict[int, int]) -> None:
+        self._notes = dict(notes)
+        self._lock = threading.Lock()
+
+    @property
+    def total(self) -> int:
+        return sum(d * n for d, n in self._notes.items())
+
+    def notes(self) -> Dict[int, int]:
+        return dict(self._notes)
+
+    def plan(self, amount: int) -> Dict[int, int]:
+        """Fewest notes that make `amount` from current stock; DispenseError if impossible."""
+        stock = {d: n for d, n in self._notes.items() if n > 0}
+        if amount <= 0 or not stock:
+            raise DispenseError(f"cannot dispense {amount}")
+        unit = 0
+        for d in stock:
+            unit = gcd(unit, d)
+        if amount % unit:
+            raise DispenseError(f"{amount} is not a multiple of {unit}")
+        target = amount // unit
+
+        best: Dict[int, Dict[int, int]] = {0: {}}          # value in units -> note plan
+        for denom, count in sorted(stock.items(), reverse=True):
+            step = denom // unit
+            nxt = dict(best)
+            for value, plan in best.items():
+                used = sum(plan.values())
+                for k in range(1, count + 1):
+                    v = value + k * step
+                    if v > target:
+                        break
+                    if v not in nxt or used + k < sum(nxt[v].values()):
+                        nxt[v] = {**plan, denom: k}
+            best = nxt
+        if target not in best:
+            raise DispenseError(f"cannot make {amount} from {stock}")
+        return best[target]
+
+    def dispense(self, plan: Dict[int, int]) -> Dict[int, int]:
+        with self._lock:
+            if any(self._notes.get(d, 0) < n for d, n in plan.items()):
+                raise DispenseError("stock changed since planning")
+            self._eject(plan)
+            for d, n in plan.items():
+                self._notes[d] -= n
+            return dict(plan)
+
+    def _eject(self, plan: Dict[int, int]) -> None:
+        """Hardware hook. Raises DispenseError on a jam."""
+
+    def load(self, notes: Dict[int, int]) -> None:
+        with self._lock:
+            for d, n in notes.items():
+                self._notes[d] = self._notes.get(d, 0) + n
+
+
+class FlakyDispenser(CashDispenser):
+    """Test double: set jam_next to make the next dispense fail before any note moves."""
+
+    jam_next = False
+
+    def _eject(self, plan: Dict[int, int]) -> None:
+        if self.jam_next:
+            self.jam_next = False
+            raise DispenseError("note jam")
+
+
+# --- ATM (State pattern) ---
 
 class ATMState(ABC):
-    def __init__(self, atm: 'ATM'):
-        self._atm = atm
+    """Default: every operation is invalid. Each state overrides what it allows."""
 
-    @abstractmethod
-    def insert_card(self, card_number: str) -> None: pass
+    name = "?"
 
-    @abstractmethod
-    def enter_pin(self, pin: str) -> None: pass
+    def __init__(self, atm: ATM) -> None:
+        self.atm = atm
 
-    @abstractmethod
-    def select_account(self, account_number: str) -> None: pass
+    def _invalid(self, op: str):
+        raise InvalidOperationError(f"cannot {op} while {self.name}")
 
-    @abstractmethod
-    def check_balance(self) -> Optional[float]: pass
-
-    @abstractmethod
-    def withdraw(self, amount: float) -> bool: pass
-
-    @abstractmethod
-    def deposit(self, amount: float) -> bool: pass
-
-    @abstractmethod
-    def eject_card(self) -> None: pass
-
-
-class IdleATMState(ATMState):
     def insert_card(self, card_number: str) -> None:
-        self._atm._current_card = card_number
-        print("  Card inserted. Please enter PIN.")
-        self._atm._state = self._atm.pin_entered_state
-
-    def enter_pin(self, pin: str) -> None: print("  Insert card first")
-    def select_account(self, account_number: str) -> None: print("  Insert card first")
-    def check_balance(self) -> Optional[float]: print("  Insert card first"); return None
-    def withdraw(self, amount: float) -> bool: print("  Insert card first"); return False
-    def deposit(self, amount: float) -> bool: print("  Insert card first"); return False
-    def eject_card(self) -> None: print("  No card to eject")
-
-
-class PinEnteredATMState(ATMState):
-    def insert_card(self, card_number: str) -> None: print("  Card already inserted")
+        self._invalid("insert card")
 
     def enter_pin(self, pin: str) -> None:
-        account = self._atm.bank.authenticate(self._atm._current_card, pin)
-        if account:
-            self._atm._current_account = account.account_number
-            print(f"  ✅ Authenticated. Account: {account}")
-            self._atm._state = self._atm.ready_state
-        # If failed, stays in same state
-
-    def select_account(self, account_number: str) -> None: print("  Enter PIN first")
-    def check_balance(self) -> Optional[float]: print("  Enter PIN first"); return None
-    def withdraw(self, amount: float) -> bool: print("  Enter PIN first"); return False
-    def deposit(self, amount: float) -> bool: print("  Enter PIN first"); return False
-    def eject_card(self) -> None:
-        self._atm._current_card = None
-        self._atm._state = self._atm.idle_state
-        print("  Card ejected")
-
-
-class ReadyATMState(ATMState):
-    def insert_card(self, card_number: str) -> None: print("  Card already inserted")
-    def enter_pin(self, pin: str) -> None: print("  Already authenticated")
+        self._invalid("enter PIN")
 
     def select_account(self, account_number: str) -> None:
-        if self._atm.bank.get_account(account_number):
-            self._atm._current_account = account_number
-            print(f"  Switched to account {account_number[-4:]}")
-        else:
-            print("  Account not found")
+        self._invalid("select account")
 
-    def check_balance(self) -> Optional[float]:
-        account = self._atm.bank.get_account(self._atm._current_account)
-        balance = account.balance if account else 0
-        print(f"  💰 Balance: ${balance:.2f}")
-        return balance
+    def balance(self) -> Decimal:
+        self._invalid("check balance")
 
-    def withdraw(self, amount: float) -> bool:
-        try:
-            self._atm.bank.withdraw(self._atm._current_account, amount)
-            print(f"  ✅ Withdrawal successful: ${amount:.2f}")
-            new_balance = self._atm.bank.get_account(self._atm._current_account).balance
-            print(f"  💰 New Balance: ${new_balance:.2f}")
-            return True
-        except (ValueError, Exception) as e:
-            print(f"  ❌ {e}")
-            return False
+    def withdraw(self, amount: int) -> Dict[int, int]:
+        self._invalid("withdraw")
 
-    def deposit(self, amount: float) -> bool:
-        tx = self._atm.bank.deposit(self._atm._current_account, amount)
-        if tx:
-            print(f"  ✅ Deposit successful: ${amount:.2f}")
-            return True
-        return False
+    def deposit(self, amount: MoneyLike) -> Transaction:
+        self._invalid("deposit")
 
     def eject_card(self) -> None:
-        self._atm._current_card = None
-        self._atm._current_account = None
-        self._atm._state = self._atm.idle_state
-        print("  👋 Card ejected. Thank you!")
+        self._invalid("eject card")
+
+
+class IdleState(ATMState):
+    name = "IDLE"
+
+    def insert_card(self, card_number: str) -> None:
+        self.atm.bank.validate_card(card_number)     # unknown/expired/blocked: stay idle
+        self.atm._card = card_number
+        self.atm._set_state(self.atm.card_inserted)
+
+
+class CardInsertedState(ATMState):
+    name = "CARD_INSERTED"
+
+    def enter_pin(self, pin: str) -> None:
+        try:
+            card = self.atm.bank.verify_pin(self.atm._card, pin)
+        except CardBlockedError:
+            self.atm._retain_card()                   # third strike: keep the card
+            raise
+        self.atm._account = card.account_number
+        self.atm._set_state(self.atm.authenticated)
+
+    def eject_card(self) -> None:
+        self.atm._end_session()
+
+
+class AuthenticatedState(ATMState):
+    name = "AUTHENTICATED"
+
+    def select_account(self, account_number: str) -> None:
+        card = self.atm.bank.validate_card(self.atm._card)
+        owned = {a.account_number for a in self.atm.bank.accounts_of(card.customer_id)}
+        if account_number not in owned:
+            raise CardError("card holder does not own this account")
+        self.atm._account = account_number
+
+    def balance(self) -> Decimal:
+        return self.atm.bank.balance(self.atm._account)
+
+    def withdraw(self, amount: int) -> Dict[int, int]:
+        atm, bank = self.atm, self.atm.bank
+        plan = atm.dispenser.plan(amount)            # 1. can we physically pay this out?
+        tx = bank.authorize_withdrawal(atm._card, atm._account, amount, atm._request_id())
+        try:
+            notes = atm.dispenser.dispense(plan)     # 2. cash out
+        except DispenseError:
+            bank.reverse(tx.tx_id)                   # 3a. nothing came out: release the hold
+            raise
+        bank.capture(tx.tx_id)                       # 3b. cash is out: settle
+        if atm.dispenser.total == 0:
+            atm._out_of_cash = True
+        return notes
+
+    def deposit(self, amount: MoneyLike) -> Transaction:
+        return self.atm.bank.deposit(self.atm._account, amount, self.atm._request_id())
+
+    def eject_card(self) -> None:
+        self.atm._end_session()
+
+
+class OutOfServiceState(ATMState):
+    name = "OUT_OF_SERVICE"
 
 
 class ATM:
-    def __init__(self, bank: BankingService, location: str = "Downtown"):
-        self._bank = bank
-        self._location = location
+    """One physical ATM: one customer session at a time."""
 
-        self._idle_state = IdleATMState(self)
-        self._pin_entered_state = PinEnteredATMState(self)
-        self._ready_state = ReadyATMState(self)
-        self._state = self._idle_state
+    def __init__(self, atm_id: str, bank: Bank, dispenser: CashDispenser) -> None:
+        self.atm_id = atm_id
+        self.bank = bank
+        self.dispenser = dispenser
+        self.idle = IdleState(self)
+        self.card_inserted = CardInsertedState(self)
+        self.authenticated = AuthenticatedState(self)
+        self.out_of_service = OutOfServiceState(self)
+        self._state: ATMState = self.idle if dispenser.total else self.out_of_service
+        self._card: Optional[str] = None
+        self._account: Optional[str] = None
+        self._out_of_cash = False
+        self._seq = itertools.count(1)
+        self.retained_cards: List[str] = []
 
-        self._current_card: Optional[str] = None
-        self._current_account: Optional[str] = None
+    @property
+    def state(self) -> str:
+        return self._state.name
 
     def insert_card(self, card_number: str) -> None:
         self._state.insert_card(card_number)
@@ -504,92 +844,128 @@ class ATM:
     def enter_pin(self, pin: str) -> None:
         self._state.enter_pin(pin)
 
-    def check_balance(self) -> Optional[float]:
-        return self._state.check_balance()
+    def select_account(self, account_number: str) -> None:
+        self._state.select_account(account_number)
 
-    def withdraw(self, amount: float) -> bool:
+    def balance(self) -> Decimal:
+        return self._state.balance()
+
+    def withdraw(self, amount: int) -> Dict[int, int]:
         return self._state.withdraw(amount)
 
-    def deposit(self, amount: float) -> bool:
+    def deposit(self, amount: MoneyLike) -> Transaction:
         return self._state.deposit(amount)
 
     def eject_card(self) -> None:
         self._state.eject_card()
 
-    @property
-    def bank(self) -> BankingService:
-        return self._bank
+    # operator actions, only between sessions
 
-    @property
-    def idle_state(self) -> ATMState:
-        return self._idle_state
+    def take_offline(self) -> None:
+        if self._state is not self.idle:
+            raise InvalidOperationError("finish the customer session first")
+        self._set_state(self.out_of_service)
 
-    @property
-    def pin_entered_state(self) -> ATMState:
-        return self._pin_entered_state
+    def restock(self, notes: Dict[int, int]) -> None:
+        if self._state not in (self.idle, self.out_of_service):
+            raise InvalidOperationError("finish the customer session first")
+        self.dispenser.load(notes)
+        self._out_of_cash = False
+        self._set_state(self.idle)
 
-    @property
-    def ready_state(self) -> ATMState:
-        return self._ready_state
+    # internals used by states
+
+    def _set_state(self, state: ATMState) -> None:
+        self._state = state
+
+    def _request_id(self) -> str:
+        return f"{self.atm_id}-{next(self._seq)}"
+
+    def _end_session(self) -> None:
+        self._card = None
+        self._account = None
+        self._set_state(self.out_of_service if self._out_of_cash else self.idle)
+
+    def _retain_card(self) -> None:
+        self.retained_cards.append(self._card)
+        self._end_session()
 
 
 # --- Demo ---
 
-def demo():
+def demo() -> None:
     print("=== ATM / Banking System ===")
-    print("=" * 50)
+    bank = Bank(clock=lambda: date(2025, 6, 1))
+    savings = bank.open_account("CUST1", AccountType.SAVINGS, "5000.00")
+    checking = bank.open_account("CUST1", AccountType.CHECKING, "2000.00")
+    other = bank.open_account("CUST2", AccountType.SAVINGS, "9000.00")
+    card = bank.issue_card(savings.account_number, "1234", daily_limit="3000.00")
+    print(f"Accounts: {savings}, {checking}")
 
-    bank = BankingService()
+    atm = ATM("ATM-MG-ROAD", bank, FlakyDispenser({2000: 2, 500: 1, 200: 10}))
 
-    # Create accounts
-    savings = bank.create_account("CUST001", AccountType.SAVINGS, 5000.0)
-    checking = bank.create_account("CUST001", AccountType.CHECKING, 2000.0)
-    credit = bank.create_account("CUST001", AccountType.CREDIT)
-
-    print(f"\nAccounts:")
-    print(f"  Savings: {savings}")
-    print(f"  Checking: {checking}")
-    print(f"  Credit: {credit}")
-
-    # Issue card
-    card = bank.issue_card("CUST001", savings.account_number, "1234", CardType.DEBIT)
-    print(f"\nCard issued: {card.card_number}")
-
-    # ATM Demo
-    print("\n--- ATM Session ---")
-    atm = ATM(bank, "Bangalore - MG Road")
+    print("\n--- Session ---")
     atm.insert_card(card.card_number)
+    try:
+        atm.enter_pin("0000")
+    except WrongPinError as e:
+        print(f"  {e}; state={atm.state}")
     atm.enter_pin("1234")
-    atm.check_balance()
-    atm.withdraw(1000)
-    atm.check_balance()
-    atm.deposit(500)
-    atm.check_balance()
+    print(f"  authenticated; balance {atm.balance()}")
 
-    # Transfer
-    print("\n--- Transfer ---")
-    bank.transfer(savings.account_number, checking.account_number, 500.0)
+    notes = atm.withdraw(600)
+    print(f"  withdraw 600 -> notes {notes} (greedy would take the 500 and get stuck)")
+    print(f"  balance {atm.balance()}, available {bank.available(savings.account_number)} "
+          f"(500.00 minimum balance)")
 
-    print(f"\nFinal Balances:")
-    print(f"  Savings: ${savings.balance:.2f}")
-    print(f"  Checking: ${checking.balance:.2f}")
+    try:
+        atm.withdraw(2500)
+    except LimitExceededError as e:
+        print(f"  withdraw 2500 refused: {e}")
 
+    try:
+        atm.select_account(other.account_number)
+    except CardError as e:
+        print(f"  select someone else's account refused: {e}")
+    atm.select_account(checking.account_number)
+    atm.deposit("250.00")
+    print(f"  deposited 250.00 to checking -> {bank.balance(checking.account_number)}")
+
+    print("\n--- Dispenser jams: hold is reversed, balance untouched ---")
+    atm.dispenser.jam_next = True
+    before = bank.balance(checking.account_number)
+    try:
+        atm.withdraw(400)
+    except DispenseError as e:
+        last = bank.statement(checking.account_number, 1)[0]
+        print(f"  {e}; {last.tx_type.value} {last.amount} is {last.status.name}; "
+              f"balance {before} -> {bank.balance(checking.account_number)}")
     atm.eject_card()
+    print(f"  card ejected; state={atm.state}")
+
+    print("\n--- Retried transfer (same request id) moves money once ---")
+    for _ in range(2):
+        out, _into = bank.transfer(savings.account_number, checking.account_number,
+                                   "100.00", request_id="mobile-42")
+        print(f"  {out.tx_id} {out.tx_type.value} {out.amount}")
+    print(f"  savings {bank.balance(savings.account_number)}, "
+          f"checking {bank.balance(checking.account_number)}")
+
+    print("\n--- Three wrong PINs ---")
+    atm.insert_card(card.card_number)
+    for pin in ("1111", "2222", "3333"):
+        try:
+            atm.enter_pin(pin)
+        except CardError as e:
+            print(f"  {pin}: {e}")
+    print(f"  state={atm.state}, retained={atm.retained_cards}")
+    try:
+        atm.insert_card(card.card_number)
+    except CardBlockedError as e:
+        print(f"  reinsert: {e}")
 
 
 if __name__ == "__main__":
     demo()
 ```
-
----
-
-## ▶️ How to Run
-
-```bash
-cd low-level-design/atm-banking-system
-python atm_banking.py
-```
-
-## 🧩 Design Patterns
-
-See the [Interview Questions](INTERVIEW_QUESTIONS.md) for a detailed breakdown of design patterns and SOLID principles applied in this implementation.
+<!-- /source -->

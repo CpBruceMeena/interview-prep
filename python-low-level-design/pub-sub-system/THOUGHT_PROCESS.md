@@ -8,99 +8,85 @@
 
 ![](pub-sub-class-diagram.drawio)
 
+!!! note "Diagram vs code"
+    The diagram shows the earlier design (a `MessageQueue` per topic, `Topic`, `DeliveryStrategy` with Direct/Async, `FilteringSubscriber`, `flush()`). The code now has a bounded queue per `Subscription`, a `RetryPolicy`, a dead-letter queue and `DedupingSubscriber`. Trust [the code](CODE.md) where they differ.
+
 ---
 
-## Phase 0: Requirements Gathering
+## ⏱️ How to run this in a 45–60 min interview
 
-How are messages delivered? (Sync, async, reliable?) Is there ordering/priority? How do subscribers register? What happens if a subscriber fails?
+| Time | Step | What to say out loud |
+|------|------|----------------------|
+| 0–7 min | **Clarify** | "In-process library or a networked broker? Push or pull? What delivery guarantee: at-most-once or at-least-once? Ordering per topic, per key, or none? What happens when a subscriber is slow or keeps failing?" |
+| 7–15 min | **Entities and interfaces** | `Message` (immutable), `Subscriber` ABC, `Subscription` (subscriber + topic + its own queue), `MessageBroker` facade. "The key decision: one queue per *subscription*, not per topic, so subscribers are isolated." |
+| 15–30 min | **Core code** | `publish` → snapshot subscriptions → `offer` to each; `dispatch_one` pops and calls the subscriber. Get fan-out working synchronously first (`run_until_idle`). |
+| 30–40 min | **Concurrency** | "One dispatcher thread per subscription: ordered, never concurrent per subscriber. The broker lock guards the map only; never hold a lock while calling subscriber code." |
+| 40–50 min | **Failure handling and extension** | Retry with backoff → DLQ; bounded queue and overflow policy; idempotent consumer. Then whatever they add: wildcards, TTL, durability, ordering per key. |
+| 50–60 min | **Testing and trade-offs** | "Inject the sleep so retry tests are instant; a slow-subscriber test proves isolation; a multi-producer test asserts per-producer order and `max_active == 1`." |
+
+### Clarifying questions worth asking
+
+1. **Scope:** in-process event bus, or a broker other services connect to? (The second needs persistence and acks; say which one you're building.)
+2. **Delivery guarantee:** can a message be lost? Can it be delivered twice?
+3. **Ordering:** none, per topic, or per key (e.g. per order id)?
+4. **Slow consumers:** block the publisher, buffer (how much?), or drop?
+5. **Failures:** retry how many times? What happens to a message that never succeeds?
+6. **Filtering / wildcards:** do subscribers want every message on the topic?
+
+---
 
 ## Phase 1: Identify the Nouns
 
-> *"Publishers send messages to topics. Subscribers receive messages from topics they've subscribed to."*
+> *"Publishers send messages to topics. Each subscriber receives, in order, the messages on topics it subscribed to."*
 
 | Noun | Decision | Why |
 |------|----------|-----|
-| Message | Regular Class | Has payload, topic, priority, headers |
-| MessageQueue | Regular Class | Stores and orders pending messages |
-| Subscription | Regular Class | Links a subscriber to a topic |
-| Topic | Regular Class | Manages subscribers + message queue for a topic |
-| MessageBroker | Facade | Main entry point |
-| Subscriber | ABC | Observer pattern |
-| DeliveryStrategy | ABC | Strategy pattern |
-| MessagePriority | Enum | LOW, NORMAL, HIGH, CRITICAL |
+| `Message` | Frozen dataclass | Shared by all subscribers, so immutable |
+| `MessagePriority` | `IntEnum` | Comparable, so the heap key is just `-priority` |
+| `Subscriber` | ABC | Observer interface; raising = failure |
+| `Subscription` | Class | The real unit of work: filter + bounded queue + dispatch |
+| `RetryPolicy` | Frozen dataclass | Strategy for backoff; per subscription |
+| `DeadLetter` | Frozen dataclass | Failed message + reason, for inspection and replay |
+| `MessageBroker` | Facade | Topics, subscriptions, publish, run modes |
 
-## Phase 2: Enums First
+The noun that is easy to miss is **`Subscription`**. Without it you end up with one queue per topic and a delivery loop that couples all subscribers together.
 
-```python
-class MessagePriority(Enum):
-    LOW = 0; NORMAL = 1; HIGH = 2; CRITICAL = 3
-```
-
-Note the integer values — they enable priority-based sorting in the queue.
-
-## Phase 3: dataclass vs `__init__`
-
-- **`Message`**: Regular `__init__` — has behavior (add_header, get_header) and auto-generated ID
-- **`MessageQueue`**: Regular — complex state with thread-safe operations
-- **`Topic`**: Regular — manages subscribers + queue
-- **`Subscription`**: Regular — links topic + subscriber
-- **Subscribers**: Regular — each implements `on_message()`
-
-## Phase 4: Assigning Responsibilities
+## Phase 2: Assigning Responsibilities
 
 | Action | Owner | Why |
 |--------|-------|-----|
-| Store message | `MessageQueue.enqueue()` | Queue owns ordering |
-| Deliver to subscriber | `Subscription.deliver()` | Subscription knows who to deliver to |
-| Subscribe/unsubscribe | `Topic.subscribe()`/`unsubscribe()` | Topic manages its subscribers |
-| Route message to topic | `MessageBroker.publish()` | Broker knows all topics |
-| Choose delivery method | `DeliveryStrategy.deliver()` | Strategy pattern |
+| Route a publish to subscribers | `MessageBroker.publish()` | Owns the topic → subscriptions map |
+| Filter, buffer, apply overflow policy | `Subscription.offer()` | Per-subscriber concern |
+| Deliver with retry, dead-letter on failure | `Subscription.dispatch_one()` | Keeps retry state next to the queue it blocks |
+| Backoff schedule | `RetryPolicy.delay()` | Swappable strategy |
+| Collect dead letters | `MessageBroker` | One place to inspect and replay |
+| Idempotency | `DedupingSubscriber` (decorator) | Consumer concern; the broker can't know what "duplicate side effect" means |
 
-## Phase 5: Observer + Strategy Patterns
+## Phase 3: Patterns, and why each is there
 
-**Observer (core pattern):**
-```python
-class Subscriber(ABC):
-    def on_message(self, message: Message): pass
+- **Observer:** `Subscriber.on_message`. Publishers don't know who listens.
+- **Facade:** `MessageBroker` is the only class callers touch.
+- **Strategy:** `RetryPolicy`; per-subscription `predicate` for filtering.
+- **Decorator:** `DedupingSubscriber` wraps any subscriber without changing it.
 
-class ConsoleSubscriber(Subscriber):  # Prints to console
-class FilteringSubscriber(Subscriber): # Decorator pattern on subscriber
+## Phase 4: Concurrency model
+
+```text
+publisher threads ──publish──▶ broker._lock (map snapshot only)
+                                   │
+                    offer() ───────┼──▶ Subscription A: Condition + heap ──▶ 1 dispatcher ──▶ subscriber A
+                                   └──▶ Subscription B: Condition + heap ──▶ 1 dispatcher ──▶ subscriber B
 ```
 
-**Strategy (delivery):**
-```python
-class DeliveryStrategy(ABC):
-    def deliver(self, subscription, message) -> bool
+- Two locks only, never nested with subscriber code running.
+- Per-subscription ordering comes from "exactly one consumer per queue", not from a lock around the subscriber.
+- `wait_idle()` waits on `queue empty and in_flight == 0`, both under the same `Condition`, so there is no window where a popped-but-unfinished message is invisible.
 
-class DirectDelivery(DeliveryStrategy):     # Synchronous
-class AsyncDelivery(DeliveryStrategy):      # Thread-based
-class ReliableDelivery(DeliveryStrategy):   # With retries
-```
+## Phase 5: Quick Checklist
 
-## Phase 6: Decorator Pattern on Subscribers
-
-```python
-class FilteringSubscriber(Subscriber):
-    """Wraps another subscriber, filters messages before passing on."""
-    def __init__(self, subscriber: Subscriber, filter_fn):
-        self._subscriber = subscriber
-        self._filter = filter_fn
-    
-    def on_message(self, message):
-        if self._filter(message):
-            self._subscriber.on_message(message)
-```
-
-This is composition over inheritance — wrapping behavior.
-
-## Phase 7: Thread Safety
-
-The `MessageQueue` uses a lock for thread-safe operations. The `AsyncDelivery` creates new threads for each delivery.
-
-## Phase 8: Quick Checklist
-
-✅ **Observer Pattern:** Subscribers observe topics
-✅ **Strategy Pattern:** Delivery methods are swappable
-✅ **Decorator Pattern:** FilteringSubscriber wraps behavior
-✅ **SRP:** MessageQueue, Topic, Subscription each own their concern
-✅ **Thread-safety:** Locks protect shared state
+✅ **Isolation:** a slow or failing subscriber only affects its own queue
+✅ **Ordering:** priority, then FIFO, per subscriber; no concurrent callbacks
+✅ **Bounded memory:** queue cap with an explicit overflow policy
+✅ **Failure path:** retry with backoff, then DLQ with a reason
+✅ **No lock held across subscriber code**
+✅ **Guarantee stated:** at-least-once on subscriber failure, not durable across crashes

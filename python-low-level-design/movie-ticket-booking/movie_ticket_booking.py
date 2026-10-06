@@ -1,583 +1,550 @@
 """
 Movie Ticket Booking System (BookMyShow) - Low Level Design
--------------------------------------------------------------
-Design Principles: SOLID, Singleton, Observer, Strategy, State
+-----------------------------------------------------------
+Search shows, hold seats for a limited time, pay, confirm, cancel.
 
-Architecture:
-  - Movie, Seat, Screen, Theatre, Show: Domain models (SRP)
-  - PricingStrategy (ABC): Pluggable pricing via Strategy pattern
-    - StandardPricing, PeakPricing, WeekendPricing
-  - Booking: State machine (PENDING → CONFIRMED / CANCELLED)
-  - BookingManager: Thread-safe booking orchestration
-  - MovieSearchService: Facade for search/discovery
+Key design decisions
+  * A Screen has a seat *layout* (immutable `Seat`s). Each Show has its own
+    seat *inventory* (`ShowSeat`s with status). Booking A1 for the 1 pm show
+    must not touch A1 for the 4 pm show.
+  * Seat state machine: AVAILABLE -> HELD(booking, expires_at) -> BOOKED.
+    HELD -> AVAILABLE on cancel or expiry; BOOKED -> AVAILABLE on cancel.
+    An expired hold counts as available immediately (lazy expiry); the
+    sweeper (`release_expired`) only tidies up.
+  * Concurrency: one lock per ShowSeat. A request for several seats takes
+    their locks in one global order (sorted seat id), checks all, then
+    changes all: all-or-nothing, no deadlock, and requests for disjoint
+    seats in the same show run in parallel. Every change to a booking's
+    status happens under its seats' locks, so confirm / cancel / expiry of
+    one booking are serialised without a separate booking lock.
+  * Payment is an external call: it is never made while holding a lock. It
+    is idempotent (keyed by booking id). If the hold expired while the user
+    was paying, confirmation fails under the locks and the charge is
+    refunded, so a seat is never sold twice.
+  * Money is Decimal (rupees, 2 dp); prices are snapshotted at hold time.
+  * Time is injected (`clock`) so expiry is testable.
 
-Interview Discussion Points:
-  - Concurrency: Lock per BookingManager + seat state machine
-  - Pricing: Strategy pattern allows composable pricing rules
-  - Double-booking: Multi-layered — app lock + DB SELECT FOR UPDATE + Redis lock
-  - Flash sales: Queue-based booking + rate limiting per user
-  - Distributed seat booking: Redis distributed locks + idempotency keys
+Python 3.10+, stdlib only.
 """
 
-from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
-from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from __future__ import annotations
+
+import itertools
 import threading
-import uuid
+from abc import ABC, abstractmethod
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
+from enum import Enum
+from typing import Callable, Iterator
+
+Clock = Callable[[], datetime]
+PAISE = Decimal("0.01")
+MAX_SEATS_PER_BOOKING = 10
 
 
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
+# --- Errors -----------------------------------------------------------------------
+
+class BookingError(Exception):
+    pass
+
+
+class SeatUnavailable(BookingError):
+    def __init__(self, seat_ids: list[str]) -> None:
+        super().__init__(f"seats not available: {', '.join(seat_ids)}")
+        self.seat_ids = seat_ids
+
+
+class HoldExpired(BookingError):
+    pass
+
+
+class PaymentFailed(BookingError):
+    pass
+
+
+class InvalidBookingState(BookingError):
+    pass
+
+
+# --- Catalogue: movies, theatres, screens, seats ------------------------------------
 
 class City(Enum):
     MUMBAI = "Mumbai"
     DELHI = "Delhi"
     BANGALORE = "Bangalore"
-    HYDERABAD = "Hyderabad"
 
 
 class Genre(Enum):
     ACTION = "Action"
     COMEDY = "Comedy"
     DRAMA = "Drama"
-    HORROR = "Horror"
-    ROMANCE = "Romance"
     SCI_FI = "Sci-Fi"
-    THRILLER = "Thriller"
 
+
+class SeatCategory(Enum):
+    REGULAR = "Regular"
+    PREMIUM = "Premium"
+    VIP = "VIP"
+
+
+@dataclass(frozen=True)
+class Movie:
+    movie_id: str
+    title: str
+    genre: Genre
+    duration_minutes: int
+    language: str
+
+
+@dataclass(frozen=True)
+class Seat:
+    """A physical seat in a screen's layout. Has no booking state."""
+    seat_id: str          # e.g. "A7"
+    row: str
+    number: int
+    category: SeatCategory
+
+
+@dataclass(frozen=True)
+class Screen:
+    screen_id: str
+    name: str
+    seats: tuple[Seat, ...]
+
+    @staticmethod
+    def with_rows(screen_id: str, name: str, rows: dict[str, SeatCategory], per_row: int) -> Screen:
+        seats = tuple(Seat(f"{r}{n}", r, n, cat) for r, cat in rows.items() for n in range(1, per_row + 1))
+        return Screen(screen_id, name, seats)
+
+
+@dataclass(frozen=True)
+class Theatre:
+    theatre_id: str
+    name: str
+    city: City
+
+
+# --- Show inventory -------------------------------------------------------------------
 
 class SeatStatus(Enum):
     AVAILABLE = "Available"
+    HELD = "Held"
     BOOKED = "Booked"
-    BLOCKED = "Blocked"
 
 
-class BookingStatus(Enum):
-    PENDING = "Pending"
-    CONFIRMED = "Confirmed"
-    CANCELLED = "Cancelled"
-    REFUNDED = "Refunded"
+@dataclass(eq=False)
+class ShowSeat:
+    """One seat for one show. Mutable fields are guarded by `lock`."""
+    seat: Seat
+    status: SeatStatus = SeatStatus.AVAILABLE
+    booking_id: str | None = None
+    hold_expires_at: datetime | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
+    def is_free(self, now: datetime) -> bool:
+        """Available, or held by a hold that has already expired."""
+        if self.status is SeatStatus.AVAILABLE:
+            return True
+        return self.status is SeatStatus.HELD and self.hold_expires_at is not None \
+            and self.hold_expires_at <= now
 
-# ---------------------------------------------------------------------------
-# Movie (SRP)
-# ---------------------------------------------------------------------------
+    def held_by(self, booking_id: str) -> bool:
+        return self.status is SeatStatus.HELD and self.booking_id == booking_id
 
-class Movie:
-    """Single Responsibility: Represents a movie"""
+    def hold(self, booking_id: str, expires_at: datetime) -> None:
+        self.status, self.booking_id, self.hold_expires_at = SeatStatus.HELD, booking_id, expires_at
 
-    def __init__(self, movie_id: str, title: str, genre: Genre,
-                 duration_minutes: int, language: str, rating: float = 0.0):
-        self._movie_id = movie_id
-        self._title = title
-        self._genre = genre
-        self._duration = duration_minutes
-        self._language = language
-        self._rating = rating
+    def book(self) -> None:
+        self.status, self.hold_expires_at = SeatStatus.BOOKED, None
 
-    @property
-    def movie_id(self) -> str:
-        return self._movie_id
+    def release(self) -> None:
+        self.status, self.booking_id, self.hold_expires_at = SeatStatus.AVAILABLE, None, None
 
-    @property
-    def title(self) -> str:
-        return self._title
-
-    @property
-    def duration(self) -> int:
-        return self._duration
-
-    def __str__(self) -> str:
-        return f"{self._title} ({self._language})"
-
-
-# ---------------------------------------------------------------------------
-# Theatre / Screen / Seat hierarchy
-# ---------------------------------------------------------------------------
-
-class Seat:
-    """A seat in a screen with a state machine: AVAILABLE → BLOCKED → BOOKED."""
-
-    def __init__(self, seat_id: str, row: str, number: int, category: str = "Regular"):
-        self._seat_id = seat_id
-        self._row = row
-        self._number = number
-        self._category = category  # Regular, Premium, VIP
-        self._status = SeatStatus.AVAILABLE
-
-    @property
-    def seat_id(self) -> str:
-        return self._seat_id
-
-    @property
-    def category(self) -> str:
-        return self._category
-
-    @property
-    def status(self) -> SeatStatus:
-        return self._status
-
-    @status.setter
-    def status(self, value: SeatStatus) -> None:
-        self._status = value
-
-    def __str__(self) -> str:
-        return f"{self._row}{self._number}"
-
-
-class Screen:
-    """A screen (auditorium) containing seats."""
-
-    def __init__(self, screen_id: str, name: str):
-        self._screen_id = screen_id
-        self._name = name
-        self._seats: Dict[str, Seat] = {}
-
-    @property
-    def screen_id(self) -> str:
-        return self._screen_id
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def add_seat(self, seat: Seat) -> None:
-        self._seats[seat.seat_id] = seat
-
-    def get_seat(self, seat_id: str) -> Optional[Seat]:
-        return self._seats.get(seat_id)
-
-    def get_all_seats(self) -> List[Seat]:
-        return list(self._seats.values())
-
-    def get_available_seats(self) -> List[Seat]:
-        return [s for s in self._seats.values() if s.status == SeatStatus.AVAILABLE]
-
-
-class Theatre:
-    """A physical theatre location with multiple screens."""
-
-    def __init__(self, theatre_id: str, name: str, city: City, address: str):
-        self._theatre_id = theatre_id
-        self._name = name
-        self._city = city
-        self._address = address
-        self._screens: Dict[str, Screen] = {}
-
-    @property
-    def theatre_id(self) -> str:
-        return self._theatre_id
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def city(self) -> City:
-        return self._city
-
-    def add_screen(self, screen: Screen) -> None:
-        self._screens[screen.screen_id] = screen
-
-    def get_screen(self, screen_id: str) -> Optional[Screen]:
-        return self._screens.get(screen_id)
-
-
-# ---------------------------------------------------------------------------
-# Show (SRP)
-# ---------------------------------------------------------------------------
 
 class Show:
-    """Represents a movie screening at a specific time in a specific screen."""
+    def __init__(self, show_id: str, movie: Movie, theatre: Theatre, screen: Screen,
+                 start_time: datetime, base_prices: dict[SeatCategory, Decimal]) -> None:
+        missing = {s.category for s in screen.seats} - base_prices.keys()
+        if missing:
+            raise ValueError(f"no base price for {sorted(c.value for c in missing)}")
+        self.show_id = show_id
+        self.movie = movie
+        self.theatre = theatre
+        self.screen = screen
+        self.start_time = start_time
+        self.end_time = start_time + timedelta(minutes=movie.duration_minutes + 15)  # + cleaning
+        self.base_prices = dict(base_prices)
+        self._seats: dict[str, ShowSeat] = {s.seat_id: ShowSeat(s) for s in screen.seats}
 
-    def __init__(self, show_id: str, movie: Movie, screen: Screen,
-                 theatre: Theatre, start_time: datetime):
-        self._show_id = show_id
-        self._movie = movie
-        self._screen = screen
-        self._theatre = theatre
-        self._start_time = start_time
-        # End time = start + duration + 15 min buffer (cleaning/intermission)
-        self._end_time = start_time + timedelta(minutes=movie.duration + 15)
-        # Base prices by seat category (can be overridden)
-        self._pricing: Dict[str, float] = {"Regular": 150.0, "Premium": 250.0, "VIP": 400.0}
+    def seat(self, seat_id: str) -> ShowSeat:
+        try:
+            return self._seats[seat_id]
+        except KeyError:
+            raise BookingError(f"no seat {seat_id!r} in {self.screen.name}") from None
 
-    @property
-    def show_id(self) -> str:
-        return self._show_id
-
-    @property
-    def movie(self) -> Movie:
-        return self._movie
-
-    @property
-    def screen(self) -> Screen:
-        return self._screen
-
-    @property
-    def theatre(self) -> Theatre:
-        return self._theatre
-
-    @property
-    def start_time(self) -> datetime:
-        return self._start_time
-
-    @property
-    def end_time(self) -> datetime:
-        return self._end_time
-
-    def get_price(self, category: str) -> float:
-        """Get the base price for a seat category."""
-        return self._pricing.get(category, 150.0)
-
-    def set_pricing(self, category: str, price: float) -> None:
-        """Override the base price for a seat category."""
-        self._pricing[category] = price
+    def available_seat_ids(self, now: datetime) -> list[str]:
+        # Unlocked read: a snapshot for display. It can be stale by the time the
+        # user clicks; the locked check in hold_seats is what counts.
+        return [sid for sid, s in self._seats.items() if s.is_free(now)]
 
     def __str__(self) -> str:
-        return f"{self._movie.title} at {self._theatre.name} on {self._start_time:%d %b %I:%M %p}"
+        return f"{self.movie.title} @ {self.theatre.name} {self.start_time:%a %d %b %H:%M}"
 
 
-# ---------------------------------------------------------------------------
-# Pricing Strategy (Strategy Pattern — OCP)
-# ---------------------------------------------------------------------------
+@contextmanager
+def locked_in_order(seats: list[ShowSeat]) -> Iterator[None]:
+    """Acquire seat locks in one global order (seat id). Two requests for
+    {A1, A2} and {A2, A1} both lock A1 first, so neither can hold one lock
+    while waiting for the other: no deadlock."""
+    with ExitStack() as stack:
+        for s in sorted(seats, key=lambda s: s.seat.seat_id):
+            stack.enter_context(s.lock)
+        yield
+
+
+# --- Pricing (Strategy) ---------------------------------------------------------------
 
 class PricingStrategy(ABC):
-    """Interface for computing the final ticket price.
-
-    Concrete strategies are composed in BookingManager to apply multiple
-    pricing rules (e.g., PeakPricing + WeekendPricing combined).
-    """
-
     @abstractmethod
-    def calculate_price(self, base_price: float, show: Show, category: str) -> float:
-        """Return the final price given the base price, show, and seat category."""
-        pass
+    def price(self, base: Decimal, show: Show, seat: Seat) -> Decimal: ...
 
 
 class StandardPricing(PricingStrategy):
-    """No surcharge — returns base price as-is."""
-
-    def calculate_price(self, base_price: float, show: Show, category: str) -> float:
-        return base_price
+    def price(self, base: Decimal, show: Show, seat: Seat) -> Decimal:
+        return base
 
 
-class PeakPricing(PricingStrategy):
-    """Applies a surcharge multiplier during peak hours.
+class PeakHourPricing(PricingStrategy):
+    def __init__(self, hours: range = range(18, 22), multiplier: Decimal = Decimal("1.2")) -> None:
+        self.hours, self.multiplier = hours, multiplier
 
-    Peak hours are typically evening shows (6 PM – 10 PM) and weekends.
-    """
-
-    def __init__(self, peak_hours: Set[int], surcharge: float = 1.5):
-        self._peak_hours = peak_hours
-        self._surcharge = surcharge
-
-    def calculate_price(self, base_price: float, show: Show, category: str) -> float:
-        if show.start_time.hour in self._peak_hours:
-            return base_price * self._surcharge
-        return base_price
+    def price(self, base: Decimal, show: Show, seat: Seat) -> Decimal:
+        return base * self.multiplier if show.start_time.hour in self.hours else base
 
 
 class WeekendPricing(PricingStrategy):
-    """Applies a surcharge for shows on Saturday/Sunday."""
+    def __init__(self, multiplier: Decimal = Decimal("1.25")) -> None:
+        self.multiplier = multiplier
 
-    def __init__(self, weekend_surcharge: float = 1.25):
-        self._weekend_surcharge = weekend_surcharge
-
-    def calculate_price(self, base_price: float, show: Show, category: str) -> float:
-        if show.start_time.weekday() >= 5:  # Saturday = 5, Sunday = 6
-            return base_price * self._weekend_surcharge
-        return base_price
+    def price(self, base: Decimal, show: Show, seat: Seat) -> Decimal:
+        return base * self.multiplier if show.start_time.weekday() >= 5 else base
 
 
-# ---------------------------------------------------------------------------
-# Booking (SRP + State pattern)
-# ---------------------------------------------------------------------------
+class CompositePricing(PricingStrategy):
+    """Applies strategies in sequence (each sees the previous one's output)."""
 
+    def __init__(self, *strategies: PricingStrategy) -> None:
+        self.strategies = strategies
+
+    def price(self, base: Decimal, show: Show, seat: Seat) -> Decimal:
+        for s in self.strategies:
+            base = s.price(base, show, seat)
+        return base
+
+
+# --- Payment --------------------------------------------------------------------------
+
+class PaymentGateway(ABC):
+    @abstractmethod
+    def charge(self, idempotency_key: str, amount: Decimal) -> str:
+        """Charge once per key; a retry with the same key returns the same
+        payment id without charging again. Raises PaymentFailed if declined."""
+
+    @abstractmethod
+    def refund(self, payment_id: str, amount: Decimal) -> None: ...
+
+
+class FakePaymentGateway(PaymentGateway):
+    def __init__(self) -> None:
+        self._by_key: dict[str, str] = {}
+        self.charges: list[tuple[str, Decimal]] = []
+        self.refunds: list[tuple[str, Decimal]] = []
+        self.decline_next = False
+        self.during_charge: Callable[[], None] | None = None   # test hook: simulate a slow gateway
+        self._ids = itertools.count(1)
+        self._lock = threading.Lock()
+
+    def charge(self, idempotency_key: str, amount: Decimal) -> str:
+        if self.during_charge:
+            self.during_charge()
+        with self._lock:
+            if idempotency_key in self._by_key:
+                return self._by_key[idempotency_key]
+            if self.decline_next:
+                self.decline_next = False
+                raise PaymentFailed("card declined")
+            pid = f"PAY-{next(self._ids)}"
+            self._by_key[idempotency_key] = pid
+            self.charges.append((pid, amount))
+            return pid
+
+    def refund(self, payment_id: str, amount: Decimal) -> None:
+        with self._lock:
+            self.refunds.append((payment_id, amount))
+
+
+# --- Booking --------------------------------------------------------------------------
+
+class BookingStatus(Enum):
+    PENDING = "Pending"       # seats held, awaiting payment
+    CONFIRMED = "Confirmed"
+    CANCELLED = "Cancelled"
+    EXPIRED = "Expired"
+
+
+@dataclass(eq=False)
 class Booking:
-    """Represents a confirmed or pending ticket booking.
-
-    States: PENDING → CONFIRMED (on payment) or CANCELLED (on cancel/timeout)
-    """
-
-    def __init__(self, booking_id: str, show: Show, user_id: str,
-                 seats: List[Seat], pricing_strategy: PricingStrategy):
-        self._booking_id = booking_id
-        self._show = show
-        self._user_id = user_id
-        self._seats = seats
-        self._total_amount: float = 0.0
-        self._status = BookingStatus.PENDING
-        self._created_at = datetime.now()
-        self._lock = threading.Lock()
-
-        # Calculate total using the pricing strategy
-        # This ensures peak/weekend surcharges are applied correctly
-        for seat in seats:
-            base_price = show.get_price(seat.category)
-            final_price = pricing_strategy.calculate_price(base_price, show, seat.category)
-            self._total_amount += final_price
+    """Status changes only under the locks of `seats` (see BookingService)."""
+    booking_id: str
+    user_id: str
+    show: Show
+    seats: list[ShowSeat]
+    line_prices: dict[str, Decimal]          # seat id -> price, snapshotted at hold time
+    expires_at: datetime
+    status: BookingStatus = BookingStatus.PENDING
+    payment_id: str | None = None
 
     @property
-    def booking_id(self) -> str:
-        return self._booking_id
+    def total(self) -> Decimal:
+        return sum(self.line_prices.values(), Decimal("0"))
 
     @property
-    def show(self) -> Show:
-        return self._show
-
-    @property
-    def seats(self) -> List[Seat]:
-        return self._seats
-
-    @property
-    def total_amount(self) -> float:
-        return self._total_amount
-
-    @property
-    def status(self) -> BookingStatus:
-        return self._status
-
-    def confirm(self) -> None:
-        """Transition from PENDING → CONFIRMED."""
-        with self._lock:
-            if self._status != BookingStatus.PENDING:
-                raise ValueError(f"Cannot confirm booking in {self._status} status")
-            self._status = BookingStatus.CONFIRMED
-
-    def cancel(self) -> None:
-        """Transition from CONFIRMED → CANCELLED and release seats."""
-        with self._lock:
-            if self._status != BookingStatus.CONFIRMED:
-                raise ValueError(f"Cannot cancel booking in {self._status} status")
-            self._status = BookingStatus.CANCELLED
-            # Release seats back to AVAILABLE
-            for seat in self._seats:
-                seat.status = SeatStatus.AVAILABLE
+    def seat_ids(self) -> list[str]:
+        return [s.seat.seat_id for s in self.seats]
 
 
-# ---------------------------------------------------------------------------
-# BookingManager (SRP)
-# ---------------------------------------------------------------------------
+class BookingService:
+    """Facade for the booking flow: hold -> pay_and_confirm -> (cancel)."""
 
-class BookingManager:
-    """Manages the booking lifecycle with thread safety.
+    def __init__(self, gateway: PaymentGateway, pricing: PricingStrategy | None = None,
+                 clock: Clock = datetime.now, hold_ttl: timedelta = timedelta(minutes=10)) -> None:
+        self._gateway = gateway
+        self._pricing = pricing or StandardPricing()
+        self._clock = clock
+        self._hold_ttl = hold_ttl
+        self._shows: dict[str, Show] = {}
+        self._bookings: dict[str, Booking] = {}
+        self._registry_lock = threading.Lock()     # guards the two dicts only
+        self._ids = itertools.count(1)
 
-    Uses a single lock to serialize seat selection within this process.
-    For distributed systems, replace with Redis distributed locks
-    (see HIGH_LEVEL_DESIGN.md for details).
-    """
-
-    def __init__(self, pricing_strategy: Optional[PricingStrategy] = None):
-        self._bookings: Dict[str, Booking] = {}
-        self._pricing_strategy = pricing_strategy or StandardPricing()
-        self._lock = threading.Lock()
-
-    def create_booking(self, show: Show, user_id: str, seat_ids: List[str]) -> Booking:
-        """Thread-safe seat booking with transaction-like behaviour.
-
-        1. Acquire lock → validate seats are AVAILABLE → mark as BLOCKED
-        2. Release lock → create Booking (uses PricingStrategy for total)
-        3. Store booking in memory
-
-        In production, step 1 would be a DB transaction with SELECT FOR UPDATE
-        and step 2 would involve a payment gateway call.
-        """
-        # ---- Phase 1: Validate & block seats (critical section) ----
-        with self._lock:
-            seats = []
-            for seat_id in seat_ids:
-                seat = show.screen.get_seat(seat_id)
-                if not seat:
-                    raise ValueError(f"Seat {seat_id} not found")
-                if seat.status != SeatStatus.AVAILABLE:
-                    raise ValueError(f"Seat {seat_id} is already {seat.status.value}")
-                seats.append(seat)
-
-            # Block seats (temporary hold — released on timeout or payment failure)
-            for seat in seats:
-                seat.status = SeatStatus.BLOCKED
-
-        # ---- Phase 2: Create booking with pricing strategy ----
-        booking_id = f"BK-{uuid.uuid4().hex[:8].upper()}"
-        # NOTE: PricingStrategy is now used to compute the total amount
-        booking = Booking(booking_id, show, user_id, seats, self._pricing_strategy)
-
-        with self._lock:
-            self._bookings[booking_id] = booking
-
-        print(f"  Booking {booking_id} created for {len(seats)} seat(s)")
-        print(f"    Base price breakdown:")
-        for seat in seats:
-            base = show.get_price(seat.category)
-            final = self._pricing_strategy.calculate_price(base, show, seat.category)
-            print(f"      {seat} ({seat.category}): ${base:.2f} → ${final:.2f}")
-        print(f"    Total: ${booking.total_amount:.2f}")
-        return booking
-
-    def confirm_booking(self, booking_id: str) -> Booking:
-        """Confirm a booking (simulates successful payment)."""
-        booking = self._bookings.get(booking_id)
-        if not booking:
-            raise ValueError(f"Booking {booking_id} not found")
-
-        booking.confirm()
-        # Mark seats as permanently BOOKED
-        for seat in booking.seats:
-            seat.status = SeatStatus.BOOKED
-        print(f"  Booking {booking_id} confirmed!")
-        return booking
-
-    def cancel_booking(self, booking_id: str) -> Booking:
-        """Cancel a confirmed booking and release seats."""
-        booking = self._bookings.get(booking_id)
-        if not booking:
-            raise ValueError(f"Booking {booking_id} not found")
-        booking.cancel()
-        print(f"  Booking {booking_id} cancelled. Seats released.")
-        return booking
-
-    def get_booking(self, booking_id: str) -> Optional[Booking]:
-        return self._bookings.get(booking_id)
-
-
-# ---------------------------------------------------------------------------
-# Search Service (Facade pattern)
-# ---------------------------------------------------------------------------
-
-class MovieSearchService:
-    """Facade for searching movies/theatres/shows by various criteria."""
-
-    def __init__(self):
-        self._movies: Dict[str, Movie] = {}
-        self._shows: Dict[str, Show] = {}
-
-    def add_movie(self, movie: Movie) -> None:
-        self._movies[movie.movie_id] = movie
+    # Catalogue ---------------------------------------------------------------
 
     def add_show(self, show: Show) -> None:
-        self._shows[show.show_id] = show
+        with self._registry_lock:
+            self._shows[show.show_id] = show
 
-    def search_by_city(self, city: City) -> List[Show]:
-        return [s for s in self._shows.values() if s.theatre.city == city]
+    def show(self, show_id: str) -> Show:
+        with self._registry_lock:
+            try:
+                return self._shows[show_id]
+            except KeyError:
+                raise BookingError(f"unknown show {show_id!r}") from None
 
-    def search_by_movie(self, movie_id: str) -> List[Show]:
-        return [s for s in self._shows.values() if s.movie.movie_id == movie_id]
+    def search(self, city: City | None = None, movie_id: str | None = None,
+               on: date | None = None, genre: Genre | None = None) -> list[Show]:
+        with self._registry_lock:
+            shows = list(self._shows.values())
+        return sorted((s for s in shows
+                       if (city is None or s.theatre.city is city)
+                       and (movie_id is None or s.movie.movie_id == movie_id)
+                       and (on is None or s.start_time.date() == on)
+                       and (genre is None or s.movie.genre is genre)),
+                      key=lambda s: s.start_time)
 
-    def search_by_genre(self, genre: Genre, city: Optional[City] = None) -> List[Show]:
-        shows = self._shows.values()
-        if city:
-            shows = [s for s in shows if s.theatre.city == city]
-        return [s for s in shows if s.movie._genre == genre]
+    def available_seats(self, show_id: str) -> list[str]:
+        return self.show(show_id).available_seat_ids(self._clock())
 
-    def search_by_date(self, date: datetime, city: Optional[City] = None) -> List[Show]:
-        shows = self._shows.values()
-        if city:
-            shows = [s for s in shows if s.theatre.city == city]
-        return [s for s in shows if s.start_time.date() == date.date()]
+    def booking(self, booking_id: str) -> Booking:
+        with self._registry_lock:
+            try:
+                return self._bookings[booking_id]
+            except KeyError:
+                raise BookingError(f"unknown booking {booking_id!r}") from None
 
-    def get_available_seats(self, show_id: str) -> List[Seat]:
-        show = self._shows.get(show_id)
-        if show:
-            return show.screen.get_available_seats()
-        return []
+    # Step 1: hold ------------------------------------------------------------
+
+    def hold_seats(self, show_id: str, user_id: str, seat_ids: list[str]) -> Booking:
+        if not seat_ids:
+            raise BookingError("select at least one seat")
+        if len(set(seat_ids)) != len(seat_ids):
+            raise BookingError("duplicate seat in request")
+        if len(seat_ids) > MAX_SEATS_PER_BOOKING:
+            raise BookingError(f"at most {MAX_SEATS_PER_BOOKING} seats per booking")
+        show = self.show(show_id)
+        seats = [show.seat(sid) for sid in seat_ids]
+        booking_id = f"BK-{next(self._ids):05d}"
+
+        with locked_in_order(seats):
+            now = self._clock()
+            if now >= show.start_time:
+                raise BookingError("show has already started")
+            taken = [s.seat.seat_id for s in seats if not s.is_free(now)]
+            if taken:
+                raise SeatUnavailable(taken)        # nothing changed: all-or-nothing
+            expires_at = now + self._hold_ttl
+            for s in seats:
+                s.hold(booking_id, expires_at)
+
+        prices = {s.seat.seat_id: self._pricing.price(show.base_prices[s.seat.category], show, s.seat)
+                  .quantize(PAISE, ROUND_HALF_UP) for s in seats}
+        booking = Booking(booking_id, user_id, show, seats, prices, expires_at)
+        with self._registry_lock:
+            self._bookings[booking_id] = booking
+        return booking
+
+    # Step 2: pay and confirm -------------------------------------------------
+
+    def pay_and_confirm(self, booking_id: str) -> Booking:
+        """Safe to retry: the charge is idempotent on booking id, and a second
+        call on a CONFIRMED booking returns it unchanged."""
+        booking = self.booking(booking_id)
+        if booking.status is BookingStatus.CONFIRMED:
+            return booking
+        if booking.status is not BookingStatus.PENDING:
+            raise InvalidBookingState(f"{booking_id} is {booking.status.value}")
+        if self._clock() >= booking.expires_at:      # cheap early exit; re-checked under locks
+            self._expire(booking)
+            raise HoldExpired(f"{booking_id}: hold expired before payment; not charged")
+
+        # External call: never while holding seat locks.
+        payment_id = self._gateway.charge(booking_id, booking.total)
+
+        with locked_in_order(booking.seats):
+            if booking.status is BookingStatus.CONFIRMED:
+                return booking                         # a concurrent retry won
+            still_ours = (booking.status is BookingStatus.PENDING
+                          and self._clock() < booking.expires_at
+                          and all(s.held_by(booking_id) for s in booking.seats))
+            if still_ours:
+                for s in booking.seats:
+                    s.book()
+                booking.status, booking.payment_id = BookingStatus.CONFIRMED, payment_id
+                return booking
+            self._expire_locked(booking)
+
+        # Paid, but the hold lapsed (or was cancelled) first: give the money back.
+        self._gateway.refund(payment_id, booking.total)
+        raise HoldExpired(f"{booking_id}: hold lapsed during payment; refunded")
+
+    # Cancel / expire -----------------------------------------------------------
+
+    def cancel(self, booking_id: str) -> Booking:
+        booking = self.booking(booking_id)
+        with locked_in_order(booking.seats):
+            was = booking.status
+            if was not in (BookingStatus.PENDING, BookingStatus.CONFIRMED):
+                raise InvalidBookingState(f"{booking_id} is {was.value}")
+            for s in booking.seats:
+                if s.booking_id == booking_id:       # never release a seat someone else now holds
+                    s.release()
+            booking.status = BookingStatus.CANCELLED
+        if was is BookingStatus.CONFIRMED and booking.payment_id:
+            self._gateway.refund(booking.payment_id, booking.total)   # refund policy plugs in here
+        return booking
+
+    def release_expired(self) -> int:
+        """Sweeper: expire PENDING bookings past their hold. Correctness does not
+        depend on it (expired holds are already treated as free); it keeps
+        booking statuses and seat maps tidy."""
+        now = self._clock()
+        with self._registry_lock:
+            due = [b for b in self._bookings.values()
+                   if b.status is BookingStatus.PENDING and b.expires_at <= now]
+        return sum(self._expire(b) for b in due)
+
+    def _expire(self, booking: Booking) -> bool:
+        with locked_in_order(booking.seats):
+            return self._expire_locked(booking)
+
+    def _expire_locked(self, booking: Booking) -> bool:
+        if booking.status is not BookingStatus.PENDING:
+            return False
+        for s in booking.seats:
+            if s.held_by(booking.booking_id):
+                s.release()
+        booking.status = BookingStatus.EXPIRED
+        return True
 
 
-# ---------------------------------------------------------------------------
-# Demo
-# ---------------------------------------------------------------------------
+# --- Demo -----------------------------------------------------------------------------
 
-def setup_system() -> Tuple[MovieSearchService, BookingManager]:
-    search = MovieSearchService()
-    # Use WeekendPricing (weekend surcharge = 1.25x) and PeakPricing (evenings = 1.5x)
-    # Combined via a CompositePricing-like approach or chaining:
-    # Here we use WeekendPricing for the demo — the user can see the surcharge applied
-    manager = BookingManager(WeekendPricing(weekend_surcharge=1.25))
+class FakeClock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
 
-    # Add movies
-    movie1 = Movie("M1", "Inception", Genre.SCI_FI, 148, "English", 8.8)
-    movie2 = Movie("M2", "The Dark Knight", Genre.ACTION, 152, "English", 9.0)
-    movie3 = Movie("M3", "3 Idiots", Genre.COMEDY, 170, "Hindi", 8.4)
-    search.add_movie(movie1)
-    search.add_movie(movie2)
-    search.add_movie(movie3)
+    def __call__(self) -> datetime:
+        return self.now
 
-    # Add theatres
-    theatre1 = Theatre("T1", "PVR Cinemas", City.MUMBAI, "Andheri West")
-    theatre2 = Theatre("T2", "INOX", City.BANGALORE, "Forum Mall")
-
-    # Setup screens and seats
-    for theatre in [theatre1, theatre2]:
-        screen = Screen(f"S1_{theatre.theatre_id}", "Screen 1")
-        for row in "ABCDEF":
-            for num in range(1, 11):
-                category = "VIP" if row <= "B" else ("Premium" if row <= "D" else "Regular")
-                seat = Seat(f"{row}{num}", row, num, category)
-                screen.add_seat(seat)
-        theatre.add_screen(screen)
-
-    # Add shows (tomorrow at various times)
-    tomorrow = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    for i, movie in enumerate([movie1, movie2, movie3]):
-        show = Show(f"SH{i+1}", movie, theatre1.get_screen("S1_T1"),
-                    theatre1, tomorrow + timedelta(hours=3 * (i + 1)))
-        search.add_show(show)
-
-    return search, manager
+    def advance(self, **kw: float) -> None:
+        self.now += timedelta(**kw)
 
 
-def demo():
-    print("=== Movie Ticket Booking System (BookMyShow) ===")
-    print("=" * 50)
+def build_demo() -> tuple[BookingService, FakeClock, FakePaymentGateway]:
+    clock = FakeClock(datetime(2026, 10, 9, 12, 0))           # a Friday
+    gateway = FakePaymentGateway()
+    service = BookingService(gateway, CompositePricing(PeakHourPricing(), WeekendPricing()), clock)
+    screen = Screen.with_rows("S1", "Audi 1", {"A": SeatCategory.VIP, "B": SeatCategory.PREMIUM,
+                                               "C": SeatCategory.REGULAR, "D": SeatCategory.REGULAR}, 8)
+    pvr = Theatre("T1", "PVR Phoenix", City.MUMBAI)
+    inception = Movie("M1", "Inception", Genre.SCI_FI, 148, "English")
+    prices = {SeatCategory.REGULAR: Decimal("200"), SeatCategory.PREMIUM: Decimal("320"),
+              SeatCategory.VIP: Decimal("450")}
+    for show_id, start in (("SH1", datetime(2026, 10, 9, 13, 0)),
+                           ("SH2", datetime(2026, 10, 9, 19, 0)),
+                           ("SH3", datetime(2026, 10, 10, 19, 0))):
+        service.add_show(Show(show_id, inception, pvr, screen, start, prices))
+    return service, clock, gateway
 
-    search, manager = setup_system()
 
-    # Search
-    print("\n--- Search: Movies in Mumbai ---")
-    shows = search.search_by_city(City.MUMBAI)
-    for show in shows:
-        print(f"  {show}")
-        avail = show.screen.get_available_seats()
-        print(f"    Available seats: {len(avail)}")
+def demo() -> None:
+    service, clock, gateway = build_demo()
 
-    # Book tickets (with pricing strategy applied!)
-    print("\n--- Booking ---")
-    show = shows[0]
-    seat_ids = [s.seat_id for s in show.screen.get_available_seats()[:3]]
-    print(f"  Booking '{show.movie.title}' - Seats: {', '.join(seat_ids)}")
-    if show.start_time.weekday() >= 5:
-        print(f"  (Weekend surcharge 1.25x will be applied)")
+    print("=== Search ===")
+    for s in service.search(city=City.MUMBAI, movie_id="M1"):
+        print(f"  {s.show_id}: {s}  free={len(service.available_seats(s.show_id))}")
 
-    booking = manager.create_booking(show, "user_123", seat_ids)
-    manager.confirm_booking(booking.booking_id)
+    print("\n=== Hold + pay (Saturday evening: peak x1.2 then weekend x1.25) ===")
+    b1 = service.hold_seats("SH3", "asha", ["A1", "A2", "C5"])
+    print(f"  {b1.booking_id} held {b1.seat_ids} until {b1.expires_at:%H:%M}: "
+          + ", ".join(f"{k}=₹{v}" for k, v in b1.line_prices.items()) + f"  total ₹{b1.total}")
+    service.pay_and_confirm(b1.booking_id)
+    service.pay_and_confirm(b1.booking_id)   # client retry: no second charge
+    print(f"  {b1.booking_id}: {b1.status.value}, charges recorded: {len(gateway.charges)}")
 
-    # Try booking same seats (should fail — double-booking prevention)
-    print("\n--- Attempt Double Booking ---")
+    print("\n=== Same seat, different show is independent ===")
+    b2 = service.hold_seats("SH1", "ravi", ["A1"])
+    print(f"  SH1 A1 -> {b2.booking_id} {b2.status.value}")
+
+    print("\n=== Double booking is rejected, all-or-nothing ===")
     try:
-        manager.create_booking(show, "user_456", seat_ids[:1])
-    except ValueError as e:
-        print(f"  ⚠️  Double booking prevented: {e}")
+        service.hold_seats("SH3", "vik", ["C4", "C5"])
+    except SeatUnavailable as e:
+        print(f"  rejected: {e}; C4 still free: {'C4' in service.available_seats('SH3')}")
 
-    # Cancel booking
-    print("\n--- Cancellation ---")
-    manager.cancel_booking(booking.booking_id)
+    print("\n=== Hold expires while the user is paying ===")
+    slow = service.hold_seats("SH2", "meera", ["B3"])
+    taken_by: list[Booking] = []
 
-    # Verify seats are available again
-    avail = show.screen.get_available_seats()
-    print(f"\n  Available after cancel: {len(avail)} seats")
+    def gateway_takes_11_minutes() -> None:
+        gateway.during_charge = None
+        clock.advance(minutes=11)                               # meera's hold lapses...
+        taken_by.append(service.hold_seats("SH2", "dev", ["B3"]))  # ...and dev grabs B3
 
-    # Demo: Show pricing strategy output on a weekend show
-    print("\n--- Pricing Strategy Demo ---")
-    weekend_booking = manager.create_booking(
-        show, "user_789",
-        [s.seat_id for s in show.screen.get_available_seats()[:2]]
-    )
-    print(f"  Total paid: ${weekend_booking.total_amount:.2f}")
-    manager.confirm_booking(weekend_booking.booking_id)
+    gateway.during_charge = gateway_takes_11_minutes
+    try:
+        service.pay_and_confirm(slow.booking_id)
+    except HoldExpired as e:
+        print(f"  meera: {e}")
+    service.pay_and_confirm(taken_by[0].booking_id)
+    print(f"  dev: {taken_by[0].status.value}; meera {slow.status.value}; "
+          f"charges={len(gateway.charges)} refunds={len(gateway.refunds)}")
 
-    print("\n✅ Demo complete!")
+    print("\n=== Cancel a confirmed booking ===")
+    service.cancel(b1.booking_id)
+    print(f"  {b1.booking_id}: {b1.status.value}; A1 free again: {'A1' in service.available_seats('SH3')}")
+    print(f"  sweeper expired {service.release_expired()} stale hold(s)")
 
 
 if __name__ == "__main__":

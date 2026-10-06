@@ -1,1108 +1,618 @@
 /**
- * Meeting Scheduler - Low Level Design (Java)
- * --------------------------------------------
- * Design Principles: SOLID, Strategy Pattern, Observer Pattern, Command Pattern
+ * Meeting Scheduler - Low Level Design (Java 17+)
+ * ------------------------------------------------
+ * Run:  java MeetingSchedulerSystem.java   (single-file source launcher; main self-checks and
+ *                                            throws AssertionError if any behaviour breaks)
  *
- * Key Design Decisions:
- * - Calendar as aggregate root for time-slot management
- * - Conflict detection using interval tree structure
- * - Observer pattern for notifications (email, calendar invites)
- * - Strategy pattern for room booking policies
- * - Command pattern for undoable operations (cancel/rebook)
- * - Recurring meeting expansion with exception handling
- * - Room recommendation based on attendee count and amenities
- * - Meeting analytics for usage tracking
+ * Scope: rooms and participants each own a calendar. Schedule a meeting (explicit room or
+ * auto-allocated), cancel, reschedule, find common free slots across attendees in different
+ * time zones, and propose the earliest slot that also has a suitable room.
+ *
+ * Key design decisions:
+ *   - Time is an Instant; a TimeSlot is HALF-OPEN [start, end), so 9:00-10:00 and 10:00-11:00
+ *     do not conflict. Working hours are evaluated in each participant's own ZoneId.
+ *   - IntervalCalendar = TreeMap of non-overlapping entries keyed by start. Only the floor and
+ *     higher neighbours of a new start can overlap it, so the conflict check is O(log n).
+ *   - Booking is all-or-nothing across the room and every attendee. The scheduler locks all the
+ *     involved calendars in one canonical order (sorted by key), checks every one, then inserts
+ *     into every one. Ordered acquisition makes deadlock impossible; holding all the locks makes
+ *     check-then-insert atomic. No global lock: meetings with disjoint people and rooms run in
+ *     parallel.
+ *   - Free-slot search: collect busy intervals of all attendees (meetings + outside working
+ *     hours), sort, sweep once to find gaps. O(N log N) in the number of busy intervals.
+ *   - Room choice is a Strategy (best fit: smallest room that seats everyone and has the
+ *     required features), so a big room is not wasted on a 1:1.
  */
 
 import java.time.*;
-import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
-import java.time.temporal.TemporalAdjusters;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.stream.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
-// ============================================================
-// ENUMS & VALUE OBJECTS
-// ============================================================
-
-enum MeetingStatus { SCHEDULED, ONGOING, COMPLETED, CANCELLED, RESCHEDULED }
-
-enum ParticipantStatus { PENDING, ACCEPTED, DECLINED, TENTATIVE }
-
-enum RecurrencePattern { NONE, DAILY, WEEKLY, BIWEEKLY, MONTHLY, YEARLY }
-
-enum RoomFeature {
-    PROJECTOR, WHITEBOARD, VIDEO_CONF, CATERING, PHONE,
-    STANDING_DESK, STAGE, SOUND_SYSTEM, LARGE_SCREEN
-}
-
-record TimeSlot(LocalDateTime start, LocalDateTime end) {
-    public TimeSlot {
-        if (!end.isAfter(start)) {
-            throw new IllegalArgumentException("End must be after start");
-        }
-    }
-
-    public Duration duration() { return Duration.between(start, end); }
-
-    public long durationMinutes() { return ChronoUnit.MINUTES.between(start, end); }
-
-    public boolean overlaps(TimeSlot other) {
-        return !start.isAfter(other.end) && !other.start.isAfter(end);
-    }
-
-    public boolean contains(LocalDateTime point) {
-        return !point.isBefore(start) && point.isBefore(end);
-    }
-
-    public boolean isWithinWorkingHours() {
-        int startHour = start.getHour();
-        int endHour = end.getHour();
-        return startHour >= 9 && endHour <= 18 && start.getDayOfWeek() != DayOfWeek.SATURDAY
-            && start.getDayOfWeek() != DayOfWeek.SUNDAY;
-    }
-
-    public TimeSlot shift(Duration offset) {
-        return new TimeSlot(start.plus(offset), end.plus(offset));
-    }
-}
-
-record Participant(String id, String name, String email, String department,
-                   String timezone, boolean isAssistant) {
-    public Participant(String id, String name, String email) {
-        this(id, name, email, "General", "UTC", false);
-    }
-}
-
-record Room(String id, String name, int capacity, String building, int floor,
-            List<RoomFeature> features) {
-    public Room(String id, String name, int capacity, List<String> featureNames) {
-        this(id, name, capacity, "Building A", 1,
-            featureNames.stream()
-                .map(n -> {
-                    try { return RoomFeature.valueOf(n); }
-                    catch (IllegalArgumentException e) { return null; }
-                })
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList()));
-    }
-
-    public boolean hasAllFeatures(List<RoomFeature> required) {
-        return features.containsAll(required);
-    }
-
-    public boolean canAccommodate(int attendeeCount) {
-        return capacity >= attendeeCount;
-    }
-
-    public int scoreForMeeting(int attendeeCount, List<RoomFeature> required) {
-        int score = 0;
-        // Capacity match (closer to attendee count = better, but not under)
-        if (capacity < attendeeCount) return -1;
-        score += 10 - (capacity - attendeeCount) / 5; // Prefer right-sized rooms
-
-        // Feature match
-        for (RoomFeature f : required) {
-            if (features.contains(f)) score += 5;
-        }
-        return score;
+/** Entry point. Must be the first top-level class: `java File.java` runs the first class it finds. */
+public class MeetingSchedulerSystem {
+    public static void main(String[] args) throws Exception {
+        MeetingDemo.run();
     }
 }
 
 // ============================================================
-// MEETING SERIES (Recurring Meeting Support)
+// VALUE TYPES
 // ============================================================
 
-class MeetingSeries {
-    private final String seriesId;
-    private final String title;
-    private final String description;
-    private final TimeSlot templateSlot;  // The original time slot
-    private final RecurrencePattern pattern;
-    private final List<Participant> attendees;
-    private final Participant organizer;
-    private final Room preferredRoom;
-    private final LocalDate seriesStart;
-    private final LocalDate seriesEnd;
-    private final Set<LocalDate> exceptionDates; // Dates where meeting is cancelled
-    private final Map<LocalDate, TimeSlot> modifiedSlots; // Date -> modified time
-    private final int maxInstances;
-
-    public MeetingSeries(String seriesId, String title, String description,
-                         TimeSlot templateSlot, RecurrencePattern pattern,
-                         List<Participant> attendees, Participant organizer,
-                         Room preferredRoom, LocalDate seriesStart, LocalDate seriesEnd) {
-        this.seriesId = seriesId;
-        this.title = title;
-        this.description = description;
-        this.templateSlot = templateSlot;
-        this.pattern = pattern;
-        this.attendees = new CopyOnWriteArrayList<>(attendees);
-        this.organizer = organizer;
-        this.preferredRoom = preferredRoom;
-        this.seriesStart = seriesStart;
-        this.seriesEnd = seriesEnd;
-        this.exceptionDates = ConcurrentHashMap.newKeySet();
-        this.modifiedSlots = new ConcurrentHashMap<>();
-        this.maxInstances = 52; // Default: 1 year of weekly meetings
+/** Half-open [start, end). */
+record TimeSlot(Instant start, Instant end) {
+    TimeSlot {
+        Objects.requireNonNull(start);
+        Objects.requireNonNull(end);
+        if (!end.isAfter(start)) throw new IllegalArgumentException("end must be after start");
     }
 
-    public List<MeetingInstance> expand(LocalDate fromDate, LocalDate toDate) {
-        List<MeetingInstance> instances = new ArrayList<>();
-        LocalDate current = fromDate.isAfter(seriesStart) ? fromDate : seriesStart;
+    static TimeSlot of(Instant start, Duration d) { return new TimeSlot(start, start.plus(d)); }
 
-        int count = 0;
-        while (!current.isAfter(toDate) && !current.isAfter(seriesEnd) && count < maxInstances) {
-            boolean shouldSchedule = switch (pattern) {
-                case NONE -> false;
-                case DAILY -> true;
-                case WEEKLY -> current.getDayOfWeek() == templateSlot.start().getDayOfWeek();
-                case BIWEEKLY -> current.getDayOfWeek() == templateSlot.start().getDayOfWeek()
-                    && (ChronoUnit.WEEKS.between(seriesStart, current) % 2 == 0);
-                case MONTHLY -> current.getDayOfMonth() == templateSlot.start().getDayOfMonth();
-                case YEARLY -> current.getDayOfYear() == templateSlot.start().getDayOfYear();
-            };
+    Duration duration() { return Duration.between(start, end); }
 
-            if (shouldSchedule && !exceptionDates.contains(current)) {
-                LocalTime startTime = templateSlot.start().toLocalTime();
-                LocalTime endTime = templateSlot.end().toLocalTime();
+    boolean overlaps(TimeSlot o) { return start.isBefore(o.end) && o.start.isBefore(end); }
 
-                // Check for modified time on this date
-                TimeSlot slot = modifiedSlots.getOrDefault(current,
-                    new TimeSlot(LocalDateTime.of(current, startTime),
-                                 LocalDateTime.of(current, endTime)));
+    /** Intersection with another slot, if non-empty. */
+    Optional<TimeSlot> clip(TimeSlot o) {
+        Instant s = start.isAfter(o.start) ? start : o.start;
+        Instant e = end.isBefore(o.end) ? end : o.end;
+        return e.isAfter(s) ? Optional.of(new TimeSlot(s, e)) : Optional.empty();
+    }
+}
 
-                if (slot.start().getDayOfWeek() != DayOfWeek.SATURDAY
-                    && slot.start().getDayOfWeek() != DayOfWeek.SUNDAY) {
-                    instances.add(new MeetingInstance(
-                        seriesId + "-" + count,
-                        title, description, slot, organizer,
-                        attendees, preferredRoom, seriesId, current));
-                    count++;
-                }
+enum Feature { VIDEO_CONF, WHITEBOARD, PROJECTOR }
+
+record Room(String id, int capacity, Set<Feature> features) {
+    Room { features = Set.copyOf(features); }
+    boolean fits(int headcount, Set<Feature> required) { return capacity >= headcount && features.containsAll(required); }
+}
+
+/** Working hours are local to the participant's zone, Monday to Friday. */
+record Participant(String id, ZoneId zone, LocalTime workStart, LocalTime workEnd) {
+    Participant(String id, ZoneId zone) { this(id, zone, LocalTime.of(9, 0), LocalTime.of(17, 0)); }
+
+    /** Intervals inside the window when this person is NOT working (nights, weekends). */
+    List<TimeSlot> offHours(TimeSlot window) {
+        List<TimeSlot> out = new ArrayList<>();
+        LocalDate day = window.start().atZone(zone).toLocalDate().minusDays(1);
+        LocalDate last = window.end().atZone(zone).toLocalDate().plusDays(1);
+        for (; !day.isAfter(last); day = day.plusDays(1)) {
+            Instant dayStart = day.atStartOfDay(zone).toInstant();          // DST-safe
+            Instant dayEnd = day.plusDays(1).atStartOfDay(zone).toInstant();
+            DayOfWeek dow = day.getDayOfWeek();
+            if (dow == DayOfWeek.SATURDAY || dow == DayOfWeek.SUNDAY) {
+                new TimeSlot(dayStart, dayEnd).clip(window).ifPresent(out::add);
+            } else {
+                Instant ws = day.atTime(workStart).atZone(zone).toInstant();
+                Instant we = day.atTime(workEnd).atZone(zone).toInstant();
+                new TimeSlot(dayStart, ws).clip(window).ifPresent(out::add);
+                new TimeSlot(we, dayEnd).clip(window).ifPresent(out::add);
             }
-
-            current = current.plusDays(1);
         }
-
-        return instances;
+        return out;
     }
-
-    public void cancelInstance(LocalDate date) {
-        exceptionDates.add(date);
-    }
-
-    public void modifyInstance(LocalDate date, TimeSlot newSlot) {
-        if (!exceptionDates.contains(date)) {
-            modifiedSlots.put(date, newSlot);
-        }
-    }
-
-    public String getSeriesId() { return seriesId; }
-    public RecurrencePattern getPattern() { return pattern; }
 }
 
-record MeetingInstance(String id, String title, String description,
-                       TimeSlot slot, Participant organizer,
-                       List<Participant> attendees, Room room,
-                       String seriesId, LocalDate date) {
-    public boolean isRecurring() { return seriesId != null; }
+enum MeetingStatus { SCHEDULED, CANCELLED }
+
+/** What the caller asks for. roomId == null means "pick a room for me". */
+record MeetingRequest(String title, String organizerId, Set<String> attendeeIds, TimeSlot slot,
+                      Set<Feature> requiredFeatures, String roomId) {
+    MeetingRequest {
+        Set<String> all = new TreeSet<>(attendeeIds);
+        all.add(organizerId);                                  // organizer always attends
+        attendeeIds = Collections.unmodifiableSet(all);
+        requiredFeatures = Set.copyOf(requiredFeatures);
+    }
+}
+
+record Proposal(TimeSlot slot, Room room) {}
+
+class ConflictException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    ConflictException(String msg) { super(msg); }
 }
 
 // ============================================================
 // MEETING
 // ============================================================
 
-class Meeting {
+final class Meeting {
     private final String id;
     private final String title;
-    private final String description;
-    private TimeSlot slot;
-    private final Participant organizer;
-    private final List<Participant> attendees;
-    private final Map<String, ParticipantStatus> responses;
-    private Room room;
-    private volatile MeetingStatus status;
-    private final RecurrencePattern recurrence;
-    private final String seriesId;
-    private final LocalDateTime createdAt;
-    private LocalDateTime lastModifiedAt;
-    private final List<String> notes;
-    private String cancellationReason;
+    private final String organizerId;
+    private final Set<String> attendeeIds;
+    private final String roomId;
+    // Mutated only while the scheduler holds the locks of ALL this meeting's calendars.
+    private volatile TimeSlot slot;
+    private volatile MeetingStatus status = MeetingStatus.SCHEDULED;
 
-    public Meeting(String id, String title, String description, TimeSlot slot,
-                   Participant organizer, List<Participant> attendees,
-                   Room room, RecurrencePattern recurrence, String seriesId) {
+    Meeting(String id, String title, String organizerId, Set<String> attendeeIds, String roomId, TimeSlot slot) {
         this.id = id;
         this.title = title;
-        this.description = description;
+        this.organizerId = organizerId;
+        this.attendeeIds = Set.copyOf(attendeeIds);
+        this.roomId = roomId;
         this.slot = slot;
-        this.organizer = organizer;
-        this.attendees = new CopyOnWriteArrayList<>(attendees);
-        this.responses = new ConcurrentHashMap<>();
-        this.room = room;
-        this.status = MeetingStatus.SCHEDULED;
-        this.recurrence = recurrence;
-        this.seriesId = seriesId;
-        this.createdAt = LocalDateTime.now();
-        this.lastModifiedAt = LocalDateTime.now();
-        this.notes = new CopyOnWriteArrayList<>();
-
-        // Organizer auto-accepts
-        responses.put(organizer.email(), ParticipantStatus.ACCEPTED);
-        // Attendees start as PENDING
-        attendees.forEach(a -> responses.putIfAbsent(a.email(), ParticipantStatus.PENDING));
     }
 
-    // Getters
-    public String getId() { return id; }
-    public String getTitle() { return title; }
-    public TimeSlot getSlot() { return slot; }
-    public Participant getOrganizer() { return organizer; }
-    public List<Participant> getAttendees() { return List.copyOf(attendees); }
-    public Room getRoom() { return room; }
-    public MeetingStatus getStatus() { return status; }
-    public RecurrencePattern getRecurrence() { return recurrence; }
-    public String getSeriesId() { return seriesId; }
-    public boolean isRecurring() { return seriesId != null; }
-    public String getCancellationReason() { return cancellationReason; }
+    String id() { return id; }
+    String title() { return title; }
+    String organizerId() { return organizerId; }
+    Set<String> attendeeIds() { return attendeeIds; }
+    String roomId() { return roomId; }
+    TimeSlot slot() { return slot; }
+    MeetingStatus status() { return status; }
+    void moveTo(TimeSlot s) { slot = s; }
+    void markCancelled() { status = MeetingStatus.CANCELLED; }
 
-    public Map<String, ParticipantStatus> getResponses() { return Map.copyOf(responses); }
+    @Override public String toString() { return "%s '%s' %s %s [%s]".formatted(id, title, roomId, slot, status); }
+}
 
-    public synchronized void reschedule(TimeSlot newSlot) {
-        this.slot = newSlot;
-        this.status = MeetingStatus.RESCHEDULED;
-        this.lastModifiedAt = LocalDateTime.now();
-        // Reset attendee statuses
-        attendees.forEach(a -> responses.put(a.email(), ParticipantStatus.PENDING));
-    }
+// ============================================================
+// INTERVAL CALENDAR (one per room and per participant)
+// ============================================================
 
-    public synchronized void cancel(String reason) {
-        this.status = MeetingStatus.CANCELLED;
-        this.cancellationReason = reason;
-        this.lastModifiedAt = LocalDateTime.now();
-    }
+record CalendarEntry(String meetingId, TimeSlot slot) {}
 
-    public synchronized void respond(String email, ParticipantStatus status) {
-        responses.put(email, status);
-    }
+final class IntervalCalendar {
+    private final String key;                                   // "person:alice", "room:R1" - defines lock order
+    final ReentrantLock lock = new ReentrantLock();
+    private final TreeMap<Instant, CalendarEntry> byStart = new TreeMap<>();   // guarded by lock
 
-    public synchronized void start() { this.status = MeetingStatus.ONGOING; }
-    public synchronized void complete() { this.status = MeetingStatus.COMPLETED; }
+    IntervalCalendar(String key) { this.key = key; }
+    String key() { return key; }
 
-    public synchronized void addNote(String note) { notes.add(note); }
-    public List<String> getNotes() { return List.copyOf(notes); }
-
-    public boolean allAccepted() {
-        return attendees.stream()
-            .allMatch(a -> responses.getOrDefault(a.email(), ParticipantStatus.PENDING)
-                          == ParticipantStatus.ACCEPTED);
-    }
-
-    public boolean hasAcceptedCount() {
-        return attendees.stream()
-            .filter(a -> responses.getOrDefault(a.email(), ParticipantStatus.PENDING)
-                      == ParticipantStatus.ACCEPTED)
-            .count();
-    }
-
-    @Override
-    public String toString() {
-        return String.format("Meeting[%s] '%s' %s-%s (%s) Room=%s Status=%s",
-            id, title, slot.start().toLocalTime(), slot.end().toLocalTime(),
-            slot.start().toLocalDate(), room.name(), status);
-    }
-
-    public String toDetailedString() {
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format("╔══════════════════════════════════╗%n"));
-        sb.append(String.format("║ %-32s ║%n", title));
-        sb.append(String.format("╠══════════════════════════════════╣%n"));
-        sb.append(String.format("║ ID:     %-24s ║%n", id));
-        sb.append(String.format("║ Date:   %-24s ║%n", slot.start().toLocalDate()));
-        sb.append(String.format("║ Time:   %s - %s        ║%n",
-            slot.start().toLocalTime(), slot.end().toLocalTime()));
-        sb.append(String.format("║ Room:   %-24s ║%n", room.name()));
-        sb.append(String.format("║ Status: %-24s ║%n", status));
-        sb.append(String.format("║ Organizer: %-20s ║%n", organizer.name()));
-        sb.append(String.format("║ Attendees: %d/%-18d ║%n",
-            hasAcceptedCount(), attendees.size()));
-        if (isRecurring()) {
-            sb.append(String.format("║ Series: %-22s ║%n", seriesId));
-            sb.append(String.format("║ Pattern: %-22s ║%n", recurrence));
+    /** The entry that overlaps the slot, if any. O(log n): only two neighbours can overlap. */
+    Optional<CalendarEntry> conflict(TimeSlot s) {
+        lock.lock();
+        try {
+            Map.Entry<Instant, CalendarEntry> before = byStart.floorEntry(s.start());
+            if (before != null && before.getValue().slot().overlaps(s)) return Optional.of(before.getValue());
+            Map.Entry<Instant, CalendarEntry> after = byStart.higherEntry(s.start());
+            if (after != null && after.getKey().isBefore(s.end())) return Optional.of(after.getValue());
+            return Optional.empty();
+        } finally {
+            lock.unlock();
         }
-        sb.append(String.format("╚══════════════════════════════════╝"));
-        return sb.toString();
+    }
+
+    /** Caller must already have checked conflict() under the same lock hold. */
+    void add(String meetingId, TimeSlot s) {
+        lock.lock();
+        try {
+            byStart.put(s.start(), new CalendarEntry(meetingId, s));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    void remove(String meetingId, TimeSlot s) {
+        lock.lock();
+        try {
+            CalendarEntry e = byStart.get(s.start());
+            if (e != null && e.meetingId().equals(meetingId)) byStart.remove(s.start());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Entries overlapping the window, in start order. */
+    List<CalendarEntry> entries(TimeSlot window) {
+        lock.lock();
+        try {
+            Instant from = Optional.ofNullable(byStart.floorKey(window.start())).orElse(window.start());
+            return byStart.subMap(from, true, window.end(), false).values().stream()
+                    .filter(e -> e.slot().overlaps(window)).collect(Collectors.toList());
+        } finally {
+            lock.unlock();
+        }
     }
 }
 
 // ============================================================
-// ROOM BOOKING POLICY (Strategy Pattern)
+// ROOM ALLOCATION (Strategy)
 // ============================================================
 
-interface RoomBookingPolicy {
-    boolean canBook(Room room, TimeSlot slot, int attendeeCount, List<RoomFeature> requiredFeatures);
-    String rejectionReason();
+interface RoomAllocationStrategy {
+    /** Rooms that satisfy the request, best first. */
+    List<Room> rank(Collection<Room> rooms, int headcount, Set<Feature> required);
 }
 
-class StandardBookingPolicy implements RoomBookingPolicy {
+/** Smallest room that fits, then fewest unneeded features, then id (deterministic). */
+final class BestFitRoomStrategy implements RoomAllocationStrategy {
     @Override
-    public boolean canBook(Room room, TimeSlot slot, int attendeeCount, List<RoomFeature> requiredFeatures) {
-        return room.capacity() >= attendeeCount
-            && slot.durationMinutes() >= 15
-            && slot.durationMinutes() <= 480  // Max 8 hours
-            && room.hasAllFeatures(requiredFeatures);
-    }
-
-    @Override
-    public String rejectionReason() { return "Room does not meet standard booking criteria"; }
-}
-
-class ExecutiveBookingPolicy implements RoomBookingPolicy {
-    @Override
-    public boolean canBook(Room room, TimeSlot slot, int attendeeCount, List<RoomFeature> requiredFeatures) {
-        return room.capacity() >= attendeeCount
-            && room.hasAllFeatures(requiredFeatures)
-            && (room.features().contains(RoomFeature.VIDEO_CONF)
-                || room.features().contains(RoomFeature.PROJECTOR));
-    }
-
-    @Override
-    public String rejectionReason() { return "Room lacks executive features (projector/video conf)"; }
-}
-
-class CompositingBookingPolicy implements RoomBookingPolicy {
-    private final List<RoomBookingPolicy> policies;
-
-    public CompositingBookingPolicy(RoomBookingPolicy... policies) {
-        this.policies = Arrays.asList(policies);
-    }
-
-    @Override
-    public boolean canBook(Room room, TimeSlot slot, int attendeeCount, List<RoomFeature> requiredFeatures) {
-        return policies.stream().allMatch(p -> p.canBook(room, slot, attendeeCount, requiredFeatures));
-    }
-
-    @Override
-    public String rejectionReason() {
-        return policies.stream()
-            .map(RoomBookingPolicy::rejectionReason)
-            .collect(Collectors.joining("; "));
+    public List<Room> rank(Collection<Room> rooms, int headcount, Set<Feature> required) {
+        return rooms.stream()
+                .filter(r -> r.fits(headcount, required))
+                .sorted(Comparator.comparingInt(Room::capacity)
+                        .thenComparingInt((Room r) -> r.features().size())
+                        .thenComparing(Room::id))
+                .collect(Collectors.toList());
     }
 }
 
 // ============================================================
-// CONFLICT DETECTOR (Interval Tree Based)
+// SCHEDULER (Facade)
 // ============================================================
 
-class ConflictDetector {
-    private final Map<String, NavigableSet<TimeSlot>> roomCalendar;
-    private final Map<String, NavigableSet<TimeSlot>> participantCalendar;
+final class MeetingScheduler {
+    static final Duration GRID = Duration.ofMinutes(15);
 
-    public ConflictDetector() {
-        this.roomCalendar = new ConcurrentHashMap<>();
-        this.participantCalendar = new ConcurrentHashMap<>();
+    private final Map<String, Room> rooms;
+    private final Map<String, Participant> people;
+    private final Map<String, IntervalCalendar> calendars;     // fixed after construction
+    private final Map<String, Meeting> meetings = new ConcurrentHashMap<>();
+    private final RoomAllocationStrategy allocation;
+    private final AtomicLong ids = new AtomicLong();
+
+    MeetingScheduler(List<Room> rooms, List<Participant> people, RoomAllocationStrategy allocation) {
+        this.rooms = rooms.stream().collect(Collectors.toUnmodifiableMap(Room::id, r -> r));
+        this.people = people.stream().collect(Collectors.toUnmodifiableMap(Participant::id, p -> p));
+        Map<String, IntervalCalendar> cals = new HashMap<>();
+        rooms.forEach(r -> cals.put(roomKey(r.id()), new IntervalCalendar(roomKey(r.id()))));
+        people.forEach(p -> cals.put(personKey(p.id()), new IntervalCalendar(personKey(p.id()))));
+        this.calendars = Map.copyOf(cals);
+        this.allocation = allocation;
     }
 
-    public void addEntry(String roomId, TimeSlot slot) {
-        roomCalendar.computeIfAbsent(roomId, k -> new ConcurrentSkipListSet<>(
-            Comparator.comparing((TimeSlot s) -> s.start()).thenComparing(s -> s.end())
-        )).add(slot);
+    /** Book atomically across the room and every attendee, or throw ConflictException and change nothing. */
+    Meeting schedule(MeetingRequest req) {
+        req.attendeeIds().forEach(this::person);
+        int headcount = req.attendeeIds().size();
+        List<Room> candidates;
+        if (req.roomId() != null) {
+            Room r = room(req.roomId());
+            if (!r.fits(headcount, req.requiredFeatures())) {
+                throw new IllegalArgumentException(r.id() + " does not fit " + headcount + " with " + req.requiredFeatures());
+            }
+            candidates = List.of(r);
+        } else {
+            candidates = allocation.rank(rooms.values(), headcount, req.requiredFeatures());
+            if (candidates.isEmpty()) throw new IllegalArgumentException("no room fits " + headcount + " with " + req.requiredFeatures());
+        }
+        String id = "M-" + ids.incrementAndGet();
+        for (Room room : candidates) {
+            List<IntervalCalendar> involved = calendarsFor(req.attendeeIds(), room.id());
+            Meeting booked = withLocks(involved, () -> {
+                for (String pid : req.attendeeIds()) {
+                    calendar(personKey(pid)).conflict(req.slot()).ifPresent(c -> {
+                        throw new ConflictException(pid + " is busy (" + c.meetingId() + ")");
+                    });
+                }
+                if (calendar(roomKey(room.id())).conflict(req.slot()).isPresent()) return null;   // try next room
+                Meeting m = new Meeting(id, req.title(), req.organizerId(), req.attendeeIds(), room.id(), req.slot());
+                involved.forEach(c -> c.add(id, req.slot()));
+                meetings.put(id, m);
+                return m;
+            });
+            if (booked != null) return booked;
+        }
+        throw new ConflictException("no suitable room free for " + req.slot());
     }
 
-    public void addParticipantEntry(String email, TimeSlot slot) {
-        participantCalendar.computeIfAbsent(email, k -> new ConcurrentSkipListSet<>(
-            Comparator.comparing((TimeSlot s) -> s.start()).thenComparing(s -> s.end())
-        )).add(slot);
+    void cancel(String meetingId) {
+        Meeting m = meeting(meetingId);
+        withLocks(calendarsFor(m.attendeeIds(), m.roomId()), () -> {
+            if (m.status() == MeetingStatus.CANCELLED) throw new IllegalStateException(meetingId + " already cancelled");
+            calendarsFor(m.attendeeIds(), m.roomId()).forEach(c -> c.remove(m.id(), m.slot()));
+            m.markCancelled();
+            return null;
+        });
     }
 
-    public void removeEntry(String roomId, TimeSlot slot) {
-        NavigableSet<TimeSlot> slots = roomCalendar.get(roomId);
-        if (slots != null) slots.remove(slot);
+    /** Move to a new slot in the same room. Atomic: on conflict the meeting stays where it was. */
+    void reschedule(String meetingId, TimeSlot newSlot) {
+        Meeting m = meeting(meetingId);
+        List<IntervalCalendar> involved = calendarsFor(m.attendeeIds(), m.roomId());
+        withLocks(involved, () -> {
+            if (m.status() == MeetingStatus.CANCELLED) throw new IllegalStateException(meetingId + " is cancelled");
+            TimeSlot old = m.slot();
+            involved.forEach(c -> c.remove(m.id(), old));       // so the meeting doesn't conflict with itself
+            for (IntervalCalendar c : involved) {
+                Optional<CalendarEntry> clash = c.conflict(newSlot);
+                if (clash.isPresent()) {
+                    involved.forEach(x -> x.add(m.id(), old));  // roll back; nobody saw the gap (locks held)
+                    throw new ConflictException(c.key() + " is busy (" + clash.get().meetingId() + ")");
+                }
+            }
+            involved.forEach(c -> c.add(m.id(), newSlot));
+            m.moveTo(newSlot);
+            return null;
+        });
     }
 
-    public void removeParticipantEntry(String email, TimeSlot slot) {
-        NavigableSet<TimeSlot> slots = participantCalendar.get(email);
-        if (slots != null) slots.remove(slot);
+    /**
+     * Grid-aligned slots of the given length inside the window when EVERY attendee is free and
+     * within their working hours. Sweep over the merged busy intervals: O(N log N).
+     */
+    List<TimeSlot> findFreeSlots(Set<String> attendeeIds, Duration length, TimeSlot window, int limit) {
+        List<TimeSlot> out = new ArrayList<>();
+        for (TimeSlot gap : commonGaps(attendeeIds, window)) {
+            for (Instant s = alignUp(gap.start()); !s.plus(length).isAfter(gap.end()) && out.size() < limit; s = s.plus(GRID)) {
+                out.add(TimeSlot.of(s, length));
+            }
+            if (out.size() >= limit) break;
+        }
+        return out;
     }
 
-    public Optional<TimeSlot> findConflict(String roomId, TimeSlot slot) {
-        NavigableSet<TimeSlot> slots = roomCalendar.get(roomId);
-        if (slots == null) return Optional.empty();
-
-        // Check nearby slots for overlap (O(log n))
-        TimeSlot floor = slots.floor(slot);
-        if (floor != null && floor.overlaps(slot)) return Optional.of(floor);
-        TimeSlot ceil = slots.ceiling(slot);
-        if (ceil != null && ceil.overlaps(slot)) return Optional.of(ceil);
-
+    /** Earliest slot where all attendees are free AND a suitable room is free. Advisory: book with schedule(). */
+    Optional<Proposal> proposeEarliest(Set<String> attendeeIds, Duration length, TimeSlot window, Set<Feature> required) {
+        List<Room> fitting = allocation.rank(rooms.values(), attendeeIds.size(), required);
+        for (TimeSlot gap : commonGaps(attendeeIds, window)) {
+            for (Instant s = alignUp(gap.start()); !s.plus(length).isAfter(gap.end()); s = s.plus(GRID)) {
+                TimeSlot slot = TimeSlot.of(s, length);
+                for (Room r : fitting) {
+                    if (calendar(roomKey(r.id())).conflict(slot).isEmpty()) return Optional.of(new Proposal(slot, r));
+                }
+            }
+        }
         return Optional.empty();
     }
 
-    public List<TimeSlot> findParticipantConflicts(String email, TimeSlot slot) {
-        NavigableSet<TimeSlot> slots = participantCalendar.get(email);
-        if (slots == null) return List.of();
-
-        return slots.stream()
-            .filter(s -> s.overlaps(slot))
-            .collect(Collectors.toList());
+    List<Meeting> agenda(String personId, TimeSlot window) {
+        person(personId);
+        return calendar(personKey(personId)).entries(window).stream()
+                .map(e -> meetings.get(e.meetingId())).collect(Collectors.toList());
     }
 
-    public Map<String, List<TimeSlot>> findAllParticipantConflicts(List<String> emails, TimeSlot slot) {
-        return emails.stream()
-            .collect(Collectors.toMap(
-                email -> email,
-                email -> findParticipantConflicts(email, slot)
-            ))
-            .entrySet().stream()
-            .filter(e -> !e.getValue().isEmpty())
-            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+    Meeting meeting(String id) {
+        Meeting m = meetings.get(id);
+        if (m == null) throw new NoSuchElementException("no meeting " + id);
+        return m;
     }
 
-    public List<TimeSlot> findAvailableSlots(String roomId, LocalDate date, int durationMinutes) {
-        NavigableSet<TimeSlot> booked = roomCalendar.getOrDefault(roomId, new ConcurrentSkipListSet<>(
-            Comparator.comparing((TimeSlot s) -> s.start()).thenComparing(s -> s.end())
-        ));
+    Collection<Meeting> allMeetings() { return List.copyOf(meetings.values()); }
 
-        List<TimeSlot> available = new ArrayList<>();
-        LocalDateTime cursor = date.atStartOfDay().plusHours(9); // 9 AM
-        LocalDateTime endOfDay = date.atTime(18, 0); // 6 PM
+    // ---- internals ----
 
-        while (cursor.plusMinutes(durationMinutes).isBefore(endOfDay)) {
-            TimeSlot candidate = new TimeSlot(cursor, cursor.plusMinutes(durationMinutes));
-
-            if (candidate.isWithinWorkingHours()) {
-                boolean hasConflict = booked.stream().anyMatch(b -> b.overlaps(candidate));
-                if (!hasConflict) {
-                    available.add(candidate);
-                }
-            }
-            cursor = cursor.plusMinutes(15); // 15-min granularity
+    /** Merge busy time of all attendees (meetings + off-hours) and return the gaps inside the window. */
+    private List<TimeSlot> commonGaps(Set<String> attendeeIds, TimeSlot window) {
+        List<TimeSlot> busy = new ArrayList<>();
+        for (String pid : attendeeIds) {
+            busy.addAll(person(pid).offHours(window));
+            calendar(personKey(pid)).entries(window).forEach(e -> busy.add(e.slot()));
         }
-
-        return available;
-    }
-
-    public List<TimeSlot> findMutualAvailableSlots(List<String> roomIds, List<String> participantEmails,
-                                                    LocalDate date, int durationMinutes) {
-        // Check all rooms for availability
-        List<TimeSlot> candidates = new ArrayList<>();
-        for (String roomId : roomIds) {
-            candidates.addAll(findAvailableSlots(roomId, date, durationMinutes));
+        busy.sort(Comparator.comparing(TimeSlot::start));
+        List<TimeSlot> gaps = new ArrayList<>();
+        Instant cursor = window.start();
+        for (TimeSlot b : busy) {
+            if (b.start().isAfter(cursor)) gaps.add(new TimeSlot(cursor, b.start()));
+            if (b.end().isAfter(cursor)) cursor = b.end();
         }
-
-        // Filter out slots where participants are busy
-        return candidates.stream()
-            .filter(slot -> {
-                for (String email : participantEmails) {
-                    if (!findParticipantConflicts(email, slot).isEmpty()) {
-                        return false;
-                    }
-                }
-                return true;
-            })
-            .collect(Collectors.toList());
-    }
-}
-
-// ============================================================
-// ROOM RECOMMENDER
-// ============================================================
-
-class RoomRecommender {
-    private final List<Room> rooms;
-
-    public RoomRecommender(List<Room> rooms) {
-        this.rooms = rooms;
+        if (window.end().isAfter(cursor)) gaps.add(new TimeSlot(cursor, window.end()));
+        return gaps;
     }
 
-    public List<Room> recommendRooms(int attendeeCount, List<RoomFeature> requiredFeatures) {
-        return rooms.stream()
-            .map(r -> Map.entry(r, r.scoreForMeeting(attendeeCount, requiredFeatures)))
-            .filter(e -> e.getValue() >= 0)
-            .sorted(Map.Entry.<Room, Integer>comparingByValue().reversed())
-            .map(Map.Entry::getKey)
-            .collect(Collectors.toList());
+    private static Instant alignUp(Instant t) {
+        long grid = GRID.getSeconds();
+        long secs = t.getEpochSecond() + (t.getNano() > 0 ? 1 : 0);
+        return Instant.ofEpochSecond(Math.floorDiv(secs + grid - 1, grid) * grid);
     }
 
-    public Optional<Room> findBestRoom(int attendeeCount, List<RoomFeature> requiredFeatures) {
-        return recommendRooms(attendeeCount, requiredFeatures).stream().findFirst();
-    }
-}
-
-// ============================================================
-// NOTIFICATION SERVICE (Observer Pattern)
-// ============================================================
-
-interface MeetingObserver {
-    void onMeetingCreated(Meeting meeting);
-    void onMeetingCancelled(Meeting meeting, String reason);
-    void onMeetingRescheduled(Meeting meeting, TimeSlot oldSlot, TimeSlot newSlot);
-    void onResponseReceived(Meeting meeting, Participant participant, ParticipantStatus status);
-    void onMeetingReminder(Meeting meeting);
-    void onMeetingStarted(Meeting meeting);
-    void onMeetingCompleted(Meeting meeting);
-    void onSeriesInstanceCreated(Meeting meeting, String seriesId);
-}
-
-class CalendarInviteService implements MeetingObserver {
-    @Override
-    public void onMeetingCreated(Meeting meeting) {
-        System.out.printf("📅 Calendar invite sent for '%s' to %d attendees%n",
-            meeting.getTitle(), meeting.getAttendees().size());
-        if (meeting.isRecurring()) {
-            System.out.printf("  ↪ Recurring series: %s%n", meeting.getSeriesId());
-        }
-    }
-
-    @Override
-    public void onMeetingCancelled(Meeting meeting, String reason) {
-        System.out.printf("📅 Calendar cancellation for '%s': %s%n",
-            meeting.getTitle(), reason != null ? reason : "No reason");
-    }
-
-    @Override
-    public void onMeetingRescheduled(Meeting meeting, TimeSlot oldSlot, TimeSlot newSlot) {
-        System.out.printf("📅 Calendar update for '%s' - %s → %s%n",
-            meeting.getTitle(), oldSlot.start(), newSlot.start());
-    }
-
-    @Override
-    public void onResponseReceived(Meeting meeting, Participant participant, ParticipantStatus status) {
-        System.out.printf("📧 %s %s for '%s'%n", participant.name(), status, meeting.getTitle());
-    }
-
-    @Override
-    public void onMeetingReminder(Meeting meeting) {
-        System.out.printf("⏰ Reminder: '%s' starts in 15 min in %s%n",
-            meeting.getTitle(), meeting.getRoom().name());
-    }
-
-    @Override
-    public void onMeetingStarted(Meeting meeting) {
-        System.out.printf("▶️ Meeting '%s' has started with %d participants%n",
-            meeting.getTitle(), meeting.hasAcceptedCount());
-    }
-
-    @Override
-    public void onMeetingCompleted(Meeting meeting) {
-        System.out.printf("✅ Meeting '%s' completed. Duration: %d min%n",
-            meeting.getTitle(), meeting.getSlot().durationMinutes());
-    }
-
-    @Override
-    public void onSeriesInstanceCreated(Meeting meeting, String seriesId) {
-        System.out.printf("🔄 Recurring instance created: '%s' (%s)%n",
-            meeting.getTitle(), meeting.getSlot().start().toLocalDate());
-    }
-}
-
-// ============================================================
-// MEETING ANALYTICS
-// ============================================================
-
-class MeetingAnalytics {
-    private final Map<String, Integer> meetingsByRoom = new ConcurrentHashMap<>();
-    private final Map<String, Integer> meetingsByOrganizer = new ConcurrentHashMap<>();
-    private final Map<DayOfWeek, Integer> meetingsByDay = new ConcurrentHashMap<>();
-    private final AtomicLong totalMeetings = new AtomicLong(0);
-    private final AtomicLong totalDuration = new AtomicLong(0);
-    private final AtomicLong cancelledMeetings = new AtomicLong(0);
-
-    public void recordMeeting(Meeting meeting) {
-        totalMeetings.incrementAndGet();
-        totalDuration.addAndGet(meeting.getSlot().durationMinutes());
-        meetingsByRoom.merge(meeting.getRoom().name(), 1, Integer::sum);
-        meetingsByOrganizer.merge(meeting.getOrganizer().email(), 1, Integer::sum);
-        meetingsByDay.merge(meeting.getSlot().start().getDayOfWeek(), 1, Integer::sum);
-    }
-
-    public void recordCancellation() { cancelledMeetings.incrementAndGet(); }
-
-    public void printReport() {
-        System.out.println("\n" + "=".repeat(55));
-        System.out.println("           MEETING ANALYTICS");
-        System.out.println("=".repeat(55));
-        System.out.printf("Total meetings:     %d%n", totalMeetings.get());
-        System.out.printf("Total duration:     %d hours%n", totalDuration.get() / 60);
-        System.out.printf("Cancelled:          %d (%.1f%%)%n",
-            cancelledMeetings.get(),
-            totalMeetings.get() > 0 ? (double) cancelledMeetings.get() / totalMeetings.get() * 100 : 0);
-
-        System.out.println("\n📊 By Day of Week:");
-        for (DayOfWeek day : DayOfWeek.values()) {
-            if (day != DayOfWeek.SATURDAY && day != DayOfWeek.SUNDAY) {
-                int count = meetingsByDay.getOrDefault(day, 0);
-                System.out.printf("  %-10s: %d%n", day, count);
-            }
-        }
-
-        System.out.println("\n🏠 Top Rooms:");
-        meetingsByRoom.entrySet().stream()
-            .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-            .limit(5)
-            .forEach(e -> System.out.printf("  %-20s: %d meetings%n", e.getKey(), e.getValue()));
-
-        System.out.println("=".repeat(55));
-    }
-}
-
-// ============================================================
-// MEETING SCHEDULER (Facade)
-// ============================================================
-
-class MeetingScheduler {
-    private final ConflictDetector conflictDetector;
-    private final RoomBookingPolicy bookingPolicy;
-    private final RoomRecommender roomRecommender;
-    private final List<MeetingObserver> observers;
-    private final Map<String, Meeting> meetings;
-    private final Map<String, List<Meeting>> participantMeetings;
-    private final Map<String, MeetingSeries> meetingSeries;
-    private final ScheduledExecutorService scheduler;
-    private final MeetingAnalytics analytics;
-    private int meetingCounter;
-
-    public MeetingScheduler(RoomBookingPolicy policy, List<Room> rooms) {
-        this.conflictDetector = new ConflictDetector();
-        this.bookingPolicy = policy;
-        this.roomRecommender = new RoomRecommender(rooms);
-        this.observers = new CopyOnWriteArrayList<>();
-        this.meetings = new ConcurrentHashMap<>();
-        this.participantMeetings = new ConcurrentHashMap<>();
-        this.meetingSeries = new ConcurrentHashMap<>();
-        this.scheduler = Executors.newSingleThreadScheduledExecutor();
-        this.analytics = new MeetingAnalytics();
-        this.meetingCounter = 0;
-
-        // Add default observer
-        addObserver(new CalendarInviteService());
-
-        // Schedule reminders
-        scheduler.scheduleAtFixedRate(this::sendReminders, 1, 5, TimeUnit.MINUTES);
-    }
-
-    public void addObserver(MeetingObserver observer) { observers.add(observer); }
-    public MeetingAnalytics getAnalytics() { return analytics; }
-
-    // --- Room Recommendations ---
-
-    public List<Room> recommendRooms(int attendeeCount, List<RoomFeature> requiredFeatures) {
-        return roomRecommender.recommendRooms(attendeeCount, requiredFeatures);
-    }
-
-    // --- Slot Discovery ---
-
-    public List<TimeSlot> findAvailableSlots(Room room, LocalDate date, int durationMinutes) {
-        return conflictDetector.findAvailableSlots(room.id(), date, durationMinutes);
-    }
-
-    public List<TimeSlot> findMutualSlots(List<Room> rooms, List<Participant> participants,
-                                           LocalDate date, int durationMinutes) {
-        return conflictDetector.findMutualAvailableSlots(
-            rooms.stream().map(Room::id).collect(Collectors.toList()),
-            participants.stream().map(Participant::email).collect(Collectors.toList()),
-            date, durationMinutes);
-    }
-
-    // --- Meeting Scheduling ---
-
-    public synchronized Meeting scheduleMeeting(String title, String description,
-                                                  TimeSlot slot, Participant organizer,
-                                                  List<Participant> attendees, Room room,
-                                                  RecurrencePattern recurrence) {
-        // Validate booking policy
-        if (!bookingPolicy.canBook(room, slot, attendees.size(), List.of())) {
-            throw new IllegalArgumentException("Room " + room.name()
-                + " cannot accommodate this meeting: " + bookingPolicy.rejectionReason());
-        }
-
-        // Check room conflicts
-        Optional<TimeSlot> conflict = conflictDetector.findConflict(room.id(), slot);
-        if (conflict.isPresent()) {
-            throw new IllegalStateException("Room " + room.name()
-                + " is already booked for " + conflict.get());
-        }
-
-        // Check participant conflicts
-        List<String> allEmails = new ArrayList<>();
-        allEmails.add(organizer.email());
-        allEmails.addAll(attendees.stream().map(Participant::email).collect(Collectors.toList()));
-
-        Map<String, List<TimeSlot>> allConflicts = conflictDetector.findAllParticipantConflicts(allEmails, slot);
-        if (!allConflicts.isEmpty()) {
-            String firstConflict = allConflicts.entrySet().iterator().next().getKey();
-            throw new IllegalStateException(firstConflict + " has a scheduling conflict");
-        }
-
-        // Create meeting
-        meetingCounter++;
-        String meetingId = "MTG-" + String.format("%05d", meetingCounter);
-        Meeting meeting = new Meeting(meetingId, title, description, slot,
-            organizer, attendees, room, recurrence, null);
-
-        registerMeeting(meeting);
-        return meeting;
-    }
-
-    public synchronized Meeting scheduleRecurringInstance(MeetingSeries series, LocalDate date) {
-        List<MeetingInstance> instances = series.expand(date, date);
-        if (instances.isEmpty()) {
-            throw new IllegalArgumentException("No instance to schedule on " + date);
-        }
-
-        MeetingInstance instance = instances.get(0);
-        meetingCounter++;
-        String meetingId = "MTG-" + String.format("%05d", meetingCounter);
-
-        Meeting meeting = new Meeting(meetingId, instance.title(), instance.description(),
-            instance.slot(), instance.organizer(), instance.attendees(),
-            instance.room(), series.getPattern(), series.getSeriesId());
-
-        registerMeeting(meeting);
-        notifySeriesInstance(meeting, series.getSeriesId());
-        return meeting;
-    }
-
-    public synchronized MeetingSeries createMeetingSeries(String seriesId, String title,
-                                                           String description, TimeSlot templateSlot,
-                                                           RecurrencePattern pattern,
-                                                           List<Participant> attendees,
-                                                           Participant organizer, Room preferredRoom,
-                                                           LocalDate seriesStart, LocalDate seriesEnd) {
-        MeetingSeries series = new MeetingSeries(seriesId, title, description,
-            templateSlot, pattern, attendees, organizer,
-            preferredRoom, seriesStart, seriesEnd);
-
-        meetingSeries.put(seriesId, series);
-
-        // Expand and schedule first batch of instances
-        LocalDate expandUntil = seriesStart.plusWeeks(4); // Schedule 4 weeks ahead
-        for (MeetingInstance instance : series.expand(seriesStart, expandUntil)) {
-            try {
-                boolean roomAvailable = conflictDetector.findConflict(
-                    preferredRoom.id(), instance.slot()).isEmpty();
-                if (roomAvailable) {
-                    scheduleRecurringInstance(series, instance.date());
-                }
-            } catch (IllegalStateException e) {
-                System.out.printf("  ⚠️ Skipping %s: %s%n", instance.date(), e.getMessage());
-            }
-        }
-
-        return series;
-    }
-
-    private void registerMeeting(Meeting meeting) {
-        meetings.put(meeting.getId(), meeting);
-        conflictDetector.addEntry(meeting.getRoom().id(), meeting.getSlot());
-        conflictDetector.addParticipantEntry(meeting.getOrganizer().email(), meeting.getSlot());
-        meeting.getAttendees().forEach(a ->
-            conflictDetector.addParticipantEntry(a.email(), meeting.getSlot()));
-
-        // Register in participant calendars
-        participantMeetings.computeIfAbsent(meeting.getOrganizer().email(),
-            k -> new CopyOnWriteArrayList<>()).add(meeting);
-        meeting.getAttendees().forEach(a ->
-            participantMeetings.computeIfAbsent(a.email(),
-                k -> new CopyOnWriteArrayList<>()).add(meeting));
-
-        analytics.recordMeeting(meeting);
-        notifyCreated(meeting);
-    }
-
-    // --- Meeting Lifecycle ---
-
-    public synchronized void cancelMeeting(String meetingId, String reason) {
-        Meeting meeting = meetings.get(meetingId);
-        if (meeting == null) throw new IllegalArgumentException("Meeting not found: " + meetingId);
-
-        meeting.cancel(reason);
-        conflictDetector.removeEntry(meeting.getRoom().id(), meeting.getSlot());
-        meeting.getAttendees().forEach(a ->
-            conflictDetector.removeParticipantEntry(a.email(), meeting.getSlot()));
-
-        analytics.recordCancellation();
-        notifyCancelled(meeting, reason);
-    }
-
-    public synchronized void cancelSeriesInstance(String seriesId, LocalDate date) {
-        MeetingSeries series = meetingSeries.get(seriesId);
-        if (series == null) throw new IllegalArgumentException("Series not found: " + seriesId);
-
-        series.cancelInstance(date);
-        System.out.printf("🗑️ Cancelled instance of '%s' on %s%n", seriesId, date);
-    }
-
-    public synchronized void respondToMeeting(String meetingId, Participant participant,
-                                                ParticipantStatus status) {
-        Meeting meeting = meetings.get(meetingId);
-        if (meeting == null) throw new IllegalArgumentException("Meeting not found: " + meetingId);
-
-        meeting.respond(participant.email(), status);
-        notifyResponse(meeting, participant, status);
-    }
-
-    public synchronized void startMeeting(String meetingId) {
-        Meeting meeting = meetings.get(meetingId);
-        if (meeting == null) throw new IllegalArgumentException("Meeting not found: " + meetingId);
-        meeting.start();
-        notifyStarted(meeting);
-    }
-
-    public synchronized void completeMeeting(String meetingId) {
-        Meeting meeting = meetings.get(meetingId);
-        if (meeting == null) throw new IllegalArgumentException("Meeting not found: " + meetingId);
-        meeting.complete();
-        notifyCompleted(meeting);
-    }
-
-    // --- Queries ---
-
-    public List<Meeting> getMeetingsForUser(String email, LocalDate date) {
-        return participantMeetings.getOrDefault(email, List.of()).stream()
-            .filter(m -> m.getSlot().start().toLocalDate().equals(date))
-            .filter(m -> m.getStatus() != MeetingStatus.CANCELLED)
-            .sorted(Comparator.comparing(m -> m.getSlot().start()))
-            .collect(Collectors.toList());
-    }
-
-    public List<Meeting> getUpcomingMeetings(String email, int limit) {
-        LocalDateTime now = LocalDateTime.now();
-        return participantMeetings.getOrDefault(email, List.of()).stream()
-            .filter(m -> m.getSlot().start().isAfter(now))
-            .filter(m -> m.getStatus() != MeetingStatus.CANCELLED)
-            .sorted(Comparator.comparing(m -> m.getSlot().start()))
-            .limit(limit)
-            .collect(Collectors.toList());
-    }
-
-    public DailyAgenda getDailyAgenda(String email, LocalDate date) {
-        List<Meeting> meetings = getMeetingsForUser(email, date);
-        return new DailyAgenda(email, date, meetings);
-    }
-
-    // --- Internal ---
-
-    private void sendReminders() {
-        LocalDateTime now = LocalDateTime.now();
-        LocalDateTime in15Min = now.plusMinutes(15);
-
-        meetings.values().stream()
-            .filter(m -> m.getStatus() == MeetingStatus.SCHEDULED)
-            .filter(m -> m.getSlot().start().isAfter(now) && m.getSlot().start().isBefore(in15Min))
-            .forEach(this::notifyReminder);
-    }
-
-    private void notifyCreated(Meeting m) { observers.forEach(o -> o.onMeetingCreated(m)); }
-    private void notifyCancelled(Meeting m, String reason) {
-        observers.forEach(o -> o.onMeetingCancelled(m, reason));
-    }
-    private void notifyRescheduled(Meeting m, TimeSlot old, TimeSlot now) {
-        observers.forEach(o -> o.onMeetingRescheduled(m, old, now));
-    }
-    private void notifyResponse(Meeting m, Participant p, ParticipantStatus s) {
-        observers.forEach(o -> o.onResponseReceived(m, p, s));
-    }
-    private void notifyReminder(Meeting m) { observers.forEach(o -> o.onMeetingReminder(m)); }
-    private void notifyStarted(Meeting m) { observers.forEach(o -> o.onMeetingStarted(m)); }
-    private void notifyCompleted(Meeting m) { observers.forEach(o -> o.onMeetingCompleted(m)); }
-    private void notifySeriesInstance(Meeting m, String seriesId) {
-        observers.forEach(o -> o.onSeriesInstanceCreated(m, seriesId));
-    }
-
-    public void shutdown() { scheduler.shutdown(); }
-}
-
-// ============================================================
-// DAILY AGENDA
-// ============================================================
-
-record DailyAgenda(String email, LocalDate date, List<Meeting> meetings) {
-    public void print() {
-        System.out.println("\n" + "=".repeat(55));
-        System.out.printf("  📋 AGENDA for %s on %s%n", email, date);
-        System.out.println("=".repeat(55));
-
-        if (meetings.isEmpty()) {
-            System.out.println("  🎉 No meetings scheduled — Enjoy your day!");
-            System.out.println("=".repeat(55));
-            return;
-        }
-
-        for (int i = 0; i < meetings.size(); i++) {
-            Meeting m = meetings.get(i);
-            System.out.printf("  %d. %s - %s | %s | %s%n",
-                i + 1,
-                m.getSlot().start().toLocalTime(),
-                m.getSlot().end().toLocalTime(),
-                m.getTitle(),
-                m.getRoom().name());
-            System.out.printf("     ▸ %d attendees | %s%n",
-                m.getAttendees().size(),
-                m.getStatus());
-            if (m.isRecurring()) {
-                System.out.printf("     ↪ Recurring: %s%n", m.getRecurrence());
-            }
-        }
-
-        System.out.printf("  📊 Total: %d meetings, %d minutes%n",
-            meetings.size(),
-            meetings.stream().mapToLong(m -> m.getSlot().durationMinutes()).sum());
-        System.out.println("=".repeat(55));
-    }
-}
-
-// ============================================================
-// DEMO
-// ============================================================
-
-public class MeetingSchedulerSystem {
-    public static void main(String[] args) {
-        System.out.println("╔══════════════════════════════════╗");
-        System.out.println("║    MEETING SCHEDULER DEMO       ║");
-        System.out.println("╚══════════════════════════════════╝\n");
-
-        System.out.println("🏢 Enterprise: Acme Corp — 3 buildings, 8 rooms\n");
-
-        // Setup rooms with features
-        List<Room> rooms = Arrays.asList(
-            new Room("R001", "Conference A", 10,
-                List.of("PROJECTOR", "WHITEBOARD", "VIDEO_CONF")),
-            new Room("R002", "Meeting Room B", 6,
-                List.of("WHITEBOARD")),
-            new Room("R003", "Board Room", 20,
-                List.of("PROJECTOR", "VIDEO_CONF", "CATERING", "SOUND_SYSTEM")),
-            new Room("R004", "Phone Booth", 2,
-                List.of("PHONE")),
-            new Room("R005", "Innovation Lab", 15,
-                List.of("PROJECTOR", "WHITEBOARD", "VIDEO_CONF", "STANDING_DESK", "LARGE_SCREEN")),
-            new Room("R006", "Training Room", 30,
-                List.of("PROJECTOR", "SOUND_SYSTEM", "STAGE")),
-            new Room("R007", "Quiet Room", 4,
-                List.of("WHITEBOARD")),
-            new Room("R008", "Executive Suite", 8,
-                List.of("PROJECTOR", "VIDEO_CONF", "CATERING"))
-        );
-
-        // Setup participants with departments
-        Participant alice = new Participant("P001", "Alice", "alice@acme.com",
-            "Engineering", "America/New_York", false);
-        Participant bob = new Participant("P002", "Bob", "bob@acme.com",
-            "Engineering", "America/New_York", false);
-        Participant charlie = new Participant("P003", "Charlie", "charlie@acme.com",
-            "Design", "America/Chicago", false);
-        Participant diana = new Participant("P004", "Diana", "diana@acme.com",
-            "Product", "America/New_York", false);
-        Participant eve = new Participant("P005", "Eve", "eve@acme.com",
-            "Engineering", "America/New_York", true);
-
-        // Create scheduler with compositing policy
-        RoomBookingPolicy policy = new CompositingBookingPolicy(
-            new StandardBookingPolicy(),
-            new ExecutiveBookingPolicy()
-        );
-        MeetingScheduler scheduler = new MeetingScheduler(policy, rooms);
-        LocalDate tomorrow = LocalDate.now().plusDays(1);
-
-        // ---- ROOM RECOMMENDATION ----
-        System.out.println("--- ROOM RECOMMENDATION ---");
-        System.out.println("Finding best room for 8 people with video conf + projector:");
-        var recommended = scheduler.recommendRooms(8, List.of(RoomFeature.VIDEO_CONF, RoomFeature.PROJECTOR));
-        recommended.forEach(r -> System.out.println("  ✅ " + r.name() + " (capacity: " + r.capacity() + ")"));
-
-        // ---- SLOT DISCOVERY ----
-        System.out.println("\n--- AVAILABLE SLOTS ---");
-        var slots = scheduler.findAvailableSlots(rooms.get(0), tomorrow, 60);
-        System.out.println("Available 1-hour slots in Conference A:");
-        slots.stream().limit(5).forEach(s ->
-            System.out.println("  " + s.start().toLocalTime() + " - " + s.end().toLocalTime()));
-
-        // ---- SCHEDULE MEETINGS ----
-        System.out.println("\n--- SCHEDULING MEETINGS ---");
-        TimeSlot slot1 = slots.get(0);
-        Meeting m1 = scheduler.scheduleMeeting(
-            "Sprint Planning", "Plan next sprint goals and tasks",
-            slot1, alice, List.of(bob, charlie, diana), rooms.get(0),
-            RecurrencePattern.WEEKLY);
-        System.out.println("Scheduled: " + m1.toDetailedString());
-
-        // Try to schedule conflicting meeting
+    /** Lock every calendar in key order (deadlock-free), run, unlock in reverse. */
+    private static <T> T withLocks(List<IntervalCalendar> cals, Supplier<T> action) {
+        List<IntervalCalendar> ordered = cals.stream().distinct()
+                .sorted(Comparator.comparing(IntervalCalendar::key)).collect(Collectors.toList());
+        int locked = 0;
         try {
-            scheduler.scheduleMeeting(
-                "Conflict Test", "Should fail",
-                slot1, bob, List.of(charlie), rooms.get(0),
-                RecurrencePattern.NONE);
-        } catch (IllegalStateException e) {
-            System.out.println("✅ Conflict detection: " + e.getMessage());
+            for (IntervalCalendar c : ordered) { c.lock.lock(); locked++; }
+            return action.get();
+        } finally {
+            for (int i = locked - 1; i >= 0; i--) ordered.get(i).lock.unlock();
+        }
+    }
+
+    private List<IntervalCalendar> calendarsFor(Set<String> personIds, String roomId) {
+        List<IntervalCalendar> l = new ArrayList<>();
+        personIds.forEach(p -> l.add(calendar(personKey(p))));
+        l.add(calendar(roomKey(roomId)));
+        return l;
+    }
+
+    private IntervalCalendar calendar(String key) { return calendars.get(key); }
+    private static String roomKey(String id) { return "room:" + id; }
+    private static String personKey(String id) { return "person:" + id; }
+
+    private Room room(String id) {
+        Room r = rooms.get(id);
+        if (r == null) throw new IllegalArgumentException("unknown room " + id);
+        return r;
+    }
+
+    private Participant person(String id) {
+        Participant p = people.get(id);
+        if (p == null) throw new IllegalArgumentException("unknown participant " + id);
+        return p;
+    }
+}
+
+// ============================================================
+// DEMO + SELF-CHECKS
+// ============================================================
+
+final class MeetingDemo {
+    // Monday 11 Jan 2027: no DST in either zone. London = UTC+0, New York = UTC-5.
+    static final LocalDate MONDAY = LocalDate.of(2027, 1, 11);
+    static final ZoneId LONDON = ZoneId.of("Europe/London"), NEW_YORK = ZoneId.of("America/New_York");
+
+    static Instant utc(int h, int m) { return MONDAY.atTime(h, m).toInstant(ZoneOffset.UTC); }
+    static TimeSlot slot(int h1, int m1, int h2, int m2) { return new TimeSlot(utc(h1, m1), utc(h2, m2)); }
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        System.out.println("  ok  " + what);
+    }
+
+    static MeetingScheduler scheduler() {
+        List<Room> rooms = List.of(
+                new Room("Huddle", 4, Set.of(Feature.WHITEBOARD)),
+                new Room("Focus", 6, Set.of(Feature.VIDEO_CONF)),
+                new Room("Board", 12, Set.of(Feature.VIDEO_CONF, Feature.PROJECTOR, Feature.WHITEBOARD)));
+        List<Participant> people = List.of(
+                new Participant("alice", NEW_YORK), new Participant("bob", LONDON),
+                new Participant("carol", LONDON), new Participant("dan", LONDON),
+                new Participant("erin", LONDON));
+        return new MeetingScheduler(rooms, people, new BestFitRoomStrategy());
+    }
+
+    static MeetingRequest req(String title, String organizer, Set<String> attendees, TimeSlot s, Set<Feature> f, String room) {
+        return new MeetingRequest(title, organizer, attendees, s, f, room);
+    }
+
+    static void run() throws Exception {
+        System.out.println("== 1. Half-open intervals and O(log n) calendar ==");
+        {
+            check(!slot(9, 0, 10, 0).overlaps(slot(10, 0, 11, 0)), "9-10 and 10-11 do not overlap");
+            IntervalCalendar cal = new IntervalCalendar("room:test");
+            cal.add("long", slot(8, 0, 12, 0));
+            check(cal.conflict(slot(11, 0, 11, 30)).map(CalendarEntry::meetingId).equals(Optional.of("long")),
+                  "floor neighbour 8-12 detected for 11:00-11:30");
+            check(cal.conflict(slot(7, 0, 8, 0)).isEmpty() && cal.conflict(slot(12, 0, 13, 0)).isEmpty(),
+                  "touching slots before and after are free");
+            check(cal.conflict(slot(7, 30, 8, 15)).isPresent(), "higher neighbour detected for 7:30-8:15");
         }
 
-        // ---- RECURRING MEETINGS ----
-        System.out.println("\n--- RECURRING MEETINGS ---");
-        MeetingSeries standupSeries = scheduler.createMeetingSeries(
-            "SERIES-001", "Daily Standup", "Daily engineering standup",
-            new TimeSlot(tomorrow.atTime(9, 30), tomorrow.atTime(9, 45)),
-            RecurrencePattern.DAILY,
-            List.of(bob, charlie, diana, eve),
-            alice, rooms.get(1),
-            tomorrow, tomorrow.plusWeeks(4));
-        System.out.println("Created daily standup series: SERIES-001");
+        System.out.println("== 2. Room allocation: best fit ==");
+        {
+            MeetingScheduler s = scheduler();
+            Meeting a = s.schedule(req("1:1", "bob", Set.of("carol"), slot(10, 0, 11, 0), Set.of(), null));
+            check(a.roomId().equals("Huddle"), "2 people, no features -> smallest room (Huddle)");
+            Meeting b = s.schedule(req("Sync", "dan", Set.of("erin"), slot(10, 0, 11, 0), Set.of(), null));
+            check(b.roomId().equals("Focus"), "Huddle busy -> next best fit (Focus)");
+            Meeting c = s.schedule(req("Demo", "alice", Set.of(), slot(15, 0, 16, 0), Set.of(Feature.PROJECTOR), null));
+            check(c.roomId().equals("Board"), "projector required -> Board");
+            check(throwsIAE(() -> s.schedule(req("All hands", "bob", Set.of("alice", "carol", "dan", "erin"),
+                    slot(12, 0, 13, 0), Set.of(), "Huddle"))),
+                  "5 people do not fit the 4-seat Huddle");
+        }
 
-        // Cancel one instance
-        scheduler.cancelSeriesInstance("SERIES-001", tomorrow.plusDays(2));
-        System.out.println("Cancelled Friday's standup");
+        System.out.println("== 3. Atomic booking: a busy attendee blocks the whole meeting ==");
+        {
+            MeetingScheduler s = scheduler();
+            s.schedule(req("Bob busy", "bob", Set.of(), slot(14, 0, 15, 0), Set.of(), "Focus"));
+            check(throwsConflict(() -> s.schedule(req("Team", "carol", Set.of("bob", "dan"), slot(14, 30, 15, 30), Set.of(), "Board"))),
+                  "bob double-booked -> ConflictException");
+            check(s.agenda("carol", slot(0, 0, 23, 59)).isEmpty() && s.agenda("dan", slot(0, 0, 23, 59)).isEmpty(),
+                  "no partial writes: carol and dan calendars untouched");
+            Meeting ok = s.schedule(req("Team", "carol", Set.of("bob", "dan"), slot(15, 0, 16, 0), Set.of(), "Board"));
+            check(ok.status() == MeetingStatus.SCHEDULED, "back-to-back with bob's 14-15 is fine");
+        }
 
-        // ---- RESPONSES ----
-        System.out.println("\n--- PARTICIPANT RESPONSES ---");
-        scheduler.respondToMeeting(m1.getId(), bob, ParticipantStatus.ACCEPTED);
-        scheduler.respondToMeeting(m1.getId(), charlie, ParticipantStatus.TENTATIVE);
-        scheduler.respondToMeeting(m1.getId(), diana, ParticipantStatus.ACCEPTED);
+        System.out.println("== 4. Cancel and reschedule ==");
+        {
+            MeetingScheduler s = scheduler();
+            Meeting m = s.schedule(req("Plan", "bob", Set.of("carol"), slot(10, 0, 11, 0), Set.of(), "Focus"));
+            s.cancel(m.id());
+            check(s.agenda("bob", slot(0, 0, 23, 0)).isEmpty(), "cancel frees the ORGANIZER's calendar too");
+            check(throwsISE(() -> s.cancel(m.id())), "double cancel rejected");
+            Meeting again = s.schedule(req("Plan", "bob", Set.of("carol"), slot(10, 0, 11, 0), Set.of(), "Focus"));
+            Meeting blocker = s.schedule(req("Carol 1:1", "carol", Set.of("dan"), slot(13, 0, 14, 0), Set.of(), "Huddle"));
+            check(throwsConflict(() -> s.reschedule(again.id(), slot(13, 30, 14, 30))), "reschedule into carol's 1:1 fails");
+            check(again.slot().equals(slot(10, 0, 11, 0)) && s.agenda("bob", slot(10, 0, 11, 0)).size() == 1,
+                  "failed reschedule leaves the meeting where it was");
+            s.reschedule(again.id(), slot(10, 30, 11, 30));
+            check(again.slot().equals(slot(10, 30, 11, 30)), "reschedule overlapping its own old slot works");
+            check(blocker.status() == MeetingStatus.SCHEDULED, "other meetings untouched");
+        }
 
-        // ---- DAILY AGENDA ----
-        System.out.println("\n--- DAILY AGENDA ---");
-        DailyAgenda agenda = scheduler.getDailyAgenda(alice.email(), tomorrow);
-        agenda.print();
+        System.out.println("== 5. Free slots across time zones ==");
+        {
+            MeetingScheduler s = scheduler();
+            // Working-hours overlap: London 09-17 UTC, New York 14-22 UTC -> 14:00-17:00 UTC.
+            s.schedule(req("Alice busy", "alice", Set.of(), slot(14, 0, 15, 0), Set.of(), "Huddle"));
+            s.schedule(req("Bob busy", "bob", Set.of(), slot(15, 30, 16, 0), Set.of(), "Focus"));
+            TimeSlot day = new TimeSlot(utc(0, 0), utc(0, 0).plus(Duration.ofDays(1)));
+            List<TimeSlot> halfHours = s.findFreeSlots(Set.of("alice", "bob"), Duration.ofMinutes(30), day, 10);
+            check(halfHours.equals(List.of(slot(15, 0, 15, 30), slot(16, 0, 16, 30), slot(16, 15, 16, 45), slot(16, 30, 17, 0))),
+                  "30-min slots: 15:00, then 16:00/16:15/16:30 on the 15-min grid");
+            List<TimeSlot> hour = s.findFreeSlots(Set.of("alice", "bob"), Duration.ofHours(1), day, 10);
+            check(hour.equals(List.of(slot(16, 0, 17, 0))), "only one 60-min slot: 16:00-17:00 UTC");
+            TimeSlot saturday = new TimeSlot(utc(0, 0).plus(Duration.ofDays(5)), utc(0, 0).plus(Duration.ofDays(6)));
+            check(s.findFreeSlots(Set.of("bob"), Duration.ofMinutes(30), saturday, 5).isEmpty(), "nobody works on Saturday");
 
-        // ---- UPCOMING MEETINGS ----
-        System.out.println("\n--- UPCOMING MEETINGS ---");
-        var upcoming = scheduler.getUpcomingMeetings(alice.email(), 5);
-        System.out.println("Upcoming meetings for Alice:");
-        upcoming.forEach(m -> System.out.println("  📅 " + m.getSlot().start() + " - " + m.getTitle()));
+            // With a room requirement: the only VIDEO_CONF rooms are Focus (busy 15:30-16:00) and Board.
+            s.schedule(req("Board taken", "carol", Set.of(), slot(15, 0, 15, 30), Set.of(), "Board"));
+            s.schedule(req("Focus taken", "dan", Set.of(), slot(15, 0, 15, 30), Set.of(), "Focus"));
+            Optional<Proposal> p = s.proposeEarliest(Set.of("alice", "bob"), Duration.ofMinutes(30), day, Set.of(Feature.VIDEO_CONF));
+            check(p.isPresent() && p.get().slot().equals(slot(16, 0, 16, 30)) && p.get().room().id().equals("Focus"),
+                  "earliest with VIDEO_CONF skips 15:00 (both video rooms busy) -> 16:00 in Focus");
+            Meeting booked = s.schedule(req("Booked", "alice", Set.of("bob"), p.get().slot(), Set.of(Feature.VIDEO_CONF), null));
+            check(booked.roomId().equals("Focus"), "booking the proposal succeeds");
+        }
 
-        // ---- MEETING LIFECYCLE ----
-        System.out.println("\n--- MEETING LIFECYCLE ---");
-        scheduler.startMeeting(m1.getId());
-        scheduler.completeMeeting(m1.getId());
+        System.out.println("== 6. Concurrency: random bookings from 12 threads ==");
+        {
+            MeetingScheduler s = scheduler();
+            List<String> ids = List.of("alice", "bob", "carol", "dan", "erin");
+            ExecutorService pool = Executors.newFixedThreadPool(12);
+            CountDownLatch go = new CountDownLatch(1);
+            List<Future<int[]>> fs = new ArrayList<>();
+            for (int t = 0; t < 12; t++) {
+                final int seed = t;
+                fs.add(pool.submit(() -> {
+                    Random rnd = new Random(seed);
+                    go.await();
+                    int ok = 0, conflicts = 0;
+                    for (int i = 0; i < 400; i++) {
+                        Set<String> who = new HashSet<>();
+                        for (int k = 0; k < 1 + rnd.nextInt(3); k++) who.add(ids.get(rnd.nextInt(ids.size())));
+                        String org = who.iterator().next();
+                        int startQ = rnd.nextInt(40);            // quarter-hours from 08:00 UTC
+                        TimeSlot sl = TimeSlot.of(utc(8, 0).plus(quarters(startQ)), quarters(1 + rnd.nextInt(4)));
+                        try {
+                            Meeting m = s.schedule(req("r", org, who, sl, Set.of(), null));
+                            ok++;
+                            if (rnd.nextInt(4) == 0) s.cancel(m.id());
+                            else if (rnd.nextInt(4) == 0) {
+                                try { s.reschedule(m.id(), TimeSlot.of(sl.start().plus(quarters(1)), sl.duration())); }
+                                catch (ConflictException ignored) { }
+                            }
+                        } catch (ConflictException e) {
+                            conflicts++;
+                        }
+                    }
+                    return new int[] {ok, conflicts};
+                }));
+            }
+            go.countDown();
+            int ok = 0;
+            for (Future<int[]> f : fs) ok += f.get(20, TimeUnit.SECONDS)[0];   // timeout would mean deadlock
+            pool.shutdown();
+            List<Meeting> live = s.allMeetings().stream().filter(m -> m.status() == MeetingStatus.SCHEDULED).collect(Collectors.toList());
+            check(ok > 0 && noOverlaps(live, m -> m.attendeeIds()) && noOverlaps(live, m -> Set.of("room:" + m.roomId())),
+                  ok + " bookings across 12 threads, no person or room ever double-booked, no deadlock");
+            boolean calendarsAgree = ids.stream().allMatch(p ->
+                    s.agenda(p, new TimeSlot(utc(0, 0), utc(23, 0))).stream().allMatch(m -> m.status() == MeetingStatus.SCHEDULED
+                            && m.attendeeIds().contains(p))
+                    && s.agenda(p, new TimeSlot(utc(0, 0), utc(23, 0))).size()
+                       == live.stream().filter(m -> m.attendeeIds().contains(p)).count());
+            check(calendarsAgree, "every person's calendar matches the live meetings exactly");
+        }
 
-        // ---- CANCELLATION ----
-        System.out.println("\n--- BOOKING A SECOND MEETING & CANCELLING ---");
-        TimeSlot slot2 = slots.get(2);
-        Meeting m2 = scheduler.scheduleMeeting(
-            "Product Review", "Review Q4 product roadmap",
-            slot2, diana, List.of(alice, bob), rooms.get(4),
-            RecurrencePattern.NONE);
-        System.out.println("Scheduled: " + m2);
-
-        scheduler.cancelMeeting(m2.getId(), "Postponed to next quarter");
-        System.out.println("Cancelled: " + m2.getTitle());
-
-        // ---- ANALYTICS ----
-        scheduler.getAnalytics().printReport();
-
-        // ---- MUTUAL AVAILABILITY ----
-        System.out.println("\n--- MUTUAL AVAILABILITY ---");
-        var mutualSlots = scheduler.findMutualSlots(
-            List.of(rooms.get(0), rooms.get(4), rooms.get(7)),
-            List.of(alice, bob, charlie, diana),
-            tomorrow.plusDays(2), 30);
-        System.out.println("Mutually available 30-min slots:");
-        mutualSlots.stream().limit(3).forEach(s ->
-            System.out.println("  ✅ " + s.start().toLocalTime() + " - " + s.end().toLocalTime()));
-
-        scheduler.shutdown();
-        System.out.println("\n╔══════════════════════════════════╗");
-        System.out.println("║       DEMO COMPLETE             ║");
-        System.out.println("╚══════════════════════════════════╝");
+        System.out.println("\nAll meeting scheduler checks passed.");
     }
+
+    static Duration quarters(int n) { return MeetingScheduler.GRID.multipliedBy(n); }
+
+    static boolean noOverlaps(List<Meeting> live, java.util.function.Function<Meeting, Set<String>> owners) {
+        Map<String, List<TimeSlot>> byOwner = new HashMap<>();
+        for (Meeting m : live) for (String o : owners.apply(m)) byOwner.computeIfAbsent(o, k -> new ArrayList<>()).add(m.slot());
+        for (List<TimeSlot> l : byOwner.values()) {
+            l.sort(Comparator.comparing(TimeSlot::start));
+            for (int i = 1; i < l.size(); i++) if (l.get(i - 1).overlaps(l.get(i))) return false;
+        }
+        return true;
+    }
+
+    static boolean throwsIAE(Runnable r) { try { r.run(); return false; } catch (IllegalArgumentException e) { return true; } }
+    static boolean throwsISE(Runnable r) { try { r.run(); return false; } catch (IllegalStateException e) { return true; } }
+    static boolean throwsConflict(Runnable r) { try { r.run(); return false; } catch (ConflictException e) { return true; } }
 }

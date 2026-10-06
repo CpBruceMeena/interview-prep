@@ -8,11 +8,33 @@
 
 ![](atm-banking-class-diagram.drawio)
 
+> The diagram predates the current code. It still shows float balances, `BankingService`, `PinEnteredState`/`ReadyATMState` and a bank-owned `CashDispenser`. The code has `Bank`, `IdleState` → `CardInsertedState` → `AuthenticatedState` (+ `OutOfServiceState`), a dispenser owned by each `ATM`, and `Decimal` money.
+
+---
+
+## ⏱️ How to Run This in a 45–60 min Interview
+
+| Time | Step | What to say out loud |
+|------|------|----------------------|
+| 0–7 min | **Clarify** | "Which operations: balance, withdraw, deposit, transfer? Account types and their rules? Daily limits? What happens on three wrong PINs? Do I model the dispenser's denominations?" |
+| 7–15 min | **Entities + interfaces** | "The ATM is a state machine; the bank is a separate service the ATM calls. Accounts differ only in how much can be withdrawn. Every money call carries a request id." Sketch the state table before any code. |
+| 15–35 min | **Core code** | `Account.withdrawable()` and the three subclasses; `Bank.authorize_withdrawal / capture / reverse`; the four ATM states with a base class that rejects everything. |
+| 35–45 min | **Failure + concurrency** | Walk the withdrawal sequence and ask "what if the dispenser jams here? what if the network drops here?" That gives two-phase withdraw, idempotent capture/reverse, request ids. Then per-account locks and lock ordering for transfers. |
+| 45–60 min | **Extension + tests** | Session timeout, partial dispense, fees, PIN change. Tests: jam reverses the hold, retry moves money once, 16 threads cannot overdraw, A→B / B→A do not deadlock, three wrong PINs retain the card. |
+
+**Clarifying questions worth asking**
+
+- Operations in scope (balance, withdraw, deposit, transfer, PIN change, mini-statement)?
+- Account types and their limits (minimum balance, overdraft, credit limit)? Per-card daily withdrawal limit?
+- Wrong PIN policy: how many attempts, and is the card retained?
+- Denominations in the cassettes? Must the ATM pick the combination, or is any valid combination fine?
+- Is the bank in-process, or a remote service (so retries and timeouts matter)?
+
 ---
 
 ## Phase 0: Requirements Gathering
 
-What account types? (Savings, Checking, Credit?) What ATM operations? (Withdraw, deposit, transfer, balance inquiry?) Card authentication? PIN validation?
+Customers insert a card, enter a PIN, and then check balance, withdraw cash, deposit, or transfer between their own accounts. Accounts are savings (minimum balance), checking (overdraft) or credit (credit limit). Cards have a daily withdrawal limit and are blocked after three wrong PINs.
 
 ## Phase 1: Identify the Nouns
 
@@ -20,100 +42,73 @@ What account types? (Savings, Checking, Credit?) What ATM operations? (Withdraw,
 
 | Noun | Decision | Why |
 |------|----------|-----|
-| Account | ABC | Abstract — different account types |
-| SavingsAccount | Regular | Min balance, monthly withdrawal limit |
-| CheckingAccount | Regular | Overdraft limit |
-| CreditAccount | Regular | Credit limit, APR, available credit |
-| Transaction | Regular | Audit record for every operation |
-| Card | Regular | PIN validation, expiry, block status |
-| CashDispenser | Regular | Manages denominations |
-| BankingService | Facade | Manages accounts, cards, ATM operations |
-| ATM | Regular | State machine for ATM sessions |
-| ATMState | ABC | State pattern: Idle → PinEntered → Ready |
-| AccountType | Enum | SAVINGS, CHECKING, CREDIT, LOAN |
-| TransactionType | Enum | DEPOSIT, WITHDRAWAL, TRANSFER, etc. |
-| CardType | Enum | DEBIT, CREDIT, ATM |
+| Account | ABC | One abstract rule: `withdrawable()` |
+| SavingsAccount / CheckingAccount / CreditAccount | Subclasses | Min balance / overdraft / credit limit |
+| Transaction | dataclass | Ledger entry with a status state machine |
+| Card | Regular class | PIN hash, attempts, block flag, expiry, daily limit |
+| Bank | Facade | Accounts, cards, ledger, idempotency, locks |
+| CashDispenser | Regular class | Notes per denomination, planning |
+| ATM | Context | Owns session and dispenser; delegates to its state |
+| ATMState | ABC | Idle, CardInserted, Authenticated, OutOfService |
 
 ## Phase 2: Enums First
 
 ```python
-class AccountType(Enum):     SAVINGS, CHECKING, CREDIT, LOAN
-class TransactionType(Enum): DEPOSIT, WITHDRAWAL, TRANSFER, PAYMENT, FEE, INTEREST
-class CardType(Enum):        DEBIT, CREDIT, ATM
-class TransactionStatus(Enum): PENDING, COMPLETED, FAILED, REVERSED
+class AccountType(Enum):       SAVINGS, CHECKING, CREDIT
+class TransactionType(Enum):   WITHDRAWAL, DEPOSIT, TRANSFER_OUT, TRANSFER_IN
+class TransactionStatus(Enum): PENDING, COMPLETED, REVERSED
 ```
 
-## Phase 3: dataclass vs `__init__`
+Only the values the code uses. An enum value nobody handles (the old `LOAN`, `FEE`, `INTEREST`) is a promise the code does not keep.
 
-- **`Account`**: ABC — abstract, subclasses have different rules
-- **`SavingsAccount`**: Regular — min balance, interest rate, withdrawal limit
-- **`CheckingAccount`**: Regular — overdraft limit
-- **`CreditAccount`**: Regular — credit limit, APR, `available_credit` computed
-- **`Transaction`**: Regular — auto-generated IDs, timestamp
-- **`Card`**: Regular — PIN validation state, block logic
-- **`CashDispenser`**: Regular — denomination management
-
-## Phase 4: Assigning Responsibilities
+## Phase 3: Assigning Responsibilities
 
 | Action | Owner | Why |
 |--------|-------|-----|
-| Validate withdrawal | `Account.can_withdraw()` | Each account type has different rules |
-| Deposit money | `Account.deposit()` | Account owns its balance |
-| Withdraw money | `Account.withdraw()` | Account validates + updates balance |
-| Validate PIN | `Card.validate_pin()` | Card owns PIN + attempts counter |
-| Check card expiry | `Card.is_expired()` | Card owns its expiry date |
-| Dispense cash | `CashDispenser.dispense()` | Manages denominations |
-| Authenticate | `BankingService.authenticate()` | Orchestrates Card → Account |
-| State transitions | `ATMState` subclasses | Each state has different allowed actions |
+| How much can leave this account? | `Account.withdrawable()` | The only thing that differs by type |
+| Hold / capture / reverse | `Bank` | Needs the account lock, the ledger and the daily limit |
+| Validate PIN, count attempts | `Card.verify_pin()` | Card owns the hash and the counter |
+| Is the card usable? | `Bank.validate_card()` | Unknown, blocked, expired |
+| Which notes? | `CashDispenser.plan()` | Pure function of stock and amount |
+| What is allowed right now? | `ATMState` subclasses | No `if state == ...` anywhere |
 
-## Phase 5: State Pattern for ATM
-
-The ATM has a clear lifecycle:
+## Phase 4: State Pattern for the ATM
 
 ```
-IDLE → insert_card → PIN_ENTERED → enter_pin → READY → perform_operations
-                                                          → eject_card → IDLE
+IDLE --insert_card (valid card)--> CARD_INSERTED --enter_pin (ok)--> AUTHENTICATED
+  ^                                   |   wrong PIN: stay (attempts left)        |
+  |                                   |   3rd wrong PIN: block + retain -> IDLE  |
+  +------------- eject_card ----------+------------------------------------------+
+IDLE <--restock-- OUT_OF_SERVICE <-- (session ends with an empty dispenser, or take_offline)
 ```
 
-Each state has different allowed operations:
-- **Idle:** Only insert_card works
-- **PinEntered:** Only enter_pin or eject_card
-- **Ready:** Only banking operations or eject_card
+The base `ATMState` raises `InvalidOperationError` for every operation; each state overrides only what it allows. That makes "what can happen in this state" readable in one place and makes holes visible.
 
-This eliminates `if state == X` conditionals everywhere.
+## Phase 5: The Withdrawal Sequence (the part to slow down on)
 
-## Phase 6: Account Hierarchy (LSP)
+1. `dispenser.plan(amount)`: can this machine pay it? No side effects.
+2. `bank.authorize_withdrawal(card, account, amount, request_id)`: daily limit, ownership, hold funds. Transaction `PENDING`.
+3. `dispenser.dispense(plan)`.
+4. Success → `bank.capture(tx)`. Jam → `bank.reverse(tx)`.
 
-```python
-class Account(ABC):
-    @abstractmethod
-    def can_withdraw(self, amount: float) -> bool: pass
-    def deposit(self, amount) -> Transaction      # Shared logic
-    def withdraw(self, amount) -> Transaction     # Uses can_withdraw()
+Ask out loud at each arrow: "What if we crash or time out here?" Before 2: nothing happened. Between 2 and 3: a hold exists; reverse it. Between 3 and 4: cash is out, so capture must be retried until it succeeds, which is why capture is idempotent.
 
-class SavingsAccount(Account):   # can_withdraw: min_balance check + withdrawal limit
-class CheckingAccount(Account):  # can_withdraw: overdraft limit check
-class CreditAccount(Account):    # can_withdraw: available_credit check
-```
+## Phase 6: Concurrency
 
-`BankingService` treats all accounts uniformly — just calls `account.withdraw()`.
+- Per-account lock for check-and-hold / check-and-debit.
+- Transfers lock both accounts in account-number order.
+- Daily limit is per card and gets its own small lock.
+- Idempotency claim is atomic (`_requests_lock`), the operation itself runs outside it.
 
 ## Phase 7: Cash Dispenser Denominations
 
-```python
-class CashDispenser:
-    def __init__(self):
-        self._denominations = {100: 200, 500: 100, 2000: 20}
-    
-    def _can_make_amount(self, amount: int) -> bool:
-        # Greedy algorithm: try to make amount with available denominations
-```
-
-The greedy approach works for standard denominations. This is a real-world detail.
+Greedy (largest note first) fails when it matters: 600 from `{500 × 1, 200 × 3}`. Use a bounded min-notes DP over amounts divided by the gcd of the denominations. Plan before authorizing, so an amount the machine cannot pay never touches the account.
 
 ## Phase 8: Quick Checklist
 
-✅ **State Pattern:** ATM states are clean and extensible
-✅ **LSP:** All account types are interchangeable
-✅ **SRP:** Account holds balance logic, Card holds authentication, Dispenser holds cash
-✅ **Encapsulation:** PIN validation, balance changes are through methods
+✅ **State pattern** with a reject-by-default base class; no unreachable or leaky states
+✅ **Two-phase withdrawal**: hold → dispense → capture/reverse
+✅ **Idempotency** on every money-moving call; capture and reverse are idempotent too
+✅ **Locks** per account, ordered for transfers; no check-then-act races
+✅ **Money** is `Decimal`; **PINs** are salted hashes compared in constant time
+✅ **Ownership**: a session can only reach the card holder's accounts

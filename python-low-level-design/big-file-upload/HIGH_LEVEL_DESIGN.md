@@ -8,17 +8,27 @@
 
 **Purpose:** Handle reliable upload of large files (100MB–100GB) with progress tracking, resume capability, virus scanning, and post-processing pipelines.
 
-**Scale:** 10K concurrent uploads, files up to 100GB, 1M+ files stored, 500MB/s aggregate throughput
+**Scale:** 10K concurrent uploads, files up to 100GB, 1M+ files stored
+
+**Capacity (derive, don't assert):**
+
+| Quantity | Estimate |
+|----------|----------|
+| Aggregate ingress | 10K uploads × ~10 Mbps average client uplink ≈ 100 Gbps ≈ 12.5 GB/s. Far more than app servers should proxy → bytes go **direct to S3** via pre-signed part URLs |
+| Chunk PUT rate | 12.5 GB/s ÷ 8 MiB parts ≈ 1,500 PUT/s, spread over thousands of `{upload_id}` prefixes (S3: ~3,500 PUT/s per prefix) |
+| Metadata writes | One row update per part ≈ 1,500 writes/s: fine for one Postgres primary; nothing per byte |
+| Part size | `max(5 MiB, ceil(size / 10,000))`: 100 GiB needs ≥ 10.24 MiB parts |
+| Temp storage | Incomplete uploads × size; e.g. 10K × 5 GB average = 50 TB in flight, which is why GC and lifecycle rules matter |
 
 **Users:** End users (upload/download), Content moderators (review/approve), System admins (monitor/manage)
 
 **Use Cases:** Video upload (YouTube/Vimeo), Document upload (Google Drive), Media sharing (Dropbox), Dataset upload (ML platforms), Medical imaging (DICOM)
 
 **Constraints:**
-- p99 upload completion time < 30 min for 10GB file (on 50 Mbps connection)
+- Upload time within ~1.2× raw transfer time (10 GB at 50 Mbps is ~27 min of pure transfer, so "10 GB in < 30 min on 50 Mbps" leaves almost no headroom)
 - Resumability: survive network drops up to 7 days
 - Virus scanning: 100% of uploads scanned < 5 min
-- 99.9% durability for stored files
+- Durability inherited from S3 (designed for 11 nines); 99.9% availability for the upload API
 - Idempotency: no duplicate storage on retry
 
 ---
@@ -157,8 +167,8 @@ Client                Upload Service           Metadata DB          Object Store
   │                         │── INSERT upload ────►│                   │
   │                         │   (status=INITIATED) │                   │
   │◄─── {upload_id,         │                      │                   │
-  │      chunk_size: 5MB,   │                      │                   │
-  │      max_chunks: 100}   │                      │                   │
+  │      chunk_size,        │  (≥ 5 MiB and ≥ size/10,000)             │
+  │      total_chunks}      │                      │                   │
   │                         │                      │                   │
   │ ═══════ UPLOAD CHUNKS (parallel, up to 6) ════════                │
   │                         │                      │                   │
@@ -175,8 +185,11 @@ Client                Upload Service           Metadata DB          Object Store
   │ (network drops here!)   │                      │                   │
   │                         │                      │                   │
   │──── HEAD /upload/{id} ──►                      │                   │
-  │                         │── SELECT max(offset)─►│                   │
-  │◄─── {offset: 5242880}   │                      │                   │
+  │                         │── SELECT received ───►│                   │
+  │                         │   chunk numbers       │                   │
+  │◄─── {offset: <end of contiguous prefix>,       │                   │
+  │      missing: [1, 4, …]}│                      │                   │
+  │   (NOT max(offset): with parallel chunks there can be gaps below it)│
   │                         │                      │                   │
   │──── PATCH /upload/{id} ─►                      │                   │
   │   /chunk?offset=5242880 │                      │                   │
@@ -251,13 +264,14 @@ CREATE TABLE uploads (
     chunk_size      INT NOT NULL DEFAULT 5242880,  -- 5MB default
     total_chunks    INT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'initiated'
-                    CHECK (status IN ('initiated','in_progress','completed',
-                                      'processing','ready','quarantined','failed')),
+                    CHECK (status IN ('initiated','in_progress','assembling','completed',
+                                      'ready','quarantined','failed','cancelled','expired')),
     storage_key     TEXT,                       -- S3 object key
+    storage_upload_id TEXT,                     -- S3 multipart UploadId
     storage_bucket  TEXT,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     completed_at    TIMESTAMPTZ,
-    expires_at      TIMESTAMPTZ DEFAULT NOW() + INTERVAL '7 days'
+    expires_at      TIMESTAMPTZ DEFAULT NOW() + INTERVAL '7 days'   -- bumped on every chunk
 );
 
 -- Chunk tracking
@@ -330,7 +344,7 @@ bucket/
 ```
 
 **Lifecycle Policies:**
-- `temp-chunks/`: Auto-delete after 7 days (abandoned uploads)
+- `temp-chunks/`: Auto-delete after **14** days, and `AbortIncompleteMultipartUpload` after 14 days. Lifecycle rules count from object creation, not last activity, so they must be longer than the app's 7-day *sliding* TTL; otherwise S3 deletes chunks of an upload the user resumed on day 6. The app GC is primary, lifecycle is the backstop.
 - `quarantine/`: Auto-delete after 30 days
 - `thumbnails/` and `hls/`: Retain indefinitely
 
@@ -354,7 +368,10 @@ Pros:
 Cons:
   - More complex client logic
   - Pre-signed URL expiry management
-  - S3 event notifications have eventual consistency
+  - S3 event notifications are asynchronous and at-least-once (usually seconds,
+    occasionally longer); S3 reads themselves are strongly consistent
+  - The URL fixes the key, not the content: verify size/checksums (ListParts)
+    before calling CompleteMultipartUpload
 
 When to use:
   - Files > 100MB
@@ -401,8 +418,11 @@ Multipart Upload (S3):
   - Upload parts in parallel
   - Upload parts in any order
   - Resume from failed parts
-  - Min part size: 5MB (except last)
-  - Max parts: 10,000
+  - Part size: 5 MiB – 5 GiB (the last part may be smaller)
+  - Max parts: 10,000 → 5 MiB parts cap the object at ~48.8 GiB;
+    for 100 GiB use ≥ 10.24 MiB parts
+  - Max object: 5 TiB
+  - Per-part checksums (x-amz-checksum-sha256 / crc32c) are verified by S3
 
 Single Object Upload:
   - Simple PUT request
@@ -459,17 +479,42 @@ RETRY_BACKOFF = {
 # Background job — runs every hour
 async def cleanup_abandoned_uploads():
     """Delete chunks for uploads that were never completed."""
+    # Claim and mark in ONE statement. (A bare SELECT ... FOR UPDATE SKIP LOCKED
+    # in autocommit releases its locks immediately, so two GC workers would
+    # both process the same rows.) Use expires_at, which slides with activity,
+    # not created_at, or you expire uploads that are actively resuming.
     stale_uploads = await db.fetch("""
-        SELECT id FROM uploads
-        WHERE status IN ('initiated', 'in_progress')
-        AND created_at < NOW() - INTERVAL '7 days'
-        FOR UPDATE SKIP LOCKED
+        UPDATE uploads SET status = 'expired'
+        WHERE id IN (SELECT id FROM uploads
+                     WHERE status IN ('initiated', 'in_progress')
+                       AND expires_at < NOW()
+                     LIMIT 500
+                     FOR UPDATE SKIP LOCKED)
+        RETURNING id
     """)
     for upload in stale_uploads:
         await storage.delete_prefix(f"temp-chunks/{upload.id}/")
         await db.execute("DELETE FROM chunks WHERE upload_id = $1", upload.id)
-        await db.execute("UPDATE uploads SET status = 'expired' WHERE id = $1", upload.id)
+        # (and AbortMultipartUpload if storage_upload_id is set; release the
+        #  user's concurrency slot and refund reserved quota)
 ```
+
+---
+
+### Failure Modes
+
+| Failure | What happens | Handling |
+|---------|--------------|----------|
+| Client crashes / laptop closes | Upload stays `in_progress` | Client persisted `upload_id`; on restart it asks for missing parts and sends only those |
+| Same part sent twice (retry after a lost ack) | Second write is a duplicate | Deterministic key + `ON CONFLICT DO NOTHING`; same checksum → success, different → 409 |
+| Two concurrent requests for one part | Race on the same key | In-flight reservation (or the unique constraint); loser gets a retryable 409 |
+| `complete` races a part upload | Could assemble without a part the client thinks it sent | Refuse `complete` while parts are in flight; `assembling` state blocks new writes |
+| Storage error during assembly | Upload stranded in `assembling` | Roll back to `in_progress` (parts intact); client retries `complete` |
+| Lost response to `complete` | Client retries | `complete` is idempotent: already `completed` → same response |
+| Crash between "status = completed" and "publish file.uploaded" | Scan never runs | Transactional outbox in the same DB transaction; relay to Kafka; idempotent consumers |
+| Corruption at rest | Assembled file wrong | S3-side part checksums; re-verify failing parts and ask the client to re-send them |
+| S3 503 SlowDown | Part PUTs fail | Exponential backoff + jitter on the client, more retries than 3; keys spread over many prefixes |
+| Abandoned uploads | Temp storage grows | Sliding-TTL GC + lifecycle backstop (longer than the TTL) |
 
 ---
 
@@ -484,6 +529,9 @@ async def cleanup_abandoned_uploads():
 | **Unrestricted upload size** | Reject files > max_allowed_size (100GB default) |
 | **SSRF via upload URL** | Validate all redirect URLs, use allowlist |
 | **Storage access bypass** | Signed URLs for downloads with expiry |
+| **Stored XSS via uploaded HTML/SVG** | Serve user files from a separate cookieless domain with `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff` |
+| **Decompression bombs** | Cap expanded size and file count when scanning or unpacking archives |
+| **Content-type spoofing** | Sniff magic bytes server-side; never trust the client's `Content-Type` |
 
 ---
 

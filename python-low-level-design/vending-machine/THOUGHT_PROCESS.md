@@ -10,85 +10,80 @@
 
 ---
 
-## Phase 0: Requirements Gathering
+## ⏱️ How to Run This in a 45–60 min Interview
 
-What products? What prices? What payment methods (cash/card/mobile)? How does change-making work? What are the machine's states?
+| Time | Step | What to say out loud |
+|------|------|----------------------|
+| 0–5 | **Clarify** | "Cash only, or card too? Which denominations, and which can it pay out? Select first or pay first? What happens if it can't make change? One item per transaction? Do I need maintenance/restock?" |
+| 5–12 | **Entities + interfaces** | "Money is integer cents. States: idle, awaiting payment, out of service. Two ports to the outside world — `Dispenser` and `PaymentGateway` — because both can fail and I want to fake them in tests." |
+| 12–35 | **Core code** | `Inventory`, `make_change`, the state classes, then `VendingMachine`. Write the cash path end to end first: select → insert → change check → dispense → commit. |
+| 35–45 | **Failure + concurrency** | "Jam: refund escrow / void the hold. Can't make change: reject the piece. One lock per machine because restock and remote purchases run alongside the keypad." |
+| 45–60 | **Extension** | Card payments (authorize/capture/void), timeouts, multi-item cart, pricing policy. |
+
+**Clarifying questions worth asking** (defaults to propose):
+
+- Payment methods? → cash and card.
+- Order: select then pay, or pay then select? → select first (price is known, change check is possible).
+- Can't make change? → reject the coin/note that overpays; light "exact change only".
+- Which pieces are paid out? → coins only; notes are accepted and kept.
+- Partial dispense / jam? → full refund, stock unchanged.
+- Concurrency? → keypad is single-user, but operator and remote purchases are concurrent.
+
+---
 
 ## Phase 1: Identify the Nouns
 
-> *"A vending machine displays products. User inserts money, selects a product, and receives it with change."*
+> *"A vending machine displays products. User selects a product, inserts money, and receives it with change."*
 
 | Noun | Decision | Why |
 |------|----------|-----|
-| Product | Regular Class | Has id, name, price |
-| Inventory | Regular Class | Manages product stock levels |
-| Coin/Note | Enum | Fixed denominations |
-| PaymentStrategy | ABC | Multiple payment methods |
-| CashPayment | Regular | Handles coin insertion and change |
-| VendingState | ABC | State pattern for machine lifecycle |
-| VendingMachine | Facade | Main entry point |
+| Denomination | Enum `(cents, is_coin)` | Fixed set; tuple values so a $1 coin and $1 note aren't Enum aliases |
+| Product | Frozen dataclass | Immutable catalogue entry, price in cents |
+| Slot | Dataclass | Where stock lives: code, product, quantity, capacity |
+| Inventory | Class | Slot lookup, restock with capacity check |
+| CashBox | Class | The machine's coins/notes |
+| Escrow | `Counter` on the machine | Customer's pieces until the sale commits |
+| Dispenser | ABC | Hardware that can fail |
+| PaymentGateway | ABC | Card auth/capture/void |
+| MachineState | Base class + 3 states | State pattern |
+| Receipt | Frozen dataclass | Result of a sale |
 
-## Phase 2: Enums First
-
-```python
-class Coin(Enum):     PENNY=0.01, NICKEL=0.05, DIME=0.10, QUARTER=0.25
-class Note(Enum):     ONE=1.0, FIVE=5.0, TEN=10.0, TWENTY=20.0
-class PaymentMethod(Enum): CASH, CARD, MOBILE
-```
-
-**Note:** Coin and Note are enums with *values* — perfect for currency.
-
-## Phase 3: dataclass vs `__init__`
-
-- **`Product`**: Regular — has attributes but minimal behavior
-- **`Inventory`**: Regular — manages dictionary of stock, has behavior (`dispense`, `is_available`)
-- **`CashPayment`**: Regular — tracks inserted amount, has behavior
-- **`CoinMechanism`**: Regular — handles change-making algorithm
-
-## Phase 4: Assigning Responsibilities
+## Phase 2: Assign Responsibilities
 
 | Action | Owner | Why |
 |--------|-------|-----|
-| Select product | `VendingState.select_product()` | State machine controls flow |
-| Insert money | `CashPayment.insert_coin()` | Payment strategy owns money |
-| Process payment | `PaymentStrategy.process_payment()` | Each payment method differs |
-| Dispense product | `Inventory.dispense()` | Inventory owns stock |
-| Make change | `CoinMechanism.dispense_change()` | Coin system owns change logic |
-| Show messages | `VendingDisplay` | SRP: UI/display separate |
+| Is this action allowed now? | Current `MachineState` | No `if state == ...` chains |
+| Can I make change? | `make_change()` | Pure function, easy to test |
+| Hold customer cash | Machine `_escrow` | Must be returnable as-is |
+| Drop the product | `Dispenser` | Hardware port; may fail |
+| Charge a card | `PaymentGateway` | Two-phase so we never charge for nothing |
+| Commit a sale | `VendingMachine._vend_cash/_vend_card` | One place moves stock and money together |
 
-## Phase 5: State Pattern (Critical!)
+## Phase 3: The State Machine
 
-The vending machine has clear states: **Idle → WaitingForMoney → ReadyToDispense**
-
-```python
-class VendingState(ABC):
-    def select_product(self, product_id)  # Each state behaves differently
-    def insert_coin(self, coin)
-    def dispense_product(self)
-    def cancel_transaction(self)
-
-class IdleState(VendingState):     # Only select_product works
-class WaitingForMoneyState(VendingState):  # Only insert_coin works
-class ReadyToDispenseState(VendingState):  # Only dispense works
+```
+IDLE --select(code)--> AWAITING_PAYMENT
+AWAITING_PAYMENT --insert (balance < price)--> AWAITING_PAYMENT
+AWAITING_PAYMENT --insert (completes, change OK)--> [dispense] --> IDLE
+AWAITING_PAYMENT --insert (completes, no change)--> reject piece, stay
+AWAITING_PAYMENT --pay_by_card--> [authorize, dispense, capture] --> IDLE
+AWAITING_PAYMENT --cancel | jam--> refund --> IDLE
+any --enter_maintenance--> (refund if open) OUT_OF_SERVICE --exit--> IDLE
 ```
 
-**Why State Pattern?** Without it, you'd have `if state == IDLE: ... elif state == WAITING: ...` scattered everywhere. With it, each state's behavior is encapsulated.
+## Phase 4: The Order of Operations That Keeps Money Safe
 
-## Phase 6: Strategy Pattern for Payment
+1. Validate the selection (exists, in stock).
+2. Accept pieces into escrow.
+3. On the piece that completes payment, check change **before** accepting it.
+4. Drive the motor; if the drop sensor fails, refund/void and stop.
+5. Commit: escrow → cash box, change out, stock − 1 (card: capture).
 
-```python
-class PaymentStrategy(ABC):
-    def process_payment(self, amount) -> bool
-    def refund(self, amount) -> bool
+## Phase 5: Quick Checklist
 
-class CashPayment(PaymentStrategy):  # Handles physical money
-class CardPayment(PaymentStrategy):   # Swipe/insert card
-class MobilePayment(PaymentStrategy): # UPI/Apple Pay
-```
-
-## Phase 7: Quick Checklist
-
-✅ **State Pattern:** Machine lifecycle is clean and extensible
-✅ **Strategy Pattern:** Payment methods are swappable
-✅ **SRP:** Inventory, Payment, Display, CoinMechanism are all separate
-✅ **OCP:** Add a new state or payment method → new class, zero existing changes
+✅ Integer cents, never float
+✅ Escrow returned as the exact pieces on cancel
+✅ Change computed with bounded DP, checked before taking the money
+✅ Card captured only after a confirmed drop; voided on jam
+✅ Every public method atomic under one machine lock
+✅ Hardware and gateway behind ABCs, faked in tests

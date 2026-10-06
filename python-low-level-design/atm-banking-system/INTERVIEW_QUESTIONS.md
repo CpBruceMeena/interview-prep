@@ -1,7 +1,7 @@
 # ATM/Banking System - Interview Questions & Answers
 
 > **Target Level:** Senior/Staff Engineer (6+ years)  
-> **Evaluation Focus:** State machines, security, concurrency, financial transaction integrity
+> **Evaluation Focus:** State machines, failure handling around cash, idempotency, concurrency, money correctness
 
 ---
 
@@ -10,150 +10,199 @@
 
 ### 🎯 Expected Answer
 
-**State Machine Design (the heart of this problem):**
-```
-IDLE → CARD_INSERTED → PIN_ENTERED → READY
-  │         │               │           │
-  │         └── (wrong PIN ×3) → BLOCKED
-  │                                      │
-  └─── EJECT_CARD ←──────────────────────┘
-```
+**State machine first:**
 
-**State Pattern Implementation:**
+| State | Allowed | Transitions |
+|-------|---------|-------------|
+| `IDLE` | insert card | valid card → `CARD_INSERTED`; invalid → stay |
+| `CARD_INSERTED` | enter PIN, eject | ok → `AUTHENTICATED`; wrong → stay; 3rd wrong → block, retain card, `IDLE` |
+| `AUTHENTICATED` | balance, withdraw, deposit, select own account, eject | eject → `IDLE` (or `OUT_OF_SERVICE` if cash ran out) |
+| `OUT_OF_SERVICE` | nothing | operator restock → `IDLE` |
+
 ```python
 class ATMState(ABC):
-    @abstractmethod
-    def insert_card(self, card_number): pass
-    @abstractmethod
-    def enter_pin(self, pin): pass
-    @abstractmethod
-    def check_balance(self): pass
-    @abstractmethod
-    def withdraw(self, amount): pass
-    @abstractmethod
-    def eject_card(self): pass
+    def _invalid(self, op): raise InvalidOperationError(f"cannot {op} while {self.name}")
+    def insert_card(self, card_number): self._invalid("insert card")
+    def enter_pin(self, pin):           self._invalid("enter PIN")
+    def withdraw(self, amount):         self._invalid("withdraw")
+    ...
 
-class IdleATMState(ATMState):
-    def insert_card(self, card_number):
-        self._atm._current_card = card_number
-        self._atm._state = self._atm._pin_entered_state
-
-class PinEnteredATMState(ATMState):
+class CardInsertedState(ATMState):
     def enter_pin(self, pin):
-        account = self._atm._bank.authenticate(self._atm._current_card, pin)
-        if account:
-            self._atm._current_account = account
-            self._atm._state = self._atm._ready_state
-        # On failure, track attempts. 3 failures → BLOCKED state.
-
-class ReadyATMState(ATMState):
-    def withdraw(self, amount):
-        if self._atm._cash_dispenser.can_dispense(amount):
-            tx = self._atm._bank.withdraw(self._atm._current_account, amount)
-            self._atm._cash_dispenser.dispense(amount)
-            return tx
+        try:
+            card = self.atm.bank.verify_pin(self.atm._card, pin)
+        except CardBlockedError:
+            self.atm._retain_card()
+            raise
+        self.atm._account = card.account_number
+        self.atm._set_state(self.atm.authenticated)
 ```
 
-**Why State Pattern over if-else?** With `if state == IDLE: ... elif state == PIN_ENTERED:`, adding a new state (e.g., `MAINTENANCE`) requires modifying every method. With State Pattern, add one class — OCP satisfied.
+**Why a reject-by-default base class?** Each state lists only what it allows. Adding `MAINTENANCE` is one class, and nothing is silently allowed because someone forgot an `elif`.
 
 ---
 
-## Question 2: Account Types & Transactions
-**Interviewer:** *"Handle Savings, Checking, and Credit accounts with different rules."*
+## Question 2: The Withdrawal Sequence
+**Interviewer:** *"Walk me through a withdrawal. What if the dispenser jams?"*
+
+### 🎯 Answer
+
+```
+plan  = dispenser.plan(amount)                 # can this machine pay it? no side effects
+tx    = bank.authorize_withdrawal(..., request_id)   # hold funds, PENDING
+try:    dispenser.dispense(plan)
+except DispenseError: bank.reverse(tx); raise  # nothing came out
+bank.capture(tx)                               # cash is out
+```
+
+Then go arrow by arrow:
+
+- **Dispenser cannot make the amount** → caught at `plan`, before any hold. (The naive version debits first and leaves the customer short.)
+- **Authorization declined** (funds, daily limit, ownership) → nothing to undo.
+- **Jam before notes move** → `reverse`. The hold is released and the daily limit is given back.
+- **Notes presented, capture call times out** → retry `capture` with the same transaction; it is idempotent. Never reverse here: the customer has the cash.
+- **Ambiguous jam (some notes may have been presented)** → do not guess. Mark the transaction for reconciliation; the cassette counters and the purge bin settle it at end of day.
+
+In real ISO 8583 networks this is usually a single financial request (0200) that debits on approval, followed by a reversal advice (0420) on failure that the ATM stores and forwards until acknowledged. Same effect: the default after a failure is to give the money back, and the reversal must be delivered reliably.
+
+---
+
+## Question 3: Idempotency
+**Interviewer:** *"The ATM sends a withdrawal, the response is lost, and it retries. What happens?"*
+
+### 🎯 Answer
+
+Every money-moving request carries a `request_id` generated by the ATM (`ATM._request_id()`: ATM id + sequence). The bank:
+
+1. Atomically claims the id. If it already completed, it returns the stored result; if the parameters differ, it rejects the request as a client bug; if it is still in flight, it tells the caller to retry later.
+2. Runs the operation, then stores the result. A failed attempt releases the claim so a decline is re-evaluated on retry.
+
+`capture` and `reverse` are idempotent by state: capturing a `COMPLETED` transaction is a no-op, and capture after reverse is an error. In a database the claim is a `UNIQUE (request_id)` insert in the same transaction as the balance update, and the stored response is returned on conflict.
+
+---
+
+## Question 4: Concurrency
+**Interviewer:** *"Two ATMs withdraw from the same joint account at the same time."*
+
+### 🎯 Answer
+
+The race is check-then-act on the balance. In process: one lock per account, held across "check `withdrawable()` → add hold". The test runs 16 threads × 50 withdrawals of 100 against 10,000 withdrawable and gets exactly 100 successes.
+
+In a database, make the check part of the write:
+
+```sql
+UPDATE accounts SET held = held + :amt
+WHERE id = :id AND balance - held - :min_balance >= :amt;     -- 0 rows -> declined
+```
+
+Prefer this over optimistic `version` retries for hot accounts: under contention, optimistic locking turns into a retry storm, while the conditional update just waits for the row lock briefly.
+
+**Transfers** touch two accounts: lock them in a global order (account number) so A→B and B→A cannot deadlock. In SQL, `SELECT ... FOR UPDATE` both rows ordered by id, or update them in id order.
+
+**Daily limits** are per card, and one card can reach several accounts, so the counter needs its own lock (or its own row with a conditional update), not the account lock.
+
+---
+
+## Question 5: Account Types
+**Interviewer:** *"Handle savings, checking, and credit accounts with different rules."*
 
 ### 🎯 Answer
 
 ```python
 class Account(ABC):
     @abstractmethod
-    def can_withdraw(self, amount) -> bool: pass
+    def withdrawable(self) -> Decimal: ...
 
-class SavingsAccount(Account):
-    def can_withdraw(self, amount):
-        return (self._balance - amount >= self._min_balance 
-                and amount <= 50000)  # Daily limit
-
-class CheckingAccount(Account):
-    def can_withdraw(self, amount):
-        return self._balance - amount >= -self._overdraft_limit  # $1000 OD
-
-class CreditAccount(Account):
-    def can_withdraw(self, amount):
-        return self.available_credit >= amount
+class SavingsAccount(Account):   # balance - held - min_balance
+class CheckingAccount(Account):  # balance - held + overdraft_limit
+class CreditAccount(Account):    # credit_limit + balance - held   (balance < 0 means owed)
 ```
 
-**Polymorphism eliminates if-else chains.** Each account type knows its own constraints. The withdrawal logic never checks `account_type == SAVINGS` — it just calls `can_withdraw()`.
+All the shared mechanics (hold, capture, debit, credit) live in the base class and call `withdrawable()`. Two classic bugs to avoid: letting credit withdrawals bypass the limit check, and computing available credit with `abs(balance)`, which makes an overpayment *reduce* available credit.
 
 ---
 
-## Question 3: Security
+## Question 6: Cash Management
+**Interviewer:** *"How does the ATM decide which notes to dispense?"*
+
+### 🎯 Answer
+
+Greedy (largest note first) is wrong in general: 600 from `{500 × 1, 200 × 3}` takes the 500 and is stuck at 100, though `3 × 200` works. Use a bounded min-notes DP over `amount / gcd(denominations)`; ATM amounts keep this to a few hundred states. Plan before authorizing.
+
+Operationally: alert on low cassettes, forecast demand per ATM (weekends, paydays, festivals), and reconcile dispensed notes against captured transactions daily.
+
+---
+
+## Question 7: Security
+**Interviewer:** *"How is the PIN protected?"*
+
+### 🎯 Answer
 
 | Layer | Measure |
 |-------|---------|
-| **Card** | PIN hashing (bcrypt), 3-attempt lockout, EMV chip |
-| **Session** | Auto-eject after 30s inactivity |
-| **Transaction** | Daily limits ($500 withdrawal), velocity checks |
-| **Network** | End-to-end encryption (TLS 1.3), HSM for PIN blocks |
-| **Audit** | Every transaction logged, immutable audit trail |
+| **PIN pad** | Encrypting PIN pad; the PIN is formatted into an ISO 9564 PIN block (format 0 or 4) and encrypted with a symmetric key (DUKPT or a terminal key), never sent in clear |
+| **Network** | Translated between zone keys inside HSMs at each hop; message MACs |
+| **Verification** | Inside the issuer's HSM against a PIN offset (IBM 3624) or PVV (Visa). The application never sees the PIN |
+| **Storage** | Never store anything a stolen database can brute-force: a 4-digit PIN has 10,000 values, so a hash alone is not protection |
+| **Attempts** | Durable counter (database, not a cache with a TTL); block after 3; retain the card |
+| **Session** | Timeout ejects or retains the card; a session can only reach the card holder's accounts |
 
-**PIN verification flow (never transmit raw PIN):**
-```python
-# ATM encrypts PIN with HSM public key
-encrypted_pin = hsm.encrypt(pin, hsm_public_key)
-# Bank decrypts and verifies
-decrypted_pin = hsm.decrypt(encrypted_pin, hsm_private_key)
-# Compare with stored hash
-is_valid = bcrypt.checkpw(decrypted_pin, stored_hash)
-```
+In the LLD, salted PBKDF2 plus `hmac.compare_digest` stands in for the HSM.
 
 ---
 
-## Question 4: Cash Management
+## Question 8: "Now add X" Extensions
 
-**Denomination optimization for dispensing:**
-```python
-def dispense(self, amount: int):
-    notes = {}
-    for denom in [2000, 500, 100]:  # INR denominations
-        count = min(amount // denom, self._available[denom])
-        if count > 0:
-            notes[denom] = count
-            amount -= count * denom
-            self._available[denom] -= count
-    if amount > 0:
-        raise InsufficientFundsError("Cannot dispense requested amount")
-    return notes
-```
-
-**Predictive replenishment:** Monitor average daily withdrawal per ATM. Schedule cash refill when predicted to drop below 20% capacity. Use historical patterns (weekends = higher demand).
+| Interviewer adds | Answer |
+|------------------|--------|
+| **Session timeout** | `ATM.tick(now)`; `CardInsertedState` and `AuthenticatedState` eject after N seconds idle, retain if the card is not taken |
+| **PIN change** | New operation in `AuthenticatedState`; verify old PIN again, update hash, reset attempts |
+| **Fees for other-bank cards** | Separate `FEE` transaction captured together with the withdrawal, under the same account lock |
+| **Cash deposit** | `PENDING` until the note acceptor counts; credit the counted amount; mismatches go to reconciliation |
+| **Mini statement** | `Bank.statement(account, limit)`; read-only, no state change |
+| **Offline (stand-in) mode** | Approve small withdrawals against a stand-in limit, queue the advices, reconcile when back online; accept the risk explicitly |
 
 ---
 
-## Question 5: Transaction Processing
+## Question 9: Testing Strategy
 
-**ACID properties for financial transactions:**
-```python
-def transfer(from_acct, to_acct, amount):
-    with db.transaction():  # Atomic
-        from_acct.withdraw(amount)  # Checked
-        to_acct.deposit(amount)     # Consistent
-        
-        # Durability: written to WAL before commit
-        audit_log.record(from_acct, to_acct, amount, "TRANSFER")
-    # On failure, entire transaction rolls back
-```
-
-**Daily settlement:** Batch process at EOD — reconcile ATM cash dispensed vs. transaction records. Any discrepancy triggers investigation.
+- **State machine:** every disallowed operation in every state raises; unknown/expired/blocked cards never leave `IDLE`; three wrong PINs block and retain; a correct PIN resets the counter.
+- **Withdrawal failure paths:** cannot-dispense makes no hold; jam reverses the hold and frees the daily limit; insufficient funds leaves notes in the machine.
+- **Idempotency:** same request id twice → one money movement; same id with different parameters → error; same id from 8 threads → one movement.
+- **Transaction state:** capture/reverse idempotent; capture after reverse rejected.
+- **Concurrency:** many threads against one account never overdraw; opposite transfers finish (join with timeout) and conserve the total.
+- **Dispenser:** the greedy counter-example, min notes, impossible amounts.
 
 ---
 
-## Question 6: Design Patterns
+## Question 10: Design Patterns
 
 | Pattern | Where | Why |
 |---------|-------|-----|
-| **State** | ATM states | Clean lifecycle, easy extension |
-| **Strategy** | Account types | Different withdrawal rules |
-| **Facade** | BankingService | Unified interface |
-| **Singleton** | CashDispenser | Single cash inventory per ATM |
-| **Factory** | Account creation | Config-driven setup |
-| **Chain of Responsibility** | Transaction validation | Fee check → limit check → fraud check → execute |
+| **State** | `ATMState` subclasses | Allowed operations per state, reject by default |
+| **Template method** | `Account` + `withdrawable()` | Shared hold/debit logic, one varying rule |
+| **Facade** | `Bank` | Accounts, cards, ledger, locks, idempotency behind one API |
+| **Factory** | `Bank.open_account` | `AccountType` → subclass |
+
+A `CashDispenser` is **not** a singleton: there is one per ATM, and the bank talks to thousands.
+
+---
+
+## ⚠️ Common Mistakes
+
+- Debiting the account before checking that the dispenser can pay the amount.
+- Reversing after cash was presented because the capture call timed out.
+- No request id, so a network retry withdraws twice.
+- Check-then-act on balance without a lock or conditional update.
+- Locking two accounts in call order, so opposite transfers deadlock.
+- A state machine that prints "invalid" and keeps going, or lets a blocked card keep trying PINs.
+- Letting the session select any account number instead of the card holder's own.
+- `float` money; greedy note selection; PINs stored in plain text or as a bare hash.
+- Calling the dispenser a singleton.
+
+---
+
+## 🎚️ Senior vs Staff Signal
+
+- **Senior:** clean state pattern, polymorphic account rules, `Decimal`, per-account locking with ordered transfer locks, a jam handled by reversal, tests for the main paths.
+- **Staff:** reasons through every crash point in the withdrawal sequence and knows which way to fail at each one; makes every money call idempotent and explains where the idempotency record lives; picks conditional updates over optimistic retries for hot rows; knows the PIN never touches application code; brings up reconciliation, stand-in mode and what is acceptable risk.

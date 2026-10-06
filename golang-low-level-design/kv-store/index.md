@@ -15,4 +15,4 @@ A low-level design worked end to end in Go — from the reasoning you'd show an 
 
 ---
 
-**Runnable source:** `kv_store.go`
+**Runnable source:** `kv_store.go`, `kv_store_test.go`

@@ -66,12 +66,12 @@
 1. Rider opens app → sends pickup location
 2. API Gateway routes to Rider Service
 3. Rider Service calls Driver Service with pickup coords
-4. Driver Service queries Redis GEO: GEORADIUS pickup 3km
-5. Redis returns nearest available drivers (sorted by distance)
-6. Driver Service selects closest driver, sends dispatch notification
-7. Driver accepts → Trip Service creates trip record
-8. Trip event published to Kafka topic 'trip.events'
-9. Payment service (async consumer) processes pre-authorization
+4. Driver Service queries Redis GEO: GEOSEARCH pickup BYRADIUS 2 km (expand to 5, 10 km on miss)
+5. Redis returns nearby drivers (sorted by distance); the matcher ranks them
+6. Matcher claims the best one atomically (SET NX PX / conditional UPDATE); on failure, the next
+7. Trip Service creates the trip in REQUESTED (+ outbox row) and sends the offer to the driver
+8. Driver accepts → ACCEPTED; declines or times out → claim released, re-match excluding them
+9. Trip events relayed from the outbox to Kafka 'trip.events'; Payment pre-authorises asynchronously
 ```
 
 ### 🎬 Animated Sequence Diagram
@@ -114,7 +114,7 @@
                                               │                   │
                                               │         ┌─────────▼────────┐
                                               │         │  Zone Lookup     │
-                                              │         │  (PostGIS query) │
+                                              │         │  (H3, in-process)│
                                               │         └─────────┬────────┘
                                               │                   │
                                               │         ┌─────────▼────────┐
@@ -125,10 +125,10 @@
 
 **Staff-level considerations:**
 - **Partition key:** `driver_id` → ensures same driver's events go to same partition for ordered processing
-- **Idempotent producer:** Exactly-once semantics to avoid duplicate GPS updates
+- **Delivery semantics:** at-least-once. Commit offsets after the Redis write; the consumer drops any ping whose timestamp is not newer than the stored one, so replays are harmless. (An idempotent producer only removes duplicate appends from producer retries; it does not make the Redis write exactly-once.)
 - **Dead letter queue:** Messages that fail enrichment (e.g., malformed GPS) go to `gps.dlq`
-- **Backpressure:** If Redis Geo write fails, buffer in Kafka and replay; never drop location updates
-- **Scaling:** Each city gets its own Kafka cluster to isolate blast radius
+- **Backpressure:** If Redis is slow, pause partitions (Kafka buffers durably). After a long lag, skip to the newest pings per driver: a stale position is worth less than a fresh one
+- **Scaling:** Partition by `driver_id`, add partitions/consumers per region. Isolate blast radius per region (cluster per region), not per city
 
 ---
 
@@ -137,16 +137,18 @@
 ### Redis GEO Implementation
 
 ```python
-# Production: Redis GEO with sorted sets
-def find_nearest_drivers(pickup_lat, pickup_lng, radius_km=3, limit=5):
-    drivers = redis.georadius(
-        "drivers:available",
-        pickup_lng, pickup_lat,      # Note: Redis uses (lng, lat) order
-        radius_km, unit="km",
-        withcoord=True, withdist=True,
-        sort="ASC", count=limit
+# Production: Redis GEO (GEOSEARCH, Redis >= 6.2; GEORADIUS is deprecated)
+def find_nearest_drivers(city, cab_type, pickup_lat, pickup_lng, radius_km=2, limit=10):
+    return redis.geosearch(
+        f"drivers:available:{city}:{cab_type}",
+        longitude=pickup_lng, latitude=pickup_lat,   # Redis takes (lng, lat)
+        radius=radius_km, unit="km",
+        withdist=True, sort="ASC", count=limit,
     )
-    return drivers
+
+def claim(driver_id, trip_id):
+    # The only authoritative step: atomic, self-expiring if we crash.
+    return redis.set(f"driver:{driver_id}:assignment", trip_id, nx=True, px=15000)
 ```
 
 ### Progressive Radius Expansion
@@ -168,11 +170,11 @@ Pickup Location
 ```
 
 **Staff-level considerations:**
-- **Geohash precision trade-off:** Shorter geohash prefix = broader search = more O(log N) nodes to scan
-- **Cache warming:** Pre-compute geohash prefixes for high-demand areas (airports, train stations)
-- **Read-replicas:** Route GEORADIUS queries to Redis read-replicas to reduce primary write load
-- **Race condition:** Driver status changes between GEORADIUS and dispatch → use optimistic locking with trip version
-- **Grid partitioning:** Over-engineer by pre-sharding `drivers:available` by cab_type → `drivers:available:mini`, `drivers:available:suv`
+- **Query cost:** `GEOSEARCH` is O(N + log M): N = points in the 9 bounding cells, M = points in the result shape. Dense downtown cells make N large; keep radii small there and expand only on miss
+- **Neighbour cells:** a geohash prefix search must include the 8 neighbouring cells or drivers just across an edge are missed (Redis does this internally)
+- **Read-replicas:** replicas lag the primary (async replication), so a replica may still list a just-booked driver. Fine, because the claim below is the authority
+- **Race condition:** the search result is stale the moment it returns. Reserve with an atomic claim (`SET driver:{id}:assignment {trip} NX PX 15000` or `UPDATE drivers SET status='BOOKED' WHERE id=? AND status='AVAILABLE'`); on failure try the next candidate
+- **Key layout:** shard by city and cab type → `drivers:available:{city}:mini`. One GEO key lives on one Redis shard, so this is also how you spread load; remove a driver from the key when they are booked
 
 ---
 
@@ -212,7 +214,7 @@ Every 30 seconds (tumbling window):
 │   requests =    │
 │     COUNT(ride_requests)       │
 │     WHERE zone_id = Z          │
-│     IN LAST 5 MINUTES          │
+│     IN THIS 30 s WINDOW        │
 │                 │
 │   surge = f(drivers, requests) │
 │                 │
@@ -224,17 +226,18 @@ Every 30 seconds (tumbling window):
 ### Surge Multiplier Calculation
 
 ```python
-def calculate_surge(driver_count: int, demand_count: int) -> float:
-    if driver_count == 0:
-        return 2.5  # Max surge
-    
-    ratio = demand_count / driver_count
-    
-    if ratio > 3.0:      return 2.0
-    elif ratio > 2.0:    return 1.5
-    elif ratio > 1.5:    return 1.25
-    else:                return 1.0
-    # Note: Surge decays with 5-minute half-life to prevent driver gaming
+def compute_surge(demand: int, supply: int) -> Decimal:
+    if demand == 0:
+        return Decimal("1.0")   # no demand, no surge, even with zero drivers
+    if supply == 0:
+        return Decimal("2.5")   # cap
+    ratio = demand / supply
+    if ratio > 3.0:   return Decimal("2.0")
+    if ratio > 2.0:   return Decimal("1.5")
+    if ratio > 1.5:   return Decimal("1.25")
+    return Decimal("1.0")
+# Production adds: smoothing across neighbouring cells, hysteresis/decay so the
+# multiplier doesn't flicker, and the multiplier is locked into the quote.
 ```
 
 ---
@@ -243,13 +246,13 @@ def calculate_surge(driver_count: int, demand_count: int) -> float:
 
 ### PostgreSQL + PostGIS Tables
 
-See [CODE.md](CODE.md) for the complete 9-table DDL schema.
+See [DB_SCHEMA.md](DB_SCHEMA.md) for the complete DDL.
 
 **Key tables:**
 - `riders` — user accounts, ratings, payment methods (JSONB)
 - `drivers` — license, cab type, availability status, **GEOGRAPHY(Point)** for geo-radius queries
 - `trips` — full trip state machine, fare breakdown, **GEOGRAPHY** pickup/dropoff
-- `zones` — hexagonal zone definitions with **GIST spatial index**
+- `zones` — zone (H3 cell) definitions with **GIST spatial index**
 - `driver_location_history` — **partitioned by month** for query performance
 - `payments` — with idempotency key for exactly-once processing
 - `surge_pricing_log` — time-series of zone supply/demand
@@ -257,11 +260,12 @@ See [CODE.md](CODE.md) for the complete 9-table DDL schema.
 ### Redis Keys
 
 ```ascii
-drivers:available              → GEO (sorted set of available drivers)
-driver:{id}:status             → STRING (AVAILABLE/ON_TRIP/OFFLINE)
+drivers:available:{city}:{type} → GEO (sorted set of available drivers)
+driver:{id}:assignment         → STRING trip_id, SET NX PX 15000 (the claim)
+driver:{id}:status             → STRING (AVAILABLE/BOOKED/ON_TRIP/OFFLINE)
 trip:{id}:state                → HASH (current trip state machine)
 zone:{id}:surge                → STRING (current surge multiplier)
-zone:{id}:driver_count         → STRING (number of available drivers)
+zone:{id}:drivers              → ZSET driver_id scored by last-seen ts (ZCARD = supply)
 ```
 
 ---
@@ -282,8 +286,8 @@ Driver App ──(WebSocket, binary protobuf)──▶ WS Gateway (Nginx/HAProxy
                                                      ├── Kafka producer (async, batching)
                                                      │    └── Topic: gps.raw.updates (5 partitions per city)
                                                      │
-                                                     ├── Redis Geo write (synchronous, every 3rd update)
-                                                     │    └── GEOADD drivers:available <lng> <lat> <driver_id>
+                                                     ├── Stream processor → Redis GEO (every update, ts-guarded)
+                                                     │    └── GEOADD drivers:available:{city}:{type} <lng> <lat> <driver_id>
                                                      │
                                                      └── Batch write to Cassandra (30s cadence)
                                                           └── driver_location_history (TTL: 90 days)
@@ -294,11 +298,11 @@ Driver App ──(WebSocket, binary protobuf)──▶ WS Gateway (Nginx/HAProxy
 2. **Adaptive polling** — 3s when moving, 30s when stationary (detect via accelerometer)
 3. **Dead reckoning** — if GPS drops, estimate position from last known speed/direction
 4. **Kalman filter** — smooth GPS noise at the app level before sending
-5. **Write-behind cache** — Redis Geo is source of truth for real-time; Cassandra for history
+5. **Rebuildable index** — Redis GEO is the source of truth for *current* position only; every driver re-pings within ~3 s, so a lost index heals in one interval. Cassandra holds history
 6. **Kafka partitioning** — `driver_id` as partition key ensures ordered processing per driver
 
 **Failure modes:**
-- **Redis Geo cluster down:** Fall back to PostGIS `ST_DWithin` query with degraded SLA (200ms vs 5ms)
+- **Redis GEO shard down:** fail over to its replica (seconds); the index refills from the next round of pings. PostGIS `ST_DWithin` on the last persisted positions is a degraded fallback
 - **Kafka broker failure:** Rebalance partitions across remaining brokers; drivers re-publish on reconnect
 - **GPS data corruption:** Schema validation at Kafka producer; DLQ for bad messages
 
@@ -311,17 +315,17 @@ Driver App ──(WebSocket, binary protobuf)──▶ WS Gateway (Nginx/HAProxy
 **Geo-fencing architecture:**
 
 ```
-1. Partition city into ~500m hexagonal zones (~500 zones for a 10km² city)
-2. Maintain zone state in Redis Hashes:
-     HINCRBY zone:{id}:stats drivers 1    (when driver enters zone)
-     HINCRBY zone:{id}:stats requests 1   (when ride requested in zone)
+1. Partition the city into H3 resolution-8 cells (≈0.74 km² each; a 10 km-radius city ≈ 314 km² ≈ 425 cells)
+2. Maintain zone state in Redis:
+     ZADD zone:{id}:drivers <ts> <driver_id>  (on each ping; ZREM from the old zone when the cell changes)
+     ZREMRANGEBYSCORE zone:{id}:drivers -inf <now-30s>; ZCARD → supply
+     HINCRBY zone:{id}:stats requests 1      (when ride requested in zone)
 3. Run aggregation worker every 30 seconds:
      For each zone:
-       supply = HGET zone:{id}:stats drivers
-       demand = HGET zone:{id}:stats requests
-       surge = f(supply, demand)
+       supply = ZCARD zone:{id}:drivers (after trimming stale entries)
+       demand = MULTI; HGET requests; HSET requests 0; EXEC  (read-and-reset = tumbling window)
+       surge = f(demand, supply)
        HSET zone:{id}:stats surge {surge}
-       EXPIRE zone:{id}:stats 60  (auto-reset supply/demand)
 4. Publish zone stats to Kafka topic 'gps.zone.driver_counts'
 5. Rider app reads surge via GET /api/zones/{zone_id}/surge
    (cached for 5 seconds at API Gateway)
@@ -476,13 +480,45 @@ Rider requests Mumbai → Pune (150km)
 
 ---
 
+## 7a. CONSISTENCY, IDEMPOTENCY & FAILURE MODES
+
+**Where strong consistency is required, and where it isn't:**
+
+| Data | Consistency | Why |
+|------|-------------|-----|
+| Driver assignment (claim) | Linearizable per driver (Redis `SET NX` on the primary, or a conditional UPDATE) | Double-booking is the one unacceptable failure |
+| Trip status | Linearizable per trip (conditional UPDATE on `status`/`version`) | Cancel-vs-start must have one winner |
+| Driver positions | Eventual, last-writer-wins by device timestamp | Stale by ≤ 3 s anyway; rebuildable |
+| Surge multipliers | Eventual (30 s windows) | Quoted and locked into the trip at request time |
+| Payments | Exactly-once effect via idempotency keys | Money |
+
+**Idempotency:**
+- `POST /rides` takes an `Idempotency-Key`; `trips.idempotency_key` is UNIQUE, so a retried request returns the original trip.
+- GPS consumer is idempotent by timestamp; trip-event consumers dedupe on `(trip_id, version)`.
+- Payment capture uses `payments.idempotency_key`; retries never double-charge.
+
+**Failure modes:**
+
+| Failure | Effect | Mitigation |
+|---------|--------|------------|
+| Matcher dies after claim, before trip insert | Driver stuck BOOKED | Claim TTL (`PX 15000`) or reaper for claims with no trip |
+| Trip committed but event not published | Payment/notifications never hear about it | Transactional outbox + relay |
+| Driver app disconnects mid-offer | Rider waits forever | Offer timeout → decline path → re-match |
+| Redis primary failover | Last ~1 s of positions/claims may be lost (async replication) | Positions heal on next ping; re-check claims against the trip DB on accept |
+| Kafka consumer lag | Positions stale, matches worse | Alert on lag; skip to latest offsets; widen first search radius |
+| Hot zone (stadium exit) | Thousands of requests on one geo cell | Batch matching per cell every 1–2 s; per-cell single-writer dispatch |
+
+**Capacity (per the scale in §1):** 100K drivers / 3 s ≈ 33K position writes/s (~3.3 MB/s); a GEO member is ~50–100 bytes, so 100K drivers ≈ 10 MB of index — memory is not the constraint, write rate and per-key hotness are. Peak 500 ride requests/min/city ≈ 8/s/city, each ≈ 1–3 GEOSEARCH calls + 1 claim.
+
+---
+
 ## 8. TRADE-OFF ANALYSIS
 
 | Decision | Choice | Rationale | Alternative |
 |----------|--------|-----------|-------------|
-| **Geo-index** | Redis GEO | 5ms query, O(log N), built-in geo commands | PostGIS (more features, 50ms) |
+| **Geo-index** | Redis GEO | Sub-ms server time, O(N + log M) per search, built-in geo commands | PostGIS (durable, polygons; 33K updates/s causes MVCC/vacuum churn) |
 | **Event bus** | Kafka | Durable, replayable, ordered per partition | RabbitMQ (simpler, lower throughput) |
-| **Zone shape** | Hexagonal | All neighbors equidistant, better than squares | H3 Uber library (production proven) |
+| **Zone shape** | H3 hexagons (res 8) | All 6 neighbours equidistant, O(1) point→cell, hierarchical | Geohash cells (simpler, but rectangles distort with latitude) |
 | **Driver matching** | Progressive radius | Simple, predictable, easy to debug | ML-based (optimal but opaque) |
 | **Surge calculation** | Fixed thresholds | Transparent, easier to tune | ML pricing (optimal but hard to explain) |
 | **Location DB** | Cassandra | Writes optimized, TTL support, horizontal scaling | TimescaleDB (SQL interface, but more overhead) |

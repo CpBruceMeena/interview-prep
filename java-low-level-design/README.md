@@ -2,6 +2,8 @@
 
 A collection of **3 Low-Level Design (LLD)** problems implemented in **Java**, following **SOLID principles** and **design patterns** — curated for backend developer interviews.
 
+> 🎯 Preparing for the round itself? See the [LLD Interview Playbook](../python-low-level-design/LLD_INTERVIEW_PLAYBOOK.md) (language-neutral, with Java and Go concurrency equivalents).
+
 ## 📋 Project Index
 
 | # | Project | Domain | Key Patterns |

@@ -1,500 +1,797 @@
 # Inventory Management — Implementation
 
-> Python implementation of the Inventory Management system following SOLID principles and design patterns.
+> Multi-warehouse stock with a two-phase **reserve → commit / release** flow, all-or-nothing multi-line reservations, per-item locking that cannot oversell or deadlock, and pluggable allocation and reorder policies. Single file, stdlib only, Python 3.10+.
 
+---
+
+## 🧭 The model in one picture
+
+```
+Product ──1:N── InventoryItem ──N:1── Warehouse          (one item per (sku, warehouse))
+                   on_hand, reserved, available = on_hand - reserved
+
+Reservation(order_id, lines[(sku, warehouse, qty)], expires_at, status)
+     ACTIVE ──commit──▶ COMMITTED      (on_hand -= q, reserved -= q, SHIP movement)
+        │──release──▶ RELEASED         (reserved -= q)
+        └──TTL──────▶ EXPIRED          (reserved -= q; sweeper or lazily on commit)
+
+Movement ledger: append-only, one row per physical change to on_hand
+PurchaseOrder: OPEN ──▶ RECEIVED | CANCELLED
+```
+
+**Invariant**, per item, always true while its lock is free: `0 <= reserved <= on_hand`.
+
+---
+
+## 🔑 Key design decisions
+
+| Decision | Why |
+|----------|-----|
+| **Reserve and commit are separate steps** | Checkout needs a promise ("these units are yours for 15 minutes") before payment succeeds. Decrementing `on_hand` at checkout would make the physical count wrong; not tracking promises at all oversells. |
+| **`available` is computed, never stored** | One less field to keep in sync. Everything that promises stock checks `available`; everything that ships consumes `reserved`. |
+| **Reservations have identity and a TTL** | Commit and release act on *the* reservation, not "some quantity of SKU X", so a cancel can never release someone else's units. TTL bounds how long abandoned carts hold stock. |
+| **One lock per `InventoryItem`, acquired in sorted `(sku, warehouse_id)` order** | Two orders for different SKUs run in parallel. A multi-line order locks all candidate items up front, so the check (`_plan`) and the act (`reserve`) happen under the same locks: no check-then-act race. Global lock ordering rules out deadlock (e.g. two opposite transfers). |
+| **Plan, then mutate** | `_plan` raises `InsufficientStockError` before any item is touched, so a failed multi-line reservation leaves nothing behind. No compensation logic needed. |
+| **Idempotent on `order_id`** | A client retry after a timeout returns the original reservation. Same `order_id` with different lines raises `IdempotencyConflictError` (the same rule Stripe applies to reused idempotency keys); a concurrent duplicate in flight also gets a conflict instead of a second reservation. |
+| **Commit checks the TTL itself** | The sweeper is periodic, so an expired-but-not-yet-swept reservation must not be committable. `commit` expires it lazily and raises `ReservationExpiredError`. Both paths take `reservation.lock`, so commit and the sweeper cannot both win. |
+| **Transfers and write-offs only touch *available* units** | You cannot move stock already promised to a customer. `transfer_stock` locks source and destination together, so a failure leaves both unchanged (the original version debited the source and then crashed on an unknown destination). |
+| **Inventory position = available + open PO quantity** | Reorder decisions use position, not on-hand. Counting open POs is what stops `check_reorder()` from raising a duplicate PO every time it runs. |
+| **`Decimal` for money, `ManualClock` for time** | No float rounding in valuation; tests and demo are deterministic. |
+
+---
+
+## 🧩 Where to extend
+
+| Extension point | Built-in implementations | Typical interview "now add X" |
+|-----------------|--------------------------|-------------------------------|
+| `AllocationStrategy.allocate(qty, stock)` | `SingleWarehouseFirstAllocation` (default: fewest shipments), `GreedySplitAllocation` | Nearest warehouse to the customer, cheapest shipping, keep safety stock per warehouse. It receives an immutable `StockView` snapshot taken under the locks, so it stays a pure function and is trivially unit-testable. |
+| `ReorderPolicy.reorder_quantity(ctx)` | `FixedReorderPolicy` ((s, Q) policy), `DemandBasedReorderPolicy` (lead time + safety days, cover days) | EOQ, seasonality, supplier minimums. Gets a `ReorderContext` with position and average daily demand computed from `SHIP` movements only (transfers are not demand). |
+| `MovementType` + `_record` | RECEIVE, SHIP, TRANSFER_OUT/IN, ADJUST | Returns (RMA), damage write-offs, lot/expiry tracking. |
+
+Not built, deliberately: partial commit (ship some lines of a reservation), backorders, lot/serial tracking, warehouse capacity. Each is a small addition to the structures above.
+
+---
+
+## 🔒 Concurrency walkthrough
+
+| Lock | Guards | Held while acquiring |
+|------|--------|----------------------|
+| `_registry_lock` | product / warehouse / item dicts | nothing |
+| `InventoryItem.lock` | that item's `on_hand` / `reserved` | other item locks, in sorted order only; then `_ledger_lock` or `_res_lock` briefly |
+| `Reservation.lock` | that reservation's status transition | item locks |
+| `_res_lock` | reservation dicts, in-flight order ids | nothing |
+| `_po_lock` | purchase orders | one item lock at a time; `_ledger_lock` |
+
+The acquisition order is always `Reservation.lock → item locks (sorted) → _res_lock / _ledger_lock`, so there is no cycle. `reserve()` takes item locks and then `_res_lock`; `commit()` takes the reservation lock and then item locks; nothing takes a reservation lock while holding an item lock.
+
+Reads such as `available(sku)` lock each item in turn, so the total is not a single atomic snapshot across warehouses. That is fine for display; anything that *acts* on availability goes through `reserve()`.
+
+---
+
+## 💻 Full source
+
+<!-- source: inventory_management.py -->
 ```python
 """
 Inventory Management System - Low Level Design
--------------------------------------------------
-Design Principles: SOLID, Strategy Pattern, Observer Pattern
+==============================================
+
+Multi-warehouse stock with a two-phase reserve -> commit/release flow.
+
+    on_hand    physical units on the shelf
+    reserved   units promised to orders that have not shipped yet
+    available  on_hand - reserved   (what we may still promise)
+
+Invariant, per (sku, warehouse), held under that item's lock:
+    0 <= reserved <= on_hand
+
+Order flow:
+    reserve(order_id, {sku: qty})  -> Reservation (ACTIVE, has a TTL)
+    commit(reservation_id)         -> stock leaves the building (on_hand and reserved drop)
+    release(reservation_id)        -> order cancelled, units become available again
+    expire_reservations()          -> sweeper releases ACTIVE reservations past their TTL
+
+Concurrency model: one lock per InventoryItem. Any operation touching several
+items acquires their locks in a global sorted order (sku, warehouse_id), so two
+requests can never deadlock and a multi-line reservation is all-or-nothing.
+
+Extension points (ABCs): AllocationStrategy (which warehouse fills a line) and
+ReorderPolicy (when and how much to replenish).
+
+Stdlib only, Python 3.10+.
 """
 
+from __future__ import annotations
+
+import itertools
+import math
+import threading
+import time
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from contextlib import ExitStack
+from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
-import uuid
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+Clock = Callable[[], float]  # seconds since epoch; injectable for tests
+SECONDS_PER_DAY = 86_400
 
 
-class ProductStatus(Enum):
-    ACTIVE = "Active"
-    INACTIVE = "Inactive"
-    DISCONTINUED = "Discontinued"
+# ---------------------------------------------------------------- errors
+
+class InventoryError(Exception):
+    """Base class for domain errors."""
 
 
-class InventoryMovementType(Enum):
-    STOCK_IN = "Stock In"
-    STOCK_OUT = "Stock Out"
-    RETURN = "Return"
-    ADJUSTMENT = "Adjustment"
-    TRANSFER = "Transfer"
+class NotFoundError(InventoryError):
+    pass
 
 
-class OrderStatus(Enum):
-    PENDING = "Pending"
-    CONFIRMED = "Confirmed"
-    PROCESSING = "Processing"
-    SHIPPED = "Shipped"
-    DELIVERED = "Delivered"
-    CANCELLED = "Cancelled"
+class InsufficientStockError(InventoryError):
+    def __init__(self, sku: str, requested: int, available: int):
+        super().__init__(f"{sku}: requested {requested}, available {available}")
+        self.sku, self.requested, self.available = sku, requested, available
 
 
-class Warehouse:
-    """Represents a physical warehouse location"""
-
-    def __init__(self, warehouse_id: str, name: str, location: str,
-                 capacity: int):
-        self._warehouse_id = warehouse_id
-        self._name = name
-        self._location = location
-        self._capacity = capacity
-
-    @property
-    def warehouse_id(self) -> str:
-        return self._warehouse_id
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def __str__(self) -> str:
-        return f"{self._name} ({self._location})"
+class InvalidStateError(InventoryError):
+    """An operation is not allowed in the object's current state."""
 
 
-# --- Product (SRP) ---
+class ReservationExpiredError(InvalidStateError):
+    pass
 
+
+class IdempotencyConflictError(InventoryError):
+    """Same order_id reused with different lines, or a concurrent duplicate is in flight."""
+
+
+# ---------------------------------------------------------------- enums
+
+class MovementType(Enum):
+    RECEIVE = "receive"            # goods in (PO receipt, manual receipt)
+    SHIP = "ship"                  # committed reservation leaves the warehouse
+    TRANSFER_OUT = "transfer_out"
+    TRANSFER_IN = "transfer_in"
+    ADJUST = "adjust"              # cycle-count correction, damage, shrinkage
+
+
+class ReservationStatus(Enum):
+    ACTIVE = "active"
+    COMMITTED = "committed"
+    RELEASED = "released"
+    EXPIRED = "expired"
+
+
+class POStatus(Enum):
+    OPEN = "open"
+    RECEIVED = "received"
+    CANCELLED = "cancelled"
+
+
+# ---------------------------------------------------------------- value objects
+
+@dataclass(frozen=True)
 class Product:
-    """Single Responsibility: Represents a product's metadata"""
-
-    def __init__(self, product_id: str, sku: str, name: str,
-                 category: str, unit_price: float, reorder_level: int = 10,
-                 reorder_quantity: int = 50):
-        self._product_id = product_id
-        self._sku = sku
-        self._name = name
-        self._category = category
-        self._unit_price = unit_price
-        self._reorder_level = reorder_level
-        self._reorder_quantity = reorder_quantity
-        self._status = ProductStatus.ACTIVE
-
-    @property
-    def product_id(self) -> str:
-        return self._product_id
-
-    @property
-    def sku(self) -> str:
-        return self._sku
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def category(self) -> str:
-        return self._category
-
-    @property
-    def unit_price(self) -> float:
-        return self._unit_price
-
-    @property
-    def reorder_level(self) -> int:
-        return self._reorder_level
-
-    @property
-    def reorder_quantity(self) -> int:
-        return self._reorder_quantity
-
-    def __str__(self) -> str:
-        return f"{self._name} ({self._sku}) - ${self._unit_price:.2f}"
+    sku: str
+    name: str
+    unit_price: Decimal
+    reorder_level: int = 10       # reorder when inventory position <= this
+    reorder_quantity: int = 50    # default / minimum order size
 
 
-# --- Inventory Item (SRP) ---
+@dataclass(frozen=True)
+class Warehouse:
+    warehouse_id: str
+    name: str
+    priority: int = 0             # lower = preferred (e.g. closer to customers, cheaper to ship)
+
+
+@dataclass(frozen=True)
+class Movement:
+    """Immutable ledger entry. Only physical changes to on_hand are recorded."""
+    movement_id: int
+    sku: str
+    warehouse_id: str
+    type: MovementType
+    delta: int                    # signed change to on_hand
+    on_hand_after: int
+    reference: str
+    at: float
+
+
+@dataclass(frozen=True)
+class ReservationLine:
+    sku: str
+    warehouse_id: str
+    quantity: int
+
+
+@dataclass(frozen=True)
+class StockView:
+    """What an AllocationStrategy is allowed to see (read under the item locks)."""
+    warehouse_id: str
+    priority: int
+    available: int
+
+
+# ---------------------------------------------------------------- stock per (sku, warehouse)
 
 class InventoryItem:
-    """Tracks stock for a specific product at a specific warehouse"""
+    """Stock of one product at one warehouse. All mutators require self.lock to be held."""
 
-    def __init__(self, product: Product, warehouse: Warehouse,
-                 quantity: int = 0, bin_location: str = ""):
-        self._product = product
-        self._warehouse = warehouse
-        self._quantity = quantity
-        self._reserved_quantity = 0
-        self._bin_location = bin_location
-        self._movements: List['InventoryMovement'] = []
+    def __init__(self, product: Product, warehouse: Warehouse):
+        self.product = product
+        self.warehouse = warehouse
+        self.lock = threading.Lock()
+        self._on_hand = 0
+        self._reserved = 0
 
     @property
-    def product(self) -> Product:
-        return self._product
+    def key(self) -> Tuple[str, str]:
+        return (self.product.sku, self.warehouse.warehouse_id)
 
     @property
-    def warehouse(self) -> Warehouse:
-        return self._warehouse
+    def on_hand(self) -> int:
+        return self._on_hand
 
     @property
-    def quantity(self) -> int:
-        return self._quantity
+    def reserved(self) -> int:
+        return self._reserved
 
     @property
-    def reserved_quantity(self) -> int:
-        return self._reserved_quantity
+    def available(self) -> int:
+        return self._on_hand - self._reserved
 
-    @property
-    def available_quantity(self) -> int:
-        return self._quantity - self._reserved_quantity
+    def receive(self, qty: int) -> None:
+        self._on_hand += qty
 
-    def add_stock(self, quantity: int, reference: str = "") -> 'InventoryMovement':
-        self._quantity += quantity
-        movement = InventoryMovement(self._product.product_id,
-                                      self._warehouse.warehouse_id,
-                                      InventoryMovementType.STOCK_IN,
-                                      quantity, self._quantity, reference)
-        self._movements.append(movement)
-        return movement
+    def correct(self, delta: int) -> None:
+        """Cycle-count correction; the caller guarantees on_hand stays >= reserved."""
+        if self._on_hand + delta < self._reserved:
+            raise InvalidStateError(f"{self.key}: correction would drop on_hand below reserved")
+        self._on_hand += delta
 
-    def remove_stock(self, quantity: int, reference: str = "") -> 'InventoryMovement':
-        if self.available_quantity < quantity:
-            raise ValueError(f"Insufficient stock. Available: {self.available_quantity}")
-        self._quantity -= quantity
-        movement = InventoryMovement(self._product.product_id,
-                                      self._warehouse.warehouse_id,
-                                      InventoryMovementType.STOCK_OUT,
-                                      -quantity, self._quantity, reference)
-        self._movements.append(movement)
-        return movement
+    def reserve(self, qty: int) -> None:
+        if qty > self.available:
+            raise InsufficientStockError(self.product.sku, qty, self.available)
+        self._reserved += qty
 
-    def reserve(self, quantity: int) -> bool:
-        if self.available_quantity >= quantity:
-            self._reserved_quantity += quantity
-            return True
-        return False
+    def release(self, qty: int) -> None:
+        if qty > self._reserved:  # would mean a bookkeeping bug: fail loudly, never clamp
+            raise InvalidStateError(f"{self.key}: releasing {qty} but only {self._reserved} reserved")
+        self._reserved -= qty
 
-    def release_reservation(self, quantity: int) -> None:
-        self._reserved_quantity = max(0, self._reserved_quantity - quantity)
+    def ship_reserved(self, qty: int) -> None:
+        """Commit: units that were reserved physically leave."""
+        if qty > self._reserved:
+            raise InvalidStateError(f"{self.key}: shipping {qty} but only {self._reserved} reserved")
+        self._reserved -= qty
+        self._on_hand -= qty
 
-    def needs_reorder(self) -> bool:
-        return self._quantity <= self._product.reorder_level
+    def remove_available(self, qty: int) -> None:
+        """Take unreserved units (transfer out, write-off). Never touches promised stock."""
+        if qty > self.available:
+            raise InsufficientStockError(self.product.sku, qty, self.available)
+        self._on_hand -= qty
 
-    def __str__(self) -> str:
-        return (f"{self._product.name}: {self._quantity} units "
-                f"({self.available_quantity} available) at {self._warehouse.name}")
+    def __repr__(self) -> str:
+        return (f"InventoryItem({self.product.sku}@{self.warehouse.warehouse_id}: "
+                f"on_hand={self._on_hand}, reserved={self._reserved})")
 
 
-# --- Inventory Movement (SRP) ---
+# ---------------------------------------------------------------- reservations & POs
 
-class InventoryMovement:
-    def __init__(self, product_id: str, warehouse_id: str,
-                 movement_type: InventoryMovementType,
-                 quantity: int, balance_after: int,
-                 reference: str = ""):
-        self._movement_id = f"MV-{uuid.uuid4().hex[:8].upper()}"
-        self._product_id = product_id
-        self._warehouse_id = warehouse_id
-        self._type = movement_type
-        self._quantity = quantity
-        self._balance_after = balance_after
-        self._timestamp = datetime.now()
-        self._reference = reference
+@dataclass
+class Reservation:
+    reservation_id: str
+    order_id: str
+    lines: Tuple[ReservationLine, ...]
+    expires_at: float
+    status: ReservationStatus = ReservationStatus.ACTIVE
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
-    @property
-    def movement_id(self) -> str:
-        return self._movement_id
-
-    @property
-    def product_id(self) -> str:
-        return self._product_id
-
-    @property
-    def movement_type(self) -> InventoryMovementType:
-        return self._type
-
-    @property
-    def quantity(self) -> int:
-        return self._quantity
-
-    @property
-    def timestamp(self) -> datetime:
-        return self._timestamp
-
-    def __str__(self) -> str:
-        return (f"[{self._timestamp:%H:%M}] {self._type.value}: "
-                f"{abs(self._quantity)} units (Balance: {self._balance_after})")
+    def requested(self) -> Dict[str, int]:
+        """Lines collapsed back to {sku: qty}; used for idempotency comparison."""
+        out: Dict[str, int] = {}
+        for line in self.lines:
+            out[line.sku] = out.get(line.sku, 0) + line.quantity
+        return out
 
 
-# --- Reorder Strategy (Strategy Pattern) ---
-
-class ReorderStrategy(ABC):
-    @abstractmethod
-    def should_reorder(self, item: InventoryItem) -> bool:
-        pass
-
-    @abstractmethod
-    def get_reorder_quantity(self, item: InventoryItem) -> int:
-        pass
-
-
-class SimpleReorderStrategy(ReorderStrategy):
-    def should_reorder(self, item: InventoryItem) -> bool:
-        return item.needs_reorder()
-
-    def get_reorder_quantity(self, item: InventoryItem) -> int:
-        return item.product.reorder_quantity
-
-
-class DemandBasedReorderStrategy(ReorderStrategy):
-    def __init__(self, lookback_days: int = 30):
-        self._lookback = lookback_days
-
-    def should_reorder(self, item: InventoryItem) -> bool:
-        return item.quantity <= item.product.reorder_level
-
-    def get_reorder_quantity(self, item: InventoryItem) -> int:
-        # Calculate average daily consumption
-        recent = [m for m in item._movements
-                  if m.movement_type in (InventoryMovementType.STOCK_OUT,)
-                  and m.timestamp > datetime.now() - timedelta(days=self._lookback)]
-        if not recent:
-            return item.product.reorder_quantity
-        total_out = sum(abs(m.quantity) for m in recent)
-        avg_daily = total_out / self._lookback
-        return max(item.product.reorder_quantity, int(avg_daily * 14))  # 14 days stock
-
-
-# --- Purchase Order / Reorder (SRP) ---
-
+@dataclass
 class PurchaseOrder:
-    def __init__(self, order_id: str, product: Product, warehouse: Warehouse,
-                 quantity: int, strategy: ReorderStrategy = None):
-        self._order_id = order_id
-        self._product = product
-        self._warehouse = warehouse
-        self._quantity = quantity
-        self._status = OrderStatus.PENDING
-        self._created_at = datetime.now()
-        self._strategy = strategy or SimpleReorderStrategy()
-
-    @property
-    def order_id(self) -> str:
-        return self._order_id
-
-    @property
-    def product(self) -> Product:
-        return self._product
-
-    @property
-    def quantity(self) -> int:
-        return self._quantity
-
-    @property
-    def status(self) -> OrderStatus:
-        return self._status
-
-    def confirm(self) -> None:
-        self._status = OrderStatus.CONFIRMED
-
-    def receive(self) -> None:
-        self._status = OrderStatus.DELIVERED
-
-    def cancel(self) -> None:
-        self._status = OrderStatus.CANCELLED
-
-    def __str__(self) -> str:
-        return f"PO[{self._order_id[:8]}]: {self._product.name} x{self._quantity}"
+    po_id: str
+    sku: str
+    warehouse_id: str
+    quantity: int
+    status: POStatus = POStatus.OPEN
 
 
-# --- Inventory Service (Facade) ---
+# ---------------------------------------------------------------- strategies
+
+class AllocationStrategy(ABC):
+    """Decides which warehouses fill a line. Pure function of the snapshot it is given."""
+
+    @abstractmethod
+    def allocate(self, qty: int, stock: Sequence[StockView]) -> Optional[List[Tuple[str, int]]]:
+        """Return [(warehouse_id, qty), ...] summing to qty, or None if it cannot be filled."""
+
+
+class GreedySplitAllocation(AllocationStrategy):
+    """Fill from the most preferred warehouse first, spilling over to the next."""
+
+    def allocate(self, qty: int, stock: Sequence[StockView]) -> Optional[List[Tuple[str, int]]]:
+        plan, remaining = [], qty
+        for s in sorted(stock, key=lambda s: (s.priority, s.warehouse_id)):
+            take = min(remaining, s.available)
+            if take > 0:
+                plan.append((s.warehouse_id, take))
+                remaining -= take
+            if remaining == 0:
+                return plan
+        return None
+
+
+class SingleWarehouseFirstAllocation(AllocationStrategy):
+    """Prefer one warehouse that can fill the whole line (one shipment); split only if none can."""
+
+    def __init__(self) -> None:
+        self._fallback = GreedySplitAllocation()
+
+    def allocate(self, qty: int, stock: Sequence[StockView]) -> Optional[List[Tuple[str, int]]]:
+        for s in sorted(stock, key=lambda s: (s.priority, s.warehouse_id)):
+            if s.available >= qty:
+                return [(s.warehouse_id, qty)]
+        return self._fallback.allocate(qty, stock)
+
+
+@dataclass(frozen=True)
+class ReorderContext:
+    product: Product
+    warehouse_id: str
+    position: int                 # available + quantity on open POs
+    avg_daily_demand: float       # shipped units / day over the lookback window
+
+
+class ReorderPolicy(ABC):
+    @abstractmethod
+    def reorder_quantity(self, ctx: ReorderContext) -> int:
+        """Units to order now; 0 means no reorder."""
+
+
+class FixedReorderPolicy(ReorderPolicy):
+    """Classic (s, Q): when position <= reorder_level, order reorder_quantity."""
+
+    def reorder_quantity(self, ctx: ReorderContext) -> int:
+        return ctx.product.reorder_quantity if ctx.position <= ctx.product.reorder_level else 0
+
+
+class DemandBasedReorderPolicy(ReorderPolicy):
+    """Reorder point = demand over (lead time + safety days); order enough for cover_days."""
+
+    def __init__(self, lead_time_days: int = 7, safety_days: int = 3, cover_days: int = 14):
+        self._lead, self._safety, self._cover = lead_time_days, safety_days, cover_days
+
+    def reorder_quantity(self, ctx: ReorderContext) -> int:
+        reorder_point = max(ctx.product.reorder_level,
+                            math.ceil(ctx.avg_daily_demand * (self._lead + self._safety)))
+        if ctx.position > reorder_point:
+            return 0
+        target = math.ceil(ctx.avg_daily_demand * self._cover)
+        return max(ctx.product.reorder_quantity, target - ctx.position)
+
+
+# ---------------------------------------------------------------- service
 
 class InventoryService:
-    def __init__(self):
+    def __init__(self,
+                 allocation: Optional[AllocationStrategy] = None,
+                 reorder_policy: Optional[ReorderPolicy] = None,
+                 reservation_ttl_s: float = 15 * 60,
+                 demand_lookback_days: int = 30,
+                 clock: Clock = time.time):
+        self._allocation = allocation or SingleWarehouseFirstAllocation()
+        self._reorder_policy = reorder_policy or FixedReorderPolicy()
+        self._ttl = reservation_ttl_s
+        self._lookback_days = demand_lookback_days
+        self._clock = clock
+
+        # Catalog + item registry. _registry_lock guards these dicts, not item contents.
+        self._registry_lock = threading.Lock()
         self._products: Dict[str, Product] = {}
         self._warehouses: Dict[str, Warehouse] = {}
-        self._inventory: Dict[str, Dict[str, InventoryItem]] = {}  # product_id -> warehouse_id -> item
-        self._orders: Dict[str, PurchaseOrder] = {}
-        self._reorder_strategy: ReorderStrategy = SimpleReorderStrategy()
-        self._low_stock_alerts: List[str] = []
+        self._items: Dict[Tuple[str, str], InventoryItem] = {}
 
-    def add_product(self, sku: str, name: str, category: str,
-                    unit_price: float, reorder_level: int = 10,
-                    reorder_qty: int = 50) -> Product:
-        pid = f"PRD-{uuid.uuid4().hex[:6].upper()}"
-        product = Product(pid, sku, name, category, unit_price,
-                          reorder_level, reorder_qty)
-        self._products[pid] = product
+        # Reservations. _res_lock guards the dicts; each Reservation has its own lock for transitions.
+        self._res_lock = threading.Lock()
+        self._reservations: Dict[str, Reservation] = {}
+        self._by_order: Dict[str, Reservation] = {}
+        self._in_flight_orders: set[str] = set()
+
+        self._po_lock = threading.Lock()
+        self._purchase_orders: Dict[str, PurchaseOrder] = {}
+
+        self._ledger_lock = threading.Lock()
+        self._ledger: List[Movement] = []   # append-only; in production this is a DB table
+
+        self._ids = itertools.count(1)
+
+    # ---- catalog -------------------------------------------------------
+
+    def add_product(self, product: Product) -> Product:
+        if product.unit_price < 0:
+            raise ValueError("unit_price must be >= 0")
+        with self._registry_lock:
+            if product.sku in self._products:
+                raise InventoryError(f"duplicate sku {product.sku}")
+            self._products[product.sku] = product
         return product
 
-    def get_product(self, product_id: str) -> Optional[Product]:
-        return self._products.get(product_id)
-
-    def search_products(self, query: str) -> List[Product]:
-        q = query.lower()
-        return [p for p in self._products.values()
-                if q in p.name.lower() or q in p.sku.lower() or q in p.category.lower()]
-
-    def add_warehouse(self, name: str, location: str, capacity: int) -> Warehouse:
-        wid = f"WH-{uuid.uuid4().hex[:6].upper()}"
-        warehouse = Warehouse(wid, name, location, capacity)
-        self._warehouses[wid] = warehouse
+    def add_warehouse(self, warehouse: Warehouse) -> Warehouse:
+        with self._registry_lock:
+            if warehouse.warehouse_id in self._warehouses:
+                raise InventoryError(f"duplicate warehouse {warehouse.warehouse_id}")
+            self._warehouses[warehouse.warehouse_id] = warehouse
         return warehouse
 
-    def add_stock(self, product_id: str, warehouse_id: str,
-                  quantity: int, bin_location: str = "") -> InventoryItem:
-        product = self._products.get(product_id)
-        warehouse = self._warehouses.get(warehouse_id)
-        if not product or not warehouse:
-            raise ValueError("Product or warehouse not found")
+    # ---- stock in / out ------------------------------------------------
 
-        if product_id not in self._inventory:
-            self._inventory[product_id] = {}
-
-        if warehouse_id not in self._inventory[product_id]:
-            item = InventoryItem(product, warehouse, 0, bin_location)
-            self._inventory[product_id][warehouse_id] = item
-        else:
-            item = self._inventory[product_id][warehouse_id]
-
-        item.add_stock(quantity, "Initial stock")
+    def receive_stock(self, sku: str, warehouse_id: str, qty: int, reference: str = "") -> InventoryItem:
+        _require_positive(qty)
+        item = self._get_or_create_item(sku, warehouse_id)
+        with item.lock:
+            item.receive(qty)
+            self._record(item, MovementType.RECEIVE, qty, reference)
         return item
 
-    def get_inventory(self, product_id: str,
-                      warehouse_id: Optional[str] = None) -> List[InventoryItem]:
-        if product_id not in self._inventory:
-            return []
-        if warehouse_id:
-            item = self._inventory[product_id].get(warehouse_id)
-            return [item] if item else []
-        return list(self._inventory[product_id].values())
+    def adjust_stock(self, sku: str, warehouse_id: str, counted_on_hand: int, reason: str) -> int:
+        """Cycle count: set on_hand to what was physically counted. Returns the delta.
 
-    def remove_stock(self, product_id: str, warehouse_id: str,
-                     quantity: int, reference: str = "") -> InventoryMovement:
-        item = self._inventory.get(product_id, {}).get(warehouse_id)
-        if not item:
-            raise ValueError("Inventory item not found")
-        return item.remove_stock(quantity, reference)
+        Refuses to drop below what is already promised; in production this raises an
+        incident instead, because those reservations are now oversold.
+        """
+        if counted_on_hand < 0:
+            raise ValueError("counted_on_hand must be >= 0")
+        item = self._get_item(sku, warehouse_id)
+        with item.lock:
+            if counted_on_hand < item.reserved:
+                raise InsufficientStockError(sku, item.reserved, counted_on_hand)
+            delta = counted_on_hand - item.on_hand
+            if delta:
+                item.correct(delta)
+                self._record(item, MovementType.ADJUST, delta, reason)
+            return delta
 
-    def transfer_stock(self, product_id: str, from_warehouse: str,
-                       to_warehouse: str, quantity: int) -> Tuple[InventoryMovement, InventoryMovement]:
-        """Transfer stock between warehouses"""
-        self.remove_stock(product_id, from_warehouse, quantity,
-                          f"Transfer to {to_warehouse}")
+    def transfer_stock(self, sku: str, from_wh: str, to_wh: str, qty: int) -> None:
+        """Atomic move of *available* units. Both items are locked in key order, so either
+        both sides change or neither does, and two opposite transfers cannot deadlock."""
+        _require_positive(qty)
+        if from_wh == to_wh:
+            raise ValueError("source and destination are the same warehouse")
+        src = self._get_item(sku, from_wh)
+        dst = self._get_or_create_item(sku, to_wh)  # validates to_wh before anything moves
+        with self._lock_all([src, dst]):
+            src.remove_available(qty)
+            dst.receive(qty)
+            ref = f"transfer {from_wh}->{to_wh}"
+            self._record(src, MovementType.TRANSFER_OUT, -qty, ref)
+            self._record(dst, MovementType.TRANSFER_IN, qty, ref)
 
-        # Add to destination
-        if product_id not in self._inventory:
-            self._inventory[product_id] = {}
-        if to_warehouse not in self._inventory[product_id]:
-            product = self._products[product_id]
-            wh = self._warehouses[to_warehouse]
-            self._inventory[product_id][to_warehouse] = InventoryItem(product, wh)
+    # ---- reservations: reserve -> commit | release | expire -------------
 
-        movement_in = self._inventory[product_id][to_warehouse].add_stock(
-            quantity, f"Transfer from {from_warehouse}")
-        print(f"  Transferred {quantity} units of {self._products[product_id].name}")
-        return (None, movement_in)
+    def reserve(self, order_id: str, request: Mapping[str, int]) -> Reservation:
+        """All-or-nothing reservation of every line, possibly split across warehouses.
+
+        Idempotent on order_id: a retry with the same lines returns the original reservation.
+        """
+        if not request:
+            raise ValueError("empty request")
+        for qty in request.values():
+            _require_positive(qty)
+        wanted = dict(request)
+
+        with self._res_lock:
+            existing = self._by_order.get(order_id)
+            if existing is not None:
+                if existing.requested() != wanted:
+                    raise IdempotencyConflictError(f"order {order_id} already reserved with different lines")
+                return existing
+            if order_id in self._in_flight_orders:
+                raise IdempotencyConflictError(f"order {order_id} is already being reserved")
+            self._in_flight_orders.add(order_id)
+
+        try:
+            items = self._items_for_skus(wanted.keys())
+            with self._lock_all(items):
+                lines = self._plan(wanted, items)            # raises before any mutation
+                by_key = {i.key: i for i in items}
+                for line in lines:
+                    by_key[(line.sku, line.warehouse_id)].reserve(line.quantity)
+                reservation = Reservation(f"RSV-{next(self._ids)}", order_id, tuple(lines),
+                                          expires_at=self._clock() + self._ttl)
+            with self._res_lock:
+                self._reservations[reservation.reservation_id] = reservation
+                self._by_order[order_id] = reservation
+            return reservation
+        finally:
+            with self._res_lock:
+                self._in_flight_orders.discard(order_id)
+
+    def commit(self, reservation_id: str, reference: str = "") -> Reservation:
+        """Order shipped/paid: reserved units physically leave. ACTIVE -> COMMITTED only."""
+        res = self._get_reservation(reservation_id)
+        with res.lock:
+            if res.status is ReservationStatus.COMMITTED:
+                return res                                    # idempotent retry
+            if res.status is ReservationStatus.ACTIVE and self._clock() >= res.expires_at:
+                self._release_locked(res, ReservationStatus.EXPIRED)
+            if res.status is ReservationStatus.EXPIRED:
+                raise ReservationExpiredError(f"{reservation_id} expired")
+            if res.status is not ReservationStatus.ACTIVE:
+                raise InvalidStateError(f"{reservation_id} is {res.status.value}")
+            items = {l: self._get_item(l.sku, l.warehouse_id) for l in res.lines}
+            with self._lock_all(list(items.values())):
+                for line, item in items.items():
+                    item.ship_reserved(line.quantity)
+                    self._record(item, MovementType.SHIP, -line.quantity, reference or res.order_id)
+            res.status = ReservationStatus.COMMITTED
+            return res
+
+    def release(self, reservation_id: str) -> Reservation:
+        """Order cancelled: give units back. Idempotent; refuses to un-ship a committed order."""
+        res = self._get_reservation(reservation_id)
+        with res.lock:
+            if res.status in (ReservationStatus.RELEASED, ReservationStatus.EXPIRED):
+                return res
+            if res.status is ReservationStatus.COMMITTED:
+                raise InvalidStateError(f"{reservation_id} already committed; use a return flow")
+            self._release_locked(res, ReservationStatus.RELEASED)
+            return res
+
+    def expire_reservations(self) -> List[Reservation]:
+        """Sweeper: release ACTIVE reservations whose TTL has passed."""
+        now = self._clock()
+        with self._res_lock:
+            candidates = [r for r in self._reservations.values()
+                          if r.status is ReservationStatus.ACTIVE and r.expires_at <= now]
+        expired = []
+        for res in candidates:
+            with res.lock:  # re-check: a commit may have won the race since the snapshot
+                if res.status is ReservationStatus.ACTIVE:
+                    self._release_locked(res, ReservationStatus.EXPIRED)
+                    expired.append(res)
+        return expired
+
+    # ---- replenishment ---------------------------------------------------
 
     def check_reorder(self) -> List[PurchaseOrder]:
-        """Check all inventory items and create reorder POs if needed"""
-        orders = []
-        for pid, warehouses in self._inventory.items():
-            for wid, item in warehouses.items():
-                if self._reorder_strategy.should_reorder(item):
-                    qty = self._reorder_strategy.get_reorder_quantity(item)
-                    oid = f"PO-{uuid.uuid4().hex[:8].upper()}"
-                    po = PurchaseOrder(oid, item.product, item.warehouse, qty)
-                    self._orders[oid] = po
-                    orders.append(po)
-                    self._low_stock_alerts.append(
-                        f"Reorder: {item.product.name} at {item.warehouse.name}"
-                    )
-                    print(f"  📋 Auto-generated PO: {po}")
-        return orders
+        """Raise POs where the policy says so. Open POs count toward the inventory position,
+        so calling this repeatedly does not create duplicate orders."""
+        created = []
+        with self._po_lock:
+            for item in self._all_items():
+                with item.lock:
+                    available = item.available
+                sku, wh = item.key
+                on_order = sum(po.quantity for po in self._purchase_orders.values()
+                               if po.status is POStatus.OPEN and (po.sku, po.warehouse_id) == item.key)
+                ctx = ReorderContext(item.product, wh, available + on_order, self._avg_daily_demand(sku, wh))
+                qty = self._reorder_policy.reorder_quantity(ctx)
+                if qty > 0:
+                    po = PurchaseOrder(f"PO-{next(self._ids)}", sku, wh, qty)
+                    self._purchase_orders[po.po_id] = po
+                    created.append(po)
+        return created
 
-    def get_low_stock_products(self) -> List[InventoryItem]:
-        """Get all items that need reordering"""
-        low = []
-        for warehouses in self._inventory.values():
-            for item in warehouses.values():
-                if item.needs_reorder():
-                    low.append(item)
-        return low
+    def receive_purchase_order(self, po_id: str) -> PurchaseOrder:
+        with self._po_lock:
+            po = self._purchase_orders.get(po_id)
+            if po is None:
+                raise NotFoundError(po_id)
+            if po.status is not POStatus.OPEN:
+                raise InvalidStateError(f"{po_id} is {po.status.value}")  # no double receipt
+            po.status = POStatus.RECEIVED
+        self.receive_stock(po.sku, po.warehouse_id, po.quantity, reference=po_id)
+        return po
 
-    def get_inventory_value(self) -> float:
-        """Calculate total inventory value"""
-        total = 0.0
-        for warehouses in self._inventory.values():
-            for item in warehouses.values():
-                total += item.quantity * item.product.unit_price
+    def cancel_purchase_order(self, po_id: str) -> PurchaseOrder:
+        with self._po_lock:
+            po = self._purchase_orders.get(po_id)
+            if po is None:
+                raise NotFoundError(po_id)
+            if po.status is not POStatus.OPEN:
+                raise InvalidStateError(f"{po_id} is {po.status.value}")
+            po.status = POStatus.CANCELLED
+            return po
+
+    # ---- queries -----------------------------------------------------------
+
+    def stock(self, sku: str, warehouse_id: str) -> Tuple[int, int, int]:
+        """(on_hand, reserved, available), read consistently under the item lock."""
+        item = self._get_item(sku, warehouse_id)
+        with item.lock:
+            return item.on_hand, item.reserved, item.available
+
+    def available(self, sku: str) -> int:
+        """Total available across warehouses (each item read under its own lock)."""
+        total = 0
+        for item in self._items_for_skus([sku]):
+            with item.lock:
+                total += item.available
         return total
 
-    def set_reorder_strategy(self, strategy: ReorderStrategy) -> None:
-        self._reorder_strategy = strategy
+    def inventory_value(self) -> Decimal:
+        total = Decimal("0")
+        for item in self._all_items():
+            with item.lock:
+                total += item.product.unit_price * item.on_hand
+        return total
+
+    def movements(self, sku: Optional[str] = None) -> List[Movement]:
+        with self._ledger_lock:
+            return [m for m in self._ledger if sku is None or m.sku == sku]
+
+    # ---- internals -----------------------------------------------------------
+
+    def _plan(self, wanted: Mapping[str, int], items: Sequence[InventoryItem]) -> List[ReservationLine]:
+        lines: List[ReservationLine] = []
+        for sku, qty in sorted(wanted.items()):
+            views = [StockView(i.warehouse.warehouse_id, i.warehouse.priority, i.available)
+                     for i in items if i.product.sku == sku]
+            plan = self._allocation.allocate(qty, views)
+            if plan is None:
+                raise InsufficientStockError(sku, qty, sum(v.available for v in views))
+            lines.extend(ReservationLine(sku, wh, q) for wh, q in plan)
+        return lines
+
+    def _release_locked(self, res: Reservation, final: ReservationStatus) -> None:
+        """Caller holds res.lock and has checked res is ACTIVE."""
+        items = {l: self._get_item(l.sku, l.warehouse_id) for l in res.lines}
+        with self._lock_all(list(items.values())):
+            for line, item in items.items():
+                item.release(line.quantity)
+        res.status = final
+
+    @staticmethod
+    def _lock_all(items: Sequence[InventoryItem]) -> ExitStack:
+        """Acquire item locks in a single global order (sorted, de-duplicated) to rule out deadlock."""
+        stack = ExitStack()
+        for item in sorted({i.key: i for i in items}.values(), key=lambda i: i.key):
+            stack.enter_context(item.lock)
+        return stack
+
+    def _record(self, item: InventoryItem, mtype: MovementType, delta: int, reference: str) -> None:
+        with self._ledger_lock:
+            self._ledger.append(Movement(next(self._ids), item.product.sku, item.warehouse.warehouse_id,
+                                         mtype, delta, item.on_hand, reference, self._clock()))
+
+    def _avg_daily_demand(self, sku: str, warehouse_id: str) -> float:
+        since = self._clock() - self._lookback_days * SECONDS_PER_DAY
+        with self._ledger_lock:
+            shipped = sum(-m.delta for m in self._ledger
+                          if m.type is MovementType.SHIP and m.sku == sku
+                          and m.warehouse_id == warehouse_id and m.at >= since)
+        return shipped / self._lookback_days
+
+    def _get_or_create_item(self, sku: str, warehouse_id: str) -> InventoryItem:
+        with self._registry_lock:
+            product = self._products.get(sku)
+            warehouse = self._warehouses.get(warehouse_id)
+            if product is None or warehouse is None:
+                raise NotFoundError(f"unknown sku {sku!r} or warehouse {warehouse_id!r}")
+            item = self._items.get((sku, warehouse_id))
+            if item is None:
+                item = self._items[(sku, warehouse_id)] = InventoryItem(product, warehouse)
+            return item
+
+    def _get_item(self, sku: str, warehouse_id: str) -> InventoryItem:
+        with self._registry_lock:
+            item = self._items.get((sku, warehouse_id))
+        if item is None:
+            raise NotFoundError(f"no stock record for {sku!r} at {warehouse_id!r}")
+        return item
+
+    def _items_for_skus(self, skus) -> List[InventoryItem]:
+        skus = set(skus)
+        with self._registry_lock:
+            unknown = skus - self._products.keys()
+            if unknown:
+                raise NotFoundError(f"unknown sku(s) {sorted(unknown)}")
+            return [i for k, i in self._items.items() if k[0] in skus]
+
+    def _all_items(self) -> List[InventoryItem]:
+        with self._registry_lock:
+            return sorted(self._items.values(), key=lambda i: i.key)
+
+    def _get_reservation(self, reservation_id: str) -> Reservation:
+        with self._res_lock:
+            res = self._reservations.get(reservation_id)
+        if res is None:
+            raise NotFoundError(reservation_id)
+        return res
 
 
-# --- Demo ---
+def _require_positive(qty: int) -> None:
+    if not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0:
+        raise ValueError(f"quantity must be a positive int, got {qty!r}")
 
-def demo():
-    print("=== Inventory Management System ===")
-    print("=" * 50)
 
-    inv = InventoryService()
+class ManualClock:
+    """Deterministic clock for the demo and tests."""
 
-    # Add products
-    laptop = inv.add_product("LAP-001", "Gaming Laptop Pro", "Electronics", 1200.0, 5, 20)
-    phone = inv.add_product("PHN-001", "Smartphone X", "Electronics", 800.0, 10, 30)
-    headphones = inv.add_product("HPH-001", "Wireless Headphones", "Audio", 150.0, 15, 50)
-    print(f"\nProducts added:")
-    for p in [laptop, phone, headphones]:
-        print(f"  {p}")
+    def __init__(self, start: float = 1_700_000_000.0):
+        self.now = start
 
-    # Add warehouses
-    wh1 = inv.add_warehouse("Main Warehouse", "Bangalore", 10000)
-    wh2 = inv.add_warehouse("East Distribution", "Kolkata", 5000)
-    print(f"\nWarehouses: {wh1}, {wh2}")
+    def __call__(self) -> float:
+        return self.now
 
-    # Add stock
-    inv.add_stock(laptop.product_id, wh1.warehouse_id, 25, "Aisle-1, Rack-A")
-    inv.add_stock(phone.product_id, wh1.warehouse_id, 50, "Aisle-2, Rack-B")
-    inv.add_stock(headphones.product_id, wh1.warehouse_id, 8, "Aisle-3, Rack-C")  # Below reorder
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
-    inv.add_stock(laptop.product_id, wh2.warehouse_id, 10, "Aisle-1, Rack-A")
-    inv.add_stock(phone.product_id, wh2.warehouse_id, 20, "Aisle-2, Rack-B")
 
-    # Transfer stock
-    print("\n--- Stock Transfer ---")
-    inv.transfer_stock(laptop.product_id, wh1.warehouse_id, wh2.warehouse_id, 5)
+# ---------------------------------------------------------------- demo
 
-    # Check inventory
-    print("\n--- Inventory Status ---")
-    for pid in [laptop.product_id, phone.product_id, headphones.product_id]:
-        items = inv.get_inventory(pid)
-        for item in items:
-            print(f"  {item}")
-            if item.needs_reorder():
-                print(f"    ⚠️ Below reorder level ({item.product.reorder_level})!")
+def demo() -> None:
+    clock = ManualClock()
+    inv = InventoryService(reservation_ttl_s=600, clock=clock)
 
-    # Check reorder
-    print("\n--- Auto-Reorder Check ---")
-    inv.set_reorder_strategy(DemandBasedReorderStrategy(30))
-    orders = inv.check_reorder()
+    inv.add_product(Product("LAP-1", "Laptop", Decimal("1200.00"), reorder_level=5, reorder_quantity=20))
+    inv.add_product(Product("PHN-1", "Phone", Decimal("799.99"), reorder_level=10, reorder_quantity=30))
+    inv.add_warehouse(Warehouse("BLR", "Bangalore", priority=0))
+    inv.add_warehouse(Warehouse("CCU", "Kolkata", priority=1))
 
-    print(f"\n--- Summary ---")
-    print(f"  Total inventory value: ${inv.get_inventory_value():.2f}")
-    print(f"  Low stock items: {len(inv.get_low_stock_products())}")
-    print(f"  Auto-generated POs: {len(orders)}")
+    inv.receive_stock("LAP-1", "BLR", 8)
+    inv.receive_stock("LAP-1", "CCU", 6)
+    inv.receive_stock("PHN-1", "BLR", 40)
+    print("Laptops available:", inv.available("LAP-1"))                      # 14
+
+    # 1. Multi-line order, laptops split across warehouses because BLR alone has only 8.
+    r1 = inv.reserve("order-1", {"LAP-1": 10, "PHN-1": 2})
+    print("order-1 lines:", [(l.sku, l.warehouse_id, l.quantity) for l in r1.lines])
+    assert inv.reserve("order-1", {"LAP-1": 10, "PHN-1": 2}) is r1          # idempotent retry
+
+    # 2. All-or-nothing: not enough laptops left, nothing gets reserved.
+    try:
+        inv.reserve("order-2", {"PHN-1": 1, "LAP-1": 5})
+    except InsufficientStockError as e:
+        print("order-2 rejected:", e)
+    assert inv.stock("PHN-1", "BLR") == (40, 2, 38)
+
+    # 3. Commit order-1: on_hand drops, reservation consumed.
+    inv.commit(r1.reservation_id)
+    print("after commit LAP-1@BLR/CCU:", inv.stock("LAP-1", "BLR"), inv.stock("LAP-1", "CCU"))
+
+    # 4. A reservation that is never paid for expires and gives its stock back.
+    r3 = inv.reserve("order-3", {"PHN-1": 5})
+    clock.advance(601)
+    print("expired:", [r.order_id for r in inv.expire_reservations()], "->", inv.stock("PHN-1", "BLR"))
+
+    # 5. Transfer, then reorder (open POs count toward position, so a second check adds nothing).
+    inv.transfer_stock("PHN-1", "BLR", "CCU", 10)
+    pos = inv.check_reorder()
+    print("POs:", [(p.po_id, p.sku, p.warehouse_id, p.quantity) for p in pos])
+    assert inv.check_reorder() == []
+    for po in pos:
+        inv.receive_purchase_order(po.po_id)
+
+    print("inventory value:", inv.inventory_value())
+    print("ledger:", len(inv.movements()), "movements;", r3.status.value)
 
 
 if __name__ == "__main__":
     demo()
 ```
+<!-- /source -->
 
 ---
 
 ## ▶️ How to Run
 
 ```bash
-cd low-level-design/inventory-management
-python inventory_management.py
+cd python-low-level-design/inventory-management
+python3 inventory_management.py                    # deterministic demo
+python3 -m unittest test_inventory_management -v  # 25 tests, including concurrency
 ```
 
-## 🧩 Design Patterns
-
-See the [Interview Questions](INTERVIEW_QUESTIONS.md) for a detailed breakdown of design patterns and SOLID principles applied in this implementation.
+The tests cover reserve/commit/release/expire, all-or-nothing multi-line orders, split allocation, idempotent retries, transfers that cannot lose stock, cycle-count adjustments, duplicate-PO prevention, demand-based reorder, and four concurrency cases: 40 threads racing for 50 units (exactly 25 succeed), opposite transfers (no deadlock, stock conserved), commit vs. expiry sweeper (exactly one winner), and concurrent duplicate `order_id` (reserved once).

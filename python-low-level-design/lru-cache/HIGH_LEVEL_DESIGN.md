@@ -90,25 +90,27 @@
 
 **✅ Answer:**
 ```python
+import bisect, hashlib
+
+def _h(s: str) -> int:
+    # Stable across processes. Python's hash() of str is randomized per
+    # process (PYTHONHASHSEED), so clients would disagree on placement.
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:8], "big")
+
 class ConsistentHashRing:
     def __init__(self, nodes, vnodes=150):
-        self._ring = {}
-        for node in nodes:
-            for i in range(vnodes):  # Virtual nodes for balance
-                hash_val = hash(f"{node}:{i}")
-                self._ring[hash_val] = node
-    
-    def get_node(self, key):
-        hash_val = hash(key)
-        # Binary search for nearest clockwise node
-        keys = sorted(self._ring.keys())
-        idx = bisect_left(keys, hash_val)
-        if idx == len(keys):
-            idx = 0  # Wrap around
-        return self._ring[keys[idx]]
+        # Sort once; re-sorting per lookup would be O(n log n) per request.
+        self._ring = sorted((_h(f"{n}#{i}"), n) for n in nodes for i in range(vnodes))
+        self._points = [p for p, _ in self._ring]
+
+    def node_for(self, key: str) -> str:
+        i = bisect.bisect(self._points, _h(key)) % len(self._ring)  # wrap around
+        return self._ring[i][1]
 ```
 
-**Why virtual nodes?** Without them, adding/removing a node causes disproportionate key redistribution. With 150 virtual nodes per physical node, distribution is nearly uniform.
+**Why virtual nodes?** With one point per node, arc lengths are very uneven and a removed node dumps its whole range on a single neighbour. With ~100–200 points per node, load evens out (a few % spread) and a departing node's keys scatter across all survivors. Vnode counts can also be weighted by node capacity.
+
+**Alternative:** Redis Cluster uses 16,384 fixed hash slots (`CRC16(key) mod 16384`) assigned to nodes explicitly; resharding moves slots, and clients learn the map via `MOVED`/`ASK` redirects.
 
 ---
 
@@ -122,7 +124,7 @@ class ConsistentHashRing:
 **✅ Answer:** After a write, subsequent reads from stale replicas see old data. Mitigation:
 1. **Read-your-writes:** Track writes in client session, route reads for recently-written keys to primary
 2. **Configurable consistency:** `--consistency=strong` → always read from primary
-3. **Version vector:** Each key has version; replica rejects stale version reads
+3. **Version check:** The client remembers the version it last wrote for a key; a replica whose copy is older than that version makes the client fall back to the primary
 
 ---
 
@@ -141,11 +143,9 @@ When a new cache node joins the cluster, rebalancing happens in **5 phases** to 
 
 2. **Consistent hash ring update** — The new node adds N virtual nodes (e.g., 150) to the ring. Each virtual node hashes to a position on the ring. Keys whose nearest clockwise node was previously shard X now map to the new node. Approximately **1/N of all keys** remap (where N is the new total node count).
 
-3. **Lazy key migration (no mass invalidation)** — Rather than invalidating all remapped keys upfront (which would cause a thundering herd against the DB), the system uses **lazy migration**:
-   - Client library caches the ring state locally.
-   - On a cache miss, the client sends the request to the *old* node.
-   - The old node detects the key no longer belongs to it and returns a **MOVED redirect** (identical to Redis Cluster's approach).
-   - Client updates its ring cache and retries against the correct node.
+3. **Key migration** — two options, and for a cache the first is usually right:
+   - **Let them miss.** The ~1/N remapped keys miss on the new node and reload from the source of truth. Simple; the cost is a temporary DB load spike, so add nodes one at a time and off-peak.
+   - **Warm the new node.** While the ring change is pending, on a miss at the new owner, read the old owner and copy the value over (dual-read), or stream the affected ranges in the background. Clients with stale ring state are corrected by a redirect from the node they hit (Redis Cluster's `MOVED`/`ASK`), then refresh their map.
 
 4. **Proactive hot-key migration** — A background goroutine/thread walks the keyspace and migrates frequently-accessed ("hot") keys before they're requested. This avoids the MOVED redirect penalty for popular keys.
 
@@ -156,7 +156,7 @@ When a new cache node joins the cluster, rebalancing happens in **5 phases** to 
 
 **Failure scenarios:**
 - **Node crashes during rebalance:** The cluster manager detects failure via gossip timeout. The rebalance pauses, the dead node's virtual nodes are removed from the ring, and its keys remap to remaining nodes.
-- **Network partition:** During a split, both sides continue operating. When the partition heals, the cluster manager reconciles via Raft — the side with the higher term wins and triggers a full rebalance if needed.
+- **Network partition:** Only the side holding a Raft majority can change membership or promote replicas; the minority side cannot commit config changes. Cache nodes on the minority side may keep serving reads (possibly stale) unless clients are configured to fail closed — for a cache, serving slightly stale data is usually the right choice. Redis Cluster's equivalent: a primary isolated from the majority stops accepting writes after `cluster-node-timeout`.
 
 ---
 
@@ -165,7 +165,7 @@ When a new cache node joins the cluster, rebalancing happens in **5 phases** to 
 | Strategy | Read | Write | Consistency | Use Case |
 |----------|------|-------|-------------|----------|
 | **Cache-aside** | Miss → load from DB | Write DB, invalidate cache | Eventual | General purpose |
-| **Write-through** | Same as aside | Write cache + DB | Strong | Write-heavy |
+| **Write-through** | Same as aside | Write cache + DB on the same path | Fresher, but not atomic (crash between writes diverges) | Read-heavy data that must be fresh after writes |
 | **Write-behind** | Same as aside | Write cache, async to DB | Eventual | High throughput |
 | **Refresh-ahead** | Predict and pre-load | — | Eventual | Predictable access |
 
@@ -176,7 +176,7 @@ When a new cache node joins the cluster, rebalancing happens in **5 phases** to 
 | Strategy | When to Use | When NOT to Use |
 |----------|-------------|-----------------|
 | **LRU** | Temporal locality (session cache) | Scan-heavy workloads (bulk reads thrash) |
-| **LFU** | Popularity-driven access (product cache) | New items never get cached |
+| **LFU** | Popularity-driven access (product cache) | Shifting popularity: old hot items never age out, new items are evicted first (needs decay or W-TinyLFU) |
 | **TTL** | Fixed expiry (rate limiter counters) | No access pattern awareness |
 | **ARC** | Mixed workloads | Implementation complexity |
 | **2Q** | Good balance | Tuning parameters needed |
@@ -185,16 +185,16 @@ When a new cache node joins the cluster, rebalancing happens in **5 phases** to 
 
 ## 6. SCALABILITY & RELIABILITY
 
-**Bottleneck:** Single node memory capacity
+**Bottleneck:** At 10M req/s, **throughput**, not memory. One Redis primary handles roughly 100–200K simple ops/s (more with pipelining or I/O threads), so 10M req/s needs ~60–100 primaries; memory alone (500 GB / 50 GB) would suggest only 10.
 
-**Solution:** Shard by key hash. Each shard = Redis node or memcached instance. 500GB / 50GB per node = 10 shards + 10 replicas = 20 nodes.
+**Solution:** Shard by key hash across ~80 primaries (≈125K ops/s each, leaving headroom) + 80 replicas. Each holds ~6–7 GB, so smaller memory-optimised instances suffice. Hot keys still concentrate on one shard regardless of shard count: replicate them to L1 in-process caches or split them (`key#1..key#k`) and read a random copy.
 
 **Cache avalanche prevention:**
 1. **Uniform TTL + jitter:** `TTL = base_TTL + random(0, TTL_jitter)` — prevents mass expiry
 2. **Circuit breaker:** If DB can't handle reload traffic, return stale cache instead
 3. **Rate limiting per origin:** Limit number of concurrent cache misses
 
-**Thundering herd protection:** Mutex per key — first request loads from DB, subsequent requests wait for completion.
+**Thundering herd protection:** Single-flight per key — the first miss loads from the DB, concurrent misses wait for its result (the LLD's `get_or_load`). Across servers: a short `SET lock:k NX PX 2000` or memcache-style leases.
 
 ---
 
@@ -202,8 +202,10 @@ When a new cache node joins the cluster, rebalancing happens in **5 phases** to 
 
 | Component | Nodes | Cost |
 |-----------|-------|------|
-| Cache nodes (r6g.xlarge) | 10 | $3,200 |
-| Replica nodes | 10 | $3,200 |
-| Cluster manager (3-node) | 3 | $600 |
-| Bandwidth + Monitoring | — | $500 |
-| **Total** | | **$7,500** |
+| Cache primaries (~16 GB memory-optimised, ~$150/mo each) | 80 | ~$12,000 |
+| Replicas | 80 | ~$12,000 |
+| Cluster manager (3-node) | 3 | ~$600 |
+| Bandwidth + Monitoring | — | ~$2,000 |
+| **Total** | | **~$27,000** |
+
+> Rough on-demand list prices; the point is that request rate, not data size, sets the node count.

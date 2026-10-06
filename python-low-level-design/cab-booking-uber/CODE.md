@@ -1,57 +1,221 @@
 # Cab Booking (Uber) — Implementation
 
-> Python implementation of the Cab Booking (Uber) system following SOLID principles and design patterns.
-> Includes: GeoRadius matching, Kafka event pipeline, Zone-based surge management, Production DB schema.
+> Single-file Python implementation (`cab_booking.py`, stdlib only, Python 3.10+): geo-indexed driver matching
+> that can't double-book a driver, a validated trip state machine, Decimal fares with zone surge, and an
+> in-memory Kafka pipeline for GPS updates. Tests: `test_cab_booking.py`.
+
+---
+
+## ▶️ How to Run
+
+```bash
+cd python-low-level-design/cab-booking-uber
+python3 cab_booking.py                      # deterministic demo
+python3 -m unittest test_cab_booking -v     # 20 tests, < 1 s
+```
+
+---
+
+## 🗺️ Map of the File
+
+| Section | Classes | Role |
+|---------|---------|------|
+| Vocabulary | `CabStatus`, `TripStatus`, `CabType`, `BookingError` family, `Location` | Enums, domain errors, frozen value object with haversine `distance_to` |
+| People | `Rider`, `Driver` | `Driver` owns its status and only changes it with a compare-and-set (`try_claim`, `compare_and_set`) |
+| Pricing | `PricingStrategy`, `StandardPricing`, `SurgePricing`, `RateCard` | Strategy + Decorator, all money is `Decimal` rounded half-up to paise/cents |
+| Geo | `geohash_encode`, `geohash_bbox`, `geohash_neighbourhood`, `GeoIndex` | Redis-GEO-style index: sorted by geohash, radius = 9 range scans + exact filter |
+| Events | `KafkaBroker`, `KafkaMessage` | Partitioned logs, `crc32(key) % n` partitioning, per-group committed offsets |
+| Surge | `Zone`, `ZoneManager`, `compute_surge` | Zone id = geohash-6 cell, so point → zone is O(1) |
+| Consumers | `GPSLocationStreamProcessor`, `ZoneAnalyticsAggregator` | raw GPS → index + enriched topic; enriched → supply/demand → surge |
+| Matching | `DriverMatchingStrategy`, `NearestDriverMatching`, `HighestRatedDriverMatching` | Pure ranking of eligible candidates |
+| Lifecycle | `Trip` (+ `_TRANSITIONS` table) | State machine; owns its driver's status while active |
+| Facade | `CabBookingService` | Registration, location updates, `request_ride` (search → rank → claim), trip actions |
+
+---
+
+## 🔑 Key Design Decisions
+
+### 1. Matching = search → rank → **claim** (no double booking)
+
+The geo search is a snapshot; by the time you act on it, another request may have taken the driver. So
+matching is split in three, and only the last step is authoritative:
+
+```python
+for radius in self.SEARCH_RADII_KM:                       # 2 km → 5 km → 10 km
+    candidates = [eligible (driver, dist) from geo_index.search(pickup, radius)]
+    for driver in self._matching.rank(pickup, candidates):
+        if driver.try_claim():                            # AVAILABLE → BOOKED, atomic
+            return driver
+```
+
+`Driver.try_claim()` is a compare-and-set under the driver's own lock. Losing a claim is not an error; the
+request simply moves on to the next-ranked driver. That's why `test_n_drivers_n_riders_each_driver_used_once`
+gets 12 trips with 12 distinct drivers, and why 16 riders racing for one driver produce exactly one trip.
+In production the same CAS is `SET driver:{id}:lock <trip> NX PX 15000` in Redis or
+`UPDATE drivers SET status='BOOKED' WHERE id=? AND status='AVAILABLE'` (check rows affected).
+
+Strategies only **rank**; they never mutate. That keeps them trivially testable and means a new policy
+(ETA-based, acceptance-rate-weighted) never has to re-implement the concurrency.
+
+### 2. The trip state machine is a table, enforced under the trip lock
+
+```
+REQUESTED ──accept──▶ ACCEPTED ──arrive──▶ DRIVER_ARRIVED ──start──▶ STARTED ──complete──▶ COMPLETED
+    │  ▲                  │                      │
+    │  └─decline (re-match another driver)       │
+    └───────────┴──────────cancel────────────────┴──▶ CANCELLED
+```
+
+`Trip._move()` rejects anything not in `_TRANSITIONS` with `InvalidTransitionError`. Every service action
+runs under `trip.lock`, so "rider cancels" racing "driver starts" has exactly one winner and the driver's
+status always matches (`test_cancel_vs_start_race_has_one_winner`). The old version let you cancel a
+completed trip, which flipped a driver who might already be on someone else's trip back to AVAILABLE.
+
+Driver status follows the trip: claimed → `BOOKED`, `start()` → `ON_TRIP`, `complete()`/`cancel()`/declined
+→ `AVAILABLE`. **Lock order is always trip → driver**; driver locks are leaves and nothing holds a driver
+lock while taking another lock, so there is no deadlock cycle.
+
+### 3. Offer / decline is modelled
+
+`request_ride` claims a driver and creates the trip in `REQUESTED` (the offer). `decline_trip` (also what
+an offer timeout would call) frees that driver, records them in `declined_by`, and re-runs the claim loop
+excluding everyone who already declined. If nobody is left, the trip is cancelled with a reason.
+
+### 4. One active trip per rider
+
+`request_ride` reserves the rider in `_active_trip_by_rider` under the service lock *before* matching, so
+two taps from the same rider can't both claim drivers. The reservation is released on failure and when the
+trip reaches a terminal state.
+
+### 5. GeoIndex works like Redis GEO, including its edge cases
+
+- One sorted list of `(geohash, driver_id)`; a radius query picks the finest precision whose cell is at
+  least `radius` tall and wide, scans the centre cell **plus its 8 neighbours** (without the neighbours,
+  drivers just across a cell edge are missed), then filters by exact haversine distance.
+- Cost: O(9·log N + M) for the query. Inserts here are O(N) (list insert); Redis uses a skiplist, O(log N).
+- Neighbour longitudes wrap, so a search near ±180° works (tested).
+- `upsert(driver_id, location, ts)` drops updates older than the indexed one. GPS events can arrive out of
+  order and Kafka redelivers on retry; this makes the consumer idempotent.
+- It stores ids only. Availability and cab type are filtered by the caller (the production equivalent is
+  separate keys like `drivers:available:mini`, removing a driver from the key when they're booked).
+
+Geohash cell sizes (at the equator; width shrinks with cos(lat)): precision 5 ≈ 4.9 × 4.9 km, 6 ≈ 1.2 × 0.61 km,
+7 ≈ 153 × 153 m.
+
+### 6. Money and surge
+
+Rate cards are `Decimal`; `StandardPricing` converts distance/duration once and rounds to 2 places.
+`SurgePricing` decorates any strategy. `compute_surge(demand, supply)` is a step function, and **no demand
+means no surge** even with zero drivers (the old code surged an empty zone to 2.5×). The fare is quoted
+and locked at request time (upfront pricing), and `complete_trip` charges the quote.
+
+### 7. Kafka simulation semantics are honest
+
+- `produce` partitions by `crc32(key)`; Python's `hash()` is randomised per process and would not be stable.
+- Consumers `poll` from the committed offset and `commit` **after** handling each message: at-least-once.
+  Replays are harmless because the index upsert is timestamp-guarded.
+- Malformed GPS goes to `gps.dlq` with the error; the consumer moves on.
+- `ZoneAnalyticsAggregator` tracks each driver's *latest* zone (a moving driver counts once), counts only
+  AVAILABLE drivers as supply, and resets demand each window (tumbling).
+
+---
+
+## 🧩 Where to Extend
+
+| New requirement | Change |
+|-----------------|--------|
+| ETA-based matching | New `DriverMatchingStrategy.rank()` using a road-network ETA instead of straight-line distance |
+| Batched / global matching | Collect requests for 1–2 s per zone, solve an assignment problem, then `try_claim` the chosen pairs |
+| Offer timeout | Scheduler calls `decline_trip(trip_id)` if still `REQUESTED` after N seconds |
+| Cancellation fee | In `Trip.cancel`, charge if `status` was `DRIVER_ARRIVED` or after a grace period |
+| Pool rides | Driver gets `seats`; claim becomes "decrement seats if ≥ needed" (still a CAS) |
+| Scheduled rides | A `ScheduledRequest` that triggers `request_ride` T-10 min; widen radius as T approaches |
+| New cab type | Add the enum value and a `RATE_CARDS` entry; no class changes |
+
+---
+
+## 🏛️ Location Update Flow
+
+```
+Driver app ──GPS every ~3 s──▶ gps.raw.updates (key = driver_id)
+                                   │
+                         GPSLocationStreamProcessor.poll()
+                                   ├── validate (bad → gps.dlq)
+                                   ├── GeoIndex.upsert(driver, loc, ts)   (stale ts → ignored)
+                                   ├── ZoneManager.zone_for(loc)          (geohash-6)
+                                   └── produce gps.enriched.locations, commit offset
+                                                   │
+                                    ZoneAnalyticsAggregator.aggregate()
+                                                   ├── latest zone per driver, AVAILABLE only
+                                                   ├── demand = requests in window
+                                                   ├── Zone.update_supply_demand → surge
+                                                   └── produce gps.zone.driver_counts
+```
 
 ---
 
 ## 🗄️ Database Schema
 
-The complete production schema for the cab booking system is in [**DB_SCHEMA.md**](DB_SCHEMA.md).
-It includes 8 PostgreSQL + PostGIS tables:
-- `riders`, `drivers`, `trips`, `zones`, `driver_location_history` (partitioned by month)
-- `payments`, `rider_ratings`, `surge_pricing_log`
-- Redis GEO keys for real-time matching
-- PostGIS geo-radius query examples
+The production schema (PostgreSQL + PostGIS, Redis keys) is in [**DB_SCHEMA.md**](DB_SCHEMA.md).
 
 ---
 
-## 📦 Core Implementation
+## 📦 Full Source
 
+<!-- source: cab_booking.py -->
 ```python
 """
 Cab Booking Service (Uber/Ola) - Low Level Design
-----------------------------------------------------
-Design Principles: SOLID, Strategy Pattern, Observer Pattern
-
-Infrastructure Additions:
-  - GeoRadius-based driver matching (simulated Redis GEO)
-  - Kafka event simulation for GPS location updates
-  - Zone creation & driver counting per zone for surge
-  - Proper DB schema for all entities
+-------------------------------------------------
+Core flows : register riders/drivers, stream driver GPS, request a ride, match a
+             nearby driver, run the trip state machine, price with zone surge.
+Patterns   : Strategy (pricing, driver ranking), Decorator (surge on top of base
+             fare), State machine (Trip), Facade (CabBookingService).
+Concurrency: a driver is claimed with a compare-and-set under the driver's own
+             lock, so two concurrent requests can never book the same driver.
+             Trip transitions are validated under the trip's lock, so "rider
+             cancels" racing "driver starts" has exactly one winner.
+             Lock order is always trip -> driver (driver locks are leaves).
+Infra sims : GeoIndex (Redis GEO), KafkaBroker (topics/partitions/offsets),
+             geohash-cell zones for surge. Stdlib only, Python 3.10+.
 """
 
-from abc import ABC, abstractmethod
-from enum import Enum
-from typing import Dict, List, Optional, Tuple, Set, Callable
-from datetime import datetime, timedelta
-import math
-import uuid
-import random
-import json
+from __future__ import annotations
 
+import bisect
+import itertools
+import math
+import random
+import threading
+import zlib
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
+from enum import Enum
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+MONEY = Decimal("0.01")
+
+
+def to_money(value: Decimal) -> Decimal:
+    return value.quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+# ============================================================
+# Enums, errors, value objects
+# ============================================================
 
 class CabStatus(Enum):
-    AVAILABLE = "Available"
-    BOOKED = "Booked"
-    ON_TRIP = "On Trip"
+    AVAILABLE = "Available"   # online and matchable
+    BOOKED = "Booked"         # claimed for a trip (offered or accepted), not yet driving it
+    ON_TRIP = "On Trip"       # rider on board
     OFFLINE = "Offline"
-    MAINTENANCE = "Maintenance"
 
 
 class TripStatus(Enum):
-    REQUESTED = "Requested"
-    ACCEPTED = "Accepted"
+    REQUESTED = "Requested"            # driver reserved, offer pending
+    ACCEPTED = "Accepted"              # driver accepted, en route to pickup
+    DRIVER_ARRIVED = "Driver Arrived"
     STARTED = "Started"
     COMPLETED = "Completed"
     CANCELLED = "Cancelled"
@@ -65,602 +229,900 @@ class CabType(Enum):
     AUTO = "Auto"
 
 
-class PaymentMethod(Enum):
-    CASH = "Cash"
-    CARD = "Card"
-    WALLET = "Wallet"
-    UPI = "UPI"
+class BookingError(Exception):
+    """Base class for domain errors."""
 
 
-# --- Location (Value Object) ---
+class NotFoundError(BookingError):
+    pass
 
+
+class NoDriverAvailableError(BookingError):
+    pass
+
+
+class RiderBusyError(BookingError):
+    pass
+
+
+class InvalidTransitionError(BookingError):
+    pass
+
+
+@dataclass(frozen=True)
 class Location:
-    def __init__(self, lat: float, lng: float):
-        self._lat = lat
-        self._lng = lng
+    lat: float
+    lng: float
 
-    @property
-    def lat(self) -> float:
-        return self._lat
+    def __post_init__(self) -> None:
+        if not (-90 <= self.lat <= 90 and -180 <= self.lng <= 180):
+            raise ValueError(f"invalid coordinates {self.lat}, {self.lng}")
 
-    @property
-    def lng(self) -> float:
-        return self._lng
-
-    def distance_to(self, other: 'Location') -> float:
-        """Haversine formula for km distance"""
-        R = 6371
-        d_lat = math.radians(other._lat - self._lat)
-        d_lng = math.radians(other._lng - self._lng)
-        a = (math.sin(d_lat / 2) ** 2 +
-             math.cos(math.radians(self._lat)) * math.cos(math.radians(other._lat)) *
-             math.sin(d_lng / 2) ** 2)
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        return R * c
+    def distance_to(self, other: Location) -> float:
+        """Great-circle (haversine) distance in km."""
+        r = 6371.0
+        d_lat = math.radians(other.lat - self.lat)
+        d_lng = math.radians(other.lng - self.lng)
+        a = (math.sin(d_lat / 2) ** 2
+             + math.cos(math.radians(self.lat)) * math.cos(math.radians(other.lat))
+             * math.sin(d_lng / 2) ** 2)
+        return 2 * r * math.asin(math.sqrt(min(1.0, a)))
 
     def to_dict(self) -> dict:
-        return {"lat": self._lat, "lng": self._lng}
+        return {"lat": self.lat, "lng": self.lng}
 
     def __str__(self) -> str:
-        return f"({self._lat:.4f}, {self._lng:.4f})"
+        return f"({self.lat:.4f}, {self.lng:.4f})"
 
 
-# --- Rider & Driver (SRP) ---
+# ============================================================
+# Rider & Driver
+# ============================================================
 
 class Rider:
     def __init__(self, rider_id: str, name: str, phone: str):
-        self._rider_id = rider_id
-        self._name = name
-        self._phone = phone
-
-    @property
-    def rider_id(self) -> str:
-        return self._rider_id
-
-    @property
-    def name(self) -> str:
-        return self._name
+        self.rider_id = rider_id
+        self.name = name
+        self.phone = phone
 
     def __str__(self) -> str:
-        return f"{self._name} ({self._phone})"
+        return f"{self.name} ({self.phone})"
 
 
 class Driver:
+    """Driver status changes only via compare-and-set under self._lock."""
+
     def __init__(self, driver_id: str, name: str, phone: str,
                  license_number: str, cab_type: CabType):
-        self._driver_id = driver_id
-        self._name = name
-        self._phone = phone
-        self._license = license_number
-        self._cab_type = cab_type
+        self.driver_id = driver_id
+        self.name = name
+        self.phone = phone
+        self.license_number = license_number
+        self.cab_type = cab_type
         self._status = CabStatus.AVAILABLE
-        self._current_location: Optional[Location] = None
         self._rating = 5.0
-        self._total_rides = 0
-
-    @property
-    def driver_id(self) -> str:
-        return self._driver_id
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def cab_type(self) -> CabType:
-        return self._cab_type
+        self._rated_trips = 0
+        self._lock = threading.Lock()
 
     @property
     def status(self) -> CabStatus:
         return self._status
 
-    @status.setter
-    def status(self, value: CabStatus) -> None:
-        self._status = value
-
-    @property
-    def current_location(self) -> Optional[Location]:
-        return self._current_location
-
-    @current_location.setter
-    def current_location(self, loc: Location) -> None:
-        self._current_location = loc
-
     @property
     def rating(self) -> float:
         return self._rating
 
-    def update_rating(self, new_rating: float) -> None:
-        self._rating = ((self._rating * self._total_rides) + new_rating) / (self._total_rides + 1)
-        self._total_rides += 1
-
     def is_available(self) -> bool:
-        return self._status == CabStatus.AVAILABLE
+        return self._status is CabStatus.AVAILABLE
+
+    def compare_and_set(self, expected: CabStatus, new: CabStatus) -> bool:
+        with self._lock:
+            if self._status is not expected:
+                return False
+            self._status = new
+            return True
+
+    def try_claim(self) -> bool:
+        """AVAILABLE -> BOOKED atomically. False means someone else got them first."""
+        return self.compare_and_set(CabStatus.AVAILABLE, CabStatus.BOOKED)
+
+    def _force_status(self, new: CabStatus) -> None:
+        # Only called by Trip while it holds the trip lock and owns this driver.
+        with self._lock:
+            self._status = new
+
+    def add_rating(self, stars: float) -> None:
+        if not 1 <= stars <= 5:
+            raise ValueError("rating must be between 1 and 5")
+        with self._lock:
+            self._rating = (self._rating * self._rated_trips + stars) / (self._rated_trips + 1)
+            self._rated_trips += 1
 
     def __str__(self) -> str:
-        return f"{self._name} ({self._cab_type.value})"
+        return f"{self.name} ({self.cab_type.value})"
 
 
-# --- Pricing Strategy (Strategy Pattern - OCP) ---
+# ============================================================
+# Pricing (Strategy + Decorator), money as Decimal
+# ============================================================
 
 class PricingStrategy(ABC):
     @abstractmethod
-    def calculate_fare(self, distance_km: float, duration_min: float) -> float:
-        pass
+    def calculate_fare(self, distance_km: float, duration_min: float) -> Decimal:
+        ...
+
+
+@dataclass(frozen=True)
+class RateCard:
+    base: Decimal
+    per_km: Decimal
+    per_min: Decimal
+
+
+RATE_CARDS: Dict[CabType, RateCard] = {
+    CabType.AUTO: RateCard(Decimal("25"), Decimal("8"), Decimal("0.5")),
+    CabType.MINI: RateCard(Decimal("50"), Decimal("10"), Decimal("1")),
+    CabType.SEDAN: RateCard(Decimal("80"), Decimal("14"), Decimal("1.5")),
+    CabType.SUV: RateCard(Decimal("120"), Decimal("18"), Decimal("2")),
+    CabType.PREMIUM: RateCard(Decimal("150"), Decimal("22"), Decimal("2.5")),
+}
 
 
 class StandardPricing(PricingStrategy):
-    _base_fare = {CabType.MINI: 50, CabType.SEDAN: 80, CabType.SUV: 120, CabType.PREMIUM: 150, CabType.AUTO: 25}
-    _per_km = {CabType.MINI: 10, CabType.SEDAN: 14, CabType.SUV: 18, CabType.PREMIUM: 22, CabType.AUTO: 8}
-    _per_min = {CabType.MINI: 1, CabType.SEDAN: 1.5, CabType.SUV: 2, CabType.PREMIUM: 2.5, CabType.AUTO: 0.5}
-
     def __init__(self, cab_type: CabType):
-        self._cab_type = cab_type
+        self._card = RATE_CARDS[cab_type]
 
-    def calculate_fare(self, distance_km: float, duration_min: float) -> float:
-        return (self._base_fare.get(self._cab_type, 50) +
-                self._per_km.get(self._cab_type, 10) * distance_km +
-                self._per_min.get(self._cab_type, 1) * duration_min)
+    def calculate_fare(self, distance_km: float, duration_min: float) -> Decimal:
+        km = Decimal(str(round(distance_km, 3)))
+        mins = Decimal(str(round(duration_min, 2)))
+        return to_money(self._card.base + self._card.per_km * km + self._card.per_min * mins)
 
 
 class SurgePricing(PricingStrategy):
-    def __init__(self, base_strategy: PricingStrategy, surge_multiplier: float = 1.5):
-        self._base = base_strategy
-        self._surge = surge_multiplier
+    """Decorator: multiplies whatever the wrapped strategy charges."""
 
-    def calculate_fare(self, distance_km: float, duration_min: float) -> float:
-        return self._base.calculate_fare(distance_km, duration_min) * self._surge
+    def __init__(self, base: PricingStrategy, multiplier: Decimal):
+        if multiplier < 1:
+            raise ValueError("surge multiplier must be >= 1")
+        self._base = base
+        self._multiplier = multiplier
+
+    def calculate_fare(self, distance_km: float, duration_min: float) -> Decimal:
+        return to_money(self._base.calculate_fare(distance_km, duration_min) * self._multiplier)
 
 
-# --- Geo-Spatial Index (Simulated Redis GEO) ---
+# ============================================================
+# Geohash + GeoIndex (in-memory stand-in for Redis GEO)
+# ============================================================
+
+_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def geohash_encode(lat: float, lng: float, precision: int) -> str:
+    lat_rng, lng_rng = [-90.0, 90.0], [-180.0, 180.0]
+    chars, ch, bit, even = [], 0, 0, True
+    while len(chars) < precision:
+        rng, val = (lng_rng, lng) if even else (lat_rng, lat)
+        mid = (rng[0] + rng[1]) / 2
+        if val >= mid:
+            ch |= 1 << (4 - bit)
+            rng[0] = mid
+        else:
+            rng[1] = mid
+        even = not even
+        bit += 1
+        if bit == 5:
+            chars.append(_BASE32[ch])
+            ch, bit = 0, 0
+    return "".join(chars)
+
+
+def geohash_bbox(gh: str) -> Tuple[float, float, float, float]:
+    """(min_lat, max_lat, min_lng, max_lng) of a geohash cell."""
+    lat_rng, lng_rng = [-90.0, 90.0], [-180.0, 180.0]
+    even = True
+    for c in gh:
+        v = _BASE32.index(c)
+        for b in range(4, -1, -1):
+            rng = lng_rng if even else lat_rng
+            mid = (rng[0] + rng[1]) / 2
+            if (v >> b) & 1:
+                rng[0] = mid
+            else:
+                rng[1] = mid
+            even = not even
+    return lat_rng[0], lat_rng[1], lng_rng[0], lng_rng[1]
+
+
+def geohash_cell_km(precision: int, at_lat: float) -> Tuple[float, float]:
+    """(height_km, width_km) of a cell. Precision 5 ~ 4.9x4.9 km, 6 ~ 0.61x1.2 km, 7 ~ 153x153 m."""
+    bits = 5 * precision
+    lng_bits, lat_bits = (bits + 1) // 2, bits // 2
+    height = 180 / (1 << lat_bits) * 111.32
+    width = 360 / (1 << lng_bits) * 111.32 * math.cos(math.radians(at_lat))
+    return height, width
+
+
+def geohash_neighbourhood(gh: str) -> List[str]:
+    """The cell itself plus its 8 neighbours (wraps at the antimeridian, clips at the poles)."""
+    min_lat, max_lat, min_lng, max_lng = geohash_bbox(gh)
+    h, w = max_lat - min_lat, max_lng - min_lng
+    c_lat, c_lng = (min_lat + max_lat) / 2, (min_lng + max_lng) / 2
+    cells = []
+    for dy in (-1, 0, 1):
+        lat = c_lat + dy * h
+        if not -90 < lat < 90:
+            continue
+        for dx in (-1, 0, 1):
+            lng = (c_lng + dx * w + 180) % 360 - 180
+            cells.append(geohash_encode(lat, lng, len(gh)))
+    return list(dict.fromkeys(cells))
+
 
 class GeoIndex:
     """
-    Simulates Redis GEO sorted set using geohash encoding.
-    
-    In production, Redis GEO uses:
-      GEOADD drivers:available <lng> <lat> <driver_id>
-      GEORADIUS drivers:available <lng> <lat> <radius> km WITHCOORD WITHDIST ASC COUNT <limit>
+    Mirrors how Redis GEO works: members live in ONE sorted structure ordered by
+    geohash, and a radius query is a handful of range scans (the 3x3 cells at a
+    precision whose cell is at least `radius` wide) followed by an exact
+    haversine filter. Query cost is O(9 log N + M) for M points in those cells.
+    (Redis uses a skiplist, so inserts are O(log N); this sorted list is O(N)
+    per insert, which is fine for a simulation.)
+
+    It stores driver ids only; availability and cab type are the caller's
+    concern, just as with a Redis key. Updates carry a timestamp and older
+    updates are ignored, so out-of-order or replayed GPS events are harmless.
     """
 
-    GEOHASH_PRECISION = 7
+    PRECISION = 7
 
-    _BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sorted: List[Tuple[str, str]] = []                    # (geohash, driver_id)
+        self._pos: Dict[str, Tuple[str, Location, float]] = {}      # driver_id -> (hash, loc, ts)
 
-    def __init__(self):
-        self._drivers: Dict[str, Driver] = {}
-        self._geohash_buckets: Dict[str, Set[str]] = {}
-        self._location_cache: Dict[str, Location] = {}
+    def upsert(self, driver_id: str, location: Location, ts: float) -> bool:
+        """Returns False (and changes nothing) if ts is older than the indexed position."""
+        new_hash = geohash_encode(location.lat, location.lng, self.PRECISION)
+        with self._lock:
+            old = self._pos.get(driver_id)
+            if old is not None:
+                if ts < old[2]:
+                    return False
+                self._remove_entry(old[0], driver_id)
+            bisect.insort(self._sorted, (new_hash, driver_id))
+            self._pos[driver_id] = (new_hash, location, ts)
+            return True
 
-    @staticmethod
-    def _encode_geohash(lat: float, lng: float, precision: int = GEOHASH_PRECISION) -> str:
-        """Encode lat/lng into a geohash string."""
-        lat_range = [-90.0, 90.0]
-        lng_range = [-180.0, 180.0]
-        hash_chars = []
-        bit = 0
-        ch = 0
-        even = True
+    def remove(self, driver_id: str) -> None:
+        with self._lock:
+            old = self._pos.pop(driver_id, None)
+            if old is not None:
+                self._remove_entry(old[0], driver_id)
 
-        while len(hash_chars) < precision:
-            if even:
-                mid = (lng_range[0] + lng_range[1]) / 2
-                if lng > mid:
-                    ch |= (1 << (4 - bit))
-                    lng_range[0] = mid
-                else:
-                    lng_range[1] = mid
-            else:
-                mid = (lat_range[0] + lat_range[1]) / 2
-                if lat > mid:
-                    ch |= (1 << (4 - bit))
-                    lat_range[0] = mid
-                else:
-                    lat_range[1] = mid
+    def location_of(self, driver_id: str) -> Optional[Location]:
+        with self._lock:
+            entry = self._pos.get(driver_id)
+            return entry[1] if entry else None
 
-            even = not even
-            if bit < 4:
-                bit += 1
-            else:
-                hash_chars.append(GeoIndex._BASE32[ch])
-                bit = 0
-                ch = 0
+    def search(self, center: Location, radius_km: float) -> List[Tuple[str, float]]:
+        """All (driver_id, distance_km) within radius, nearest first."""
+        precision = self._precision_for(radius_km, center.lat)
+        cells = geohash_neighbourhood(geohash_encode(center.lat, center.lng, precision))
+        hits: List[Tuple[str, float]] = []
+        with self._lock:
+            for prefix in cells:
+                lo = bisect.bisect_left(self._sorted, (prefix, ""))
+                hi = bisect.bisect_left(self._sorted, (prefix + "~", ""))  # '~' sorts after base32
+                for _, driver_id in self._sorted[lo:hi]:
+                    d = center.distance_to(self._pos[driver_id][1])
+                    if d <= radius_km:
+                        hits.append((driver_id, d))
+        hits.sort(key=lambda h: (h[1], h[0]))
+        return hits
 
-        return ''.join(hash_chars)
+    def __len__(self) -> int:
+        return len(self._pos)
 
-    def add_driver(self, driver: Driver) -> None:
-        self._drivers[driver.driver_id] = driver
+    def _remove_entry(self, gh: str, driver_id: str) -> None:
+        i = bisect.bisect_left(self._sorted, (gh, driver_id))
+        if i < len(self._sorted) and self._sorted[i] == (gh, driver_id):
+            del self._sorted[i]
 
-    def update_location(self, driver_id: str, location: Location) -> None:
-        """Update driver location — removes old geohash, adds new one."""
-        old_loc = self._location_cache.get(driver_id)
-        if old_loc:
-            old_hash = self._encode_geohash(old_loc.lat, old_loc.lng)
-            if driver_id in self._geohash_buckets.get(old_hash, set()):
-                self._geohash_buckets[old_hash].discard(driver_id)
-
-        new_hash = self._encode_geohash(location.lat, location.lng)
-        self._geohash_buckets.setdefault(new_hash, set()).add(driver_id)
-        self._location_cache[driver_id] = location
-        if driver_id in self._drivers:
-            self._drivers[driver_id].current_location = location
-
-    def geo_radius_search(self, center: Location, radius_km: float,
-                          cab_type: Optional[CabType] = None,
-                          limit: int = 5) -> List[Tuple[Driver, float, Location]]:
-        """
-        GEORADIUS equivalent: find drivers within radius_km of center.
-        Uses geohash prefix matching for efficient O(log N) search.
-        """
-        if radius_km <= 0.5:
-            prefix_len = 7
-        elif radius_km <= 2:
-            prefix_len = 6
-        elif radius_km <= 10:
-            prefix_len = 5
-        elif radius_km <= 50:
-            prefix_len = 4
-        else:
-            prefix_len = 3
-
-        center_hash = self._encode_geohash(center.lat, center.lng, prefix_len)
-        candidates: List[Tuple[Driver, float, Location]] = []
-
-        for geohash, driver_ids in self._geohash_buckets.items():
-            if not geohash.startswith(center_hash):
-                continue
-            for driver_id in driver_ids:
-                driver = self._drivers.get(driver_id)
-                if not driver or not driver.is_available():
-                    continue
-                if cab_type and driver.cab_type != cab_type:
-                    continue
-                loc = self._location_cache.get(driver_id)
-                if not loc:
-                    continue
-                dist = center.distance_to(loc)
-                if dist <= radius_km:
-                    candidates.append((driver, dist, loc))
-
-        candidates.sort(key=lambda x: x[1])
-        return candidates[:limit]
-
-    def count_drivers_in_radius(self, center: Location, radius_km: float) -> int:
-        return len(self.geo_radius_search(center, radius_km, limit=1000))
+    def _precision_for(self, radius_km: float, lat: float) -> int:
+        for p in range(self.PRECISION, 0, -1):
+            h, w = geohash_cell_km(p, lat)
+            if h >= radius_km and w >= radius_km:
+                return p
+        return 1
 
 
-# --- Kafka Event Simulation ---
+# ============================================================
+# Kafka simulation: partitioned append-only logs + committed offsets
+# ============================================================
 
+@dataclass(frozen=True)
 class KafkaMessage:
-    def __init__(self, topic: str, key: str, value: dict,
-                 partition: Optional[int] = None,
-                 timestamp: Optional[datetime] = None):
-        self.topic = topic
-        self.key = key
-        self.value = value
-        self.partition = partition or 0
-        self.timestamp = timestamp or datetime.now()
-        self.offset: Optional[int] = None
-
-    def __str__(self) -> str:
-        return (f"KMsg[topic={self.topic}, key={self.key}, "
-                f"partition={self.partition}, offset={self.offset}]")
-
-
-class KafkaTopic:
-    def __init__(self, name: str, partitions: int = 3, replication_factor: int = 3):
-        self.name = name
-        self.partitions = partitions
-        self.replication_factor = replication_factor
-        self._messages: List[KafkaMessage] = []
-
-    def produce(self, message: KafkaMessage) -> None:
-        message.offset = len(self._messages)
-        message.partition = hash(message.key) % self.partitions
-        self._messages.append(message)
+    topic: str
+    partition: int
+    offset: int
+    key: str
+    value: dict
 
 
 class KafkaBroker:
-    def __init__(self):
-        self._topics: Dict[str, KafkaTopic] = {}
+    """
+    Keyed messages go to partition crc32(key) % n, so one driver's events stay
+    ordered. Consumers poll per (group, topic, partition) offset and commit
+    AFTER processing (at-least-once): a crash between processing and commit
+    replays the message, which is why consumers must be idempotent.
+    """
 
-    def create_topic(self, name: str, partitions: int = 3,
-                     replication_factor: int = 3) -> KafkaTopic:
-        topic = KafkaTopic(name, partitions, replication_factor)
-        self._topics[name] = topic
-        return topic
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._topics: Dict[str, List[List[KafkaMessage]]] = {}
+        self._committed: Dict[Tuple[str, str, int], int] = {}
 
-    def produce(self, topic_name: str, key: str, value: dict) -> None:
-        topic = self._topics.get(topic_name)
-        if not topic:
-            raise ValueError(f"Topic {topic_name} does not exist")
-        msg = KafkaMessage(topic_name, key, value)
-        topic.produce(msg)
+    def create_topic(self, name: str, partitions: int = 3) -> None:
+        with self._lock:
+            self._topics.setdefault(name, [[] for _ in range(partitions)])
+
+    def produce(self, topic: str, key: str, value: dict) -> KafkaMessage:
+        with self._lock:
+            parts = self._topics.get(topic)
+            if parts is None:
+                raise NotFoundError(f"topic {topic} does not exist")
+            p = zlib.crc32(key.encode()) % len(parts)
+            msg = KafkaMessage(topic, p, len(parts[p]), key, value)
+            parts[p].append(msg)
+            return msg
+
+    def poll(self, topic: str, group: str, max_messages: int = 100) -> List[KafkaMessage]:
+        with self._lock:
+            out: List[KafkaMessage] = []
+            for p, log in enumerate(self._topics.get(topic, [])):
+                start = self._committed.get((group, topic, p), 0)
+                out.extend(log[start:start + max_messages - len(out)])
+                if len(out) >= max_messages:
+                    break
+            return out
+
+    def commit(self, group: str, msg: KafkaMessage) -> None:
+        with self._lock:
+            key = (group, msg.topic, msg.partition)
+            self._committed[key] = max(self._committed.get(key, 0), msg.offset + 1)
+
+    def topic_size(self, topic: str) -> int:
+        with self._lock:
+            return sum(len(log) for log in self._topics.get(topic, []))
 
 
-# --- Zone Management ---
+# ============================================================
+# Zones & surge (geohash-6 cells stand in for H3 hexagons)
+# ============================================================
 
+def compute_surge(demand: int, supply: int) -> Decimal:
+    """Step function on demand/supply. No demand -> no surge, whatever the supply."""
+    if demand == 0:
+        return Decimal("1.0")
+    if supply == 0:
+        return Decimal("2.5")
+    ratio = demand / supply
+    if ratio > 3.0:
+        return Decimal("2.0")
+    if ratio > 2.0:
+        return Decimal("1.5")
+    if ratio > 1.5:
+        return Decimal("1.25")
+    return Decimal("1.0")
+
+
+@dataclass
 class Zone:
-    def __init__(self, zone_id: str, center: Location, radius_km: float = 0.5):
-        self.zone_id = zone_id
-        self.center = center
-        self.radius_km = radius_km
-        self.driver_count: int = 0
-        self.ride_request_count: int = 0
-        self.surge_multiplier: float = 1.0
-        self.last_updated: Optional[datetime] = None
+    zone_id: str
+    center: Location
+    driver_count: int = 0
+    ride_request_count: int = 0
+    surge_multiplier: Decimal = Decimal("1.0")
 
     def update_supply_demand(self, driver_count: int, ride_requests: int) -> None:
         self.driver_count = driver_count
         self.ride_request_count = ride_requests
-        self.last_updated = datetime.now()
-        if driver_count == 0:
-            self.surge_multiplier = 2.5
-        else:
-            ratio = ride_requests / driver_count
-            if ratio > 3.0: self.surge_multiplier = 2.0
-            elif ratio > 2.0: self.surge_multiplier = 1.5
-            elif ratio > 1.5: self.surge_multiplier = 1.25
-            else: self.surge_multiplier = 1.0
+        self.surge_multiplier = compute_surge(ride_requests, driver_count)
+
+    def __str__(self) -> str:
+        return (f"Zone[{self.zone_id}]: {self.driver_count} drivers, "
+                f"{self.ride_request_count} requests, surge={self.surge_multiplier}x")
 
 
 class ZoneManager:
-    def __init__(self, city_center: Location, grid_radius_km: float = 10.0,
-                 zone_radius_km: float = 0.5):
-        self.city_center = city_center
-        self.grid_radius_km = grid_radius_km
-        self.zone_radius_km = zone_radius_km
+    """Point -> zone is O(1): the zone id IS the geohash cell. Zones are created lazily."""
+
+    PRECISION = 6  # ~0.6 km x 1.2 km cells
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._zones: Dict[str, Zone] = {}
 
-    def create_hexagonal_grid(self) -> None:
-        """Create hexagonal zones covering the city."""
-        h_spacing = math.sqrt(3) * self.zone_radius_km
-        v_spacing = 1.5 * self.zone_radius_km
-        num_rings = max(1, int(self.grid_radius_km / self.zone_radius_km))
-        zone_count = 0
+    def zone_for(self, location: Location) -> Zone:
+        zone_id = geohash_encode(location.lat, location.lng, self.PRECISION)
+        with self._lock:
+            zone = self._zones.get(zone_id)
+            if zone is None:
+                min_lat, max_lat, min_lng, max_lng = geohash_bbox(zone_id)
+                zone = Zone(zone_id, Location((min_lat + max_lat) / 2, (min_lng + max_lng) / 2))
+                self._zones[zone_id] = zone
+            return zone
 
-        for ring in range(num_rings):
-            hex_count = 6 * ring if ring > 0 else 1
-            if ring == 0:
-                zone = Zone(f"Z{zone_count:04d}", self.city_center, self.zone_radius_km)
-                self._zones[zone.zone_id] = zone
-                zone_count += 1
-            else:
-                for i in range(hex_count):
-                    angle = (2 * math.pi * i) / hex_count
-                    r = ring * h_spacing
-                    lat = self.city_center.lat + (r * math.cos(angle)) / 111.0
-                    lng = self.city_center.lng + (r * math.sin(angle)) / (111.0 * math.cos(math.radians(self.city_center.lat)))
-                    zone = Zone(f"Z{zone_count:04d}", Location(lat, lng), self.zone_radius_km)
-                    self._zones[zone.zone_id] = zone
-                    zone_count += 1
+    def get_zone(self, zone_id: str) -> Optional[Zone]:
+        with self._lock:
+            return self._zones.get(zone_id)
+
+    @property
+    def zones(self) -> List[Zone]:
+        with self._lock:
+            return sorted(self._zones.values(), key=lambda z: z.zone_id)
 
 
-# --- Driver Matching Strategies ---
+# ============================================================
+# Stream processors (Kafka consumers)
+# ============================================================
+
+GPS_RAW = "gps.raw.updates"
+GPS_ENRICHED = "gps.enriched.locations"
+ZONE_COUNTS = "gps.zone.driver_counts"
+GPS_DLQ = "gps.dlq"
+TRIP_EVENTS = "trip.events"
+
+
+class GPSLocationStreamProcessor:
+    """gps.raw.updates -> validate -> GeoIndex upsert -> enrich with zone -> gps.enriched.locations."""
+
+    GROUP = "gps-stream-processor"
+
+    def __init__(self, broker: KafkaBroker, geo_index: GeoIndex, zones: ZoneManager):
+        self._broker = broker
+        self._geo = geo_index
+        self._zones = zones
+        self._lock = threading.Lock()  # one consumer instance processes its partitions serially
+        self.total_processed = 0
+
+    def poll(self, max_messages: int = 100) -> int:
+        with self._lock:
+            processed = 0
+            for msg in self._broker.poll(GPS_RAW, self.GROUP, max_messages):
+                try:
+                    v = msg.value
+                    location = Location(float(v["lat"]), float(v["lng"]))
+                    if self._geo.upsert(v["driver_id"], location, float(v["ts"])):
+                        zone = self._zones.zone_for(location)
+                        self._broker.produce(GPS_ENRICHED, v["driver_id"], {
+                            "driver_id": v["driver_id"], "location": location.to_dict(),
+                            "zone_id": zone.zone_id, "speed_kmh": v.get("speed_kmh", 0),
+                            "heading": v.get("heading", 0), "ts": v["ts"]})
+                    processed += 1
+                except (KeyError, TypeError, ValueError) as e:
+                    self._broker.produce(GPS_DLQ, msg.key, {"error": repr(e), "original": msg.value})
+                self._broker.commit(self.GROUP, msg)  # commit after handling: at-least-once
+            self.total_processed += processed
+            return processed
+
+
+class ZoneAnalyticsAggregator:
+    """
+    Supply = AVAILABLE drivers whose latest position is in the zone (a driver
+    who moves is counted once, in their current zone). Demand = ride requests
+    in the current window. aggregate() closes the window (tumbling).
+    """
+
+    GROUP = "zone-analytics"
+
+    def __init__(self, broker: KafkaBroker, zones: ZoneManager,
+                 is_available: Callable[[str], bool]):
+        self._broker = broker
+        self._zones = zones
+        self._is_available = is_available
+        self._lock = threading.Lock()
+        self._driver_zone: Dict[str, str] = {}
+        self._requests: Dict[str, int] = {}
+
+    def record_ride_request(self, pickup: Location) -> None:
+        zone_id = self._zones.zone_for(pickup).zone_id
+        with self._lock:
+            self._requests[zone_id] = self._requests.get(zone_id, 0) + 1
+
+    def aggregate(self) -> List[Zone]:
+        with self._lock:
+            for msg in self._broker.poll(GPS_ENRICHED, self.GROUP, max_messages=10_000):
+                self._driver_zone[msg.value["driver_id"]] = msg.value["zone_id"]
+                self._broker.commit(self.GROUP, msg)
+            supply: Dict[str, int] = {}
+            for driver_id, zone_id in self._driver_zone.items():
+                if self._is_available(driver_id):
+                    supply[zone_id] = supply.get(zone_id, 0) + 1
+            for zone in self._zones.zones:
+                zone.update_supply_demand(supply.get(zone.zone_id, 0),
+                                          self._requests.get(zone.zone_id, 0))
+                self._broker.produce(ZONE_COUNTS, zone.zone_id, {
+                    "zone_id": zone.zone_id, "driver_count": zone.driver_count,
+                    "ride_requests": zone.ride_request_count,
+                    "surge_multiplier": str(zone.surge_multiplier)})
+            self._requests.clear()
+            return self._zones.zones
+
+
+# ============================================================
+# Driver matching: strategies RANK candidates; the service CLAIMS
+# ============================================================
 
 class DriverMatchingStrategy(ABC):
+    """Pure ranking: given eligible (driver, distance_km) pairs, return them best first."""
+
     @abstractmethod
-    def find_driver(self, pickup: Location, cab_type: CabType,
-                    drivers: List[Driver],
-                    geo_index: Optional[GeoIndex] = None) -> Optional[Driver]:
-        pass
+    def rank(self, pickup: Location, candidates: List[Tuple[Driver, float]]) -> List[Driver]:
+        ...
 
 
 class NearestDriverMatching(DriverMatchingStrategy):
-    def find_driver(self, pickup: Location, cab_type: CabType,
-                    drivers: List[Driver],
-                    geo_index: Optional[GeoIndex] = None) -> Optional[Driver]:
-        if geo_index:
-            results = geo_index.geo_radius_search(pickup, 5.0, cab_type, 1)
-            return results[0][0] if results else None
-        available = [d for d in drivers if d.is_available() and d.cab_type == cab_type and d.current_location]
-        if not available:
-            return None
-        return min(available, key=lambda d: d.current_location.distance_to(pickup))
+    def rank(self, pickup: Location, candidates: List[Tuple[Driver, float]]) -> List[Driver]:
+        return [d for d, _ in sorted(candidates, key=lambda c: (c[1], c[0].driver_id))]
 
 
-class GeoRadiusDriverMatching(DriverMatchingStrategy):
-    """GeoRadius-based matching with progressive radius expansion."""
-    def __init__(self, initial_radius_km: float = 3.0, max_radius_km: float = 10.0):
-        self._initial_radius = initial_radius_km
-        self._max_radius = max_radius_km
+class HighestRatedDriverMatching(DriverMatchingStrategy):
+    """Best rating inside the search radius; distance breaks ties."""
 
-    def find_driver(self, pickup: Location, cab_type: CabType,
-                    drivers: List[Driver],
-                    geo_index: Optional[GeoIndex] = None) -> Optional[Driver]:
-        if not geo_index:
-            return None
-        radius = self._initial_radius
-        while radius <= self._max_radius:
-            results = geo_index.geo_radius_search(pickup, radius, cab_type, 1)
-            if results:
-                return results[0][0]
-            radius *= 1.5
-        return None
+    def rank(self, pickup: Location, candidates: List[Tuple[Driver, float]]) -> List[Driver]:
+        return [d for d, _ in sorted(candidates, key=lambda c: (-c[0].rating, c[1]))]
 
 
-# --- Trip (SRP) ---
+# ============================================================
+# Trip: the state machine. Owns its driver's status while active.
+# ============================================================
 
+_TRANSITIONS: Dict[TripStatus, Set[TripStatus]] = {
+    TripStatus.REQUESTED: {TripStatus.ACCEPTED, TripStatus.CANCELLED},
+    TripStatus.ACCEPTED: {TripStatus.DRIVER_ARRIVED, TripStatus.CANCELLED},
+    TripStatus.DRIVER_ARRIVED: {TripStatus.STARTED, TripStatus.CANCELLED},
+    TripStatus.STARTED: {TripStatus.COMPLETED},
+    TripStatus.COMPLETED: set(),
+    TripStatus.CANCELLED: set(),
+}
+
+TERMINAL = {TripStatus.COMPLETED, TripStatus.CANCELLED}
+
+
+@dataclass
 class Trip:
-    def __init__(self, trip_id: str, rider: Rider, driver: Driver,
-                 pickup: Location, dropoff: Location, fare: float):
-        self._trip_id = trip_id
-        self._rider = rider
-        self._driver = driver
-        self._pickup = pickup
-        self._dropoff = dropoff
-        self._fare = fare
-        self._status = TripStatus.REQUESTED
-        self._start_time: Optional[datetime] = None
-        self._end_time: Optional[datetime] = None
+    trip_id: str
+    rider: Rider
+    driver: Driver
+    pickup: Location
+    dropoff: Location
+    cab_type: CabType
+    fare: Decimal
+    surge_multiplier: Decimal
+    status: TripStatus = TripStatus.REQUESTED
+    cancel_reason: Optional[str] = None
+    declined_by: Set[str] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
-    @property
-    def trip_id(self) -> str:
-        return self._trip_id
-    @property
-    def rider(self) -> Rider:
-        return self._rider
-    @property
-    def driver(self) -> Driver:
-        return self._driver
-    @property
-    def status(self) -> TripStatus:
-        return self._status
-    @status.setter
-    def status(self, value: TripStatus) -> None:
-        self._status = value
+    # Callers hold self.lock for every method below.
+    def _move(self, target: TripStatus) -> None:
+        if target not in _TRANSITIONS[self.status]:
+            raise InvalidTransitionError(f"{self.trip_id}: {self.status.name} -> {target.name}")
+        self.status = target
+
+    def accept(self) -> None:
+        self._move(TripStatus.ACCEPTED)
+
+    def arrive(self) -> None:
+        self._move(TripStatus.DRIVER_ARRIVED)
 
     def start(self) -> None:
-        self._status = TripStatus.STARTED
-        self._start_time = datetime.now()
+        self._move(TripStatus.STARTED)
+        self.driver._force_status(CabStatus.ON_TRIP)
 
-    def complete(self) -> float:
-        self._status = TripStatus.COMPLETED
-        self._end_time = datetime.now()
-        self._driver.status = CabStatus.AVAILABLE
-        return self._fare
+    def complete(self) -> Decimal:
+        self._move(TripStatus.COMPLETED)
+        self.driver._force_status(CabStatus.AVAILABLE)
+        return self.fare
 
-    def cancel(self) -> None:
-        self._status = TripStatus.CANCELLED
-        self._driver.status = CabStatus.AVAILABLE
+    def cancel(self, reason: str) -> None:
+        self._move(TripStatus.CANCELLED)
+        self.cancel_reason = reason
+        self.driver._force_status(CabStatus.AVAILABLE)
+
+    def reassign(self, new_driver: Driver) -> None:
+        """Offer declined: the old driver is freed, a freshly claimed one takes the offer."""
+        if self.status is not TripStatus.REQUESTED:
+            raise InvalidTransitionError(f"{self.trip_id}: can only reassign a pending offer")
+        self.declined_by.add(self.driver.driver_id)
+        self.driver._force_status(CabStatus.AVAILABLE)
+        self.driver = new_driver
+
+    def __str__(self) -> str:
+        return f"Trip[{self.trip_id}] {self.rider.name} -> {self.driver.name} {self.status.name} ({self.fare})"
 
 
-# --- Cab Booking Service (Facade) ---
+# ============================================================
+# Facade
+# ============================================================
 
 class CabBookingService:
-    def __init__(self):
+    SEARCH_RADII_KM = (2.0, 5.0, 10.0)   # progressive expansion
+    AVG_SPEED_KMH = 30.0
+
+    def __init__(self, matching: Optional[DriverMatchingStrategy] = None,
+                 broker: Optional[KafkaBroker] = None):
+        self._lock = threading.Lock()                # guards the registries below
         self._riders: Dict[str, Rider] = {}
         self._drivers: Dict[str, Driver] = {}
         self._trips: Dict[str, Trip] = {}
-        self._matching_strategy: DriverMatchingStrategy = NearestDriverMatching()
-        self._geo_index = GeoIndex()
-        self._kafka_broker: Optional[KafkaBroker] = None
-        self._zone_manager: Optional[ZoneManager] = None
+        self._active_trip_by_rider: Dict[str, Optional[str]] = {}
+        self._ids = itertools.count(1)
+        self._matching = matching or NearestDriverMatching()
 
-    def setup_geo_kafka_infrastructure(self, city_center: Location = Location(19.0760, 72.8777)) -> None:
-        """Initialize Kafka broker, create topics, and set up zone manager."""
-        self._kafka_broker = KafkaBroker()
-        self._kafka_broker.create_topic("gps.raw.updates", partitions=5)
-        self._kafka_broker.create_topic("gps.enriched.locations", partitions=5)
-        self._kafka_broker.create_topic("gps.zone.driver_counts", partitions=3)
-        self._kafka_broker.create_topic("gps.dlq", partitions=1)
-        self._kafka_broker.create_topic("trip.events", partitions=3)
-        self._zone_manager = ZoneManager(city_center, grid_radius_km=10.0, zone_radius_km=0.5)
-        self._zone_manager.create_hexagonal_grid()
+        self.geo_index = GeoIndex()
+        self.zone_manager = ZoneManager()
+        self.broker = broker
+        self._gps: Optional[GPSLocationStreamProcessor] = None
+        self.zone_analytics: Optional[ZoneAnalyticsAggregator] = None
+        if broker is not None:
+            for topic, parts in ((GPS_RAW, 5), (GPS_ENRICHED, 5), (ZONE_COUNTS, 3),
+                                 (GPS_DLQ, 1), (TRIP_EVENTS, 3)):
+                broker.create_topic(topic, parts)
+            self._gps = GPSLocationStreamProcessor(broker, self.geo_index, self.zone_manager)
+            self.zone_analytics = ZoneAnalyticsAggregator(
+                broker, self.zone_manager,
+                lambda d_id: (d := self._drivers.get(d_id)) is not None and d.is_available())
 
-    def register_driver(self, name: str, phone: str, license_num: str, cab_type: CabType) -> Driver:
-        driver_id = f"D-{uuid.uuid4().hex[:6].upper()}"
-        driver = Driver(driver_id, name, phone, license_num, cab_type)
-        self._drivers[driver_id] = driver
-        self._geo_index.add_driver(driver)
-        return driver
+    # ---- registration / lookup ----
 
-    def update_driver_location(self, driver_id: str, location: Location,
-                                speed_kmh: float = 0, heading: int = 0) -> None:
-        driver = self._drivers.get(driver_id)
-        if not driver:
-            return
-        driver.current_location = location
-        if self._kafka_broker:
-            raw_event = {
-                "driver_id": driver_id,
-                "lat": location.lat, "lng": location.lng,
-                "speed_kmh": speed_kmh, "heading": heading,
-                "timestamp": datetime.now().isoformat()
-            }
-            self._kafka_broker.produce("gps.raw.updates", driver_id, raw_event)
-        self._geo_index.update_location(driver_id, location)
+    def _next_id(self, prefix: str) -> str:
+        return f"{prefix}-{next(self._ids):04d}"
 
-    def request_ride(self, rider_id: str, pickup: Location, dropoff: Location,
-                     cab_type: CabType = CabType.MINI) -> Optional[Trip]:
-        rider = self._riders.get(rider_id)
-        if not rider:
-            return None
-        driver = self._matching_strategy.find_driver(
-            pickup, cab_type, list(self._drivers.values()), self._geo_index
-        )
-        if not driver:
-            print(f"  No {cab_type.value} available nearby")
-            return None
+    def register_rider(self, name: str, phone: str) -> Rider:
+        with self._lock:
+            rider = Rider(self._next_id("R"), name, phone)
+            self._riders[rider.rider_id] = rider
+            return rider
 
-        distance = pickup.distance_to(dropoff)
-        est_duration = distance / 30 * 60
-        pricing = SurgePricing(StandardPricing(cab_type), 1.0)
-        fare = pricing.calculate_fare(distance, est_duration)
+    def register_driver(self, name: str, phone: str, license_number: str,
+                        cab_type: CabType) -> Driver:
+        with self._lock:
+            driver = Driver(self._next_id("D"), name, phone, license_number, cab_type)
+            self._drivers[driver.driver_id] = driver
+            return driver
 
-        trip_id = f"T-{uuid.uuid4().hex[:8].upper()}"
-        trip = Trip(trip_id, rider, driver, pickup, dropoff, fare)
-        trip.status = TripStatus.ACCEPTED
-        driver.status = CabStatus.BOOKED
-        self._trips[trip_id] = trip
-
-        if self._kafka_broker:
-            self._kafka_broker.produce("trip.events", trip_id, {
-                "trip_id": trip_id, "status": "ACCEPTED",
-                "timestamp": datetime.now().isoformat()
-            })
-
-        print(f"  ✅ Trip created! {driver.name} ({cab_type.value}) - ${fare:.2f}")
+    def get_trip(self, trip_id: str) -> Trip:
+        trip = self._trips.get(trip_id)
+        if trip is None:
+            raise NotFoundError(f"trip {trip_id}")
         return trip
 
-    # ... (start_trip, complete_trip, cancel_trip remain the same)
+    def _get_driver(self, driver_id: str) -> Driver:
+        driver = self._drivers.get(driver_id)
+        if driver is None:
+            raise NotFoundError(f"driver {driver_id}")
+        return driver
+
+    def set_matching_strategy(self, strategy: DriverMatchingStrategy) -> None:
+        self._matching = strategy
+
+    # ---- driver presence ----
+
+    def update_driver_location(self, driver_id: str, location: Location, ts: float,
+                               speed_kmh: float = 0.0, heading: int = 0) -> None:
+        """With a broker: publish to Kafka and drain the consumer (synchronously, for the sim)."""
+        self._get_driver(driver_id)
+        if self.broker is None or self._gps is None:
+            self.geo_index.upsert(driver_id, location, ts)
+            return
+        self.broker.produce(GPS_RAW, driver_id, {
+            "driver_id": driver_id, "lat": location.lat, "lng": location.lng,
+            "speed_kmh": speed_kmh, "heading": heading, "ts": ts})
+        self._gps.poll()
+
+    def go_offline(self, driver_id: str) -> bool:
+        """Only an AVAILABLE driver can go offline; a booked driver must finish first."""
+        return self._get_driver(driver_id).compare_and_set(CabStatus.AVAILABLE, CabStatus.OFFLINE)
+
+    def go_online(self, driver_id: str) -> bool:
+        return self._get_driver(driver_id).compare_and_set(CabStatus.OFFLINE, CabStatus.AVAILABLE)
+
+    # ---- matching ----
+
+    def _claim_driver(self, pickup: Location, cab_type: CabType,
+                      exclude: Iterable[str] = ()) -> Optional[Driver]:
+        """
+        Search -> rank -> try_claim in rank order. The search result is a stale
+        snapshot, so a candidate may have been taken by a concurrent request;
+        try_claim is the only authority and a failed claim just means "next".
+        """
+        excluded, tried = set(exclude), set()
+        for radius in self.SEARCH_RADII_KM:
+            candidates = []
+            for driver_id, dist in self.geo_index.search(pickup, radius):
+                driver = self._drivers.get(driver_id)
+                if (driver is None or driver_id in excluded or driver_id in tried
+                        or driver.cab_type is not cab_type or not driver.is_available()):
+                    continue
+                candidates.append((driver, dist))
+            for driver in self._matching.rank(pickup, candidates):
+                tried.add(driver.driver_id)
+                if driver.try_claim():
+                    return driver
+        return None
+
+    # ---- ride lifecycle ----
+
+    def request_ride(self, rider_id: str, pickup: Location, dropoff: Location,
+                     cab_type: CabType = CabType.MINI) -> Trip:
+        """Claims a driver and creates a REQUESTED trip (the offer). Raises if nothing claimable."""
+        with self._lock:
+            rider = self._riders.get(rider_id)
+            if rider is None:
+                raise NotFoundError(f"rider {rider_id}")
+            if rider_id in self._active_trip_by_rider:
+                raise RiderBusyError(f"{rider.name} already has an active trip")
+            self._active_trip_by_rider[rider_id] = None   # reserve the rider before matching
+        try:
+            if self.zone_analytics:
+                self.zone_analytics.record_ride_request(pickup)
+            driver = self._claim_driver(pickup, cab_type)
+            if driver is None:
+                raise NoDriverAvailableError(f"no {cab_type.value} within {self.SEARCH_RADII_KM[-1]} km")
+
+            surge = self.zone_manager.zone_for(pickup).surge_multiplier
+            distance = pickup.distance_to(dropoff)
+            fare = SurgePricing(StandardPricing(cab_type), surge).calculate_fare(
+                distance, distance / self.AVG_SPEED_KMH * 60)
+            with self._lock:
+                trip = Trip(self._next_id("T"), rider, driver, pickup, dropoff, cab_type, fare, surge)
+                self._trips[trip.trip_id] = trip
+                self._active_trip_by_rider[rider_id] = trip.trip_id
+        except BaseException:
+            with self._lock:
+                self._active_trip_by_rider.pop(rider_id, None)
+            raise
+        self._publish(trip)
+        return trip
+
+    def accept_trip(self, trip_id: str) -> Trip:
+        return self._apply(trip_id, Trip.accept)
+
+    def decline_trip(self, trip_id: str) -> Trip:
+        """Driver declines (or the offer times out): re-match, never offering the same driver twice."""
+        trip = self.get_trip(trip_id)
+        with trip.lock:
+            if trip.status is not TripStatus.REQUESTED:
+                raise InvalidTransitionError(f"{trip_id}: no pending offer to decline")
+            exclude = trip.declined_by | {trip.driver.driver_id}
+            replacement = self._claim_driver(trip.pickup, trip.cab_type, exclude)
+            if replacement is not None:
+                trip.reassign(replacement)
+            else:
+                trip.cancel("no driver accepted")
+                self._release_rider(trip)
+        self._publish(trip)
+        return trip
+
+    def driver_arrived(self, trip_id: str) -> Trip:
+        return self._apply(trip_id, Trip.arrive)
+
+    def start_trip(self, trip_id: str) -> Trip:
+        return self._apply(trip_id, Trip.start)
+
+    def complete_trip(self, trip_id: str) -> Decimal:
+        trip = self._apply(trip_id, Trip.complete)
+        return trip.fare
+
+    def cancel_trip(self, trip_id: str, reason: str = "rider cancelled") -> Trip:
+        return self._apply(trip_id, lambda t: t.cancel(reason))
+
+    def rate_driver(self, trip_id: str, stars: float) -> None:
+        trip = self.get_trip(trip_id)
+        if trip.status is not TripStatus.COMPLETED:
+            raise InvalidTransitionError("can only rate a completed trip")
+        trip.driver.add_rating(stars)
+
+    def _apply(self, trip_id: str, action: Callable[[Trip], object]) -> Trip:
+        trip = self.get_trip(trip_id)
+        with trip.lock:
+            action(trip)
+            if trip.status in TERMINAL:
+                self._release_rider(trip)
+        self._publish(trip)
+        return trip
+
+    def _release_rider(self, trip: Trip) -> None:
+        with self._lock:
+            if self._active_trip_by_rider.get(trip.rider.rider_id) == trip.trip_id:
+                del self._active_trip_by_rider[trip.rider.rider_id]
+
+    def _publish(self, trip: Trip) -> None:
+        if self.broker is not None:
+            self.broker.produce(TRIP_EVENTS, trip.trip_id, {
+                "trip_id": trip.trip_id, "status": trip.status.name,
+                "rider_id": trip.rider.rider_id, "driver_id": trip.driver.driver_id,
+                "fare": str(trip.fare), "surge_multiplier": str(trip.surge_multiplier)})
+
+
+# ============================================================
+# Demo (deterministic)
+# ============================================================
+
+def demo() -> None:
+    rng = random.Random(42)
+    center = Location(19.0760, 72.8777)   # Mumbai
+    svc = CabBookingService(broker=KafkaBroker())
+
+    print("=== Cab Booking Service ===")
+    alice = svc.register_rider("Alice", "9876543210")
+    cab_types = [CabType.MINI, CabType.SEDAN, CabType.SUV, CabType.PREMIUM]
+    for i in range(20):
+        d = svc.register_driver(f"Driver-{i + 1}", f"9999{i:02d}", f"LIC{i:04d}", cab_types[i % 4])
+        loc = Location(center.lat + rng.uniform(-0.03, 0.03), center.lng + rng.uniform(-0.03, 0.03))
+        svc.update_driver_location(d.driver_id, loc, ts=float(i), speed_kmh=rng.uniform(0, 60))
+    print(f"Indexed drivers: {len(svc.geo_index)}, GPS events published: "
+          f"{svc.broker.topic_size(GPS_RAW)}")
+
+    # Happy path with the full state machine.
+    pickup, dropoff = Location(19.0780, 72.8780), Location(19.1000, 72.9000)
+    trip = svc.request_ride(alice.rider_id, pickup, dropoff, CabType.SEDAN)
+    print(f"Requested: {trip}")
+    svc.decline_trip(trip.trip_id)
+    print(f"After first driver declined: {trip} (declined_by={sorted(trip.declined_by)})")
+    for step in (svc.accept_trip, svc.driver_arrived, svc.start_trip):
+        step(trip.trip_id)
+    print(f"Completed, fare charged: {svc.complete_trip(trip.trip_id)}")
+    svc.rate_driver(trip.trip_id, 4)
+
+    # Invalid transition is rejected.
+    try:
+        svc.cancel_trip(trip.trip_id)
+    except InvalidTransitionError as e:
+        print(f"Rejected: {e}")
+
+    # Surge: many requests in one zone, then aggregate the window.
+    for i in range(6):
+        r = svc.register_rider(f"Rider-{i}", f"8000{i}")
+        try:
+            t = svc.request_ride(r.rider_id, pickup, dropoff, CabType.SUV)
+            svc.cancel_trip(t.trip_id)
+        except NoDriverAvailableError:
+            pass
+    svc.zone_analytics.aggregate()
+    zone = svc.zone_manager.zone_for(pickup)
+    print(f"Pickup {zone}")
+    surged = svc.request_ride(alice.rider_id, pickup, dropoff, CabType.MINI)
+    print(f"Surged trip: {surged}")
+    svc.cancel_trip(surged.trip_id)
+
+    # Concurrency: 10 riders race for the only PREMIUM driver near a remote pickup.
+    lone = svc.register_driver("Lone", "7000", "LIC-P", CabType.PREMIUM)
+    remote = Location(28.6139, 77.2090)  # Delhi
+    svc.update_driver_location(lone.driver_id, remote, ts=100.0)
+    riders = [svc.register_rider(f"Racer-{i}", f"6000{i}") for i in range(10)]
+    wins: List[Trip] = []
+    barrier = threading.Barrier(len(riders))
+
+    def race(r: Rider) -> None:
+        barrier.wait()
+        try:
+            wins.append(svc.request_ride(r.rider_id, remote, dropoff, CabType.PREMIUM))
+        except NoDriverAvailableError:
+            pass
+
+    threads = [threading.Thread(target=race, args=(r,)) for r in riders]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"Concurrent requests for 1 driver -> {len(wins)} trip(s) created")
+    print(f"Kafka trip events: {svc.broker.topic_size(TRIP_EVENTS)}")
+
+
+if __name__ == "__main__":
+    demo()
 ```
-
-
-
-## 🏛️ Architecture: GeoRadius + Kafka Pipeline
-
-### Location Update Flow
-
-```
-Driver App                    Kafka                          Stream Processor
-    │                           │                                  │
-    │── GPS (3s interval) ──────┤                                  │
-    │   {driver_id, lat, lng,   │                                  │
-    │    speed, heading, ts}    │                                  │
-    │                           │── Topic: gps.raw.updates ────────┤
-    │                           │                                  │
-    │                           │                                  ├── GeoIndex.update_location()
-    │                           │                                  ├── Zone lookup
-    │                           │                                  └── Publish enriched event
-    │                           │                                      │
-    │                           │── Topic: gps.enriched.locations ──┤
-    │                           │   {driver_id, location, zone_id,  │
-    │                           │    speed, heading, timestamp}     │
-    │                           │                                  │
-    │                           │                          Zone Analytics Aggregator
-    │                           │                                  │
-    │                           │── Topic: gps.zone.driver_counts ──┤
-    │                           │   {zone_id, driver_count,         │
-    │                           │    surge_multiplier, timestamp}   │
-```
-
-### GeoRadius Driver Matching
-
-```
-Rider Requests Ride
-    │
-    ├── GeoIndex.geo_radius_search(center=pickup, radius=3km)
-    │       │
-    │       ├── Encode pickup as geohash prefix (e.g., "te7u1q")
-    │       ├── Scan all buckets matching prefix
-    │       ├── Filter: status=AVAILABLE, cab_type=MINI
-    │       ├── Calculate exact haversine distance
-    │       ├── Sort by distance ASC
-    │       └── Return top 5 candidates
-    │
-    └── If no driver found → expand radius to 5km → 10km
-```
-
----
-
-## ▶️ How to Run
-
-```bash
-cd low-level-design/cab-booking-uber
-python cab_booking.py
-```
-
-## 🧩 Design Patterns
-
-See the [Interview Questions](INTERVIEW_QUESTIONS.md) for a detailed breakdown of design patterns and SOLID principles applied in this implementation.
+<!-- /source -->

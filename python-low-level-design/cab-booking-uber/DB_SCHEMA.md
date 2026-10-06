@@ -2,7 +2,7 @@
 
 > **Database:** PostgreSQL 16 with PostGIS extension  
 > **Purpose:** Riders, drivers, trips, zones, location history, payments, ratings, surge pricing  
-> **Tables:** 9 tables + 2 partitioned tables
+> **Tables:** 8 tables (`driver_location_history` is range-partitioned by month)
 
 ---
 
@@ -59,8 +59,7 @@ CREATE TABLE riders (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_riders_email ON riders(email);
-CREATE INDEX idx_riders_phone ON riders(phone);
+-- email/phone UNIQUE constraints already create their indexes; no extra indexes needed.
 
 -- -----------------------------------------------------------
 -- 2. DRIVERS
@@ -86,8 +85,9 @@ CREATE TABLE drivers (
 );
 -- GIST index for fast geo-radius queries (e.g., GEORADIUS equivalent)
 CREATE INDEX idx_drivers_location ON drivers USING GIST (current_location);
--- Partial index for real-time available driver lookup
-CREATE INDEX idx_drivers_available ON drivers(id) WHERE status = 'AVAILABLE';
+-- Partial GiST index: only AVAILABLE drivers are ever searched by radius
+CREATE INDEX idx_drivers_available_loc ON drivers USING GIST (current_location)
+    WHERE status = 'AVAILABLE';
 CREATE INDEX idx_drivers_cab_type ON drivers(cab_type);
 
 -- -----------------------------------------------------------
@@ -128,13 +128,25 @@ CREATE INDEX idx_trips_driver ON trips(driver_id);
 CREATE INDEX idx_trips_status ON trips(status);
 CREATE INDEX idx_trips_requested ON trips(requested_at);
 
+-- The database-level guard against double booking: at most one active trip
+-- per driver and per rider. A racing second INSERT fails with a unique violation
+-- even if an application-level claim is buggy.
+CREATE UNIQUE INDEX uq_trips_active_driver ON trips(driver_id)
+    WHERE status IN ('REQUESTED','ACCEPTED','DRIVER_ARRIVED','STARTED');
+CREATE UNIQUE INDEX uq_trips_active_rider ON trips(rider_id)
+    WHERE status IN ('REQUESTED','ACCEPTED','DRIVER_ARRIVED','STARTED');
+
+-- Transitions are conditional updates (optimistic, one winner):
+--   UPDATE trips SET status = 'STARTED', started_at = NOW()
+--   WHERE id = $1 AND status = 'DRIVER_ARRIVED';      -- 0 rows => lost the race
+
 -- -----------------------------------------------------------
 -- 4. ZONES (City Partitioning)
 -- -----------------------------------------------------------
 CREATE TABLE zones (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     city_id UUID NOT NULL,
-    zone_code VARCHAR(10) NOT NULL,
+    zone_code VARCHAR(16) NOT NULL,      -- H3 cell index (15 hex chars)
     center GEOGRAPHY(Point, 4326) NOT NULL,
     radius_meters DECIMAL(10,2) NOT NULL DEFAULT 500,
     surge_multiplier DECIMAL(3,2) DEFAULT 1.0,
@@ -186,7 +198,7 @@ CREATE TABLE payments (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_payments_trip ON payments(trip_id);
-CREATE INDEX idx_payments_idempotency ON payments(idempotency_key);
+-- idempotency_key UNIQUE already provides the lookup index.
 
 -- -----------------------------------------------------------
 -- 7. RIDER_RATINGS
@@ -268,8 +280,8 @@ zone:{id}:ride_requests        → STRING (ride request count in aggregation win
 | # | Table | Parent FK | Child References | Key Indexes |
 |---|-------|-----------|-----------------|-------------|
 | 1 | `riders` | — | `trips(rider_id)`, `rider_ratings(rider_id)` | email, phone |
-| 2 | `drivers` | — | `trips(driver_id)`, `driver_location_history(driver_id)`, `rider_ratings(driver_id)` | GIST(location), available(status), cab_type |
-| 3 | `trips` | `rider_id → riders`, `driver_id → drivers` | `payments(trip_id)`, `rider_ratings(trip_id)` | rider, driver, status, requested_at |
+| 2 | `drivers` | — | `trips(driver_id)`, `driver_location_history(driver_id)`, `rider_ratings(driver_id)` | GIST(location), partial GIST(location) WHERE AVAILABLE, cab_type |
+| 3 | `trips` | `rider_id → riders`, `driver_id → drivers` | `payments(trip_id)`, `rider_ratings(trip_id)` | rider, driver, status, requested_at, partial UNIQUE active-trip per driver / rider |
 | 4 | `zones` | `city_id` | `driver_location_history(zone_id)`, `surge_pricing_log(zone_id)` | GIST(center), city |
 | 5 | `driver_location_history` | `driver_id → drivers`, `zone_id → zones` | — | (driver_id, recorded_at) PK, recorded_at DESC |
 | 6 | `payments` | `trip_id → trips` | — | trip, idempotency_key |

@@ -11,6 +11,8 @@
 
 **Scale:** 10 floors × 500 spots = 5,000 total. Peak: 500 entries/hr, 500 exits/hr. Target 99.99% availability.
 
+**What those numbers mean:** 1,000 gate events/hour is ~0.3 writes/second. A single PostgreSQL primary handles that with >1000× headroom; the spot table (5,000 rows) fits in memory. The hard problems here are **correctness under concurrent gates, idempotency against flaky gate hardware, and staying usable when the network or payment provider is down** — not throughput. A staff answer says this early and keeps the architecture proportionate: one service + one DB per lot is a fine starting point; the multi-service split below is what a large operator running hundreds of lots ends up with.
+
 **Domain:** Smart mobility infrastructure with distributed entry/exit terminals.
 
 ---
@@ -44,8 +46,9 @@
     └───────────────┼─────────────────────────┘
                     │
           ┌─────────▼──────────┐
-          │  PostgreSQL (Aurora)││  + Redis Cache     │
-  └────────────────────┘
+          │ PostgreSQL (Aurora)│
+          │   + Redis cache    │
+          └────────────────────┘
 ```
 
 ### 🎬 Animated Sequence Diagram
@@ -68,12 +71,11 @@
 1. Driver arrives at entry gate
 2. Entry kiosk detects vehicle (ANPR camera)
 3. Entry processor:
-   a. Check availability (Redis cache hit: ~2ms)
-   b. Find nearest available spot (floor-based preference)
-   c. Create parking ticket with idempotency key
-   d. Open barrier gate
-   e. Update spot status → OCCUPIED
-   f. Publish event: parking.entry (for analytics/display)
+   a. Check availability (Redis cache hit: ~2ms; advisory only)
+   b. In ONE DB transaction: claim a spot (FOR UPDATE SKIP LOCKED),
+      mark it OCCUPIED, insert the ticket with the gate's idempotency key
+   c. Commit, THEN open the barrier (never open on an uncommitted claim)
+   d. Publish event: parking.entry (outbox table → bus, for analytics/display)
 4. Driver parks at assigned spot
 ```
 
@@ -83,12 +85,12 @@
 2. Exit kiosk reads ticket / ANPR lookup
 3. Exit processor:
    a. Lookup ticket in PostgreSQL
-   b. Calculate fee (base rate + duration + tax)
-   c. Process payment (async via queue)
-   d. If payment successful → open barrier
-   e. Update spot → AVAILABLE
-   f. Update ticket → PAID
-   g. Publish event: parking.exit
+   b. Calculate fee (base rate + duration + tax) using the rate card stamped on the ticket
+   c. Authorize payment SYNCHRONOUSLY with a timeout (the driver is waiting at the barrier)
+   d. On success, in one transaction: ticket → PAID, spot → AVAILABLE, payment row SUCCESS
+   e. Open barrier
+   f. Publish event: parking.exit (via outbox)
+   Capture, retries and reconciliation run async afterwards; the authorization cannot.
 4. Driver exits
 ```
 
@@ -106,34 +108,36 @@
 **✅ Answer:** Use database-level pessimistic locking with a timeout:
 ```sql
 BEGIN;
-SELECT id FROM parking_spots
-WHERE floor_id = ? AND status = 'AVAILABLE' AND spot_type = ?
-ORDER BY floor_id ASC, id ASC
+SELECT id FROM parking_spot
+WHERE floor_id = ANY(:floors_in_lot) AND status = 'AVAILABLE' AND spot_type = :type
+ORDER BY floor_id ASC, spot_number ASC
 LIMIT 1
-FOR UPDATE SKIP LOCKED;  -- Skip already-locked rows
-UPDATE parking_spots SET status = 'OCCUPIED' WHERE id = ?;
+FOR UPDATE SKIP LOCKED;  -- Skip rows another gate has locked
+UPDATE parking_spot SET status = 'OCCUPIED', version = version + 1 WHERE id = :picked;
+INSERT INTO ticket (...) VALUES (...);
 COMMIT;
 ```
+If the query joins `floor` to filter by lot, write `FOR UPDATE OF parking_spot SKIP LOCKED`; a bare `FOR UPDATE` locks the joined `floor` row too, and a second gate would then *skip every spot on that floor*.
 `FOR UPDATE SKIP LOCKED` (PostgreSQL 9.5+) allows multiple concurrent entry processors to grab different spots without waiting for each other — essential for high-throughput scenarios.
 
 ### Fee Calculation Service (Python)
 - Strategy Pattern: `HourlyFeeCalculator`, `DailyFeeCalculator`, `WeekendFeeCalculator`
 - Supports promotions via Decorator Pattern
-- Rounding: always round UP to avoid revenue loss
+- Money as `NUMERIC` / `Decimal`; billing units round up (started hour), currency quantized once at the end
 
 **🔴 Interview Question:** *"How would you implement fee calculation with different strategies?"*
 
 **✅ Answer:** Strategy + Decorator pattern:
 ```python
 # Strategy pattern for interchangeable fee logic
-fee = HourlyFeeCalculator().calculate(duration, spot_type)
+fee = HourlyFeeCalculator().calculate_fee(duration, spot_type)
 
 # Decorator pattern for composable add-ons
 fee = TaxDecorator(
     WeekdaySurchargeDecorator(
         HourlyFeeCalculator()
     )
-).calculate(duration, spot_type)
+).calculate_fee(duration, spot_type)
 ```
 
 ### Entry/Exit Processor (Node.js, Async)
@@ -164,7 +168,7 @@ CREATE TABLE parking_lot (
 CREATE TABLE floor (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parking_lot_id UUID NOT NULL REFERENCES parking_lot(id),
-    floor_number INT NOT NULL CHECK (floor_number > 0),
+    floor_number INT NOT NULL,  -- negative for basements
     label VARCHAR(50),  -- "B1", "B2", "1", "2", "R"
     UNIQUE(parking_lot_id, floor_number)
 );
@@ -206,9 +210,11 @@ CREATE TABLE ticket (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_ticket_status ON ticket(status) WHERE status = 'ACTIVE';
+-- At most one ACTIVE ticket per spot and per plate (DB-enforced invariants)
+CREATE UNIQUE INDEX uq_ticket_active_spot  ON ticket(spot_id) WHERE status = 'ACTIVE';
+CREATE UNIQUE INDEX uq_ticket_active_plate ON ticket(vehicle_license_plate) WHERE status = 'ACTIVE';
 CREATE INDEX idx_ticket_entry ON ticket(entry_time DESC);
-CREATE INDEX idx_ticket_idempotency ON ticket(idempotency_key);
+-- idempotency_key needs no extra index: UNIQUE already creates one
 ```
 
 **rate_card:**
@@ -257,7 +263,7 @@ parking:{lot_id}:spot:{id}:lock          → STRING (distributed lock, TTL 5s)
 | Operation | Cache | DB | Latency |
 |-----------|-------|----|---------|
 | Check availability | Redis `GET available_count` | — | < 1ms |
-| Find available spot | Redis `SPOP` from floor set | — | < 1ms |
+| Find available spot | — | `FOR UPDATE SKIP LOCKED` (DB is the source of truth; a Redis `SPOP` set drifts on crashes) | ~5ms |
 | Create ticket | — | PostgreSQL INSERT | ~10ms |
 | Check ticket on exit | Redis `GET ticket:{id}` | PostgreSQL (cache miss) | < 2ms / ~20ms |
 | Calculate fee | — | PostgreSQL rate_card lookup | ~5ms |
@@ -273,11 +279,13 @@ parking:{lot_id}:spot:{id}:lock          → STRING (distributed lock, TTL 5s)
 | Two gates check same spot simultaneously | `SELECT ... FOR UPDATE SKIP LOCKED` | Each transaction locks a different row |
 | Payment timeout | Async queue + DLQ | Payment failed → retry 3x → send to DLQ → manual review |
 | Display board updates | Redis Pub/Sub on spot status change | Real-time updates to all boards |
-| Lost ticket | Flat fee charge + ID verification | `status = 'LOST'`, charge daily_max × 24h |
+| Lost ticket | Plate lookup + flat penalty + ID verification | `status = 'LOST'`, charge fee-so-far + penalty (typically one day's `daily_max`) |
+| Same entry event delivered twice (gate retry) | Idempotency key | `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`, else return the existing ticket |
+| Same exit scanned twice | Conditional update | `UPDATE ticket SET status='PAID' WHERE id=? AND status='ACTIVE'`; rowcount 0 → return the stored receipt |
 
 ### Edge Cases
 
-- **Vehicle leaves without paying:** ANPR at exit captures plate; ticket goes to LOST; fine sent to registered owner
+- **Vehicle leaves without paying (tailgating):** ANPR at exit captures plate; ticket moves to an UNPAID/collections state (not LOST, which means "ticket lost, fee paid"); invoice sent to registered owner
 - **System crash mid-parking:** Tickets persisted in PostgreSQL; on restart, active tickets are recovered
 - **Grace period:** 15-minute grace for entry-exit without parking; no fee charged
 - **Overstay after payment:** Pay-by-plate cameras at exit; re-calculate fee on actual exit time
@@ -290,14 +298,30 @@ parking:{lot_id}:spot:{id}:lock          → STRING (distributed lock, TTL 5s)
 | Decision | Choice | Rationale | Alternative |
 |----------|--------|-----------|-------------|
 | Spot allocation | Nearest-available | Minimal driver walking | Even-distribution (balances floor usage) |
-| Fee rounding | Always round UP | $0.005 × 10M = $50K/yr revenue protection | Round to nearest (fairer but costly) |
+| Fee rounding | Bill per started unit (hour), quantize currency once with an explicit mode | Matches posted tariffs; avoids accumulated per-step rounding error | Per-minute billing (fairer, but needs clear signage and a minimum charge) |
 | Locking strategy | `SKIP LOCKED` | High throughput, no deadlocks | `NOWAIT` (fails immediately) or `FOR UPDATE` (blocks) |
-| Cache layer | Redis | < 1ms reads, Pub/Sub for real-time | Memcached (faster but no Pub/Sub) |
-| Async payments | Message queue | Decoupled, retryable, no blocking | Sync payment (blocks exit gate) |
+| Cache layer | Redis | < 1ms reads, Pub/Sub for real-time boards | Memcached (no Pub/Sub, no data structures) |
+| Payment | Sync authorization at the gate, async capture/reconciliation | Driver is waiting; barrier must know the outcome | Fully async (barrier opens on unknown outcome → revenue leak) |
 
 ---
 
-## 8. COST (Monthly Estimate)
+## 8. FAILURE MODES & CONSISTENCY
+
+| Failure | What happens | Design response |
+|---------|--------------|-----------------|
+| Gate loses network to the backend | Can't claim spots or validate tickets | Gate runs in **offline mode**: issues locally-signed tickets with a gate-generated UUID and queues events; on reconnect they replay idempotently. Accept temporary over-subscription; the lot is physical, drivers will find a spot or leave. |
+| DB commit succeeded, response lost | Gate retries entry | Same idempotency key → returns the existing ticket; no second spot claimed |
+| Barrier fails to open after commit | Ticket exists, car still outside | Staff override; an un-entered ticket with no ANPR sighting is voided after N minutes by a sweeper |
+| Payment provider timeout | Unknown payment outcome | Retry auth with the same idempotency key; if still unknown, fall back to "pay later by plate" and open the barrier, rather than trapping cars |
+| Redis down | Boards/app availability stale | Serve from DB (tiny table); Redis is never on the write path |
+| Primary DB fails over | Seconds of write unavailability | Multi-AZ failover; gates retry with idempotency keys; synchronous replication so committed tickets aren't lost |
+| Spot status drifts from reality (car parked in wrong spot) | Counts slightly wrong | Occupancy sensors / periodic reconciliation; allocate by **type capacity** rather than exact spot when sensors are absent |
+
+**Consistency choice:** the lot's DB is the single source of truth and the only place a spot is claimed (strong consistency, one primary per lot). Everything else (Redis counts, boards, the mobile app, analytics) is a derived, eventually consistent view fed from an outbox. This keeps the one invariant that matters — a spot is never sold twice — inside a single ACID transaction.
+
+---
+
+## 9. COST (Monthly Estimate)
 
 | Component | Configuration | Cost |
 |-----------|--------------|------|

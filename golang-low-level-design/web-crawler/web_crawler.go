@@ -1,919 +1,683 @@
 // Web Crawler - Low Level Design (Go)
-// --------------------------------------
-// Design Principles: CSP, Fan-Out/Fan-In, Worker Pool, Graceful Shutdown
+// ------------------------------------
+// A concurrent, polite, bounded web crawler.
 //
-// Key Design Decisions:
-// - Worker pool pattern for concurrent URL fetching
-// - goroutines + channels for producer-consumer
-// - sync.Map for efficient concurrent deduplication
-// - Rate limiting with token bucket per domain
-// - Context-based cancellation for graceful shutdown
-// - Sitemap parsing for SEO-aware crawling
-// - Content-type filtering for selective crawling
-// - Domain-based worker allocation for politeness
-// - Crawl statistics and progress tracking
-// - Persistent URL frontier with disk-backed queue
+// Key design decisions:
+//   - Coordinator + workers (CSP). One coordinator goroutine owns ALL crawl
+//     state: the frontier, the seen-set, the page budget and the in-flight
+//     count. No locks are needed for it, and termination is exact: the crawl
+//     is done when the frontier is empty and nothing is in flight.
+//   - Workers only do I/O: robots check, politeness wait, fetch, link
+//     extraction. They receive jobs on one channel and send results on
+//     another. The coordinator selects on "send next job" and "receive
+//     result" together, so neither side can deadlock the other.
+//   - Channel ownership: the coordinator creates and closes `jobs`; workers
+//     never close anything. `results` is never closed (its receiver decides
+//     when to stop), and every worker send also selects on ctx.Done().
+//   - errgroup-style lifecycle built on the stdlib (crawlGroup): the first
+//     error (OnPage returning an error, or ctx cancellation) cancels the
+//     shared context and every goroutine unwinds; Crawl returns only after
+//     all of them exit. No goroutine outlives Crawl.
+//   - Synchronous API: Crawl blocks and calls OnPage serially from the
+//     coordinator. The caller does not have to drain a channel to avoid a leak.
+//   - Politeness per host: robots.txt (RFC 9309 longest-match Allow/Disallow,
+//     fetched once per host with sync.Once) and a minimum delay between
+//     requests to the same host (max of PerHostDelay and Crawl-delay),
+//     claimed under a per-host lock after a ctx-aware wait.
+//   - Fetching is behind an interface, so the demo and tests run against an
+//     in-memory web: deterministic, no network.
 
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"log"
-	"math/rand"
+	"io"
+	"net/http"
 	"net/url"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // ============================================================
-// CRAWL TYPES
+// FETCHER
 // ============================================================
 
-// Page represents a crawled page result
+type Response struct {
+	URL         string // final URL after redirects; base for resolving links
+	StatusCode  int
+	ContentType string
+	Body        []byte
+}
+
+type Fetcher interface {
+	Fetch(ctx context.Context, rawURL string) (*Response, error)
+}
+
+// HTTPFetcher is the production Fetcher: bounded body size, explicit User-Agent.
+type HTTPFetcher struct {
+	Client    *http.Client
+	UserAgent string
+	MaxBody   int64
+}
+
+func (f *HTTPFetcher) Fetch(ctx context.Context, rawURL string) (*Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", f.UserAgent)
+	resp, err := f.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, f.MaxBody)) // never trust Content-Length
+	if err != nil {
+		return nil, err
+	}
+	return &Response{URL: resp.Request.URL.String(), StatusCode: resp.StatusCode,
+		ContentType: resp.Header.Get("Content-Type"), Body: body}, nil
+}
+
+// ============================================================
+// URL NORMALISATION, FILTERS, LINK EXTRACTION
+// ============================================================
+
+var trackingParams = map[string]bool{
+	"utm_source": true, "utm_medium": true, "utm_campaign": true,
+	"utm_term": true, "utm_content": true, "fbclid": true, "gclid": true,
+}
+
+// Normalize returns a canonical form used as the dedup key: lower-case
+// scheme and host, default port dropped, empty path -> "/", fragment
+// removed, tracking params removed, query keys sorted. Path case and
+// trailing slashes are kept: servers may treat them as different resources.
+func Normalize(u *url.URL) *url.URL {
+	n := *u
+	n.Scheme = strings.ToLower(n.Scheme)
+	host := strings.ToLower(n.Hostname())
+	if p := n.Port(); p != "" && !(p == "80" && n.Scheme == "http") && !(p == "443" && n.Scheme == "https") {
+		host += ":" + p
+	}
+	n.Host = host
+	n.Fragment, n.RawFragment = "", ""
+	n.User = nil
+	if n.Path == "" {
+		n.Path = "/"
+	}
+	if n.RawQuery != "" {
+		q := n.Query()
+		for k := range q {
+			if trackingParams[strings.ToLower(k)] {
+				q.Del(k)
+			}
+		}
+		n.RawQuery = q.Encode() // Encode sorts by key
+	}
+	return &n
+}
+
+// URLFilter decides whether a discovered URL should be crawled.
+type URLFilter func(u *url.URL) bool
+
+// HTTPOnly rejects mailto:, javascript:, ftp:, ...
+func HTTPOnly(u *url.URL) bool { return u.Scheme == "http" || u.Scheme == "https" }
+
+// AllowHosts permits the given hosts and their subdomains. It matches on a
+// label boundary, so "example.com" does not admit "notexample.com".
+func AllowHosts(hosts ...string) URLFilter {
+	return func(u *url.URL) bool {
+		h := u.Hostname()
+		for _, d := range hosts {
+			if h == d || strings.HasSuffix(h, "."+d) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// SkipExtensions rejects obvious non-HTML resources by path extension.
+func SkipExtensions(exts ...string) URLFilter {
+	return func(u *url.URL) bool {
+		p := strings.ToLower(u.Path)
+		for _, e := range exts {
+			if strings.HasSuffix(p, e) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// hrefRE is a deliberately small extractor: the stdlib has no HTML parser
+// (golang.org/x/net/html would be the production choice). It handles quoted
+// href attributes on <a> tags, which is what an interview needs.
+var hrefRE = regexp.MustCompile(`(?is)<a\s[^>]*?href\s*=\s*["']([^"']+)["']`)
+
+// ExtractLinks returns absolute, de-duplicated links resolved against base.
+func ExtractLinks(base *url.URL, body []byte) []*url.URL {
+	var out []*url.URL
+	seen := make(map[string]bool)
+	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
+		ref, err := url.Parse(strings.TrimSpace(string(m[1])))
+		if err != nil {
+			continue
+		}
+		abs := base.ResolveReference(ref)
+		if key := abs.String(); !seen[key] {
+			seen[key] = true
+			out = append(out, abs)
+		}
+	}
+	return out
+}
+
+// ============================================================
+// ROBOTS.TXT (RFC 9309)
+// ============================================================
+
+type robotsRule struct {
+	pattern string
+	allow   bool
+}
+
+type Robots struct {
+	rules       []robotsRule
+	crawlDelay  time.Duration
+	disallowAll bool
+}
+
+// ParseRobots keeps the group that names our user agent, falling back to "*".
+// Crawl-delay is non-standard but widely used; we honour it.
+func ParseRobots(body []byte, userAgent string) *Robots {
+	type group struct {
+		agents []string
+		rules  []robotsRule
+		delay  time.Duration
+	}
+	var groups []*group
+	var cur *group
+	lastWasAgent := false
+	sc := bufio.NewScanner(bytes.NewReader(body))
+	for sc.Scan() {
+		line, _, _ := strings.Cut(sc.Text(), "#")
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key, val = strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(val)
+		switch key {
+		case "user-agent":
+			if !lastWasAgent { // consecutive User-agent lines share one group
+				cur = &group{}
+				groups = append(groups, cur)
+			}
+			cur.agents = append(cur.agents, strings.ToLower(val))
+			lastWasAgent = true
+			continue
+		case "allow", "disallow":
+			if cur != nil && val != "" { // empty Disallow means "allow all"
+				cur.rules = append(cur.rules, robotsRule{pattern: val, allow: key == "allow"})
+			}
+		case "crawl-delay":
+			if secs, err := strconv.ParseFloat(val, 64); err == nil && cur != nil {
+				cur.delay = time.Duration(secs * float64(time.Second))
+			}
+		}
+		lastWasAgent = false
+	}
+	ua := strings.ToLower(userAgent)
+	var star *group
+	for _, g := range groups {
+		for _, a := range g.agents {
+			if a == "*" {
+				if star == nil {
+					star = g
+				}
+			} else if strings.Contains(ua, a) {
+				return &Robots{rules: g.rules, crawlDelay: g.delay}
+			}
+		}
+	}
+	if star != nil {
+		return &Robots{rules: star.rules, crawlDelay: star.delay}
+	}
+	return &Robots{}
+}
+
+// Allowed applies the longest matching rule; on a tie Allow wins; no match allows.
+func (r *Robots) Allowed(u *url.URL) bool {
+	if r.disallowAll {
+		return false
+	}
+	path := u.EscapedPath()
+	if u.RawQuery != "" {
+		path += "?" + u.RawQuery
+	}
+	best, allowed := -1, true
+	for _, rule := range r.rules {
+		if robotsMatch(rule.pattern, path) {
+			if l := len(rule.pattern); l > best || (l == best && rule.allow) {
+				best, allowed = l, rule.allow
+			}
+		}
+	}
+	return allowed
+}
+
+// robotsMatch implements RFC 9309 matching: a prefix match where '*' matches
+// any run of characters and a trailing '$' anchors the end of the path.
+func robotsMatch(pattern, path string) bool {
+	if p, ok := strings.CutSuffix(pattern, "$"); ok {
+		return wildcardMatch(p, path, true)
+	}
+	return wildcardMatch(pattern, path, false)
+}
+
+func wildcardMatch(p, s string, anchored bool) bool {
+	for len(p) > 0 {
+		if p[0] == '*' {
+			p = strings.TrimLeft(p, "*")
+			for i := 0; i <= len(s); i++ {
+				if wildcardMatch(p, s[i:], anchored) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(s) == 0 || s[0] != p[0] {
+			return false
+		}
+		p, s = p[1:], s[1:]
+	}
+	return !anchored || len(s) == 0
+}
+
+// ============================================================
+// PER-HOST POLITENESS
+// ============================================================
+
+type hostState struct {
+	robotsOnce sync.Once
+	robots     *Robots
+
+	mu   sync.Mutex
+	next time.Time // earliest time the next request may start
+}
+
+// waitTurn blocks until this host may be hit again, then claims the turn.
+// The claim happens after waking, under the lock, so the gap is between
+// actual request starts. (Pre-reserving future slots is subtly weaker: a
+// worker that wakes late then fires back-to-back with the next slot.)
+func (h *hostState) waitTurn(ctx context.Context, gap time.Duration) error {
+	for {
+		h.mu.Lock()
+		now := time.Now()
+		if !now.Before(h.next) {
+			h.next = now.Add(gap)
+			h.mu.Unlock()
+			return nil
+		}
+		at := h.next
+		h.mu.Unlock()
+		if err := sleepUntil(ctx, at); err != nil {
+			return err
+		}
+	}
+}
+
+func sleepUntil(ctx context.Context, t time.Time) error {
+	d := time.Until(t)
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ============================================================
+// ERRGROUP (stdlib-only)
+// ============================================================
+
+// crawlGroup is a minimal errgroup.WithContext: the first non-nil error
+// cancels ctx; Wait returns that error after every goroutine has exited.
+type crawlGroup struct {
+	wg     sync.WaitGroup
+	once   sync.Once
+	err    error
+	cancel context.CancelFunc
+}
+
+func newCrawlGroup(parent context.Context) (*crawlGroup, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &crawlGroup{cancel: cancel}, ctx
+}
+
+func (g *crawlGroup) Go(f func() error) {
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		if err := f(); err != nil {
+			g.once.Do(func() { g.err = err; g.cancel() })
+		}
+	}()
+}
+
+func (g *crawlGroup) Wait() error {
+	g.wg.Wait()
+	g.cancel()
+	return g.err
+}
+
+// ============================================================
+// CRAWLER
+// ============================================================
+
+var (
+	ErrRobotsDisallowed = errors.New("crawler: disallowed by robots.txt")
+	ErrNoSeeds          = errors.New("crawler: no valid seed URLs")
+)
+
 type Page struct {
 	URL        string
-	Title      string
-	Links      []string
-	Status     int
 	Depth      int
-	Size       int
-	ContentType string
-	Latency    time.Duration
-	Error      error
-	CrawledAt  time.Time
+	StatusCode int
+	Links      int // links discovered on the page (before filtering)
+	Err        error
 }
 
-// CrawlRequest represents a URL to crawl
-type CrawlRequest struct {
-	URL         string
-	Depth       int
-	ReferrerURL string
-	Priority    int // Higher = more important
+type Options struct {
+	Workers      int           // default 8
+	MaxDepth     int           // seeds are depth 0
+	MaxPages     int           // fetch budget; 0 = unlimited
+	PerHostDelay time.Duration // floor on the gap between requests to one host
+	FetchTimeout time.Duration // per request; default 10s
+	UserAgent    string
+	Filters      []URLFilter
+	Fetcher      Fetcher
+	OnPage       func(Page) error // called serially; a non-nil error aborts the crawl
 }
 
-// CrawlStats tracks crawl progress and metrics
-type CrawlStats struct {
-	PagesCrawled    atomic.Int64
-	PagesSkipped    atomic.Int64
-	PagesFailed     atomic.Int64
-	TotalBytes      atomic.Int64
-	TotalLatency    atomic.Int64
-	UniqueURLsFound atomic.Int64
-	ErrorsByType    map[string]int64
-	mu              sync.Mutex
+type Stats struct {
+	Fetched, Failed, Disallowed, Discovered int
 }
 
-func NewCrawlStats() *CrawlStats {
-	return &CrawlStats{
-		ErrorsByType: make(map[string]int64),
-	}
+// Crawler is reusable and safe for concurrent Crawl calls: all per-crawl
+// state (frontier, seen-set, host politeness) lives inside Crawl.
+type Crawler struct {
+	opts Options
 }
 
-func (cs *CrawlStats) RecordError(errorType string) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	cs.ErrorsByType[errorType]++
+// hostTable maps scheme://host to its politeness state for one crawl.
+type hostTable struct {
+	mu    sync.Mutex
+	hosts map[string]*hostState
 }
 
-func (cs *CrawlStats) Print() {
-	fmt.Printf("\n📊 CRAWL STATISTICS\n")
-	fmt.Printf("  Pages crawled:   %d\n", cs.PagesCrawled.Load())
-	fmt.Printf("  Pages skipped:   %d\n", cs.PagesSkipped.Load())
-	fmt.Printf("  Pages failed:    %d\n", cs.PagesFailed.Load())
-	fmt.Printf("  Total bytes:     %d\n", cs.TotalBytes.Load())
-	fmt.Printf("  Avg latency:     %dms\n",
-		cs.TotalLatency.Load()/max(1, cs.PagesCrawled.Load()))
-	fmt.Printf("  Unique URLs:     %d\n", cs.UniqueURLsFound.Load())
-
-	cs.mu.Lock()
-	if len(cs.ErrorsByType) > 0 {
-		fmt.Printf("  Errors by type:\n")
-		for etype, count := range cs.ErrorsByType {
-			fmt.Printf("    %s: %d\n", etype, count)
-		}
-	}
-	cs.mu.Unlock()
-}
-
-// ============================================================
-// ROBOTS.TXT CHECKER
-// ============================================================
-
-type RobotsRule struct {
-	Disallowed []string
-	Allowed    []string
-	CrawlDelay time.Duration
-}
-
-type RobotsChecker struct {
-	mu       sync.RWMutex
-	rules    map[string]*RobotsRule
-}
-
-func NewRobotsChecker() *RobotsChecker {
-	return &RobotsChecker{
-		rules: make(map[string]*RobotsRule),
-	}
-}
-
-func (rc *RobotsChecker) IsAllowed(uri string) bool {
-	parsed, err := url.Parse(uri)
-	if err != nil {
-		return false
-	}
-
-	domain := parsed.Host
-	path := parsed.Path
-
-	rc.mu.RLock()
-	rule, ok := rc.rules[domain]
-	rc.mu.RUnlock()
-
+func (t *hostTable) get(u *url.URL) *hostState {
+	key := u.Scheme + "://" + u.Host
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	h, ok := t.hosts[key]
 	if !ok {
-		return true
+		h = &hostState{}
+		t.hosts[key] = h
 	}
-
-	// Check allowed patterns first
-	for _, pattern := range rule.Allowed {
-		if strings.Contains(path, pattern) {
-			return true
-		}
-	}
-
-	// Then check disallowed
-	for _, pattern := range rule.Disallowed {
-		if strings.Contains(path, pattern) {
-			return false
-		}
-	}
-
-	return true
+	return h
 }
 
-func (rc *RobotsChecker) GetCrawlDelay(domain string) time.Duration {
-	rc.mu.RLock()
-	defer rc.mu.RUnlock()
-
-	if rule, ok := rc.rules[domain]; ok {
-		return rule.CrawlDelay
+func NewCrawler(opts Options) *Crawler {
+	if opts.Workers <= 0 {
+		opts.Workers = 8
 	}
-	return 0
+	if opts.FetchTimeout <= 0 {
+		opts.FetchTimeout = 10 * time.Second
+	}
+	if opts.UserAgent == "" {
+		opts.UserAgent = "lld-crawler/1.0"
+	}
+	if opts.Fetcher == nil {
+		opts.Fetcher = &HTTPFetcher{Client: &http.Client{Timeout: opts.FetchTimeout}, UserAgent: opts.UserAgent, MaxBody: 2 << 20}
+	}
+	if opts.OnPage == nil {
+		opts.OnPage = func(Page) error { return nil }
+	}
+	return &Crawler{opts: opts}
 }
 
-func (rc *RobotsChecker) FetchAndParse(ctx context.Context, domain string) {
-	// Simulate fetching and parsing robots.txt
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-
-	// Simulate varying crawl delays per domain
-	delay := time.Duration(100+rand.Intn(900)) * time.Millisecond
-	rc.rules[domain] = &RobotsRule{
-		Disallowed: []string{"/admin", "/private", "/api", "/wp-admin", "/tmp"},
-		Allowed:    []string{"/public", "/about", "/contact"},
-		CrawlDelay: delay,
-	}
-	log.Printf("  🤖 Parsed robots.txt for %s (delay: %v)", domain, delay)
+type job struct {
+	u     *url.URL
+	depth int
 }
 
-// ============================================================
-// SITEMAP PARSER
-// ============================================================
-
-type SitemapParser struct {
-	mu     sync.RWMutex
-	sitemaps map[string][]string // domain -> URLs from sitemap
+type result struct {
+	page  Page
+	links []*url.URL
 }
 
-func NewSitemapParser() *SitemapParser {
-	return &SitemapParser{
-		sitemaps: make(map[string][]string),
-	}
-}
-
-func (sp *SitemapParser) FetchAndParse(ctx context.Context, domain string) []string {
-	// Simulate fetching sitemap.xml
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-
-	// Generate simulated sitemap URLs
-	urls := []string{
-		fmt.Sprintf("https://%s/", domain),
-		fmt.Sprintf("https://%s/about", domain),
-		fmt.Sprintf("https://%s/products", domain),
-		fmt.Sprintf("https://%s/blog", domain),
-		fmt.Sprintf("https://%s/contact", domain),
-		fmt.Sprintf("https://%s/faq", domain),
-		fmt.Sprintf("https://%s/privacy", domain),
-		fmt.Sprintf("https://%s/terms", domain),
-	}
-	sp.sitemaps[domain] = urls
-	log.Printf("  🗺️ Parsed sitemap for %s (%d URLs)", domain, len(urls))
-	return urls
-}
-
-// ============================================================
-// URL NORMALIZER & FILTER
-// ============================================================
-
-type URLFilter interface {
-	Allow(uri string) bool
-	Name() string
-}
-
-type SchemeFilter struct{}
-func (f *SchemeFilter) Allow(uri string) bool {
-	parsed, err := url.Parse(uri)
-	if err != nil { return false }
-	return parsed.Scheme == "http" || parsed.Scheme == "https"
-}
-func (f *SchemeFilter) Name() string { return "SchemeFilter" }
-
-type ExtensionFilter struct {
-	allowedExtensions map[string]bool
-}
-
-func NewExtensionFilter() *ExtensionFilter {
-	return &ExtensionFilter{
-		allowedExtensions: map[string]bool{
-			".html": true, ".htm": true, ".php": true, ".aspx": true,
-			"/":     true, "":      true, // No extension = HTML page
-		},
-	}
-}
-
-func (f *ExtensionFilter) Allow(uri string) bool {
-	parsed, err := url.Parse(uri)
-	if err != nil { return false }
-
-	path := parsed.Path
-	lastDot := strings.LastIndex(path, ".")
-	if lastDot == -1 {
-		return true // No extension = probably HTML
-	}
-
-	ext := strings.ToLower(path[lastDot:])
-	// Allow HTML-like extensions and no-extension URLs
-	return f.allowedExtensions[ext] || !strings.Contains(ext, ".")
-}
-
-func (f *ExtensionFilter) Name() string { return "ExtensionFilter" }
-
-type DomainFilter struct {
-	allowedDomains []string
-	deniedDomains  []string
-}
-
-func NewDomainFilter(allowed, denied []string) *DomainFilter {
-	return &DomainFilter{
-		allowedDomains: allowed,
-		deniedDomains:  denied,
-	}
-}
-
-func (f *DomainFilter) Allow(uri string) bool {
-	parsed, err := url.Parse(uri)
-	if err != nil { return false }
-
-	host := parsed.Hostname()
-
-	// Check denied list
-	for _, d := range f.deniedDomains {
-		if strings.Contains(host, d) {
-			return false
-		}
-	}
-
-	// If allowed list is empty, allow all
-	if len(f.allowedDomains) == 0 {
-		return true
-	}
-
-	// Check allowed list
-	for _, d := range f.allowedDomains {
-		if strings.Contains(host, d) {
-			return true
-		}
-	}
-	return false
-}
-
-func (f *DomainFilter) Name() string { return "DomainFilter" }
-
-func normalizeURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-
-	// Normalize: lowercase scheme/host, remove fragment, sort query params
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	parsed.Host = strings.ToLower(parsed.Host)
-	parsed.Fragment = ""
-
-	path := strings.TrimRight(parsed.Path, "/")
-	if path == "" {
-		path = "/"
-	}
-	parsed.Path = path
-
-	// Sort query parameters for consistent comparison
-	if parsed.RawQuery != "" {
-		params := strings.Split(parsed.RawQuery, "&")
-		for i, p := range params {
-			parts := strings.SplitN(p, "=", 2)
-			if len(parts) == 2 {
-				params[i] = parts[0] + "=" + parts[1]
-			}
-		}
-		// Remove tracking parameters
-		clean := make([]string, 0)
-		trackingParams := map[string]bool{
-			"utm_source": true, "utm_medium": true, "utm_campaign": true,
-			"utm_term": true, "utm_content": true, "fbclid": true,
-			"gclid": true, "ref": true,
-		}
-		for _, p := range params {
-			parts := strings.SplitN(p, "=", 2)
-			if !trackingParams[parts[0]] {
-				clean = append(clean, p)
-			}
-		}
-		parsed.RawQuery = strings.Join(clean, "&")
-	}
-
-	// Remove default ports
-	if parsed.Port() == "80" && parsed.Scheme == "http" {
-		parsed.Host = strings.TrimSuffix(parsed.Host, ":80")
-	}
-	if parsed.Port() == "443" && parsed.Scheme == "https" {
-		parsed.Host = strings.TrimSuffix(parsed.Host, ":443")
-	}
-
-	return parsed.String()
-}
-
-func extractLinks(baseURL string, html string) []string {
-	var links []string
-	lines := strings.Split(html, "\n")
+// Crawl runs a breadth-first crawl from seeds and blocks until the frontier
+// is exhausted, MaxPages is reached, OnPage fails or ctx is done. It returns
+// ctx.Err() / the OnPage error in the last two cases; Stats are always valid.
+func (c *Crawler) Crawl(ctx context.Context, seeds []string) (Stats, error) {
+	var stats Stats
 	seen := make(map[string]bool)
-
-	for _, line := range lines {
-		// Find href="..." or href='...'
-		lowerLine := strings.ToLower(line)
-		idx := strings.Index(lowerLine, "href=")
-		if idx == -1 {
-			continue
+	var frontier []job // FIFO => BFS; owned by the coordinator only
+	admit := func(u *url.URL, depth int) {
+		n := Normalize(u)
+		if depth > c.opts.MaxDepth || !c.allowed(n) {
+			return
 		}
-
-		rest := line[idx+5:]
-		var quote byte
-		if len(rest) > 0 && (rest[0] == '"' || rest[0] == '\'') {
-			quote = rest[0]
-			rest = rest[1:]
-		} else {
-			continue
-		}
-
-		endIdx := strings.IndexByte(rest, quote)
-		if endIdx == -1 {
-			continue
-		}
-
-		href := rest[:endIdx]
-		if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:") {
-			continue
-		}
-
-		// Skip mailto and tel links
-		if strings.HasPrefix(href, "mailto:") || strings.HasPrefix(href, "tel:") {
-			continue
-		}
-
-		resolved := resolveURL(baseURL, href)
-		if resolved != "" && !seen[resolved] {
-			seen[resolved] = true
-			links = append(links, resolved)
+		if key := n.String(); !seen[key] {
+			seen[key] = true // mark on enqueue, not on fetch: no duplicate jobs
+			frontier = append(frontier, job{n, depth})
 		}
 	}
-
-	return links
-}
-
-func resolveURL(base, href string) string {
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		return ""
-	}
-
-	hrefURL, err := url.Parse(href)
-	if err != nil {
-		return ""
-	}
-
-	return baseURL.ResolveReference(hrefURL).String()
-}
-
-// ============================================================
-// CONTENT-TYPE DETECTOR (simulated)
-// ============================================================
-
-func detectContentType(url string) string {
-	parsed, _ := url.Parse(url)
-	path := parsed.Path
-
-	if strings.HasSuffix(path, ".pdf") { return "application/pdf" }
-	if strings.HasSuffix(path, ".xml") || strings.HasSuffix(path, ".atom") { return "application/xml" }
-	if strings.HasSuffix(path, ".json") { return "application/json" }
-	if strings.HasSuffix(path, ".css") { return "text/css" }
-	if strings.HasSuffix(path, ".js") { return "application/javascript" }
-	if strings.HasSuffix(path, ".png") || strings.HasSuffix(path, ".jpg") || strings.HasSuffix(path, ".gif") {
-		return "image/*"
-	}
-	return "text/html"
-}
-
-// ============================================================
-// FETCHER WITH RATE LIMITING
-// ============================================================
-
-type RateLimiter struct {
-	mu         sync.Mutex
-	tokens     float64
-	maxTokens  float64
-	refillRate float64
-	lastRefill time.Time
-}
-
-func NewRateLimiter(rate float64, burst int) *RateLimiter {
-	return &RateLimiter{
-		tokens:     float64(burst),
-		maxTokens:  float64(burst),
-		refillRate: rate,
-		lastRefill: time.Now(),
-	}
-}
-
-func (rl *RateLimiter) Allow() bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	now := time.Now()
-	elapsed := now.Sub(rl.lastRefill).Seconds()
-	rl.tokens = min(rl.maxTokens, rl.tokens+elapsed*rl.refillRate)
-	rl.lastRefill = now
-
-	if rl.tokens < 1 {
-		return false
-	}
-	rl.tokens--
-	return true
-}
-
-type PerDomainRateLimiter struct {
-	mu       sync.Mutex
-	limiters map[string]*RateLimiter
-	defaultRPS float64
-	defaultBurst int
-}
-
-func NewPerDomainRateLimiter(rps float64, burst int) *PerDomainRateLimiter {
-	return &PerDomainRateLimiter{
-		limiters:     make(map[string]*RateLimiter),
-		defaultRPS:   rps,
-		defaultBurst: burst,
-	}
-}
-
-func (pdrl *PerDomainRateLimiter) getLimiter(domain string) *RateLimiter {
-	pdrl.mu.Lock()
-	defer pdrl.mu.Unlock()
-
-	if lim, ok := pdrl.limiters[domain]; ok {
-		return lim
-	}
-	lim := NewRateLimiter(pdrl.defaultRPS, pdrl.defaultBurst)
-	pdrl.limiters[domain] = lim
-	return lim
-}
-
-func (pdrl *PerDomainRateLimiter) Allow(domain string) bool {
-	return pdrl.getLimiter(domain).Allow()
-}
-
-type Fetcher struct {
-	rateLimiter      *PerDomainRateLimiter
-	robots           *RobotsChecker
-	crawlDelay       time.Duration
-}
-
-func NewFetcher(rps float64, burst int) *Fetcher {
-	return &Fetcher{
-		rateLimiter: NewPerDomainRateLimiter(rps, burst),
-		robots:      NewRobotsChecker(),
-	}
-}
-
-func (f *Fetcher) Fetch(ctx context.Context, req CrawlRequest) Page {
-	start := time.Now()
-	parsed, err := url.Parse(req.URL)
-	if err != nil {
-		return Page{URL: req.URL, Error: fmt.Errorf("invalid URL: %w", err)}
-	}
-	domain := parsed.Host
-
-	log.Printf("  🌐 Crawling: %s (depth=%d, priority=%d)", req.URL, req.Depth, req.Priority)
-
-	// Check robots.txt
-	if !f.robots.IsAllowed(req.URL) {
-		return Page{
-			URL:       req.URL,
-			Depth:     req.Depth,
-			Status:    403,
-			Error:     fmt.Errorf("blocked by robots.txt"),
-			Latency:   time.Since(start),
-			CrawledAt: time.Now(),
+	for _, s := range seeds {
+		if u, err := url.Parse(s); err == nil && u.Host != "" {
+			admit(u, 0)
 		}
 	}
-
-	// Rate limit per domain
-	if !f.rateLimiter.Allow(domain) {
-		backoff := 200*time.Millisecond + time.Duration(rand.Intn(300))*time.Millisecond
-		time.Sleep(backoff)
+	if len(frontier) == 0 {
+		return stats, ErrNoSeeds
 	}
 
-	// Respect robots.txt crawl delay
-	crawlDelay := f.robots.GetCrawlDelay(domain)
-	if crawlDelay > 0 {
-		time.Sleep(crawlDelay)
+	hosts := &hostTable{hosts: make(map[string]*hostState)}
+	g, ctx := newCrawlGroup(ctx)
+	jobs := make(chan job)
+	results := make(chan result)
+
+	for i := 0; i < c.opts.Workers; i++ {
+		g.Go(func() error {
+			for j := range jobs {
+				r := c.process(ctx, hosts, j)
+				select {
+				case results <- r:
+				case <-ctx.Done():
+					return nil // the coordinator reports the cause
+				}
+			}
+			return nil
+		})
 	}
 
-	// Simulate HTTP fetch
-	page := Page{
-		URL:         req.URL,
-		Depth:       req.Depth,
-		ContentType: detectContentType(req.URL),
-	}
-
-	// Only fetch HTML pages
-	if !strings.HasPrefix(page.ContentType, "text/html") {
-		page.Status = 200
-		page.Size = 0
-		page.Latency = time.Since(start)
-		page.CrawledAt = time.Now()
-		return page
-	}
-
-	// Simulate varying latency (higher for deeper pages)
-	baseLatency := 50 + rand.Intn(150)
-	latencyMs := baseLatency + req.Depth*10
-	latency := time.Duration(latencyMs) * time.Millisecond
-
-	select {
-	case <-ctx.Done():
-		page.Error = ctx.Err()
-		page.Latency = time.Since(start)
-		return page
-	case <-time.After(latency):
-	}
-
-	page.Status = 200
-	page.Latency = latency
-	page.Size = 1000 + rand.Intn(5000) + req.Depth*200
-	page.Title = fmt.Sprintf("Page: %s", req.URL)
-
-	// Simulate links based on URL depth
-	if req.Depth < 3 {
-		simulatedLinks := []string{
-			req.URL + "/about",
-			req.URL + "/contact",
-			req.URL + "/products",
-			req.URL + "/blog",
-			req.URL + "/faq",
-			req.URL + "/privacy",
-			req.URL + "/terms",
-		}
-		page.Links = simulatedLinks
-	}
-
-	page.CrawledAt = time.Now()
-	return page
-}
-
-// ============================================================
-// URL VISIT TRACKER
-// ============================================================
-
-type VisitTracker struct {
-	visited sync.Map
-	count   atomic.Int64
-}
-
-func (vt *VisitTracker) IsVisited(url string) bool {
-	_, loaded := vt.visited.LoadOrStore(url, struct{}{})
-	if !loaded {
-		vt.count.Add(1)
-		return false
-	}
-	return true
-}
-
-func (vt *VisitTracker) Count() int64 {
-	return vt.count.Load()
-}
-
-// ============================================================
-// URL FRONTIER (Priority Queue)
-// ============================================================
-
-type FrontierEntry struct {
-	Request CrawlRequest
-	Index   int
-}
-
-type URLFrontier struct {
-	mu       sync.Mutex
-	entries  []*FrontierEntry
-	visited  *VisitTracker
-}
-
-func NewURLFrontier() *URLFrontier {
-	return &URLFrontier{
-		entries: make([]*FrontierEntry, 0),
-		visited: &VisitTracker{},
-	}
-}
-
-func (f *URLFrontier) Push(req CrawlRequest) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	// Insert sorted by priority (higher first), then depth (lower first)
-	entry := &FrontierEntry{Request: req}
-	insertIdx := len(f.entries)
-	for i, e := range f.entries {
-		if e.Request.Priority < req.Priority ||
-			(e.Request.Priority == req.Priority && e.Request.Depth > req.Depth) {
-			insertIdx = i
-			break
-		}
-	}
-
-	f.entries = append(f.entries[:insertIdx],
-		append([]*FrontierEntry{entry}, f.entries[insertIdx:]...)...)
-}
-
-func (f *URLFrontier) Pop() *CrawlRequest {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if len(f.entries) == 0 {
-		return nil
-	}
-
-	entry := f.entries[0]
-	f.entries = f.entries[1:]
-	return &entry.Request
-}
-
-func (f *URLFrontier) Len() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.entries)
-}
-
-func (f *URLFrontier) IsVisited(url string) bool {
-	return f.visited.IsVisited(url)
-}
-
-func (f *URLFrontier) VisitedCount() int64 {
-	return f.visited.Count()
-}
-
-// ============================================================
-// WEB CRAWLER (Core)
-// ============================================================
-
-type WebCrawler struct {
-	workers          int
-	maxDepth         int
-	maxPages         int
-	frontier         *URLFrontier
-	fetcher          *Fetcher
-	sitemapParser    *SitemapParser
-	results          chan Page
-	pagesFound       atomic.Int64
-	filters          []URLFilter
-	stats            *CrawlStats
-	domainWorkers    map[string]int // domain -> active workers count
-	domainWorkersMu  sync.Mutex
-}
-
-func NewWebCrawler(workers, maxDepth, maxPages int) *WebCrawler {
-	return &WebCrawler{
-		workers:       workers,
-		maxDepth:      maxDepth,
-		maxPages:      maxPages,
-		frontier:      NewURLFrontier(),
-		fetcher:       NewFetcher(10, 20),
-		sitemapParser: NewSitemapParser(),
-		results:       make(chan Page, 1000),
-		filters: []URLFilter{
-			&SchemeFilter{},
-			NewExtensionFilter(),
-		},
-		stats:         NewCrawlStats(),
-		domainWorkers: make(map[string]int),
-	}
-}
-
-func (wc *WebCrawler) AddFilter(filter URLFilter) {
-	wc.filters = append(wc.filters, filter)
-}
-
-// Crawl starts the web crawl from seed URLs
-func (wc *WebCrawler) Crawl(ctx context.Context, seeds []string) (<-chan Page, error) {
-	// Fetch sitemaps and seed the frontier
-	for _, seed := range seeds {
-		parsed, err := url.Parse(seed)
-		if err != nil {
-			continue
-		}
-		domain := parsed.Host
-
-		// Fetch robots.txt for each seed domain
-		wc.fetcher.robots.FetchAndParse(ctx, domain)
-
-		// Fetch sitemap for each seed domain
-		sitemapURLs := wc.sitemapParser.FetchAndParse(ctx, domain)
-		for _, smURL := range sitemapURLs {
-			normalized := normalizeURL(smURL)
-			if wc.allURLFiltersAllow(normalized) {
-				wc.frontier.Push(CrawlRequest{
-					URL:      normalized,
-					Depth:    0,
-					Priority: 10, // Sitemap URLs get high priority
-				})
+	g.Go(func() error {
+		defer close(jobs) // sole owner of jobs
+		inFlight, dispatched := 0, 0
+		for {
+			canSend := len(frontier) > 0 && (c.opts.MaxPages == 0 || dispatched < c.opts.MaxPages)
+			if !canSend && inFlight == 0 {
+				return nil // exact termination
+			}
+			var send chan job // nil channel: that select case is disabled
+			var next job
+			if canSend {
+				send, next = jobs, frontier[0]
+			}
+			select {
+			case send <- next:
+				frontier[0] = job{}
+				frontier = frontier[1:]
+				inFlight++
+				dispatched++
+			case r := <-results:
+				inFlight--
+				switch {
+				case errors.Is(r.page.Err, ErrRobotsDisallowed):
+					stats.Disallowed++
+				case r.page.Err != nil:
+					stats.Failed++
+				default:
+					stats.Fetched++
+				}
+				before := len(seen)
+				for _, l := range r.links {
+					admit(l, r.page.Depth+1)
+				}
+				stats.Discovered += len(seen) - before
+				if err := c.opts.OnPage(r.page); err != nil {
+					return err
+				}
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 		}
+	})
 
-		// Also add the seed URL itself
-		normalized := normalizeURL(seed)
-		if wc.allURLFiltersAllow(normalized) {
-			wc.frontier.Push(CrawlRequest{
-				URL:      normalized,
-				Depth:    0,
-				Priority: 5,
-			})
-		}
-	}
-
-	// Start worker goroutines (Fan-Out)
-	var wg sync.WaitGroup
-	for i := 0; i < wc.workers; i++ {
-		wg.Add(1)
-		go wc.worker(ctx, i, &wg)
-	}
-
-	// URL discovery goroutine
-	go wc.discoverURLs(ctx)
-
-	// Close results when all workers finish
-	go func() {
-		wg.Wait()
-		close(wc.results)
-	}()
-
-	return wc.results, nil
+	err := g.Wait()
+	return stats, err
 }
 
-func (wc *WebCrawler) allURLFiltersAllow(uri string) bool {
-	for _, filter := range wc.filters {
-		if !filter.Allow(uri) {
+func (c *Crawler) allowed(u *url.URL) bool {
+	for _, f := range c.opts.Filters {
+		if !f(u) {
 			return false
 		}
 	}
 	return true
 }
 
-// worker processes crawl requests (Fan-Out worker)
-func (wc *WebCrawler) worker(ctx context.Context, id int, wg *sync.WaitGroup) {
-	defer wg.Done()
-	log.Printf("Worker %d started", id)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
+// robotsFor fetches robots.txt once per host. Per RFC 9309: 4xx means no
+// restrictions; 5xx or a network error means assume full disallow.
+func (c *Crawler) robotsFor(ctx context.Context, u *url.URL, h *hostState) *Robots {
+	h.robotsOnce.Do(func() {
+		rctx, cancel := context.WithTimeout(ctx, c.opts.FetchTimeout)
+		defer cancel()
+		resp, err := c.opts.Fetcher.Fetch(rctx, u.Scheme+"://"+u.Host+"/robots.txt")
+		switch {
+		case err != nil || resp.StatusCode >= 500:
+			h.robots = &Robots{disallowAll: true}
+		case resp.StatusCode >= 400:
+			h.robots = &Robots{}
 		default:
+			h.robots = ParseRobots(resp.Body, c.opts.UserAgent)
 		}
-
-		// Check page limit
-		if wc.pagesFound.Load() >= int64(wc.maxPages) {
-			return
-		}
-
-		// Dequeue from frontier
-		req := wc.frontier.Pop()
-		if req == nil {
-			// No more URLs
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(100 * time.Millisecond):
-				continue
-			}
-		}
-
-		// Track domain worker
-		parsed, err := url.Parse(req.URL)
-		if err != nil {
-			continue
-		}
-		domain := parsed.Host
-
-		wc.domainWorkersMu.Lock()
-		wc.domainWorkers[domain]++
-		wc.domainWorkersMu.Unlock()
-
-		// Check depth
-		if req.Depth > wc.maxDepth {
-			wc.domainWorkersMu.Lock()
-			wc.domainWorkers[domain]--
-			wc.domainWorkersMu.Unlock()
-			wc.stats.PagesSkipped.Add(1)
-			continue
-		}
-
-		// Check if already visited
-		if wc.frontier.IsVisited(req.URL) {
-			wc.domainWorkersMu.Lock()
-			wc.domainWorkers[domain]--
-			wc.domainWorkersMu.Unlock()
-			wc.stats.PagesSkipped.Add(1)
-			continue
-		}
-
-		// Fetch the page
-		page := wc.fetcher.Fetch(ctx, *req)
-		wc.pagesFound.Add(1)
-
-		wc.domainWorkersMu.Lock()
-		wc.domainWorkers[domain]--
-		wc.domainWorkersMu.Unlock()
-
-		// Update stats
-		if page.Error != nil {
-			wc.stats.PagesFailed.Add(1)
-			wc.stats.RecordError(page.Error.Error())
-		} else {
-			wc.stats.PagesCrawled.Add(1)
-			wc.stats.TotalBytes.Add(int64(page.Size))
-			wc.stats.TotalLatency.Add(page.Latency.Milliseconds())
-		}
-
-		// Send result
-		select {
-		case wc.results <- page:
-		case <-ctx.Done():
-			return
-		}
-	}
+	})
+	return h.robots
 }
 
-// discoverURLs processes results and discovers new URLs to crawl
-func (wc *WebCrawler) discoverURLs(ctx context.Context) {
-	for page := range wc.results {
-		if page.Error != nil {
-			continue
-		}
+// process is the worker's I/O: robots, politeness, fetch, extract.
+func (c *Crawler) process(ctx context.Context, hosts *hostTable, j job) result {
+	page := Page{URL: j.u.String(), Depth: j.depth}
+	h := hosts.get(j.u)
+	robots := c.robotsFor(ctx, j.u, h)
+	if !robots.Allowed(j.u) {
+		page.Err = ErrRobotsDisallowed
+		return result{page: page}
+	}
+	gap := max(c.opts.PerHostDelay, robots.crawlDelay)
+	if err := h.waitTurn(ctx, gap); err != nil {
+		page.Err = err
+		return result{page: page}
+	}
+	fctx, cancel := context.WithTimeout(ctx, c.opts.FetchTimeout)
+	defer cancel()
+	resp, err := c.opts.Fetcher.Fetch(fctx, page.URL)
+	if err != nil {
+		page.Err = err
+		return result{page: page}
+	}
+	page.StatusCode = resp.StatusCode
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		page.Err = fmt.Errorf("crawler: HTTP %d", resp.StatusCode)
+		return result{page: page}
+	}
+	if !strings.HasPrefix(resp.ContentType, "text/html") {
+		return result{page: page}
+	}
+	base, err := url.Parse(resp.URL)
+	if err != nil {
+		base = j.u
+	}
+	links := ExtractLinks(base, resp.Body)
+	page.Links = len(links)
+	return result{page: page, links: links}
+}
 
-		for _, link := range page.Links {
-			normalized := normalizeURL(link)
+// ============================================================
+// IN-MEMORY WEB (demo + tests)
+// ============================================================
 
-			// Apply all filters
-			if !wc.allURLFiltersAllow(normalized) {
-				continue
-			}
+// FakeWeb serves canned pages and counts requests; unknown URLs are 404.
+type FakeWeb struct {
+	Pages   map[string]string // url -> HTML (or robots.txt body)
+	Latency time.Duration
 
-			// Check if already in frontier
-			if wc.frontier.IsVisited(normalized) {
-				continue
-			}
+	mu    sync.Mutex
+	Calls map[string]int
+}
 
-			// Queue new request with priority based on depth
-			priority := max(0, 10-page.Depth*2)
-			wc.frontier.Push(CrawlRequest{
-				URL:         normalized,
-				Depth:       page.Depth + 1,
-				ReferrerURL: page.URL,
-				Priority:    priority,
-			})
-			wc.stats.UniqueURLsFound.Add(1)
+func (w *FakeWeb) Fetch(ctx context.Context, rawURL string) (*Response, error) {
+	w.mu.Lock()
+	if w.Calls == nil {
+		w.Calls = make(map[string]int)
+	}
+	w.Calls[rawURL]++
+	w.mu.Unlock()
+	if w.Latency > 0 {
+		if err := sleepUntil(ctx, time.Now().Add(w.Latency)); err != nil {
+			return nil, err
 		}
 	}
+	body, ok := w.Pages[rawURL]
+	if !ok {
+		return &Response{URL: rawURL, StatusCode: 404, ContentType: "text/plain"}, nil
+	}
+	ct := "text/html; charset=utf-8"
+	if strings.HasSuffix(rawURL, "/robots.txt") {
+		ct = "text/plain"
+	}
+	return &Response{URL: rawURL, StatusCode: 200, ContentType: ct, Body: []byte(body)}, nil
+}
+
+func demoWeb() *FakeWeb {
+	return &FakeWeb{Latency: 5 * time.Millisecond, Pages: map[string]string{
+		"https://example.com/robots.txt": "User-agent: *\nDisallow: /private\nAllow: /private/press\n",
+		"https://example.com/": `<a href="/about">About</a> <a href="/blog?utm_source=x">Blog</a>
+			<a href="https://example.com/private/salaries">x</a> <a href="/private/press">Press</a>
+			<a href="https://example.org/">Partner</a> <a href="https://evil.com/">Spam</a>
+			<a href="mailto:hi@example.com">Mail</a> <a href="/logo.png">Logo</a>`,
+		"https://example.com/about":         `<a href="/">Home</a> <a href="/team#jobs">Team</a>`,
+		"https://example.com/blog":          `<a href="/blog/post-1">1</a> <a href="/blog/post-2">2</a>`,
+		"https://example.com/blog/post-1":   `<a href="/blog/post-1/comments">deep</a>`,
+		"https://example.com/private/press": `press kit`,
+		"https://example.org/":              `<a href="/docs">Docs</a> <a href="/missing">Broken</a>`,
+		"https://example.org/docs":          `docs`,
+	}}
 }
 
 // ============================================================
@@ -921,67 +685,44 @@ func (wc *WebCrawler) discoverURLs(ctx context.Context) {
 // ============================================================
 
 func main() {
-	fmt.Println("╔══════════════════════════════════╗")
-	fmt.Println("║      WEB CRAWLER DEMO            ║")
-	fmt.Println("╚══════════════════════════════════╝\n")
-
-	// Create crawler with 5 workers, max depth 2, max 30 pages
-	crawler := NewWebCrawler(5, 2, 30)
-
-	// Add domain filter to stay within example domains
-	crawler.AddFilter(NewDomainFilter(
-		[]string{"example.com", "example.org"},
-		[]string{"facebook.com", "twitter.com", "instagram.com"},
-	))
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Start crawl
-	seeds := []string{
-		"https://example.com",
-		"https://example.org",
-	}
-	log.Printf("Starting crawl from %v...\n", seeds)
-
-	results, err := crawler.Crawl(ctx, seeds)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Collect and display results
+	web := demoWeb()
 	var pages []Page
-	fmt.Println("\n--- CRAWL RESULTS ---")
-	for page := range results {
-		pages = append(pages, page)
-		status := "✅"
-		if page.Error != nil {
-			status = "❌"
-		}
-		fmt.Printf("  %s [Depth %d] %s (%d bytes, %v, %s)\n",
-			status, page.Depth, page.URL, page.Size, page.Latency, page.ContentType)
-	}
+	crawler := NewCrawler(Options{
+		Workers:      4,
+		MaxDepth:     2,
+		PerHostDelay: 10 * time.Millisecond,
+		Fetcher:      web,
+		Filters:      []URLFilter{HTTPOnly, AllowHosts("example.com", "example.org"), SkipExtensions(".png", ".jpg", ".pdf")},
+		OnPage:       func(p Page) error { pages = append(pages, p); return nil }, // serial: no lock needed
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stats, err := crawler.Crawl(ctx, []string{"https://Example.com:443/#top"})
 
-	// Stats
-	crawler.stats.Print()
-
-	fmt.Printf("\n=== Crawl Summary ===\n")
-	fmt.Printf("Total pages received: %d\n", len(pages))
-	fmt.Printf("Remaining in frontier: %d\n", crawler.frontier.Len())
-
-	var succeeded, failed int
+	sort.Slice(pages, func(i, j int) bool { return pages[i].URL < pages[j].URL })
+	fmt.Println("--- Pages (sorted; workers finish in any order) ---")
 	for _, p := range pages {
-		if p.Error != nil {
-			failed++
-		} else {
-			succeeded++
+		status := "ok"
+		if p.Err != nil {
+			status = p.Err.Error()
 		}
+		fmt.Printf("  d=%d %-40s links=%d %s\n", p.Depth, p.URL, p.Links, status)
 	}
-	fmt.Printf("Succeeded: %d\n", succeeded)
-	fmt.Printf("Failed:    %d\n", failed)
+	fmt.Printf("--- Stats: %+v err=%v\n", stats, err)
+	fmt.Println("  /blog/post-1/comments not fetched: depth 3 > MaxDepth 2")
+	fmt.Println("  every page fetched exactly once:", web.Calls["https://example.com/"] == 1)
 
-	fmt.Println("\n╔══════════════════════════════════╗")
-	fmt.Println("║       DEMO COMPLETE             ║")
-	fmt.Println("╚══════════════════════════════════╝")
+	fmt.Println("--- MaxPages budget = 3 ---")
+	limited := NewCrawler(Options{Workers: 4, MaxDepth: 5, MaxPages: 3, Fetcher: demoWeb(),
+		Filters: []URLFilter{HTTPOnly, AllowHosts("example.com")}})
+	stats, err = limited.Crawl(ctx, []string{"https://example.com/"})
+	fmt.Printf("  %+v err=%v\n", stats, err)
+
+	fmt.Println("--- Abort from OnPage ---")
+	stop := errors.New("enough")
+	aborting := NewCrawler(Options{Workers: 4, MaxDepth: 5, Fetcher: demoWeb(),
+		Filters: []URLFilter{HTTPOnly, AllowHosts("example.com")},
+		OnPage:  func(Page) error { return stop }})
+	_, err = aborting.Crawl(ctx, []string{"https://example.com/"})
+	fmt.Println("  err:", err)
 }

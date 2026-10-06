@@ -46,10 +46,15 @@ Web/Mobile App (Customer)       Admin/Fleet Dashboard
     │            │            │
     └────────────┼────────────┘
                  │
-        ┌────────▼────────┐
-        │   PostgreSQL +   │
-        │  Redis Cache    ││  (Availability) │
-  └─────────────────┘
+        ┌────────┴────────┐
+        │                 │
+┌───────▼───────┐  ┌──────▼──────────┐
+│  PostgreSQL   │  │  Redis          │
+│ (source of    │  │ (7×24 bitmaps,  │
+│  truth, EXCL. │  │  read model)    │
+│  constraint)  │  └──────▲──────────┘
+└───────┬───────┘         │
+        └── outbox/CDC ───┘  (rebuild bitmaps on every block change)
 ```
 
 ### 🎬 Animated Sequence Diagram
@@ -69,7 +74,7 @@ Web/Mobile App (Customer)       Admin/Fleet Dashboard
 
 ### 3.1 Core Problem: When is a car free?
 
-**Key insight:** A vehicle is "available" for a time range `[T1, T2]` if there is no overlapping confirmed reservation or maintenance.
+**Key insight:** A vehicle is available for `[T1, T2)` if no *active* block (pending hold, confirmed or in-progress reservation, maintenance — each extended by the turnaround buffer) overlaps it. Two half-open ranges `[a, b)` and `[c, d)` overlap iff `a < d and c < b`.
 
 ```
 Vehicle V1 timeline:
@@ -80,7 +85,7 @@ Query: Is V1 available for 14:00-16:00?
 → Yes: no overlap with existing bookings
 ```
 
-**Hourly granularity:** Each day is divided into 24 hourly slots. A booking occupies N contiguous slots.
+**Hourly granularity is a view, not the storage.** Bookings are stored as exact ranges; the 24 hourly cells per day shown in the UI are computed from them (an hour is "free" only if the whole hour is free). Storing rounded slots as the truth either misses real overlaps or wastes inventory.
 
 ### 3.2 Search Architecture
 
@@ -104,20 +109,21 @@ User Search Request: {pickup: 2024-01-15 10:00, return: 2024-01-15 14:00, type: 
 ### 3.3 Booking Workflow
 
 ```
-1. User selects vehicle + time range
-2. Backend validates: is_available(vehicle_id, pickup, return)
-3. If available:
-   a. Start transaction (PostgreSQL SERIALIZABLE isolation)
-   b. INSERT reservation with status = 'PENDING'
-   c. EXCLUDE constraint `no_overlapping_booking` prevents race condition
-   d. If conflict: rollback, notify user of schedule change
-   e. If success: commit, status → 'CONFIRMED'
-   f. Invalidate Redis cache for affected time slots
-   g. Publish event: reservation.created (for notifications, fleet dashboard)
-4. User receives confirmation with pickup instructions
+1. User selects vehicle + time range (from a possibly stale search result)
+2. One transaction at READ COMMITTED, no pre-check:
+   a. INSERT reservation (status = 'PENDING', hold_expires_at = now() + 10 min, idempotency_key)
+   b. INSERT vehicle_blocks row [pickup, return + turnaround) — the partial EXCLUDE constraint
+      `no_overlapping_blocks` rejects any overlap with SQLSTATE 23P01
+   c. INSERT outbox row (reservation.held)
+   d. COMMIT
+3. On 23P01: if the blocker is a lapsed hold, expire it and retry once; else return 409 with
+   the next free window and same-class alternatives
+4. Customer pays (payment idempotency key = reservation id) → confirm: PENDING → CONFIRMED
+   only if the hold is still live (conditional UPDATE ... WHERE status='PENDING' AND hold_expires_at > now())
+5. Outbox relay publishes events; bitmap builder refreshes Redis for that vehicle
 ```
 
-**Isolation level:** `SERIALIZABLE` is critical here — two concurrent requests for the same vehicle in the same time slot must fail atomically. PostgreSQL's serializable snapshot isolation (SSI) handles this correctly.
+**Isolation level:** READ COMMITTED is enough because the exclusion constraint is checked by the index on insert, regardless of snapshots. A plain `SELECT ... then INSERT` would need `SERIALIZABLE` (SSI aborts one of two conflicting transactions with `40001`, which you must retry) or a `SELECT ... FOR UPDATE` on the vehicle row. The constraint is simpler and can't be bypassed by a code path that forgets the check.
 
 ---
 
@@ -133,13 +139,13 @@ User Search Request: {pickup: 2024-01-15 10:00, return: 2024-01-15 14:00, type: 
 
 **✅ Answer:** The availability system is time-agnostic — it checks hourly slots regardless of branch hours. However, the search layer enforces business rules:
 ```sql
--- Enforce branch operating hours in search
+-- Enforce branch operating hours in search (compare in the branch's local time)
 SELECT v.* FROM vehicles v
 JOIN branches b ON v.branch_id = b.id
-WHERE NOT EXISTS (... overlapping reservations ...)
-  AND pickup_time >= b.opening_time
-  AND return_time <= b.closing_time
-  -- Or: if return_time > closing_time, charge overnight fee
+WHERE NOT EXISTS (... overlapping active vehicle_blocks ...)
+  AND (:pickup AT TIME ZONE b.tz)::time BETWEEN b.opening_time AND b.closing_time
+  AND (:return AT TIME ZONE b.tz)::time BETWEEN b.opening_time AND b.closing_time
+  -- Or allow after-hours return to a key drop, with an inspection the next morning
 ```
 
 ### Booking Service (Go)
@@ -151,17 +157,18 @@ WHERE NOT EXISTS (... overlapping reservations ...)
 **🔴 Staff-level Question:** *"How do you prevent race conditions where two users book the same vehicle for overlapping times?"*
 
 **✅ Answer:** Multi-layered approach:
-1. **Application-level optimistic check:** Query for overlapping reservations before insert
-2. **Database exclusion constraint (hard guarantee):** 
+1. **Database exclusion constraint (the guarantee):** one table holds every block (reservations *and* maintenance), constrained only while active:
    ```sql
-   ALTER TABLE reservations ADD CONSTRAINT no_overlapping_booking
+   ALTER TABLE vehicle_blocks ADD CONSTRAINT no_overlapping_blocks
    EXCLUDE USING gist (
        vehicle_id WITH =,
-       tstzrange(pickup_datetime, return_datetime) WITH &&
-   );
+       tstzrange(block_start, block_end) WITH &&
+   ) WHERE (active);
    ```
-3. **Idempotency key:** Prevent duplicate submissions (network retry → same idempotency key → no-op)
-4. **SERIALIZABLE isolation:** Two concurrent conflicting inserts → one wins, one gets serialization failure
+   Without `WHERE (active)` cancelled bookings block forever; with maintenance in a separate table, bookings could overlap maintenance.
+2. **Search-time check is only a hint** for UX; never rely on it.
+3. **Idempotency key:** a retried submit returns the existing reservation instead of creating a second hold.
+4. **Per-vehicle serialization is the right granularity:** contention is per car, so a global lock or SERIALIZABLE on everything buys nothing.
 
 ### Fleet Service (Python)
 - Manages vehicle inventory (add/remove/status)
@@ -176,15 +183,16 @@ WHERE NOT EXISTS (... overlapping reservations ...)
 ### Core Tables
 
 ```sql
--- See CODE.md for complete DDL
+-- See DB_SCHEMA.md for the complete DDL
 
 -- Key tables:
 vehicles          -- Fleet inventory with hourly/daily rates, location, features
 customers         -- User accounts with loyalty program
 branches          -- Physical locations with operating hours
-reservations      -- Booking with tstzrange overlap exclusion constraint
-availability_slots -- Materialized hourly slots for O(1) lookups
-maintenance_schedule -- Maintainence that blocks availability
+reservations      -- Lifecycle, quote, hold expiry, idempotency key
+vehicle_blocks    -- Every reservation/maintenance range; partial EXCLUDE constraint lives here
+availability_slots -- Derived hourly read model (async, may lag)
+maintenance_schedule -- Maintenance jobs (each also writes a vehicle_blocks row)
 payments          -- Payment transactions with idempotency
 ```
 
@@ -267,17 +275,17 @@ reservation:{id}:state                    → HASH (current reservation state)
 **Key design decisions:**
 - **Time block granularity:** 1 hour blocks. Longer rentals occupy contiguous blocks.
 - **Availability matrix:** Pre-computed 7-day × 24-hour bitmap per vehicle (168 bits = 21 bytes per vehicle)
-- **Lookup:** O(1) bitwise check `(bitmap & mask) == 0` where mask has bits set for requested hours
-- **Update:** On booking, set bits atomically. On cancel, clear bits.
-- **Race condition:** PostgreSQL exclusion constraint `tstzrange && tstzrange` provides hard guarantee
+- **Lookup:** O(1) bitwise pre-filter: with 1 = free, `(bitmap & mask) == mask` for the requested whole hours
+- **Update:** rebuild a vehicle's bitmap from its blocks on every block change (event-driven), not by flipping bits in the request path — rebuilding is idempotent, flipping isn't
+- **Race condition:** the partial exclusion constraint on `vehicle_blocks` is the guarantee; the bitmap may be stale for a second and that's fine
 
 ### Q2: "How would you scale availability queries for 10K vehicles across 200 locations?"
 
-- **Shard by location:** Each location's fleet data on separate PostgreSQL instance
-- **Redis cluster:** Pre-compute availability bitmaps, shard by `location:{id}` 
-- **Materialized views:** Refresh every 30 seconds for fleet overview
-- **CQRS pattern:** Separate read models (availability) from write models (bookings)
-- **Cache warming:** Pre-calculate next 7 days every hour, store in Redis bitmaps
+- **Do the arithmetic first:** 10K vehicles × 21 bytes/week ≈ 210 KB of bitmaps; even 30 bookings per car in the horizon is 300K block rows. One Postgres primary handles the writes (a few bookings/second); this is a read-latency problem, not a data-volume one. Don't shard yet
+- **CQRS:** writes go to Postgres; search reads Redis bitmaps keyed by `location:{id}` (one `MGET`/pipeline per search) and only touches Postgres for the final booking
+- **Event-driven rebuild** of a vehicle's bitmap on each block change, plus a nightly full rebuild that also rolls the 7-day window forward
+- **Read replicas** for the detail and admin views; replica lag is fine because booking hits the primary
+- **If it ever must shard:** by region/branch, since a booking never spans two vehicles' rows
 
 ### Q3: "How do you handle same-day bookings and branch operating hours?"
 
@@ -297,11 +305,32 @@ SELECT v.id, v.make || ' ' || v.model AS vehicle,
        24 - COALESCE(SUM(EXTRACT(EPOCH FROM (r.return_datetime - r.pickup_datetime))/3600), 0) AS available_hours
 FROM vehicles v
 CROSS JOIN generate_series(CURRENT_DATE, CURRENT_DATE + 6, '1 day') AS d(date)
-LEFT JOIN reservations r ON r.vehicle_id = v.id 
+LEFT JOIN reservations r ON r.vehicle_id = v.id
     AND r.status IN ('CONFIRMED', 'IN_PROGRESS')
     AND d.date::date = r.pickup_datetime::date
 GROUP BY v.id, v.make, v.model, d.date;
+-- Caveat: this attributes a whole multi-day rental to its pickup day, so available_hours can go
+-- negative. Correct version: intersect each rental with the day,
+--   tstzrange(r.pickup_datetime, r.return_datetime) * tstzrange(d.date, d.date + 1)
+-- and sum upper(...) - lower(...) (see DB_SCHEMA.md query 5).
 ```
+
+---
+
+## 7a. FAILURE MODES, IDEMPOTENCY & CONSISTENCY
+
+| Concern | Choice |
+|---------|--------|
+| Booking consistency | Strong, per vehicle (exclusion constraint on the primary) |
+| Search / grid consistency | Eventual (bitmaps rebuilt from events, seconds of lag); booking re-checks |
+| Duplicate submits | `reservations.idempotency_key UNIQUE`; retry returns the same hold |
+| Payment callbacks | Idempotent on reservation id; confirm is a conditional UPDATE, so webhook + client confirm can both arrive safely |
+| Lost events | Transactional outbox; bitmap builder is idempotent (full rebuild per vehicle) |
+| Hold never paid | Sweeper deactivates lapsed holds; booking path also expires a lapsed blocker on conflict |
+| Late return | Alarm at `return + grace` if not checked in; re-assign the next booking to a same-class car before the customer arrives |
+| Branch / region outage | Bookings need the primary; search can serve stale bitmaps read-only |
+
+**Capacity:** ~5K bookings/day ≈ 0.06/s average, maybe 5/s at peak — trivial for one primary. Searches dominate: at 100 searches per booking, ~500K/day ≈ 6/s average, 100+/s peak, all served from Redis. The interesting load is contention on a few popular cars at the airport on Friday evening, which the per-vehicle constraint handles without global locking.
 
 ---
 
@@ -310,11 +339,12 @@ GROUP BY v.id, v.make, v.model, d.date;
 | Decision | Choice | Rationale | Alternative |
 |----------|--------|-----------|-------------|
 | **Booking granularity** | Hourly | Supports short rentals, maximizes utilization | Daily-only (simpler, lower utilization) |
-| **Availability data** | Pre-computed bitmaps | O(1) lookup, 21 bytes/vehicle/week | Live query (200ms, accurate) |
-| **Race prevention** | Exclusion constraint | Hard DB guarantee, no app bugs possible | Application locks (complex, leaky) |
+| **Availability storage** | Exact ranges (`vehicle_blocks`) | No rounding errors, maps 1:1 to `tstzrange` | Hourly slot rows (simple UNIQUE key, but forces rounding) |
+| **Availability reads** | Pre-computed bitmaps (read model) | O(1) pre-filter, 21 bytes/vehicle/week | Live range query (accurate, slower on the browse path) |
+| **Race prevention** | Partial exclusion constraint | DB-enforced, no code path can skip it | `SELECT ... FOR UPDATE` on the vehicle row (portable, e.g. MySQL) |
 | **Search cache** | Redis | <1ms reads, TTL-based invalidation | In-memory cache (lost on restart) |
 | **Pricing model** | Hourly + Daily + Weekly discount | Flexible for all rental durations | Single rate (confusing) |
-| **Isolation level** | SERIALIZABLE | Prevents phantom reads, race-proof | REPEATABLE READ (race window) |
+| **Isolation level** | READ COMMITTED + constraint | Constraint is checked at insert regardless of snapshot | SERIALIZABLE (correct, but every conflict becomes a `40001` retry) |
 
 ---
 

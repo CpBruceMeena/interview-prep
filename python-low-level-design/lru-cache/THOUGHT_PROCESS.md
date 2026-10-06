@@ -10,107 +10,86 @@
 
 ---
 
-## Phase 0: Requirements Gathering
+## ⏱️ How to Run This in a 45–60 min Interview
 
-What eviction strategy? (LRU, LFU, TTL?) Capacity limit? Thread safety? Statistics tracking? Generics support?
+| Time | Step | What to say out loud |
+|------|------|----------------------|
+| 0–5 | **Clarify** | "Capacity in entries or bytes? Which policy — LRU, LFU, or pluggable? Per-key TTL? Is `None` a valid value? Does a `put` on an existing key count as a use? Concurrent access? Need a loader (cache-aside)?" |
+| 5–10 | **Data structures** | "Hashmap for lookup plus a doubly linked list for order: both O(1). For LFU, one list per frequency plus `min_freq`." Draw the list with sentinels and the map pointing into it. |
+| 10–30 | **Core code** | `_DList` with sentinels first (4 small methods), then `LRUCache.get/put`. Test it out loud with capacity 2: put a, put b, get a, put c → b evicted. |
+| 30–40 | **Extensions** | Pull the shared parts into `BaseCache` with hooks; add LFU (bucket move + `min_freq`), then TTL (lazy check + heap). |
+| 40–50 | **Concurrency** | "`get` mutates, so a RW lock doesn't help. One lock per cache; then stripe for contention. Single-flight loader against stampedes." |
+| 50–60 | **Scale out** | Consistent hashing across nodes, replication, invalidation (see HLD). |
+
+**Clarifying questions worth asking** (defaults to propose):
+
+- Capacity unit? → entry count; bytes is an extension (weighted eviction).
+- `get` on a missing key? → return a caller-supplied default, so `None` can be cached.
+- Overwrite counts as a use? → yes, and it resets the TTL.
+- TTL per key or global? → global default, per-key override.
+- Expired entries counted in `len`? → yes until purged (lazy expiry); say so.
+- Thread-safe? → yes, as a wrapper, so the single-threaded core stays simple and testable.
+
+---
 
 ## Phase 1: Identify the Nouns
 
-> *"A cache stores key-value pairs. When capacity is reached, an eviction strategy decides which item to remove."*
+> *"A cache stores key-value pairs. When capacity is reached, a policy decides which item to remove. Entries may expire."*
 
 | Noun | Decision | Why |
 |------|----------|-----|
-| Node | Regular Class | Doubly linked list node (key, value, prev, next) |
-| Cache | Regular (Generic) | Core cache with Dict + Strategy |
-| EvictionStrategy | ABC | Strategy pattern |
-| LRUStrategy | Regular | Least Recently Used: doubly linked list |
-| LFUStrategy | Regular | Least Frequently Used: frequency map |
-| TTLStrategy | Regular | Time To Live: expiry map |
-| CacheStats | Regular | Hit/miss/eviction counters |
-| CacheWithStats | Regular | Decorator pattern |
-| ThreadSafeCache | Regular | Wraps Cache with lock |
+| Node | `__slots__` class | Holds key (needed on evict), value, expiry, freq, prev/next |
+| Doubly linked list | Small class with sentinels | O(1) unlink anywhere; no head/tail special cases |
+| Cache | ABC with hooks (template method) | Map + TTL + stats once; policy varies |
+| LRU / LFU | Subclasses | Implement `_insert`, `_touch`, `_unlink`, `_victim` |
+| TTL | Part of the base, not a policy | Any policy can have expiring entries |
+| Stats | Dataclass | Hits, misses, evictions, expirations |
+| Thread safety | Wrapper (`ThreadSafeCache`, `StripedCache`) | Locking is orthogonal to policy |
 
-## Phase 2: Enums First
+## Phase 2: Responsibilities
 
-The cache design doesn't need many enums — it's more algorithmic. The strategies themselves are the "enum of behaviors."
+| Action | Owner | Cost |
+|--------|-------|------|
+| Lookup | `BaseCache._map` | O(1) |
+| Recency order | `LRUCache._order` | O(1) move/unlink |
+| Frequency order | `LFUCache._buckets` + `_min_freq` | O(1) bucket move |
+| Expiry | `node.expires_at` (lazy) + `_expiry_heap` (purge) | O(1) check, O(log n) push |
+| Mutual exclusion | `ThreadSafeCache._lock` / per-shard locks | — |
+| Stampede protection | `ThreadSafeCache.get_or_load` | One loader per key |
 
-## Phase 3: dataclass vs `__init__`
-
-- **`Node`**: Regular — linked list node with prev/next pointers
-- **`Cache`**: Regular — generic class with complex behavior
-- **`EvictionStrategy`**: ABC — interface for strategies
-- **`CacheStats`**: Regular — counters with methods
-- **`CacheWithStats`**: Regular — decorator pattern
-
-## Phase 4: Assigning Responsibilities
-
-| Action | Owner | Why |
-|--------|-------|-----|
-| Store key-value | `Cache._cache` (Dict) | Fast O(1) lookups |
-| Track access order | `LRUStrategy` | Doubly linked list + node map |
-| Track access frequency | `LFUStrategy` | Frequency map + min_freq tracking |
-| Track expiration | `TTLStrategy` | Expiry map with TTL per key |
-| Evict item | Strategy's `evict()` | Each strategy evicts differently |
-| Get/Put item | `Cache.get()`/`put()` | Delegates to strategy for eviction |
-| Record stats | `CacheStats.record_hit()` | SRP: stats are separate |
-
-## Phase 5: The Node + Doubly Linked List (LRU)
+## Phase 3: Write LRU First, Exactly
 
 ```python
-class Node:
-    def __init__(self, key, value):
-        self.key = key
-        self.value = value
-        self.prev = None
-        self.next = None
+def get(self, key):
+    node = self._map.get(key)
+    if node is None: return default
+    self._list.remove(node); self._list.push_front(node)
+    return node.value
 
-# LRUStrategy maintains:
-# _head (most recent) ←→ ... ←→ _tail (least recent)
-# _node_map: Dict[Any, Node]  # O(1) lookup
+def put(self, key, value):
+    node = self._map.get(key)
+    if node:                                   # overwrite = use
+        node.value = value
+        self._list.remove(node); self._list.push_front(node)
+        return
+    if len(self._map) >= self._capacity:       # evict before insert
+        lru = self._list.back()
+        self._list.remove(lru); del self._map[lru.key]
+    node = Node(key, value)
+    self._map[key] = node; self._list.push_front(node)
 ```
 
-On access: move node to front (O(1))
-On eviction: remove from tail (O(1))
-On capacity reached: evict tail, add to front
+Then point out the duplication with LFU and refactor into hooks — interviewers like seeing the abstraction emerge from working code rather than up-front.
 
-## Phase 6: Strategy Pattern
+## Phase 4: LFU — the One Subtle Line
 
-```python
-class EvictionStrategy(ABC):
-    def access(self, key, node)     # Called on get/put
-    def add(self, key, node)        # Called on put (new key)
-    def evict(self) -> Any          # Return key to evict
-    def remove(self, key)           # Called on explicit remove
+When a hit moves a node from bucket `f` to `f+1` and bucket `f` becomes empty, `min_freq` changes **only if** `f == min_freq`, and then it becomes exactly `f+1`. A new insert always resets `min_freq = 1`. Those two rules are the whole O(1) trick.
 
-class LRUStrategy(EvictionStrategy):  # Doubly linked list
-class LFUStrategy(EvictionStrategy):  # Frequency tracking
-class TTLStrategy(EvictionStrategy):  # Expiry time checks
-```
+## Phase 5: Quick Checklist
 
-The `Cache` class doesn't know *how* eviction works — it just calls `strategy.evict()`.
-
-## Phase 7: Decorator Pattern for Stats
-
-```python
-class CacheWithStats:
-    def __init__(self, cache: Cache):
-        self._cache = cache
-        self._stats = CacheStats()
-    
-    def get(self, key):
-        result = self._cache.get(key)
-        if result: self._stats.record_hit()
-        else: self._stats.record_miss()
-        return result
-```
-
-This adds stats tracking without modifying the Cache class.
-
-## Phase 8: Quick Checklist
-
-✅ **Strategy Pattern:** Eviction algorithms are swappable
-✅ **LRU:** O(1) get/put/evict with doubly linked list + map
-✅ **LFU:** O(1) with frequency buckets
-✅ **Decorator Pattern:** Stats tracking doesn't pollute Cache
-✅ **SRP:** Cache stores, Strategy evicts, Stats tracks
-✅ **OCP:** New eviction strategy → new subclass, zero Cache changes
+✅ Map + DLL with sentinels; node stores its key
+✅ Overwrite doesn't grow the cache and counts as a use
+✅ LFU ties broken by recency; `min_freq` maintained in O(1)
+✅ TTL separate from eviction; lazy + heap; expired entries reclaimed before evicting live ones
+✅ Injectable clock (monotonic); tests never `sleep` for TTL
+✅ One lock per cache, RW lock rejected with a reason; striping and single-flight discussed

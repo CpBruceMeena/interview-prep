@@ -1,20 +1,176 @@
 # Splitwise — Implementation
 
-> Python implementation of the Splitwise system following SOLID principles and design patterns.
+> Single-file Python implementation (stdlib only, 3.10+). Money is exact, splits always sum to the amount, balances always sum to zero, and the service is thread-safe.
 
+---
+
+## ▶️ How to Run
+
+```bash
+cd python-low-level-design/splitwise-expense-sharing
+python3 splitwise_expense.py                      # deterministic demo
+python3 -m unittest test_splitwise_expense        # 20 tests, < 1 s
+```
+
+---
+
+## 🗺️ Map of the Code
+
+| Piece | Role | Why it is shaped this way |
+|-------|------|---------------------------|
+| `to_money`, `to_cents`, `from_cents` | Money boundary | `Decimal` quantized to cents; `float` raises `TypeError`, sub-cent input raises `ValueError` |
+| `allocate(total_cents, weights)` | Largest-remainder allocation | The one place rounding happens; every proportional split goes through it |
+| `SplitStrategy` (ABC) → `EqualSplit`, `ExactSplit`, `PercentageSplit`, `ShareSplit` | Split rules | Strategy pattern; a new rule is a new class plus one factory entry |
+| `SplitStrategyFactory.get()` | `SplitType` → strategy | Strategies are stateless, so the factory holds singletons |
+| `Expense`, `Payment` | Immutable ledger entries | `frozen=True`; `Expense.__post_init__` enforces `sum(shares) == amount` |
+| `BalanceSheet` | Running net balance per user | Updated in O(participants) per entry instead of recomputed per read |
+| `Group` | Members + its own `BalanceSheet` | Refuses to remove a member whose balance is non-zero |
+| `SettlementStrategy` (ABC) → `GreedySettlement`, `OptimalSettlement` | "Simplify debts" | Heuristic vs exact; caller picks |
+| `SplitwiseService` | Facade | Validation, id generation, one `RLock` around every read and write |
+
+---
+
+## 🔑 Key Design Decisions
+
+### 1. Money is `Decimal`, rounding happens in exactly one place
+
+The original version used `float` and patched the rounding difference onto the first participant. That breaks in two ways that are easy to show in an interview:
+
+- `EqualSplit` of `0.05` across 7 people gave one person a share of **-0.01** (each share rounded up to 0.01, so the "fix-up" went negative).
+- `PercentageSplit` of `10.00` at 33.33/33.33/33.34 summed to **9.99**: no remainder handling at all.
+
+`allocate()` fixes both with the largest-remainder (Hamilton) method:
+
+1. Compute each exact pro-rata amount in cents as a `Fraction` (no rounding yet).
+2. Floor every amount. The leftover is a whole number of cents, always `< len(weights)`.
+3. Give one extra cent to the participants with the largest fractional remainders, ties broken by input order.
+
+So the shares sum to the total exactly, nobody is more than one cent from their exact share, and the result is deterministic. `100.00 / 3` comes out as `33.34, 33.33, 33.33`.
+
+### 2. A running ledger, not recomputation
+
+`BalanceSheet` stores net balance per user (positive = is owed). An expense credits the payer the full amount and debits each participant their share; a `Payment` (settle-up) credits the payer and debits the receiver. Both keep the invariant **sum of balances == 0**, which the tests check after a concurrent run. Zero balances are dropped so `snapshot()` only lists people who owe or are owed.
+
+`delete_expense` applies the same expense with `sign=-1`. Editing is delete plus add, which is also how you would make edits auditable.
+
+### 3. Debt simplification: a heuristic and an exact version
+
+`GreedySettlement` matches the largest debtor with the largest creditor using two heaps. Each transfer zeroes at least one person, so it needs at most **n − 1** transfers for n non-zero balances, in O(n log n).
+
+It is **not** optimal. The minimum is **n − k**, where k is the largest number of disjoint zero-sum subgroups the balances split into (a subgroup of m people settles in m − 1 transfers). Finding k is NP-hard (subset-sum style), so `OptimalSettlement` does an O(2ⁿ · n) bitmask DP for n ≤ 12 and falls back to greedy above that. The demo shows a case where greedy needs 4 transfers and the optimum is 3:
+
+```
+balances {A: -8, B: -7, C: -2, D: +9, E: +8}
+greedy : A->D 8, B->E 7, C->D 1, C->E 1      # 4
+optimal: A->E 8, B->D 7, C->D 2              # 3  (A,E) is a zero-sum pair
+```
+
+### 4. Thread-safety
+
+Every public method on `SplitwiseService` holds one `RLock`. That makes "validate membership → compute shares → store expense → update ledger" atomic, and id generation (`itertools.count`) race-free. `get_settlement_plan` takes a snapshot under the lock and runs the (possibly exponential) settlement algorithm outside it. The next step for contention is a lock per group, since groups do not share ledgers; personal (non-group) expenses would then need their own lock.
+
+### 5. Validation lives at the facade
+
+Unknown user/group → `NotFoundError`. Duplicate participants, non-positive amounts, wrong number of split values, percentages not summing to 100, exact amounts not summing to the total → `InvalidSplitError`. Payer or participant outside the group → `SplitwiseError`. Strategies validate their own `values`; the facade validates everything that needs service state.
+
+---
+
+## 🧩 Where to Extend
+
+| Requirement | Change |
+|-------------|--------|
+| New split rule (e.g. "equal plus adjustments") | Subclass `SplitStrategy`, add a `SplitType` member and a factory entry |
+| Multiple payers | Replace `Expense.paid_by` with `paid: Mapping[str, Decimal]`; `BalanceSheet.apply_expense` credits each payer |
+| Multi-currency | One `BalanceSheet` per (group, currency); convert only at settle time, with the rate recorded on the `Payment` |
+| "Who owes whom" without simplification | Add a pairwise ledger `Dict[(debtor, creditor), Decimal]` beside the net ledger |
+| Notifications | Publish an event after the ledger update, outside the lock |
+| Idempotent creates from mobile retries | `add_expense(..., request_id)` and a `request_id → expense_id` map checked under the lock |
+
+---
+
+## 📄 Full Source
+
+<!-- source: splitwise_expense.py -->
 ```python
 """
 Splitwise - Expense Sharing System - Low Level Design
 -------------------------------------------------------
-Design Principles: SOLID, Strategy Pattern, Observer Pattern
+Patterns: Strategy (split rules, settlement algorithms), Factory (split lookup),
+Facade (SplitwiseService).
+
+Money rules (the part interviewers actually probe):
+  * Money is Decimal quantized to cents. Floats are rejected at the boundary,
+    because 0.1 + 0.2 != 0.3 and balances must sum to exactly zero.
+  * Every split is allocated in integer cents with the largest-remainder
+    method, so the shares always sum to the expense amount exactly and no
+    share is more than one cent away from its exact pro-rata value.
+  * The ledger keeps a running net balance per user per group. Invariant:
+    the balances in any ledger sum to exactly 0.
+
+Concurrency: one service-wide lock makes every mutation (expense + ledger
+update) atomic and every read consistent. Per-group locks are the next step if
+contention matters; see HIGH_LEVEL_DESIGN.md.
 """
 
+from __future__ import annotations
+
+import heapq
+import itertools
+import math
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
-import uuid
+from fractions import Fraction
+from types import MappingProxyType
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Union
+
+CENT = Decimal("0.01")
+MoneyLike = Union[Decimal, int, str]
+
+
+def to_money(value: MoneyLike) -> Decimal:
+    """Parse a money amount. Rejects floats and sub-cent precision."""
+    if isinstance(value, (float, bool)):
+        raise TypeError(f"money must be Decimal, int or str, not {type(value).__name__}")
+    amount = Decimal(value)
+    if not amount.is_finite() or amount != amount.quantize(CENT):
+        raise ValueError(f"invalid money amount: {value!r}")
+    return amount.quantize(CENT)
+
+
+def to_cents(amount: Decimal) -> int:
+    return int(amount * 100)
+
+
+def from_cents(cents: int) -> Decimal:
+    return Decimal(cents).scaleb(-2)
+
+
+def allocate(total_cents: int, weights: Sequence[Decimal]) -> List[int]:
+    """Split total_cents in proportion to weights (largest-remainder method).
+
+    Exact pro-rata amounts are computed as Fractions, floored, and the leftover
+    cents (always fewer than len(weights)) go to the largest fractional
+    remainders, ties broken by position. Result sums to total_cents exactly.
+    """
+    if not weights:
+        raise ValueError("need at least one participant")
+    if any(w < 0 for w in weights):
+        raise ValueError("weights must be non-negative")
+    weight_sum = sum(Fraction(w) for w in weights)
+    if weight_sum == 0:
+        raise ValueError("weights must not all be zero")
+
+    exact = [Fraction(total_cents) * Fraction(w) / weight_sum for w in weights]
+    floors = [math.floor(x) for x in exact]
+    leftover = total_cents - sum(floors)
+    by_remainder = sorted(range(len(exact)), key=lambda i: (-(exact[i] - floors[i]), i))
+    for i in by_remainder[:leftover]:
+        floors[i] += 1
+    return floors
 
 
 class SplitType(Enum):
@@ -22,7 +178,6 @@ class SplitType(Enum):
     EXACT = "Exact"
     PERCENTAGE = "Percentage"
     SHARE = "Share"
-    ADJUSTMENT = "Adjustment"
 
 
 class ExpenseCategory(Enum):
@@ -34,429 +189,493 @@ class ExpenseCategory(Enum):
     OTHER = "Other"
 
 
-@dataclass
+class SplitwiseError(Exception):
+    """Base class for domain errors."""
+
+
+class NotFoundError(SplitwiseError):
+    pass
+
+
+class InvalidSplitError(SplitwiseError, ValueError):
+    pass
+
+
+@dataclass(frozen=True)
 class User:
-    """Represents a user in the system"""
     user_id: str
     name: str
     email: str
-    phone: str = ""
-
-    def __hash__(self) -> int:
-        return hash(self.user_id)
 
     def __str__(self) -> str:
         return self.name
 
 
-# --- Split Strategy (Strategy Pattern - OCP) ---
+# --- Split strategies (Strategy pattern; add a rule = add a class) ---
 
 class SplitStrategy(ABC):
-    """Interface Segregation: Specific to expense splitting"""
+    """Turns (amount, participants, per-participant values) into exact shares."""
 
     @abstractmethod
-    def calculate_shares(self, total_amount: float,
-                         participants: List[User],
-                         values: Optional[List[float]] = None) -> Dict[str, float]:
-        pass
+    def calculate_shares(self, amount: Decimal, participant_ids: Sequence[str],
+                         values: Optional[Sequence[MoneyLike]]) -> Dict[str, Decimal]:
+        ...
+
+    @staticmethod
+    def _require_values(participant_ids: Sequence[str],
+                        values: Optional[Sequence[MoneyLike]]) -> List[Decimal]:
+        if values is None or len(values) != len(participant_ids):
+            raise InvalidSplitError("need exactly one value per participant")
+        if any(isinstance(v, (float, bool)) for v in values):
+            raise InvalidSplitError("split values must be Decimal, int or str, not float")
+        parsed = [Decimal(v) for v in values]
+        if any(v < 0 for v in parsed):
+            raise InvalidSplitError("split values must be non-negative")
+        return parsed
+
+    @staticmethod
+    def _proportional(amount: Decimal, participant_ids: Sequence[str],
+                      weights: Sequence[Decimal]) -> Dict[str, Decimal]:
+        cents = allocate(to_cents(amount), weights)
+        return {uid: from_cents(c) for uid, c in zip(participant_ids, cents)}
 
 
 class EqualSplit(SplitStrategy):
-    def calculate_shares(self, total_amount: float,
-                         participants: List[User],
-                         values: Optional[List[float]] = None) -> Dict[str, float]:
-        share = round(total_amount / len(participants), 2)
-        result = {u.user_id: share for u in participants}
-        # Handle rounding difference
-        total = sum(result.values())
-        diff = round(total_amount - total, 2)
-        if diff != 0:
-            result[participants[0].user_id] = round(share + diff, 2)
-        return result
+    def calculate_shares(self, amount, participant_ids, values):
+        if values is not None:
+            raise InvalidSplitError("equal split takes no values")
+        return self._proportional(amount, participant_ids, [Decimal(1)] * len(participant_ids))
 
 
 class ExactSplit(SplitStrategy):
-    def calculate_shares(self, total_amount: float,
-                         participants: List[User],
-                         values: Optional[List[float]] = None) -> Dict[str, float]:
-        if not values or len(values) != len(participants):
-            raise ValueError("Exact split requires values for each participant")
-        if sum(values) != total_amount:
-            raise ValueError(f"Exact amounts must sum to {total_amount}")
-        return {u.user_id: v for u, v in zip(participants, values)}
+    def calculate_shares(self, amount, participant_ids, values):
+        exact = [to_money(v) for v in self._require_values(participant_ids, values)]
+        if sum(exact) != amount:
+            raise InvalidSplitError(f"exact amounts sum to {sum(exact)}, expected {amount}")
+        return dict(zip(participant_ids, exact))
 
 
 class PercentageSplit(SplitStrategy):
-    def calculate_shares(self, total_amount: float,
-                         participants: List[User],
-                         values: Optional[List[float]] = None) -> Dict[str, float]:
-        if not values or len(values) != len(participants):
-            raise ValueError("Percentage split requires values for each participant")
-        if sum(values) != 100.0:
-            raise ValueError("Percentages must sum to 100")
-        return {u.user_id: round(total_amount * v / 100, 2)
-                for u, v in zip(participants, values)}
+    def calculate_shares(self, amount, participant_ids, values):
+        percents = self._require_values(participant_ids, values)
+        if sum(percents) != 100:
+            raise InvalidSplitError(f"percentages sum to {sum(percents)}, expected 100")
+        return self._proportional(amount, participant_ids, percents)
 
 
 class ShareSplit(SplitStrategy):
-    def calculate_shares(self, total_amount: float,
-                         participants: List[User],
-                         values: Optional[List[float]] = None) -> Dict[str, float]:
-        if not values or len(values) != len(participants):
-            raise ValueError("Share split requires values for each participant")
-        total_shares = sum(values)
-        return {u.user_id: round(total_amount * v / total_shares, 2)
-                for u, v in zip(participants, values)}
+    """Ratio split, e.g. 2:1:1 for a couple and two singles."""
 
+    def calculate_shares(self, amount, participant_ids, values):
+        ratios = self._require_values(participant_ids, values)
+        if sum(ratios) == 0:
+            raise InvalidSplitError("at least one share must be positive")
+        return self._proportional(amount, participant_ids, ratios)
 
-# --- Split Strategy Factory ---
 
 class SplitStrategyFactory:
-    _strategies = {
-        SplitType.EQUAL: EqualSplit,
-        SplitType.EXACT: ExactSplit,
-        SplitType.PERCENTAGE: PercentageSplit,
-        SplitType.SHARE: ShareSplit,
+    _strategies: Dict[SplitType, SplitStrategy] = {
+        SplitType.EQUAL: EqualSplit(),
+        SplitType.EXACT: ExactSplit(),
+        SplitType.PERCENTAGE: PercentageSplit(),
+        SplitType.SHARE: ShareSplit(),
     }
 
     @classmethod
-    def get_strategy(cls, split_type: SplitType) -> SplitStrategy:
-        strategy_class = cls._strategies.get(split_type)
-        if not strategy_class:
-            raise ValueError(f"Unknown split type: {split_type}")
-        return strategy_class()
+    def get(cls, split_type: SplitType) -> SplitStrategy:
+        try:
+            return cls._strategies[split_type]
+        except KeyError:
+            raise InvalidSplitError(f"unsupported split type: {split_type}") from None
 
 
-# --- Expense (SRP) ---
+# --- Ledger entries (immutable once recorded) ---
 
+@dataclass(frozen=True)
 class Expense:
-    """Single Responsibility: Represents an expense"""
+    expense_id: str
+    description: str
+    amount: Decimal
+    paid_by: str
+    split_type: SplitType
+    shares: Mapping[str, Decimal]
+    category: ExpenseCategory = ExpenseCategory.OTHER
+    group_id: Optional[str] = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def __init__(self, expense_id: str, description: str, amount: float,
-                 paid_by: User, participants: List[User],
-                 split_type: SplitType = SplitType.EQUAL,
-                 category: ExpenseCategory = ExpenseCategory.OTHER,
-                 values: Optional[List[float]] = None,
-                 group_id: Optional[str] = None):
-        self._expense_id = expense_id
-        self._description = description
-        self._amount = amount
-        self._paid_by = paid_by
-        self._participants = participants
-        self._split_type = split_type
-        self._category = category
-        self._group_id = group_id
-        self._created_at = datetime.now()
-
-        # Calculate shares
-        strategy = SplitStrategyFactory.get_strategy(split_type)
-        self._shares = strategy.calculate_shares(amount, participants, values)
-
-        # Record who paid
-        self._paid_amounts: Dict[str, float] = {paid_by.user_id: amount}
-
-    @property
-    def expense_id(self) -> str:
-        return self._expense_id
-
-    @property
-    def description(self) -> str:
-        return self._description
-
-    @property
-    def amount(self) -> float:
-        return self._amount
-
-    @property
-    def paid_by(self) -> User:
-        return self._paid_by
-
-    @property
-    def shares(self) -> Dict[str, float]:
-        return dict(self._shares)
-
-    def get_share_for_user(self, user_id: str) -> float:
-        return self._shares.get(user_id, 0.0)
+    def __post_init__(self) -> None:
+        if sum(self.shares.values()) != self.amount:
+            raise InvalidSplitError("shares must sum to the expense amount")
+        object.__setattr__(self, "shares", MappingProxyType(dict(self.shares)))
 
     def __str__(self) -> str:
-        return f"{self._description}: ${self._amount:.2f} paid by {self._paid_by.name}"
+        return f"{self.description}: ${self.amount} paid by {self.paid_by}"
 
 
-# --- Group (SRP) ---
+@dataclass(frozen=True)
+class Payment:
+    """A settle-up: from_user hands to_user real money outside the app."""
+    payment_id: str
+    from_user: str
+    to_user: str
+    amount: Decimal
+    group_id: Optional[str] = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class BalanceSheet:
+    """Running net balance per user. Positive = is owed, negative = owes.
+
+    Updated incrementally (O(participants) per entry) rather than recomputed
+    from all expenses on every read. Not thread-safe on its own; the service
+    lock guards it.
+    """
+
+    def __init__(self) -> None:
+        self._net: Dict[str, Decimal] = {}
+
+    def _add(self, user_id: str, delta: Decimal) -> None:
+        value = self._net.get(user_id, Decimal("0.00")) + delta
+        if value == 0:
+            self._net.pop(user_id, None)
+        else:
+            self._net[user_id] = value
+
+    def apply_expense(self, expense: Expense, sign: int = 1) -> None:
+        self._add(expense.paid_by, sign * expense.amount)
+        for user_id, share in expense.shares.items():
+            self._add(user_id, -sign * share)
+
+    def apply_payment(self, payment: Payment) -> None:
+        self._add(payment.from_user, payment.amount)
+        self._add(payment.to_user, -payment.amount)
+
+    def balance_of(self, user_id: str) -> Decimal:
+        return self._net.get(user_id, Decimal("0.00"))
+
+    def snapshot(self) -> Dict[str, Decimal]:
+        return dict(self._net)
+
 
 class Group:
-    """Single Responsibility: Manages a group of users with shared expenses"""
-
-    def __init__(self, group_id: str, name: str, description: str = ""):
-        self._group_id = group_id
-        self._name = name
-        self._description = description
-        self._members: Dict[str, User] = {}
-        self._expenses: List[Expense] = []
+    def __init__(self, group_id: str, name: str) -> None:
+        self.group_id = group_id
+        self.name = name
+        self._member_ids: List[str] = []
+        self.ledger = BalanceSheet()
 
     @property
-    def group_id(self) -> str:
-        return self._group_id
+    def member_ids(self) -> List[str]:
+        return list(self._member_ids)
 
-    @property
-    def name(self) -> str:
-        return self._name
+    def is_member(self, user_id: str) -> bool:
+        return user_id in self._member_ids
 
-    @property
-    def members(self) -> List[User]:
-        return list(self._members.values())
-
-    def add_member(self, user: User) -> None:
-        self._members[user.user_id] = user
+    def add_member(self, user_id: str) -> None:
+        if user_id not in self._member_ids:
+            self._member_ids.append(user_id)
 
     def remove_member(self, user_id: str) -> None:
-        self._members.pop(user_id, None)
-
-    def add_expense(self, expense: Expense) -> None:
-        self._expenses.append(expense)
-
-    @property
-    def expenses(self) -> List[Expense]:
-        return list(self._expenses)
+        if self.ledger.balance_of(user_id) != 0:
+            raise SplitwiseError("cannot remove a member with a non-zero balance")
+        self._member_ids.remove(user_id)
 
     def __str__(self) -> str:
-        return f"Group: {self._name} ({len(self._members)} members)"
+        return f"Group: {self.name} ({len(self._member_ids)} members)"
 
 
-# --- Balance Calculator (SRP) ---
+# --- Settlement ("simplify debts") strategies ---
 
-class BalanceCalculator:
-    """Single Responsibility: Calculates balances between users"""
-
-    @staticmethod
-    def calculate_balances(expenses: List[Expense],
-                           members: Optional[List[User]] = None) -> Dict[str, float]:
-        """Calculate net balance for each user (positive = owed money)"""
-        balances: Dict[str, float] = {}
-
-        for expense in expenses:
-            # Person who paid is owed money
-            payer = expense.paid_by.user_id
-            balances[payer] = balances.get(payer, 0) + expense.amount
-
-            # Each participant owes their share
-            for user_id, share in expense.shares.items():
-                if user_id != payer:
-                    balances[user_id] = balances.get(user_id, 0) - share
-                elif user_id == payer:
-                    balances[payer] = balances.get(payer, 0) - share
-
-        return balances
-
-    @staticmethod
-    def simplify_debts(balances: Dict[str, float]) -> List[Tuple[str, str, float]]:
-        """Simplifies debts to minimize transactions.
-        Uses greedy algorithm to find max creditor and debtor."""
-        # Filter out zero balances
-        debts = [(uid, amt) for uid, amt in balances.items() if abs(amt) > 0.01]
-        debts.sort(key=lambda x: x[1])  # Sort by balance
-
-        transactions: List[Tuple[str, str, float]] = []
-        i, j = 0, len(debts) - 1
-
-        while i < j:
-            debtor, debt_amt = debts[i]
-            creditor, credit_amt = debts[j]
-
-            amount = min(-debt_amt, credit_amt)
-            amount = round(amount, 2)
-
-            if amount > 0.01:
-                transactions.append((debtor, creditor, amount))
-
-            debts[i] = (debtor, debt_amt + amount)
-            debts[j] = (creditor, credit_amt - amount)
-
-            if abs(debts[i][1]) < 0.01:
-                i += 1
-            if abs(debts[j][1]) < 0.01:
-                j -= 1
-
-        return transactions
+class Transfer(NamedTuple):
+    debtor: str
+    creditor: str
+    amount: Decimal
 
 
-# --- Splitwise Service (Facade) ---
+class SettlementStrategy(ABC):
+    @abstractmethod
+    def settle(self, balances: Mapping[str, Decimal]) -> List[Transfer]:
+        ...
+
+
+class GreedySettlement(SettlementStrategy):
+    """Repeatedly match the largest debtor with the largest creditor.
+
+    O(n log n). Each transfer zeroes at least one person, so it never needs
+    more than n - 1 transfers (n = people with a non-zero balance). It is not
+    always minimal: for {A:-8, B:-7, C:-2, D:+9, E:+8} it pairs A with D and
+    needs 4 transfers, missing the zero-sum pair (A, E) that allows 3.
+    """
+
+    def settle(self, balances: Mapping[str, Decimal]) -> List[Transfer]:
+        debtors = [(to_cents(b), uid) for uid, b in balances.items() if b < 0]          # most negative first
+        creditors = [(-to_cents(b), uid) for uid, b in balances.items() if b > 0]       # largest first
+        if sum(c for c, _ in debtors) + sum(-c for c, _ in creditors) != 0:
+            raise ValueError("balances must sum to zero")
+        heapq.heapify(debtors)
+        heapq.heapify(creditors)
+        transfers: List[Transfer] = []
+        while debtors and creditors:
+            owed, debtor = heapq.heappop(debtors)            # owed < 0
+            due, creditor = heapq.heappop(creditors)          # due < 0 (negated)
+            cents = min(-owed, -due)
+            transfers.append(Transfer(debtor, creditor, from_cents(cents)))
+            if owed + cents:
+                heapq.heappush(debtors, (owed + cents, debtor))
+            if due + cents:
+                heapq.heappush(creditors, (due + cents, creditor))
+        return transfers
+
+
+class OptimalSettlement(SettlementStrategy):
+    """Minimum number of transfers, exact.
+
+    Minimum transfers = n - k, where k is the largest number of disjoint
+    zero-sum subgroups the n non-zero balances can be partitioned into
+    (each subgroup of size m settles in m - 1 transfers). Finding k is
+    NP-hard, so this is a bitmask DP in O(2^n * n). Above max_people it
+    falls back to the greedy heuristic.
+    """
+
+    def __init__(self, max_people: int = 12, fallback: Optional[SettlementStrategy] = None):
+        self._max_people = max_people
+        self._fallback = fallback or GreedySettlement()
+
+    def settle(self, balances: Mapping[str, Decimal]) -> List[Transfer]:
+        people = sorted(uid for uid, b in balances.items() if b != 0)
+        n = len(people)
+        if n > self._max_people:
+            return self._fallback.settle(balances)
+        cents = [to_cents(balances[uid]) for uid in people]
+        if sum(cents) != 0:
+            raise ValueError("balances must sum to zero")
+
+        full = (1 << n) - 1
+        subset_sum = [0] * (full + 1)
+        best = [0] * (full + 1)          # max zero-sum subgroups within mask
+        for mask in range(1, full + 1):
+            low = (mask & -mask).bit_length() - 1
+            subset_sum[mask] = subset_sum[mask & (mask - 1)] + cents[low]
+            best[mask] = max(best[mask ^ (1 << i)] for i in range(n) if mask >> i & 1) \
+                + (subset_sum[mask] == 0)
+
+        # Walk the DP back to recover one optimal partition into zero-sum subgroups.
+        order, mask = [], full
+        while mask:
+            target = best[mask] - (subset_sum[mask] == 0)
+            i = next(i for i in range(n) if mask >> i & 1 and best[mask ^ (1 << i)] == target)
+            order.append(i)
+            mask ^= 1 << i
+        transfers: List[Transfer] = []
+        subgroup: Dict[str, Decimal] = {}
+        mask = full
+        for i in order:
+            subgroup[people[i]] = balances[people[i]]
+            mask ^= 1 << i
+            if mask == 0 or subset_sum[mask] == 0:
+                transfers += self._fallback.settle(subgroup)   # m - 1 transfers inside a subgroup
+                subgroup = {}
+        return transfers
+
+
+# --- Facade ---
 
 class SplitwiseService:
-    """Facade for the entire expense sharing system"""
+    """Entry point. Thread-safe: one lock covers every read and write."""
 
-    def __init__(self):
+    def __init__(self, settlement: Optional[SettlementStrategy] = None) -> None:
+        self._lock = threading.RLock()
+        self._ids = itertools.count(1)
         self._users: Dict[str, User] = {}
         self._groups: Dict[str, Group] = {}
         self._expenses: Dict[str, Expense] = {}
+        self._payments: List[Payment] = []
+        self._personal = BalanceSheet()       # expenses outside any group
+        self._settlement = settlement or GreedySettlement()
 
-    def add_user(self, name: str, email: str, phone: str = "") -> User:
-        user_id = f"U-{uuid.uuid4().hex[:6].upper()}"
-        user = User(user_id, name, email, phone)
-        self._users[user_id] = user
+    def _next_id(self, prefix: str) -> str:
+        return f"{prefix}{next(self._ids)}"
+
+    # users & groups
+
+    def add_user(self, name: str, email: str) -> User:
+        with self._lock:
+            user = User(self._next_id("U"), name, email)
+            self._users[user.user_id] = user
+            return user
+
+    def get_user(self, user_id: str) -> User:
+        with self._lock:
+            return self._require_user(user_id)
+
+    def create_group(self, name: str, member_ids: Sequence[str] = ()) -> Group:
+        with self._lock:
+            for uid in member_ids:
+                self._require_user(uid)
+            group = Group(self._next_id("G"), name)
+            for uid in member_ids:
+                group.add_member(uid)
+            self._groups[group.group_id] = group
+            return group
+
+    def add_member(self, group_id: str, user_id: str) -> None:
+        with self._lock:
+            self._require_user(user_id)
+            self._require_group(group_id).add_member(user_id)
+
+    def remove_member(self, group_id: str, user_id: str) -> None:
+        with self._lock:
+            self._require_group(group_id).remove_member(user_id)
+
+    # expenses & payments
+
+    def add_expense(self, description: str, amount: MoneyLike, paid_by: str,
+                    participant_ids: Sequence[str],
+                    split_type: SplitType = SplitType.EQUAL,
+                    values: Optional[Sequence[MoneyLike]] = None,
+                    group_id: Optional[str] = None,
+                    category: ExpenseCategory = ExpenseCategory.OTHER) -> Expense:
+        total = to_money(amount)
+        if total <= 0:
+            raise InvalidSplitError("amount must be positive")
+        if not participant_ids:
+            raise InvalidSplitError("need at least one participant")
+        if len(set(participant_ids)) != len(participant_ids):
+            raise InvalidSplitError("duplicate participant")
+
+        with self._lock:
+            ledger = self._ledger_for(group_id, [paid_by, *participant_ids])
+            shares = SplitStrategyFactory.get(split_type).calculate_shares(
+                total, participant_ids, values)
+            expense = Expense(self._next_id("E"), description, total, paid_by,
+                              split_type, shares, category, group_id)
+            self._expenses[expense.expense_id] = expense
+            ledger.apply_expense(expense)
+            return expense
+
+    def delete_expense(self, expense_id: str) -> None:
+        """Reverse an expense's ledger effect (Splitwise lets you undo/edit)."""
+        with self._lock:
+            expense = self._expenses.pop(expense_id, None)
+            if expense is None:
+                raise NotFoundError(f"expense {expense_id} not found")
+            ledger = self._groups[expense.group_id].ledger if expense.group_id else self._personal
+            ledger.apply_expense(expense, sign=-1)
+
+    def record_payment(self, from_user: str, to_user: str, amount: MoneyLike,
+                       group_id: Optional[str] = None) -> Payment:
+        value = to_money(amount)
+        if value <= 0:
+            raise InvalidSplitError("payment must be positive")
+        if from_user == to_user:
+            raise InvalidSplitError("cannot pay yourself")
+        with self._lock:
+            ledger = self._ledger_for(group_id, [from_user, to_user])
+            payment = Payment(self._next_id("P"), from_user, to_user, value, group_id)
+            self._payments.append(payment)
+            ledger.apply_payment(payment)
+            return payment
+
+    # queries
+
+    def get_balance(self, user_id: str) -> Decimal:
+        """Net across all groups and personal expenses. Positive = is owed."""
+        with self._lock:
+            self._require_user(user_id)
+            return self._personal.balance_of(user_id) + sum(
+                (g.ledger.balance_of(user_id) for g in self._groups.values()), Decimal("0.00"))
+
+    def get_group_balances(self, group_id: str) -> Dict[str, Decimal]:
+        with self._lock:
+            return self._require_group(group_id).ledger.snapshot()
+
+    def get_settlement_plan(self, group_id: str,
+                            strategy: Optional[SettlementStrategy] = None) -> List[Transfer]:
+        balances = self.get_group_balances(group_id)   # consistent snapshot, then compute unlocked
+        return (strategy or self._settlement).settle(balances)
+
+    # helpers (call with lock held)
+
+    def _require_user(self, user_id: str) -> User:
+        user = self._users.get(user_id)
+        if user is None:
+            raise NotFoundError(f"user {user_id} not found")
         return user
 
-    def get_user(self, user_id: str) -> Optional[User]:
-        return self._users.get(user_id)
-
-    def create_group(self, name: str, description: str = "",
-                     members: Optional[List[User]] = None) -> Group:
-        group_id = f"G-{uuid.uuid4().hex[:6].upper()}"
-        group = Group(group_id, name, description)
-        if members:
-            for member in members:
-                group.add_member(member)
-        self._groups[group_id] = group
+    def _require_group(self, group_id: str) -> Group:
+        group = self._groups.get(group_id)
+        if group is None:
+            raise NotFoundError(f"group {group_id} not found")
         return group
 
-    def get_group(self, group_id: str) -> Optional[Group]:
-        return self._groups.get(group_id)
-
-    def add_expense(self, description: str, amount: float,
-                    paid_by_user_id: str,
-                    participant_ids: List[str],
-                    split_type: SplitType = SplitType.EQUAL,
-                    category: ExpenseCategory = ExpenseCategory.OTHER,
-                    values: Optional[List[float]] = None,
-                    group_id: Optional[str] = None) -> Expense:
-        paid_by = self._users.get(paid_by_user_id)
-        if not paid_by:
-            raise ValueError(f"User {paid_by_user_id} not found")
-
-        participants = [self._users[uid] for uid in participant_ids]
-        if any(u is None for u in participants):
-            raise ValueError("One or more participants not found")
-
-        expense_id = f"E-{uuid.uuid4().hex[:8].upper()}"
-        expense = Expense(expense_id, description, amount, paid_by,
-                          participants, split_type, category, values, group_id)
-
-        self._expenses[expense_id] = expense
-
-        if group_id and group_id in self._groups:
-            self._groups[group_id].add_expense(expense)
-
-        return expense
-
-    def get_balance(self, user_id: str) -> float:
-        """Get net balance for a user across all expenses"""
-        balance = 0.0
-        for expense in self._expenses.values():
-            share = expense.get_share_for_user(user_id)
-            if expense.paid_by.user_id == user_id:
-                balance += expense.amount - share
-            else:
-                balance -= share
-        return round(balance, 2)
-
-    def get_group_balances(self, group_id: str) -> Dict[str, float]:
-        """Get balances within a group"""
-        group = self._groups.get(group_id)
-        if not group:
-            return {}
-        return BalanceCalculator.calculate_balances(group.expenses)
-
-    def get_simplified_debts(self, group_id: str) -> List[Tuple[str, str, float]]:
-        """Get simplified debt settlement plan"""
-        balances = self.get_group_balances(group_id)
-        return BalanceCalculator.simplify_debts(balances)
-
-    def get_all_balances(self) -> Dict[str, float]:
-        return BalanceCalculator.calculate_balances(list(self._expenses.values()))
+    def _ledger_for(self, group_id: Optional[str], user_ids: Sequence[str]) -> BalanceSheet:
+        for uid in user_ids:
+            self._require_user(uid)
+        if group_id is None:
+            return self._personal
+        group = self._require_group(group_id)
+        outsiders = [uid for uid in user_ids if not group.is_member(uid)]
+        if outsiders:
+            raise SplitwiseError(f"not members of {group.name}: {outsiders}")
+        return group.ledger
 
 
 # --- Demo ---
 
-def demo():
+def demo() -> None:
     print("=== Splitwise Expense Sharing Demo ===")
-    print("=" * 50)
+    sw = SplitwiseService()
+    alice, bob, charlie, diana = (sw.add_user(n, f"{n.lower()}@example.com")
+                                  for n in ("Alice", "Bob", "Charlie", "Diana"))
+    everyone = [alice.user_id, bob.user_id, charlie.user_id, diana.user_id]
+    trip = sw.create_group("Goa Trip", everyone)
+    print(f"\nCreated {trip}")
 
-    splitwise = SplitwiseService()
+    def name(uid: str) -> str:
+        return sw.get_user(uid).name
 
-    # Create users
-    alice = splitwise.add_user("Alice", "alice@email.com")
-    bob = splitwise.add_user("Bob", "bob@email.com")
-    charlie = splitwise.add_user("Charlie", "charlie@email.com")
-    diana = splitwise.add_user("Diana", "diana@email.com")
+    print("\n--- Adding expenses ---")
+    expenses = [
+        sw.add_expense("Dinner", "100.00", alice.user_id, everyone[:3],
+                       group_id=trip.group_id, category=ExpenseCategory.FOOD),
+        sw.add_expense("Cab", "60.00", bob.user_id, everyone,
+                       SplitType.PERCENTAGE, ["40", "20", "20", "20"], trip.group_id),
+        sw.add_expense("Hotel", "400.00", charlie.user_id, everyone,
+                       SplitType.SHARE, ["2", "1", "1", "0"], trip.group_id),
+        sw.add_expense("Drinks", "90.00", diana.user_id, [alice.user_id, diana.user_id],
+                       SplitType.EXACT, ["50.00", "40.00"], trip.group_id),
+    ]
+    for e in expenses:
+        shares = ", ".join(f"{name(u)}={s}" for u, s in e.shares.items())
+        print(f"  {e.description} ${e.amount} paid by {name(e.paid_by)} [{e.split_type.value}]: {shares}")
 
-    # Create a group for the trip
-    group = splitwise.create_group("Goa Trip 2025", "Summer vacation", [alice, bob, charlie, diana])
-    print(f"\nCreated: {group}")
+    print("\n--- Net balances (Dinner: 100 / 3 -> 33.34 + 33.33 + 33.33) ---")
+    balances = sw.get_group_balances(trip.group_id)
+    for uid in everyone:
+        print(f"  {name(uid)}: {balances.get(uid, Decimal('0.00')):+}")
+    assert sum(balances.values()) == 0
 
-    # Add expenses
-    print("\n--- Adding Expenses ---")
+    print("\n--- Settlement plan (greedy) ---")
+    plan = sw.get_settlement_plan(trip.group_id)
+    for t in plan:
+        print(f"  {name(t.debtor)} pays {name(t.creditor)} ${t.amount}")
 
-    # Dinner - paid by Alice, split equally
-    expense1 = splitwise.add_expense(
-        "Dinner at Beach Shack", 120.0, alice.user_id,
-        [alice.user_id, bob.user_id, charlie.user_id, diana.user_id],
-        SplitType.EQUAL, ExpenseCategory.FOOD, group_id=group.group_id
-    )
-    print(f"  Added: {expense1}")
+    print("\n--- Settling up ---")
+    for t in plan:
+        sw.record_payment(t.debtor, t.creditor, t.amount, trip.group_id)
+    print(f"  Balances after paying the plan: {sw.get_group_balances(trip.group_id) or 'all settled'}")
 
-    # Cab - paid by Bob, split equally
-    expense2 = splitwise.add_expense(
-        "Airport Cab", 60.0, bob.user_id,
-        [alice.user_id, bob.user_id, charlie.user_id, diana.user_id],
-        SplitType.EQUAL, ExpenseCategory.TRAVEL, group_id=group.group_id
-    )
-    print(f"  Added: {expense2}")
-
-    # Hotel - paid by Charlie with exact split
-    expense3 = splitwise.add_expense(
-        "Hotel Booking", 400.0, charlie.user_id,
-        [alice.user_id, bob.user_id, charlie.user_id, diana.user_id],
-        SplitType.EXACT, ExpenseCategory.TRAVEL,
-        values=[100.0, 100.0, 100.0, 100.0], group_id=group.group_id
-    )
-    print(f"  Added: {expense3}")
-
-    # Drinks - paid by Diana with shares
-    expense4 = splitwise.add_expense(
-        "Wine & Drinks", 90.0, diana.user_id,
-        [alice.user_id, charlie.user_id, diana.user_id],
-        SplitType.EQUAL, ExpenseCategory.ENTERTAINMENT,
-        group_id=group.group_id
-    )
-    print(f"  Added: {expense4}")
-
-    # Show balances
-    print("\n--- Individual Balances ---")
-    for user in [alice, bob, charlie, diana]:
-        balance = splitwise.get_balance(user.user_id)
-        status = "is owed" if balance > 0 else "owes"
-        print(f"  {user.name}: {status} ${abs(balance):.2f}")
-
-    # Show simplified debts
-    print("\n--- Simplified Debt Settlement ---")
-    debts = splitwise.get_simplified_debts(group.group_id)
-    for debtor_id, creditor_id, amount in debts:
-        debtor = splitwise.get_user(debtor_id)
-        creditor = splitwise.get_user(creditor_id)
-        print(f"  {debtor.name} pays {creditor.name}: ${amount:.2f}")
-
-    # Show balances by name
-    print("\n--- Group Balance Summary ---")
-    balances = splitwise.get_group_balances(group.group_id)
-    for uid, bal in sorted(balances.items(), key=lambda x: x[1], reverse=True):
-        user = splitwise.get_user(uid)
-        if user:
-            print(f"  {user.name}: {'+$' if bal >= 0 else '-$'}{abs(bal):.2f}")
+    print("\n--- Greedy vs optimal on a tricky case ---")
+    tricky = {"A": Decimal("-8"), "B": Decimal("-7"), "C": Decimal("-2"),
+              "D": Decimal("9"), "E": Decimal("8")}
+    print(f"  balances {dict((k, str(v)) for k, v in tricky.items())}")
+    for label, strategy in (("greedy ", GreedySettlement()), ("optimal", OptimalSettlement())):
+        transfers = strategy.settle(tricky)
+        print(f"  {label}: {len(transfers)} transfers: "
+              + ", ".join(f"{t.debtor}->{t.creditor} {t.amount}" for t in transfers))
 
 
 if __name__ == "__main__":
     demo()
 ```
-
----
-
-## ▶️ How to Run
-
-```bash
-cd low-level-design/splitwise-expense-sharing
-python splitwise_expense.py
-```
-
-## 🧩 Design Patterns
-
-See the [Interview Questions](INTERVIEW_QUESTIONS.md) for a detailed breakdown of design patterns and SOLID principles applied in this implementation.
+<!-- /source -->

@@ -3,7 +3,7 @@
 > **Database:** PostgreSQL 16 + Redis 7  
 > **Purpose:** Online chess platform — game state, player profiles, matchmaking, tournaments, analytics  
 > **Scale:** 1M+ users, 100K concurrent games, 500K games/day  
-> **Tables:** 12 tables + 2 partitioned tables
+> **Tables:** 12 tables (`game_moves` is hash-partitioned)
 
 ---
 
@@ -49,7 +49,7 @@
 -- Scale: 1M+ users, 100K concurrent games, 500K games/day
 -- ============================================================
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- gen_random_uuid() is built in since PostgreSQL 13; no extension needed.
 
 -- -----------------------------------------------------------
 -- 1. USERS
@@ -73,8 +73,7 @@ CREATE TABLE users (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_users_username ON users(username);
-CREATE INDEX idx_users_email ON users(email);
+-- username/email already have indexes via UNIQUE; don't duplicate them.
 CREATE INDEX idx_users_status ON users(status) WHERE status != 'OFFLINE';
 CREATE INDEX idx_users_last_seen ON users(last_seen_at DESC);
 CREATE INDEX idx_users_country ON users(country);
@@ -110,19 +109,23 @@ CREATE INDEX idx_stats_rating_blitz ON user_stats(rating_blitz DESC);
 CREATE INDEX idx_stats_games ON user_stats(games_played DESC);
 
 -- -----------------------------------------------------------
--- 3. GAME SESSIONS (Core: 100M+ rows expected; defined before user_rating_history)
+-- 3. GAME SESSIONS (~180M rows/year at 500K games/day)
+-- Not partitioned on purpose: PostgreSQL requires the partition key in every
+-- PRIMARY KEY / UNIQUE constraint and in every FK that references the table,
+-- and five tables reference game_sessions(id). An unpartitioned table with the
+-- indexes below handles this size; archive old rows to S3 instead.
 -- -----------------------------------------------------------
 CREATE TABLE game_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     white_player_id UUID NOT NULL REFERENCES users(id),
     black_player_id UUID NOT NULL REFERENCES users(id),
     winner_id UUID REFERENCES users(id),              -- NULL for draws/unfinished
-    result VARCHAR(20) DEFAULT 'IN_PROGRESS'
-        CHECK (result IN (
-            'IN_PROGRESS', 'WHITE_WIN', 'BLACK_WIN', 'DRAW',
-            'STALEMATE', 'RESIGNED', 'TIME_OUT', 'ABORTED'
-        )),
-    termination_reason VARCHAR(50),                   -- 'CHECKMATE', 'RESIGNATION', 'TIMEOUT', etc.
+    result VARCHAR(20) DEFAULT 'IN_PROGRESS'           -- WHO won
+        CHECK (result IN ('IN_PROGRESS', 'WHITE_WIN', 'BLACK_WIN', 'DRAW', 'ABORTED')),
+    termination_reason VARCHAR(30)                     -- HOW it ended
+        CHECK (termination_reason IN (
+            'CHECKMATE', 'RESIGNATION', 'TIMEOUT', 'STALEMATE', 'REPETITION',
+            'FIFTY_MOVE', 'INSUFFICIENT_MATERIAL', 'AGREEMENT', 'ABANDONED')),
     time_control VARCHAR(30) NOT NULL,                 -- '60+0', '180+2', '600+5', 'UNLIMITED'
     initial_time_seconds INT NOT NULL,                 -- Base time
     increment_seconds INT DEFAULT 0,                   -- Increment per move
@@ -145,18 +148,13 @@ CREATE TABLE game_sessions (
     eco_code VARCHAR(10),                              -- Encyclopedia of Chess Openings
     accuracy_white DECIMAL(5,2),                       -- 0-100% accuracy
     accuracy_black DECIMAL(5,2),
-    is_rated BOOLEAN DEFAULT true,
     idempotency_key VARCHAR(64) UNIQUE,
     version INT DEFAULT 1,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
-) PARTITION BY RANGE (started_at);
-
--- Monthly partitions for game_sessions
-CREATE TABLE game_sessions_202401 PARTITION OF game_sessions
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-CREATE TABLE game_sessions_202402 PARTITION OF game_sessions
-    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+,
+    CHECK (white_player_id <> black_player_id)
+);
 
 CREATE INDEX idx_games_white ON game_sessions(white_player_id);
 CREATE INDEX idx_games_black ON game_sessions(black_player_id);
@@ -164,7 +162,6 @@ CREATE INDEX idx_games_status ON game_sessions(result) WHERE result = 'IN_PROGRE
 CREATE INDEX idx_games_started ON game_sessions(started_at DESC);
 CREATE INDEX idx_games_eco ON game_sessions(eco_code);
 CREATE INDEX idx_games_players ON game_sessions(white_player_id, black_player_id, started_at DESC);
-CREATE INDEX idx_games_idempotency ON game_sessions(idempotency_key);
 
 -- -----------------------------------------------------------
 -- 4. USER RATING HISTORY (Time-series for ELO tracking)
@@ -182,17 +179,19 @@ CREATE TABLE user_rating_history (
     result VARCHAR(10) NOT NULL                       -- 'win', 'loss', 'draw'
         CHECK (result IN ('win', 'loss', 'draw')),
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, recorded_at, rating_type)
+    PRIMARY KEY (id),
+    UNIQUE (user_id, game_id, rating_type)          -- a redelivered game-over event can't double-apply
 );
 
 CREATE INDEX idx_rating_history_user ON user_rating_history(user_id, recorded_at DESC);
 CREATE INDEX idx_rating_history_game ON user_rating_history(game_id);
 
 -- -----------------------------------------------------------
--- 5. GAME MOVES (Billions of rows expected)
+-- 5. GAME MOVES (~40M rows/day; billions per year)
+-- The source of truth for active games: one INSERT per move, before ack.
+-- PK (game_id, move_number) doubles as the "one move per ply" guard.
 -- -----------------------------------------------------------
 CREATE TABLE game_moves (
-    id BIGSERIAL,
     game_id UUID NOT NULL REFERENCES game_sessions(id),
     move_number INT NOT NULL,                          -- 1-indexed half-move
     from_square VARCHAR(2) NOT NULL,                   -- e.g., 'e2'
@@ -204,17 +203,20 @@ CREATE TABLE game_moves (
     is_en_passant BOOLEAN DEFAULT false,
     is_check BOOLEAN DEFAULT false,
     is_checkmate BOOLEAN DEFAULT false,
-    fen_before VARCHAR(100) NOT NULL,                  -- Board state before move
-    fen_after VARCHAR(100) NOT NULL,                   -- Board state after move
+    fen_after VARCHAR(100) NOT NULL,                   -- Position after the move (fen_before = previous row's fen_after)
     time_taken_seconds DECIMAL(5,1),                   -- Seconds player took for this move
     evaluation_cp INT,                                 -- Centipawn evaluation (engine)
     best_move VARCHAR(5),                              -- Engine's best move at this position
     annotations TEXT,                                   -- Commentary / analysis
+    lease_epoch BIGINT NOT NULL,                       -- fencing token of the writing pod
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (game_id, move_number)
-);
+) PARTITION BY HASH (game_id);
 
-CREATE INDEX idx_moves_game ON game_moves(game_id, move_number);
+-- 64 hash partitions keep each index/vacuum unit small. The PK already covers
+-- "all moves of a game in order", so no extra index is needed.
+CREATE TABLE game_moves_p00 PARTITION OF game_moves FOR VALUES WITH (MODULUS 64, REMAINDER 0);
+-- ... game_moves_p01 .. game_moves_p63
 
 -- -----------------------------------------------------------
 -- 6. GAME ANALYSIS (Stockfish/Engine evaluations)
@@ -248,7 +250,6 @@ CREATE TABLE game_analysis (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_analysis_game ON game_analysis(game_id);
 CREATE INDEX idx_analysis_status ON game_analysis(status) WHERE status = 'PENDING';
 
 -- -----------------------------------------------------------
@@ -399,7 +400,7 @@ ORDER BY gs.started_at DESC;
 SELECT gm.move_number, gm.from_square, gm.to_square,
        gm.piece, gm.captured_piece, gm.is_castling,
        gm.is_check, gm.is_checkmate,
-       gm.fen_before, gm.fen_after,
+       gm.fen_after,
        gm.time_taken_seconds, gm.evaluation_cp
 FROM game_moves gm
 WHERE gm.game_id = 'game-uuid'
@@ -451,15 +452,16 @@ JOIN user_stats us ON us.user_id = u.id
 WHERE tr.tournament_id = 'tournament-uuid'
 ORDER BY tr.current_rank ASC;
 
--- 7. Detect engine-like play (anti-cheat heuristic)
+-- 7. Detect engine-like play (anti-cheat heuristic, games as White)
+-- (Joining game_moves here would multiply rows per move and make COUNT(*)
+--  count moves, not games.)
 SELECT u.id, u.username,
        AVG(gs.accuracy_white) AS avg_accuracy,
-       AVG(gm.evaluation_cp) AS avg_eval_change,
        COUNT(*) AS games
 FROM game_sessions gs
 JOIN users u ON gs.white_player_id = u.id
-JOIN game_moves gm ON gm.game_id = gs.id AND gm.piece != 'P'
 WHERE gs.started_at >= CURRENT_DATE - 30
+  AND gs.accuracy_white IS NOT NULL
   AND u.is_bot = false
 GROUP BY u.id, u.username
 HAVING AVG(gs.accuracy_white) > 95 AND COUNT(*) > 20
@@ -471,8 +473,9 @@ ORDER BY avg_accuracy DESC;
 ## 🔑 Redis Schema (Real-Time Game State)
 
 ```ascii
-# Redis is THE primary data store for active games.
-# PostgreSQL is the source of truth for completed/persisted games.
+# Redis is a hot CACHE for active games (fast reads, pub/sub fan-out).
+# PostgreSQL game_moves is the source of truth: every move is written there
+# before it is acknowledged, so losing Redis loses no moves.
 
 # === Active Game State ===
 game:{game_id}:state           → HASH
@@ -486,10 +489,9 @@ game:{game_id}:state           → HASH
   move_count                   → Total half-moves played
   TTL: 24h (or until game ends)
 
-# === Move History (in-memory, flushed to PG periodically) ===
-game:{game_id}:moves           → LIST
-  Each element: JSON {from, to, piece, captured, time_taken, fen_before, fen_after}
-  When game ends → flush entire list to game_moves table
+# === Recent moves (cache for reconnect/spectators; PG has the full log) ===
+game:{game_id}:moves           → LIST (capped with LTRIM to the last 50)
+  Each element: JSON {ply, from, to, promotion, time_taken_ms}
 
 # === WebSocket Connections ===
 ws:user:{user_id}              → SET of ws_connection_ids (supports multi-device)
@@ -535,12 +537,12 @@ connected_users_count          → STRING (updated via WebSocket connect/disconn
 
 | Concern | Solution |
 |---------|----------|
-| **Game state consistency** | Redis primary for active games → async flush to PG. If Redis node fails, reconstruct from PG (`game_moves` table) + last known FEN. |
-| **Race condition: double move** | Redis atomic ops (WATCH/MULTI/EXEC). Each move: verify turn, apply move, update FEN, switch turn — all in one transaction. |
+| **Game state consistency** | One writer per game (the owning engine pod, holding a lease). Each move is inserted into `game_moves` before ack; Redis is updated after. If Redis fails, replay `game_moves`. |
+| **Race condition: double move** | Single writer serialises moves; the client's `expected_ply` rejects stale submissions; `PRIMARY KEY (game_id, move_number)` rejects a second write for the same ply even if two pods briefly both think they own the game. |
 | **Race condition: simultaneous game start** | Redis `SETNX` for game lock. Only one matchmaking worker wins. Loser picks next available opponent. |
-| **Game recovery on crash** | Active game state replicated to PG every N moves (checkpoint). On crash → load last checkpoint, replay from game_moves. |
-| **ELO rating update** | Idempotent: check if rating already updated for this game in `user_rating_history` before applying. `UNIQUE(user_id, game_id, rating_type)` prevents double-counting. |
-| **Read-after-write consistency** | Session stickiness: same player always routed to same game-server pod (hash by game_id). Redis local read replicas. |
+| **Game recovery on crash** | New owner takes the lease (higher epoch), replays `game_moves`, resumes. Writes carrying an older `lease_epoch` are rejected. |
+| **ELO rating update** | Idempotent: insert into `user_rating_history` and update `user_stats` in one transaction; `UNIQUE(user_id, game_id, rating_type)` turns a redelivered event into a no-op. |
+| **Read-after-write consistency** | Moves are read from the owning pod (routed by game_id), not from Redis replicas, which lag. |
 
 ---
 
@@ -550,10 +552,10 @@ connected_users_count          → STRING (updated via WebSocket connect/disconn
 |-------|-----------|-------------|---------|
 | `users` | 1M | +10K/month | ~500 MB |
 | `user_stats` | 1M | +10K/month | ~200 MB |
-| `game_sessions` | 10M | +500K/month | ~10 GB |
-| `user_rating_history` | 50M | +3M/month | ~4 GB |
-| `game_moves` | 500M | +25M/month | ~50 GB |
-| `game_analysis` | 5M | +250K/month | ~20 GB |
+| `game_sessions` | ~180M | +15M/month (500K/day) | ~1 KB/row with PGN → ~180 GB |
+| `user_rating_history` | ~360M | +30M/month (2 rows/rated game) | ~35 GB |
+| `game_moves` | ~15B | +1.2B/month (~80 plies/game) | ~150 B/row → ~2 TB |
+| `game_analysis` | 5M | +250K/month (analysed on request) | ~20 GB |
 | `tournament*` | 100K | +5K/month | ~500 MB |
 
-**Total estimated storage after 12 months:** ~100 GB (with partitioning + compression)
+**After 12 months:** ~2–3 TB, dominated by `game_moves`. That's why the per-move row stores only `fen_after` (not before *and* after), and why finished games older than a few months move to S3 as PGN and their move rows are dropped (the PGN is the archive format).

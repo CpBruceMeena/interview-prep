@@ -1,23 +1,53 @@
 """
 Car Rental Platform - Low Level Design
------------------------------------------
-Design Principles: SOLID, Strategy Pattern, State Pattern
+--------------------------------------
+We own the fleet. Customers search by time range, place a short HOLD on a
+vehicle while they pay, then confirm. The core problems are:
 
-Core Focus:
-  - Identifying when cars are free for booking (hourly/daily granularity)
-  - 1-week lookahead availability calendar
-  - Efficient search, display, and storage of availability data
-  - Prevent double-booking with date-range exclusion constraints
+  * When is a car free?  Each vehicle has a schedule of non-overlapping,
+    half-open [start, end) blocks (reservations, holds, maintenance). That
+    interval set is the source of truth, exactly like a Postgres
+    `EXCLUDE USING gist (vehicle_id WITH =, tstzrange(...) WITH &&)`.
+    Hourly / weekly views are projections computed from it.
+  * No double booking.  "Check overlap + insert" is one atomic step under
+    the vehicle's own lock (try_block). Search results are only a hint.
+  * Reservation lifecycle.  PENDING (hold with expiry) -> CONFIRMED ->
+    IN_PROGRESS -> COMPLETED, with CANCELLED / EXPIRED exits, enforced by a
+    transition table under the reservation's lock.
+
+Lock order: reservation -> vehicle schedule (schedule locks are leaves).
+Money is Decimal. Time comes from an injectable clock. Stdlib only, 3.10+.
 """
 
-from abc import ABC, abstractmethod
-from datetime import datetime, timedelta, date, time
-from enum import Enum
-from typing import Dict, List, Optional, Tuple, Set
-from collections import defaultdict
-import uuid
-import calendar
+from __future__ import annotations
 
+import bisect
+import itertools
+import math
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Set
+
+HOUR = timedelta(hours=1)
+MONEY = Decimal("0.01")
+
+
+def to_money(value: Decimal) -> Decimal:
+    return value.quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+def billable_hours(start: datetime, end: datetime) -> int:
+    """Every started hour is billed; minimum one hour."""
+    return max(1, math.ceil((end - start) / HOUR))
+
+
+# ============================================================
+# Enums and errors
+# ============================================================
 
 class VehicleType(Enum):
     HATCHBACK = "Hatchback"
@@ -25,7 +55,6 @@ class VehicleType(Enum):
     SUV = "SUV"
     LUXURY = "Luxury"
     VAN = "Van"
-    TRUCK = "Truck"
 
 
 class FuelType(Enum):
@@ -36,860 +65,616 @@ class FuelType(Enum):
 
 
 class VehicleStatus(Enum):
-    AVAILABLE = "Available"
-    RESERVED = "Reserved"
-    RENTED = "Rented"
-    MAINTENANCE = "Maintenance"
+    """Physical state right now. Future bookings live in the calendar, not here."""
+    AVAILABLE = "Available"   # on the lot
+    RENTED = "Rented"         # out with a customer
 
 
 class ReservationStatus(Enum):
-    PENDING = "Pending"
+    PENDING = "Pending"            # hold placed, awaiting payment, expires
     CONFIRMED = "Confirmed"
     IN_PROGRESS = "In Progress"
     COMPLETED = "Completed"
     CANCELLED = "Cancelled"
+    EXPIRED = "Expired"            # hold timed out before confirmation
+
+
+class BlockKind(Enum):
+    RESERVATION = "Reservation"
+    MAINTENANCE = "Maintenance"
+
+
+class RentalError(Exception):
+    pass
+
+
+class NotFoundError(RentalError):
+    pass
+
+
+class InvalidRequestError(RentalError):
+    pass
+
+
+class InvalidTransitionError(RentalError):
+    pass
+
+
+class HoldExpiredError(RentalError):
+    pass
+
+
+class VehicleUnavailableError(RentalError):
+    def __init__(self, message: str, next_free: Optional[datetime] = None):
+        super().__init__(message)
+        self.next_free = next_free
 
 
 # ============================================================
-# TIME BLOCK: Core abstraction for availability tracking
+# Fleet and customers
 # ============================================================
 
-class TimeBlock:
-    """
-    Represents a block of time (default: 1 hour) for availability tracking.
-    This is the fundamental unit of the availability calendar.
-    """
-    def __init__(self, start_time: datetime, end_time: datetime):
-        assert start_time < end_time, "Start must be before end"
-        self._start = start_time
-        self._end = end_time
-
-    @property
-    def start(self) -> datetime:
-        return self._start
-
-    @property
-    def end(self) -> datetime:
-        return self._end
-
-    @property
-    def hours(self) -> float:
-        return (self._end - self._start).total_seconds() / 3600
-
-    def overlaps(self, other: 'TimeBlock') -> bool:
-        """Check if this block overlaps with another."""
-        return self._start < other._end and other._start < self._end
-
-    def contains(self, dt: datetime) -> bool:
-        return self._start <= dt < self._end
+@dataclass(eq=False)
+class Vehicle:
+    vehicle_id: str
+    vehicle_type: VehicleType
+    make: str
+    model: str
+    year: int
+    license_plate: str
+    fuel_type: FuelType
+    hourly_rate: Decimal
+    daily_rate: Decimal
+    location: str
+    seats: int = 5
+    status: VehicleStatus = VehicleStatus.AVAILABLE
 
     def __str__(self) -> str:
-        return f"{self._start.strftime('%a %H:%M')} - {self._end.strftime('%H:%M')}"
-
-    def __repr__(self) -> str:
-        return f"TimeBlock({self._start.isoformat()}, {self._end.isoformat()})"
+        return f"{self.year} {self.make} {self.model} ({self.license_plate})"
 
 
-# ============================================================
-# AVAILABILITY CALENDAR: Core data structure
-# ============================================================
-
-class AvailabilityCalendar:
-    """
-    Tracks vehicle availability at hourly granularity for a configurable lookahead window.
-    
-    Key design decisions:
-    1. Time-block based: Each day is divided into hourly slots
-    2. Lookahead window: Default 7 days, configurable
-    3. Reservation block: Each booking occupies contiguous time blocks
-    4. Efficient search: Pre-computed availability bitmap for quick queries
-    
-    DB equivalents:
-    - availability_slots table: (vehicle_id, slot_start, slot_end, is_booked)
-    - Or computed on-the-fly from reservations table
-    """
-
-    def __init__(self, lookahead_days: int = 7):
-        self._lookahead_days = lookahead_days
-        # availability[vehicle_id] = set of (date, hour) tuples that are booked
-        self._booked_slots: Dict[str, Set[Tuple[date, int]]] = defaultdict(set)
-
-    def _generate_hourly_slots(self, start_date: date, end_date: date) -> List[Tuple[date, int]]:
-        """Generate all hourly slots between start_date and end_date (inclusive)."""
-        slots = []
-        current = start_date
-        while current <= end_date:
-            for hour in range(24):  # 0 = midnight, 23 = 11pm
-                slots.append((current, hour))
-            current += timedelta(days=1)
-        return slots
-
-    def _get_dates_in_range(self, start_date: date, end_date: date) -> List[date]:
-        """Get all dates between start and end (inclusive)."""
-        dates = []
-        current = start_date
-        while current <= end_date:
-            dates.append(current)
-            current += timedelta(days=1)
-        return dates
-
-    def mark_booked(self, vehicle_id: str, pickup: datetime, dropoff: datetime) -> None:
-        """
-        Mark all hourly slots between pickup and dropoff as booked.
-        
-        In production, this is derived from the reservations table:
-            INSERT INTO reservations (...) 
-            WHERE NOT EXISTS (
-                SELECT 1 FROM availability_slots 
-                WHERE vehicle_id = ? AND slot_start >= ? AND slot_end <= ? AND is_booked = true
-            )
-        """
-        pickup_date = pickup.date()
-        dropoff_date = dropoff.date()
-
-        current = pickup.replace(minute=0, second=0, microsecond=0)
-        end = dropoff.replace(minute=0, second=0, microsecond=0)
-
-        while current < end:
-            slot_key = (current.date(), current.hour)
-            self._booked_slots[vehicle_id].add(slot_key)
-            current += timedelta(hours=1)
-
-    def mark_available(self, vehicle_id: str, pickup: datetime, dropoff: datetime) -> None:
-        """Mark slots as available (e.g., when a reservation is cancelled)."""
-        current = pickup.replace(minute=0, second=0, microsecond=0)
-        end = dropoff.replace(minute=0, second=0, microsecond=0)
-        while current < end:
-            slot_key = (current.date(), current.hour)
-            self._booked_slots[vehicle_id].discard(slot_key)
-            current += timedelta(hours=1)
-
-    def is_available(self, vehicle_id: str, pickup: datetime, dropoff: datetime) -> bool:
-        """Check if all hourly slots are available for this time range."""
-        current = pickup.replace(minute=0, second=0, microsecond=0)
-        end = dropoff.replace(minute=0, second=0, microsecond=0)
-
-        while current < end:
-            slot_key = (current.date(), current.hour)
-            if slot_key in self._booked_slots.get(vehicle_id, set()):
-                return False
-            current += timedelta(hours=1)
-        return True
-
-    def get_available_vehicles(self, all_vehicle_ids: List[str],
-                               pickup: datetime, dropoff: datetime) -> List[str]:
-        """Return vehicle IDs available for the given time range."""
-        available = []
-        for vid in all_vehicle_ids:
-            if self.is_available(vid, pickup, dropoff):
-                available.append(vid)
-        return available
-
-    def get_availability_summary(self, vehicle_id: str,
-                                 target_date: date) -> Dict[str, List[int]]:
-        """
-        Get hourly availability for a vehicle on a specific date.
-        Returns dict: {'available': [hours], 'booked': [hours]}
-        """
-        available_hours = []
-        booked_hours = []
-
-        for hour in range(24):
-            slot_key = (target_date, hour)
-            if slot_key in self._booked_slots.get(vehicle_id, set()):
-                booked_hours.append(hour)
-            else:
-                available_hours.append(hour)
-
-        return {
-            'available': available_hours,
-            'booked': booked_hours,
-            'date': target_date.isoformat(),
-            'total_available_hours': len(available_hours),
-            'total_booked_hours': len(booked_hours)
-        }
-
-    def get_weekly_availability(self, vehicle_id: str,
-                                start_date: date) -> Dict[str, List[dict]]:
-        """
-        Get availability for next 7 days (or remaining lookahead).
-        This is the primary UI-facing method.
-        
-        Returns:
-        {
-            'vehicle_id': str,
-            'week_start': str,
-            'days': [
-                {'date': '2024-01-15', 'day_name': 'Mon',
-                 'available_hours': [9,10,11,14,15,16],
-                 'total_available': 6,
-                 'is_fully_booked': False},
-                ...
-            ]
-        }
-        """
-        days = []
-        for day_offset in range(self._lookahead_days):
-            current_date = start_date + timedelta(days=day_offset)
-            summary = self.get_availability_summary(vehicle_id, current_date)
-            days.append({
-                'date': current_date.isoformat(),
-                'day_name': current_date.strftime('%a'),
-                'available_hours': summary['available'],
-                'total_available': summary['total_available_hours'],
-                'is_fully_booked': summary['total_available_hours'] == 0
-            })
-
-        return {
-            'vehicle_id': vehicle_id,
-            'week_start': start_date.isoformat(),
-            'days': days
-        }
-
-
-# ============================================================
-# VEHICLE: Availability-aware Fleet
-# ============================================================
-
-class Vehicle(ABC):
-    def __init__(self, vehicle_id: str, make: str, model: str, year: int,
-                 license_plate: str, fuel_type: FuelType,
-                 hourly_rate: float, daily_rate: float, mileage: int = 0):
-        self._vehicle_id = vehicle_id
-        self._make = make
-        self._model = model
-        self._year = year
-        self._license = license_plate
-        self._fuel_type = fuel_type
-        self._hourly_rate = hourly_rate
-        self._daily_rate = daily_rate
-        self._mileage = mileage
-        self._status = VehicleStatus.AVAILABLE
-        self._location: Optional[str] = None
-
-    @property
-    def vehicle_id(self) -> str: return self._vehicle_id
-    @property
-    def make(self) -> str: return self._make
-    @property
-    def model(self) -> str: return self._model
-    @property
-    def hourly_rate(self) -> float: return self._hourly_rate
-    @property
-    def daily_rate(self) -> float: return self._daily_rate
-    @property
-    def status(self) -> VehicleStatus: return self._status
-    @status.setter
-    def status(self, value: VehicleStatus) -> None: self._status = value
-    @property
-    def location(self) -> Optional[str]: return self._location
-    @location.setter
-    def location(self, loc: str) -> None: self._location = loc
-    @property
-    @abstractmethod
-    def vehicle_type(self) -> VehicleType: pass
-    @property
-    @abstractmethod
-    def seating_capacity(self) -> int: pass
-
-    def __str__(self) -> str:
-        return f"{self._year} {self._make} {self._model} ({self._license})"
-
-
-class Hatchback(Vehicle):
-    @property
-    def vehicle_type(self) -> VehicleType: return VehicleType.HATCHBACK
-    @property
-    def seating_capacity(self) -> int: return 5
-
-class Sedan(Vehicle):
-    @property
-    def vehicle_type(self) -> VehicleType: return VehicleType.SEDAN
-    @property
-    def seating_capacity(self) -> int: return 5
-
-class SUV(Vehicle):
-    @property
-    def vehicle_type(self) -> VehicleType: return VehicleType.SUV
-    @property
-    def seating_capacity(self) -> int: return 7
-
-class LuxuryCar(Vehicle):
-    @property
-    def vehicle_type(self) -> VehicleType: return VehicleType.LUXURY
-    @property
-    def seating_capacity(self) -> int: return 5
-
-class Van(Vehicle):
-    @property
-    def vehicle_type(self) -> VehicleType: return VehicleType.VAN
-    @property
-    def seating_capacity(self) -> int: return 8
-
-
-# --- Customer (SRP) ---
-
+@dataclass(eq=False)
 class Customer:
-    def __init__(self, customer_id: str, name: str, email: str,
-                 phone: str, license_number: str):
-        self._customer_id = customer_id
-        self._name = name
-        self._email = email
-        self._phone = phone
-        self._license = license_number
-        self._loyalty_points = 0
-
-    @property
-    def customer_id(self) -> str: return self._customer_id
-    @property
-    def name(self) -> str: return self._name
-    @property
-    def loyalty_points(self) -> int: return self._loyalty_points
-
-    def add_points(self, points: int) -> None: self._loyalty_points += points
-
-    def __str__(self) -> str: return self._name
+    customer_id: str
+    name: str
+    email: str
+    license_number: str
+    loyalty_points: int = 0
 
 
-# --- Pricing Strategy (Strategy Pattern) ---
+# ============================================================
+# Pricing (Strategy + Decorator)
+# ============================================================
 
 class RentalPricing(ABC):
     @abstractmethod
-    def calculate_cost(self, vehicle: Vehicle, hours: int,
-                       days: int, customer: Customer) -> float:
-        pass
+    def calculate_cost(self, vehicle: Vehicle, hours: int) -> Decimal:
+        ...
 
 
 class HourlyRentalPricing(RentalPricing):
-    """Charge by the hour for short rentals (< 24 hours)."""
-    def calculate_cost(self, vehicle: Vehicle, hours: int,
-                       days: int, customer: Customer) -> float:
-        if days >= 1:
-            # For multi-day, charge daily rate + remaining hours
-            daily_cost = vehicle.daily_rate * days
-            remaining_hours = hours - (days * 24)
-            hourly_cost = max(0, remaining_hours) * vehicle.hourly_rate
-            return daily_cost + hourly_cost
-        return max(vehicle.hourly_rate * hours, vehicle.daily_rate)
+    """Hourly, but each 24h block is capped at the daily rate."""
+
+    def calculate_cost(self, vehicle: Vehicle, hours: int) -> Decimal:
+        full_days, rest = divmod(hours, 24)
+        return to_money(vehicle.daily_rate * full_days
+                        + min(vehicle.hourly_rate * rest, vehicle.daily_rate))
 
 
 class DailyRentalPricing(RentalPricing):
-    """Charge by the day with hourly fallback."""
-    def calculate_cost(self, vehicle: Vehicle, hours: int,
-                       days: int, customer: Customer) -> float:
-        return max(
-            vehicle.daily_rate * max(1, days),
-            vehicle.hourly_rate * hours
-        )
+    """Any started day is a full day."""
+
+    def calculate_cost(self, vehicle: Vehicle, hours: int) -> Decimal:
+        return to_money(vehicle.daily_rate * math.ceil(hours / 24))
 
 
 class WeeklyDiscountPricing(RentalPricing):
-    """Strategy: Weekly discount applied on top of daily pricing."""
+    """Decorator: 10% off for 7+ days, a further 15% off for 30+ days."""
+
     def __init__(self, base: RentalPricing):
         self._base = base
 
-    def calculate_cost(self, vehicle: Vehicle, hours: int,
-                       days: int, customer: Customer) -> float:
-        cost = self._base.calculate_cost(vehicle, hours, days, customer)
-        if days >= 7:
-            cost *= 0.9  # 10% weekly discount
-        if days >= 30:
-            cost *= 0.85  # Additional 15% monthly discount
-        return cost
+    def calculate_cost(self, vehicle: Vehicle, hours: int) -> Decimal:
+        cost = self._base.calculate_cost(vehicle, hours)
+        if hours >= 7 * 24:
+            cost *= Decimal("0.90")
+        if hours >= 30 * 24:
+            cost *= Decimal("0.85")
+        return to_money(cost)
 
 
-# --- Reservation (SRP) ---
+# ============================================================
+# Availability: per-vehicle interval schedule (source of truth)
+# ============================================================
 
+@dataclass
+class Block:
+    start: datetime
+    end: datetime                       # exclusive
+    kind: BlockKind
+    ref_id: str
+    expires_at: Optional[datetime] = None   # set for unconfirmed holds
+
+    def live(self, now: datetime) -> bool:
+        return self.expires_at is None or now < self.expires_at
+
+
+class VehicleSchedule:
+    """
+    Non-overlapping blocks sorted by start. Because they never overlap, their
+    ends are sorted too, so "does [s, e) overlap anything?" is one bisect:
+    find the first block whose end > s; conflict iff that block starts < e.
+    Expired holds are dropped lazily before every read or write.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self._blocks: List[Block] = []
+
+    # All methods below require self.lock to be held by the caller.
+    def purge_expired(self, now: datetime) -> None:
+        if any(not b.live(now) for b in self._blocks):
+            self._blocks = [b for b in self._blocks if b.live(now)]
+
+    def conflict(self, start: datetime, end: datetime) -> Optional[Block]:
+        i = bisect.bisect_right(self._blocks, start, key=lambda b: b.end)
+        if i < len(self._blocks) and self._blocks[i].start < end:
+            return self._blocks[i]
+        return None
+
+    def insert(self, block: Block) -> None:
+        bisect.insort(self._blocks, block, key=lambda b: b.start)
+
+    def find(self, ref_id: str) -> Optional[Block]:
+        return next((b for b in self._blocks if b.ref_id == ref_id), None)
+
+    def remove(self, ref_id: str) -> None:
+        self._blocks = [b for b in self._blocks if b.ref_id != ref_id]
+
+    def blocks(self) -> List[Block]:
+        return list(self._blocks)
+
+
+class AvailabilityCalendar:
+    """
+    Every reservation also blocks a turnaround buffer after the return time
+    (cleaning, inspection), so back-to-back bookings leave room to turn the car.
+    """
+
+    def __init__(self, clock: Callable[[], datetime],
+                 turnaround: timedelta = timedelta(0), lookahead_days: int = 7):
+        self._clock = clock
+        self._turnaround = turnaround
+        self._lookahead_days = lookahead_days
+        self._lock = threading.Lock()
+        self._schedules: Dict[str, VehicleSchedule] = {}
+
+    def add_vehicle(self, vehicle_id: str) -> None:
+        with self._lock:
+            self._schedules.setdefault(vehicle_id, VehicleSchedule())
+
+    def _schedule(self, vehicle_id: str) -> VehicleSchedule:
+        with self._lock:
+            sched = self._schedules.get(vehicle_id)
+        if sched is None:
+            raise NotFoundError(f"vehicle {vehicle_id}")
+        return sched
+
+    def _span(self, kind: BlockKind, start: datetime, end: datetime) -> tuple[datetime, datetime]:
+        return (start, end + self._turnaround) if kind is BlockKind.RESERVATION else (start, end)
+
+    # ---- writes (atomic per vehicle) ----
+
+    def try_block(self, vehicle_id: str, start: datetime, end: datetime, kind: BlockKind,
+                  ref_id: str, expires_at: Optional[datetime] = None) -> bool:
+        """Check-and-insert as ONE step under the vehicle's lock. False = overlaps something."""
+        s, e = self._span(kind, start, end)
+        sched = self._schedule(vehicle_id)
+        with sched.lock:
+            sched.purge_expired(self._clock())
+            if sched.conflict(s, e) is not None:
+                return False
+            sched.insert(Block(s, e, kind, ref_id, expires_at))
+            return True
+
+    def confirm_hold(self, vehicle_id: str, ref_id: str) -> bool:
+        """Make a hold permanent. False if it already expired (and was possibly re-booked)."""
+        sched = self._schedule(vehicle_id)
+        with sched.lock:
+            sched.purge_expired(self._clock())
+            block = sched.find(ref_id)
+            if block is None:
+                return False
+            block.expires_at = None
+            return True
+
+    def release(self, vehicle_id: str, ref_id: str) -> None:
+        sched = self._schedule(vehicle_id)
+        with sched.lock:
+            sched.remove(ref_id)
+
+    # ---- reads ----
+
+    def is_available(self, vehicle_id: str, pickup: datetime, dropoff: datetime) -> bool:
+        """Could a reservation for [pickup, dropoff) (plus turnaround) be placed right now?"""
+        s, e = self._span(BlockKind.RESERVATION, pickup, dropoff)
+        return self._is_free(vehicle_id, s, e)
+
+    def _is_free(self, vehicle_id: str, start: datetime, end: datetime) -> bool:
+        sched = self._schedule(vehicle_id)
+        with sched.lock:
+            sched.purge_expired(self._clock())
+            return sched.conflict(start, end) is None
+
+    def get_available_vehicles(self, vehicle_ids: List[str], pickup: datetime,
+                               dropoff: datetime) -> List[str]:
+        return [v for v in vehicle_ids if self.is_available(v, pickup, dropoff)]
+
+    def next_free_window(self, vehicle_id: str, pickup: datetime, dropoff: datetime) -> datetime:
+        """Earliest start >= pickup at which a booking of the same length fits. O(n) walk of the gaps."""
+        length = dropoff - pickup + self._turnaround
+        sched = self._schedule(vehicle_id)
+        with sched.lock:
+            sched.purge_expired(self._clock())
+            candidate = pickup
+            for b in sched.blocks():
+                if b.end <= candidate:
+                    continue
+                if b.start >= candidate + length:
+                    break
+                candidate = b.end
+            return candidate
+
+    def free_hours(self, vehicle_id: str, day: date) -> List[int]:
+        """Hours h whose whole slot [h:00, h+1:00) is free (bookings may start/end mid-hour)."""
+        midnight = datetime.combine(day, time())
+        return [h for h in range(24)
+                if self._is_free(vehicle_id, midnight + h * HOUR, midnight + (h + 1) * HOUR)]
+
+    def get_availability_summary(self, vehicle_id: str, day: date) -> dict:
+        free = self.free_hours(vehicle_id, day)
+        return {"date": day.isoformat(), "available": free,
+                "booked": [h for h in range(24) if h not in free],
+                "total_available_hours": len(free)}
+
+    def get_weekly_availability(self, vehicle_id: str, start_date: date) -> dict:
+        days = []
+        for offset in range(self._lookahead_days):
+            d = start_date + timedelta(days=offset)
+            free = self.free_hours(vehicle_id, d)
+            days.append({"date": d.isoformat(), "day_name": d.strftime("%a"),
+                         "available_hours": free, "total_available": len(free),
+                         "is_fully_booked": not free})
+        return {"vehicle_id": vehicle_id, "week_start": start_date.isoformat(), "days": days}
+
+    def weekly_bitmap(self, vehicle_id: str, start_date: date) -> int:
+        """lookahead x 24-bit mask, bit (day*24 + hour) = 1 if that hour is free. 168 bits = 21 bytes/week."""
+        bits = 0
+        for offset in range(self._lookahead_days):
+            for h in self.free_hours(vehicle_id, start_date + timedelta(days=offset)):
+                bits |= 1 << (offset * 24 + h)
+        return bits
+
+
+# ============================================================
+# Reservation: the state machine
+# ============================================================
+
+_TRANSITIONS: Dict[ReservationStatus, Set[ReservationStatus]] = {
+    ReservationStatus.PENDING: {ReservationStatus.CONFIRMED, ReservationStatus.CANCELLED,
+                                ReservationStatus.EXPIRED},
+    ReservationStatus.CONFIRMED: {ReservationStatus.IN_PROGRESS, ReservationStatus.CANCELLED},
+    ReservationStatus.IN_PROGRESS: {ReservationStatus.COMPLETED},
+    ReservationStatus.COMPLETED: set(),
+    ReservationStatus.CANCELLED: set(),
+    ReservationStatus.EXPIRED: set(),
+}
+
+
+@dataclass(eq=False)
 class Reservation:
-    def __init__(self, reservation_id: str, customer: Customer,
-                 vehicle: Vehicle, pickup_datetime: datetime,
-                 return_datetime: datetime,
-                 pickup_location: str, dropoff_location: str,
-                 pricing: RentalPricing):
-        self._reservation_id = reservation_id
-        self._customer = customer
-        self._vehicle = vehicle
-        self._pickup_datetime = pickup_datetime
-        self._return_datetime = return_datetime
-        self._pickup_location = pickup_location
-        self._dropoff_location = dropoff_location
-        self._pricing = pricing
-        self._status = ReservationStatus.PENDING
-        self._total_cost = 0.0
-        self._additional_services: List[Tuple[str, float]] = []
+    reservation_id: str
+    customer: Customer
+    vehicle: Vehicle
+    pickup: datetime
+    dropoff: datetime
+    pickup_location: str
+    dropoff_location: str
+    pricing: RentalPricing
+    quoted_amount: Decimal
+    hold_expires_at: datetime
+    status: ReservationStatus = ReservationStatus.PENDING
+    final_amount: Optional[Decimal] = None
+    returned_at: Optional[datetime] = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    @property
-    def reservation_id(self) -> str: return self._reservation_id
-    @property
-    def customer(self) -> Customer: return self._customer
-    @property
-    def vehicle(self) -> Vehicle: return self._vehicle
-    @property
-    def status(self) -> ReservationStatus: return self._status
-    @status.setter
-    def status(self, value: ReservationStatus) -> None: self._status = value
-    @property
-    def pickup_datetime(self) -> datetime: return self._pickup_datetime
-    @property
-    def return_datetime(self) -> datetime: return self._return_datetime
-    @property
-    def total_cost(self) -> float: return self._total_cost
+    def move_to(self, target: ReservationStatus) -> None:
+        """Caller holds self.lock."""
+        if target not in _TRANSITIONS[self.status]:
+            raise InvalidTransitionError(f"{self.reservation_id}: {self.status.name} -> {target.name}")
+        self.status = target
 
     @property
     def duration_hours(self) -> int:
-        """Get total duration in hours (rounded up)."""
-        delta = self._return_datetime - self._pickup_datetime
-        return max(1, int(delta.total_seconds() / 3600) + 
-                   (1 if delta.total_seconds() % 3600 > 0 else 0))
-
-    @property
-    def duration_days(self) -> int:
-        """Get total duration in days."""
-        return self.duration_hours // 24
-
-    def calculate_cost(self) -> float:
-        hours = self.duration_hours
-        days = self.duration_days
-        self._total_cost = self._pricing.calculate_cost(
-            self._vehicle, hours, days, self._customer
-        )
-        # Add additional services
-        for _, cost in self._additional_services:
-            self._total_cost += cost
-        return self._total_cost
-
-    def add_service(self, service_name: str, cost: float) -> None:
-        self._additional_services.append((service_name, cost))
+        return billable_hours(self.pickup, self.dropoff)
 
     def __str__(self) -> str:
-        delta = self._return_datetime - self._pickup_datetime
-        hours = int(delta.total_seconds() / 3600)
-        return (f"Reservation[{self._reservation_id[:8]}]: "
-                f"{self._customer.name} - {self._vehicle.make} {self._vehicle.model} "
-                f"({hours}h)")
+        return (f"Reservation[{self.reservation_id}] {self.customer.name} - {self.vehicle.make} "
+                f"{self.vehicle.model} {self.pickup:%a %d %H:%M} -> {self.dropoff:%a %d %H:%M} "
+                f"{self.status.name} {self.quoted_amount}")
 
 
-# --- Fleet Manager with Availability Calendar ---
-
-class FleetManager:
-    """Manages vehicles with availability tracking."""
-
-    def __init__(self, availability_calendar: AvailabilityCalendar):
-        self._vehicles: Dict[str, Vehicle] = {}
-        self._calendar = availability_calendar
-
-    def add_vehicle(self, vehicle: Vehicle) -> None:
-        self._vehicles[vehicle.vehicle_id] = vehicle
-
-    def get_vehicle(self, vehicle_id: str) -> Optional[Vehicle]:
-        return self._vehicles.get(vehicle_id)
-
-    @property
-    def all_vehicle_ids(self) -> List[str]:
-        return list(self._vehicles.keys())
-
-    @property
-    def all_vehicles(self) -> List[Vehicle]:
-        return list(self._vehicles.values())
-
-    def update_vehicle_status(self, vehicle_id: str, status: VehicleStatus) -> None:
-        vehicle = self._vehicles.get(vehicle_id)
-        if vehicle:
-            vehicle.status = status
-
-
-# --- Search Service ---
+# ============================================================
+# Search (read side: results are a hint, booking re-checks atomically)
+# ============================================================
 
 class SearchService:
-    """
-    Handles vehicle search with availability filtering.
-    
-    Key UX flows:
-    1. Browse: Show all vehicles available for next 7 days
-    2. Search: Filter by type, location, date range
-    3. Quick view: Show hourly availability for a specific day
-    """
-
-    def __init__(self, fleet: FleetManager, calendar: AvailabilityCalendar):
-        self._fleet = fleet
+    def __init__(self, vehicles: Callable[[], List[Vehicle]], calendar: AvailabilityCalendar):
+        self._vehicles = vehicles
         self._calendar = calendar
 
-    def search_available(self, pickup_datetime: datetime,
-                         return_datetime: datetime,
+    def _matching(self, vehicle_type: Optional[VehicleType], location: Optional[str]) -> List[Vehicle]:
+        return [v for v in self._vehicles()
+                if (vehicle_type is None or v.vehicle_type is vehicle_type)
+                and (location is None or v.location == location)]
+
+    def search_available(self, pickup: datetime, dropoff: datetime,
                          vehicle_type: Optional[VehicleType] = None,
                          location: Optional[str] = None) -> List[Vehicle]:
-        """
-        Primary search: find vehicles available for given time range.
-        Filters by type and location if specified.
-        """
-        available_ids = self._calendar.get_available_vehicles(
-            self._fleet.all_vehicle_ids, pickup_datetime, return_datetime
-        )
+        """Vehicles free for the whole range, cheapest hourly rate first."""
+        found = [v for v in self._matching(vehicle_type, location)
+                 if self._calendar.is_available(v.vehicle_id, pickup, dropoff)]
+        return sorted(found, key=lambda v: (v.hourly_rate, v.vehicle_id))
 
-        results = []
-        for vid in available_ids:
-            vehicle = self._fleet.get_vehicle(vid)
-            if not vehicle:
-                continue
-            if vehicle_type and vehicle.vehicle_type != vehicle_type:
-                continue
-            if location and vehicle.location != location:
-                continue
-            results.append(vehicle)
+    def search_by_date(self, day: date, vehicle_type: Optional[VehicleType] = None) -> dict:
+        results = [{"vehicle": v, "availability": self._calendar.get_availability_summary(v.vehicle_id, day)}
+                   for v in self._matching(vehicle_type, None)]
+        results.sort(key=lambda r: -r["availability"]["total_available_hours"])
+        return {"date": day.isoformat(), "results": results,
+                "total_available": sum(1 for r in results if r["availability"]["total_available_hours"])}
 
-        return results
-
-    def search_by_date(self, target_date: date,
-                       vehicle_type: Optional[VehicleType] = None) -> Dict:
-        """
-        Browse: Show all vehicles with availability summary for a specific date.
-        Used for the "what's available today/tomorrow" view.
-        """
-        results = []
-        for vehicle in self._fleet.all_vehicles:
-            if vehicle_type and vehicle.vehicle_type != vehicle_type:
-                continue
-            summary = self._calendar.get_availability_summary(
-                vehicle.vehicle_id, target_date
-            )
-            results.append({
-                'vehicle': vehicle,
-                'availability': summary
-            })
-
-        results.sort(key=lambda r: r['availability']['total_available_hours'],
-                     reverse=True)
-
-        return {
-            'date': target_date.isoformat(),
-            'day_name': target_date.strftime('%A'),
-            'results': results,
-            'total_available': sum(
-                1 for r in results if r['availability']['total_available_hours'] > 0
-            )
-        }
-
-    def browse_weekly(self, vehicle_type: Optional[VehicleType] = None,
-                      location: Optional[str] = None) -> Dict:
-        """
-        Browse: Show all vehicles with 7-day availability calendar.
-        This is the primary fleet overview screen.
-        """
-        today = date.today()
-        fleet_availability = []
-
-        for vehicle in self._fleet.all_vehicles:
-            if vehicle_type and vehicle.vehicle_type != vehicle_type:
-                continue
-            if location and vehicle.location != location:
-                continue
-
-            weekly = self._calendar.get_weekly_availability(
-                vehicle.vehicle_id, today
-            )
-            # Compute total available hours across the week
-            total_available = sum(
-                day['total_available'] for day in weekly['days']
-            )
-            fleet_availability.append({
-                'vehicle': vehicle,
-                'weekly_availability': weekly,
-                'total_weekly_available_hours': total_available,
-                'fully_booked_days': sum(
-                    1 for day in weekly['days'] if day['is_fully_booked']
-                )
-            })
-
-        fleet_availability.sort(
-            key=lambda r: r['total_weekly_available_hours'], reverse=True
-        )
-
-        return {
-            'week_start': today.isoformat(),
-            'week_end': (today + timedelta(days=6)).isoformat(),
-            'fleet': fleet_availability,
-            'total_vehicles': len(fleet_availability),
-            'total_available_hours': sum(
-                r['total_weekly_available_hours'] for r in fleet_availability
-            )
-        }
+    def browse_weekly(self, start_date: date, vehicle_type: Optional[VehicleType] = None,
+                      location: Optional[str] = None) -> dict:
+        fleet = []
+        for v in self._matching(vehicle_type, location):
+            weekly = self._calendar.get_weekly_availability(v.vehicle_id, start_date)
+            fleet.append({"vehicle": v, "weekly_availability": weekly,
+                          "total_weekly_available_hours": sum(d["total_available"] for d in weekly["days"])})
+        fleet.sort(key=lambda r: -r["total_weekly_available_hours"])
+        return {"week_start": start_date.isoformat(), "fleet": fleet, "total_vehicles": len(fleet)}
 
 
-# --- Rental Service (Facade) ---
+# ============================================================
+# Facade
+# ============================================================
 
 class CarRentalService:
-    """Main facade for the car rental platform with availability-driven design."""
+    HOLD_TTL = timedelta(minutes=10)     # time to pay before the hold lapses
+    MIN_RENTAL = HOUR
+    RETURN_GRACE = timedelta(minutes=15)
+    POINTS_PER_HOUR = 2
 
-    def __init__(self, lookahead_days: int = 7):
-        self._calendar = AvailabilityCalendar(lookahead_days)
-        self._fleet = FleetManager(self._calendar)
-        self._search = SearchService(self._fleet, self._calendar)
+    def __init__(self, clock: Callable[[], datetime] = datetime.now,
+                 turnaround: timedelta = timedelta(minutes=30), lookahead_days: int = 7):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._vehicles: Dict[str, Vehicle] = {}
         self._customers: Dict[str, Customer] = {}
         self._reservations: Dict[str, Reservation] = {}
+        self._ids = itertools.count(1)
+        self.calendar = AvailabilityCalendar(clock, turnaround, lookahead_days)
+        self.search = SearchService(lambda: list(self._vehicles.values()), self.calendar)
 
-    @property
-    def fleet(self) -> FleetManager:
-        return self._fleet
+    # ---- registration ----
 
-    @property
-    def search(self) -> SearchService:
-        return self._search
+    def _next_id(self, prefix: str) -> str:
+        return f"{prefix}-{next(self._ids):04d}"
 
-    @property
-    def calendar(self) -> AvailabilityCalendar:
-        return self._calendar
+    def add_vehicle(self, vehicle: Vehicle) -> None:
+        with self._lock:
+            self._vehicles[vehicle.vehicle_id] = vehicle
+        self.calendar.add_vehicle(vehicle.vehicle_id)
 
-    def register_customer(self, name: str, email: str, phone: str,
-                          license_number: str) -> Customer:
-        cid = f"C-{uuid.uuid4().hex[:6].upper()}"
-        customer = Customer(cid, name, email, phone, license_number)
-        self._customers[cid] = customer
-        return customer
+    def register_customer(self, name: str, email: str, license_number: str) -> Customer:
+        with self._lock:
+            customer = Customer(self._next_id("C"), name, email, license_number)
+            self._customers[customer.customer_id] = customer
+            return customer
 
-    def get_customer(self, customer_id: str) -> Optional[Customer]:
-        return self._customers.get(customer_id)
+    def get_reservation(self, reservation_id: str) -> Reservation:
+        res = self._reservations.get(reservation_id)
+        if res is None:
+            raise NotFoundError(f"reservation {reservation_id}")
+        return res
 
-    def create_reservation(self, customer_id: str, vehicle_id: str,
-                           pickup_datetime: datetime, return_datetime: datetime,
-                           pickup_location: str, dropoff_location: str,
-                           pricing: Optional[RentalPricing] = None) -> Optional[Reservation]:
-        """
-        Create a reservation after verifying availability.
-        The key business logic: validate all hourly slots are free before booking.
-        """
+    # ---- booking ----
+
+    def create_reservation(self, customer_id: str, vehicle_id: str, pickup: datetime,
+                           dropoff: datetime, pickup_location: str, dropoff_location: str,
+                           pricing: Optional[RentalPricing] = None) -> Reservation:
+        """Places a PENDING hold. Raises VehicleUnavailableError (with next_free) on overlap."""
         customer = self._customers.get(customer_id)
-        vehicle = self._fleet.get_vehicle(vehicle_id)
-
-        if not customer or not vehicle:
-            print("  Customer or vehicle not found")
-            return None
-
-        if pickup_datetime >= return_datetime:
-            print("  Pickup must be before return")
-            return None
-
-        if pickup_datetime < datetime.now():
-            print("  Cannot book in the past")
-            return None
-
-        # Check availability for the ENTIRE requested time range
-        if not self._calendar.is_available(vehicle_id, pickup_datetime, return_datetime):
-            print(f"  ❌ Vehicle {vehicle.make} {vehicle.model} is NOT available "
-                  f"for {pickup_datetime.strftime('%a %d %H:%M')} - "
-                  f"{return_datetime.strftime('%a %d %H:%M')}")
-            # Show alternative nearby availability
-            suggested = self._find_nearest_available(vehicle_id, pickup_datetime, return_datetime)
-            if suggested:
-                print(f"  💡 Nearest availability: "
-                      f"{suggested['pickup'].strftime('%a %d %H:%M')} - "
-                      f"{suggested['return'].strftime('%a %d %H:%M')}")
-            return None
+        vehicle = self._vehicles.get(vehicle_id)
+        if customer is None or vehicle is None:
+            raise NotFoundError("customer or vehicle not found")
+        now = self._clock()
+        if pickup < now:
+            raise InvalidRequestError("cannot book in the past")
+        if dropoff - pickup < self.MIN_RENTAL:
+            raise InvalidRequestError(f"minimum rental is {self.MIN_RENTAL}")
 
         pricing = pricing or HourlyRentalPricing()
-        rid = f"R-{uuid.uuid4().hex[:8].upper()}"
-        reservation = Reservation(rid, customer, vehicle, pickup_datetime,
-                                  return_datetime, pickup_location, dropoff_location, pricing)
-        reservation.calculate_cost()
-        reservation.status = ReservationStatus.CONFIRMED
-        vehicle.status = VehicleStatus.RESERVED
+        rid = self._next_id("R")
+        hold_until = now + self.HOLD_TTL
+        if not self.calendar.try_block(vehicle_id, pickup, dropoff, BlockKind.RESERVATION,
+                                       rid, expires_at=hold_until):
+            raise VehicleUnavailableError(
+                f"{vehicle.make} {vehicle.model} is not free {pickup:%a %d %H:%M} - {dropoff:%a %d %H:%M}",
+                self.calendar.next_free_window(vehicle_id, pickup, dropoff))
+        res = Reservation(rid, customer, vehicle, pickup, dropoff, pickup_location, dropoff_location,
+                          pricing, pricing.calculate_cost(vehicle, billable_hours(pickup, dropoff)),
+                          hold_until)
+        with self._lock:
+            self._reservations[rid] = res
+        return res
 
-        # Mark the time slots as booked in the calendar
-        self._calendar.mark_booked(vehicle_id, pickup_datetime, return_datetime)
+    def confirm_reservation(self, reservation_id: str) -> Reservation:
+        """Called after payment authorisation succeeds."""
+        res = self.get_reservation(reservation_id)
+        with res.lock:
+            if res.status is not ReservationStatus.PENDING:
+                raise InvalidTransitionError(f"{reservation_id} is {res.status.name}")
+            if not self.calendar.confirm_hold(res.vehicle.vehicle_id, reservation_id):
+                res.move_to(ReservationStatus.EXPIRED)
+                raise HoldExpiredError(f"hold on {reservation_id} expired; search again")
+            res.move_to(ReservationStatus.CONFIRMED)
+        return res
 
-        self._reservations[rid] = reservation
-        hours = reservation.duration_hours
-        print(f"  ✅ {vehicle.make} {vehicle.model} booked for {hours}h: "
-              f"{pickup_datetime.strftime('%a %d %H:%M')} → "
-              f"{return_datetime.strftime('%a %d %H:%M')}")
-        print(f"  💰 Total: ${reservation.total_cost:.2f}")
-        return reservation
+    def cancel_reservation(self, reservation_id: str) -> Reservation:
+        res = self.get_reservation(reservation_id)
+        with res.lock:
+            res.move_to(ReservationStatus.CANCELLED)
+            self.calendar.release(res.vehicle.vehicle_id, reservation_id)
+        return res
 
-    def _find_nearest_available(self, vehicle_id: str,
-                                 desired_pickup: datetime,
-                                 desired_return: datetime) -> Optional[dict]:
-        """Find the nearest available time slot if the desired one is booked."""
-        # Brute-force search nearby slots (simplified)
-        for offset_hours in range(1, 48):
-            for direction in [1, -1]:
-                test_pickup = desired_pickup + timedelta(hours=offset_hours * direction)
-                test_return = test_pickup + (desired_return - desired_pickup)
+    def expire_holds(self) -> List[str]:
+        """Periodic sweep: mark lapsed PENDING holds EXPIRED (the calendar already ignores them)."""
+        now, expired = self._clock(), []
+        for res in list(self._reservations.values()):
+            with res.lock:
+                if res.status is ReservationStatus.PENDING and now >= res.hold_expires_at:
+                    res.move_to(ReservationStatus.EXPIRED)
+                    self.calendar.release(res.vehicle.vehicle_id, res.reservation_id)
+                    expired.append(res.reservation_id)
+        return expired
 
-                if test_pickup < datetime.now():
-                    continue
+    def schedule_maintenance(self, vehicle_id: str, start: datetime, end: datetime) -> str:
+        """Maintenance is just another block; it can't overlap a booking and vice versa."""
+        mid = self._next_id("M")
+        if not self.calendar.try_block(vehicle_id, start, end, BlockKind.MAINTENANCE, mid):
+            raise VehicleUnavailableError(f"maintenance window overlaps a booking on {vehicle_id}")
+        return mid
 
-                if self._calendar.is_available(vehicle_id, test_pickup, test_return):
-                    return {'pickup': test_pickup, 'return': test_return}
-        return None
+    # ---- pickup / return ----
 
-    def start_rental(self, reservation_id: str) -> None:
-        reservation = self._reservations.get(reservation_id)
-        if reservation and reservation.status == ReservationStatus.CONFIRMED:
-            reservation.status = ReservationStatus.IN_PROGRESS
-            reservation.vehicle.status = VehicleStatus.RENTED
-            print(f"  🚗 Rental started for {reservation.vehicle}")
+    def start_rental(self, reservation_id: str) -> Reservation:
+        res = self.get_reservation(reservation_id)
+        with res.lock:
+            res.move_to(ReservationStatus.IN_PROGRESS)
+            res.vehicle.status = VehicleStatus.RENTED
+        return res
 
-    def complete_rental(self, reservation_id: str) -> Optional[float]:
-        reservation = self._reservations.get(reservation_id)
-        if reservation and reservation.status == ReservationStatus.IN_PROGRESS:
-            reservation.status = ReservationStatus.COMPLETED
-            reservation.vehicle.status = VehicleStatus.AVAILABLE
-
-            # Re-calculate actual cost based on actual return time
-            actual_hours = reservation.duration_hours
-            points = int(actual_hours * 2)  # 2 points per hour
-            reservation.customer.add_points(points)
-
-            print(f"  ✅ Rental completed! Points earned: {points}")
-            return reservation.total_cost
-        return None
-
-    def cancel_reservation(self, reservation_id: str) -> None:
-        reservation = self._reservations.get(reservation_id)
-        if reservation and reservation.status in (ReservationStatus.PENDING,
-                                                  ReservationStatus.CONFIRMED):
-            # Free up the time slots
-            self._calendar.mark_available(
-                reservation.vehicle.vehicle_id,
-                reservation.pickup_datetime,
-                reservation.return_datetime
-            )
-            reservation.status = ReservationStatus.CANCELLED
-            reservation.vehicle.status = VehicleStatus.AVAILABLE
-            print(f"  ❌ Reservation {reservation_id[:8]} cancelled")
+    def complete_rental(self, reservation_id: str, returned_at: Optional[datetime] = None) -> Decimal:
+        """
+        Charges the quote, or re-prices on the actual duration if returned later
+        than the grace period. Early return still pays the booked time.
+        """
+        res = self.get_reservation(reservation_id)
+        with res.lock:
+            res.move_to(ReservationStatus.COMPLETED)
+            returned_at = returned_at or self._clock()
+            res.returned_at = returned_at
+            if returned_at > res.dropoff + self.RETURN_GRACE:
+                res.final_amount = res.pricing.calculate_cost(
+                    res.vehicle, billable_hours(res.pickup, returned_at))
+            else:
+                res.final_amount = res.quoted_amount
+            res.vehicle.status = VehicleStatus.AVAILABLE
+            self.calendar.release(res.vehicle.vehicle_id, reservation_id)
+            res.customer.loyalty_points += res.duration_hours * self.POINTS_PER_HOUR
+            return res.final_amount
 
 
-# --- Demo ---
+# ============================================================
+# Demo (deterministic: fixed clock)
+# ============================================================
 
-def demo():
-    print("=== Car Rental Platform - Availability-Driven Design ===\n")
-    print("=" * 60)
+class FixedClock:
+    def __init__(self, now: datetime):
+        self.now = now
 
-    service = CarRentalService(lookahead_days=7)
+    def __call__(self) -> datetime:
+        return self.now
 
-    # Add vehicles with hourly and daily rates
-    vehicles = [
-        SUV("V1", "Toyota", "Fortuner", 2024, "KA-01-AB-1234",
-            FuelType.DIESEL, 12.0, 80.0),
-        Sedan("V2", "Honda", "City", 2024, "KA-01-CD-5678",
-              FuelType.PETROL, 8.0, 50.0),
-        Hatchback("V3", "Maruti", "Swift", 2023, "KA-01-EF-9012",
-                  FuelType.PETROL, 5.0, 35.0),
-        LuxuryCar("V4", "Mercedes", "E-Class", 2024, "KA-01-GH-3456",
-                  FuelType.DIESEL, 22.0, 150.0),
-        SUV("V5", "Hyundai", "Creta", 2024, "KA-01-IJ-7890",
-            FuelType.PETROL, 10.0, 65.0),
-        Van("V6", "Toyota", "Innova", 2024, "KA-01-KL-0123",
-            FuelType.DIESEL, 15.0, 90.0),
-    ]
-    for v in vehicles:
-        v.location = "Bangalore Airport"
-        service.fleet.add_vehicle(v)
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
 
-    # Register customer
-    alice = service.register_customer("Alice", "alice@email.com",
-                                      "9876543210", "DL-12345678")
-    bob = service.register_customer("Bob", "bob@email.com",
-                                    "9876543211", "DL-87654321")
-    print(f"\nRegistered customers: {alice.name}, {bob.name}")
 
-    # --- DEMO 1: Browse weekly availability ---
-    print("\n" + "=" * 60)
-    print("📋 DEMO 1: Browse Weekly Fleet Availability")
-    print("=" * 60)
+def demo() -> None:
+    clock = FixedClock(datetime(2025, 1, 13, 8, 0))   # Monday 08:00
+    svc = CarRentalService(clock=clock, turnaround=timedelta(minutes=30))
+    D = Decimal
+    for v in [
+        Vehicle("V1", VehicleType.SUV, "Toyota", "Fortuner", 2024, "KA-01-AB-1234", FuelType.DIESEL, D("12"), D("80"), "Airport", 7),
+        Vehicle("V2", VehicleType.SEDAN, "Honda", "City", 2024, "KA-01-CD-5678", FuelType.PETROL, D("8"), D("50"), "Airport"),
+        Vehicle("V3", VehicleType.HATCHBACK, "Maruti", "Swift", 2023, "KA-01-EF-9012", FuelType.PETROL, D("5"), D("35"), "Airport"),
+        Vehicle("V4", VehicleType.SUV, "Hyundai", "Creta", 2024, "KA-01-IJ-7890", FuelType.PETROL, D("10"), D("65"), "City"),
+    ]:
+        svc.add_vehicle(v)
+    alice = svc.register_customer("Alice", "alice@example.com", "DL-1")
+    bob = svc.register_customer("Bob", "bob@example.com", "DL-2")
 
-    weekly = service.search.browse_weekly()
-    print(f"\nTotal vehicles: {weekly['total_vehicles']}")
-    print(f"Total available hours this week: {weekly['total_available_hours']}h\n")
+    print("=== Car Rental Platform ===")
+    pickup = datetime(2025, 1, 14, 10, 0)
+    dropoff = datetime(2025, 1, 14, 12, 30)
+    hits = svc.search.search_available(pickup, dropoff, VehicleType.SUV)
+    print("SUVs free Tue 10:00-12:30:", [str(v) for v in hits])
 
-    for entry in weekly['fleet'][:3]:  # Show top 3
-        v = entry['vehicle']
-        print(f"  {v.make} {v.model:10s} ({v.vehicle_type.value:8s}) "
-              f"${v.hourly_rate:.0f}/hr · ${v.daily_rate:.0f}/day")
+    res = svc.create_reservation(alice.customer_id, "V1", pickup, dropoff, "Airport", "Airport")
+    print(f"Hold placed: {res} (3 started hours x 12)")
+    svc.confirm_reservation(res.reservation_id)
+    print(f"Confirmed: {res.status.name}")
 
-    # --- DEMO 2: Search by date ---
-    print("\n" + "=" * 60)
-    print("📋 DEMO 2: Check Today's Availability")
-    print("=" * 60)
+    try:
+        svc.create_reservation(bob.customer_id, "V1", datetime(2025, 1, 14, 12, 45),
+                               datetime(2025, 1, 14, 15, 0), "Airport", "Airport")
+    except VehicleUnavailableError as e:
+        print(f"Bob rejected (inside turnaround): {e}; next free start {e.next_free:%a %H:%M}")
 
-    today_summary = service.search.search_by_date(date.today())
-    print(f"\n  📅 {today_summary['day_name']}, {today_summary['date']}")
-    print(f"  🚗 Available vehicles: {today_summary['total_available']}/{len(vehicles)}")
+    # Hold that lapses before payment.
+    held = svc.create_reservation(bob.customer_id, "V2", pickup, dropoff, "Airport", "Airport")
+    clock.advance(timedelta(minutes=11))
+    try:
+        svc.confirm_reservation(held.reservation_id)
+    except HoldExpiredError as e:
+        print(f"Bob's hold: {e} -> {held.status.name}")
 
-    for entry in today_summary['results'][:3]:
-        v = entry['vehicle']
-        av = entry['availability']
-        print(f"    {v.make} {v.model:10s} — {av['total_available_hours']}h available")
+    # Long rental with discount decorator.
+    week = svc.create_reservation(alice.customer_id, "V4", datetime(2025, 1, 15, 9, 0),
+                                  datetime(2025, 1, 23, 9, 0), "City", "City",
+                                  WeeklyDiscountPricing(DailyRentalPricing()))
+    print(f"8-day rental quote: {week.quoted_amount} (8 x 65 less 10%)")
 
-    # --- DEMO 3: Book a vehicle for specific hours ---
-    print("\n" + "=" * 60)
-    print("📋 DEMO 3: Book a Vehicle (Hourly)")
-    print("=" * 60)
+    svc.schedule_maintenance("V3", datetime(2025, 1, 14, 0, 0), datetime(2025, 1, 14, 12, 0))
+    print("V3 Tue free hours:", svc.calendar.free_hours("V3", date(2025, 1, 14)))
+    print("V1 Tue free hours:", svc.calendar.free_hours("V1", date(2025, 1, 14)))
 
-    today = date.today()
-    pickup = datetime.combine(today, time(10, 0)) + timedelta(days=1)
-    dropoff = pickup + timedelta(hours=6)  # 6-hour rental
+    clock.now = pickup
+    svc.start_rental(res.reservation_id)
+    charged = svc.complete_rental(res.reservation_id, returned_at=datetime(2025, 1, 14, 15, 0))
+    print(f"Returned 2.5 h late: charged {charged} (re-priced on 5 h x 12)")
+    day_hold = svc.create_reservation(bob.customer_id, "V1", datetime(2025, 1, 17, 8, 0),
+                                      datetime(2025, 1, 17, 20, 0), "Airport", "Airport")
+    print(f"12 h on V1 quoted {day_hold.quoted_amount} (12 x 12 = 144, capped at the 80 daily rate)")
 
-    print(f"  🔍 Searching: {pickup.strftime('%a %d %H:%M')} → {dropoff.strftime('%a %d %H:%M')}")
-    available = service.search.search_available(pickup, dropoff)
-    print(f"  Found {len(available)} available vehicles:")
+    # Concurrency: 8 customers race for the same car and slot.
+    racers = [svc.register_customer(f"Racer-{i}", f"r{i}@example.com", f"DL-R{i}") for i in range(8)]
+    barrier, won = threading.Barrier(len(racers)), []
 
-    for v in available[:3]:
-        print(f"    {v.make} {v.model:10s} — {v.vehicle_type.value} "
-              f"(${v.hourly_rate:.0f}/hr, ${v.daily_rate:.0f}/day)")
+    def race(c: Customer) -> None:
+        barrier.wait()
+        try:
+            won.append(svc.create_reservation(c.customer_id, "V2", datetime(2025, 1, 16, 9, 0),
+                                              datetime(2025, 1, 16, 12, 0), "Airport", "Airport"))
+        except VehicleUnavailableError:
+            pass
 
-    if available:
-        print("\n  Booking first available SUV...")
-        res1 = service.create_reservation(
-            alice.customer_id, available[0].vehicle_id,
-            pickup, dropoff, "Bangalore Airport", "Bangalore City",
-            HourlyRentalPricing()
-        )
-
-    # --- DEMO 4: Try double-booking prevention ---
-    if available:
-        print("\n" + "=" * 60)
-        print("📋 DEMO 4: Double-Booking Prevention")
-        print("=" * 60)
-        print("  Trying to book same vehicle for overlapping time...")
-        res2 = service.create_reservation(
-            bob.customer_id, available[0].vehicle_id,
-            pickup, dropoff, "Bangalore Airport", "MG Road",
-            HourlyRentalPricing()
-        )
-
-    # --- DEMO 5: Multi-day booking ---
-    print("\n" + "=" * 60)
-    print("📋 DEMO 5: Multi-Day Booking with Discount")
-    print("=" * 60)
-
-    pickup2 = datetime.combine(today, time(10, 0)) + timedelta(days=2)
-    dropoff2 = pickup2 + timedelta(days=5)  # 5-day rental
-
-    available2 = service.search.search_available(pickup2, dropoff2, VehicleType.SUV)
-    if available2:
-        res3 = service.create_reservation(
-            alice.customer_id, available2[0].vehicle_id,
-            pickup2, dropoff2, "Bangalore Airport", "Mysore City",
-            WeeklyDiscountPricing(DailyRentalPricing())
-        )
-
-    # --- DEMO 6: Weekly overview for a specific vehicle ---
-    print("\n" + "=" * 60)
-    print("📋 DEMO 6: Weekly Availability Calendar")
-    print("=" * 60)
-
-    weekly_cal = service.calendar.get_weekly_availability("V1", date.today())
-    print(f"\n  Vehicle: {weekly_cal['vehicle_id']}")
-    print(f"  Week: {weekly_cal['week_start']} onward\n")
-    print(f"  {'Day':6s} | {'Date':10s} | {'Available Hours':20s} | {'Status'}")
-    print(f"  {'-'*6} | {'-'*10} | {'-'*20} | {'-'*12}")
-
-    for day in weekly_cal['days']:
-        hours_str = ', '.join(f"{h:02d}:00" for h in day['available_hours'][:4])
-        if len(day['available_hours']) > 4:
-            hours_str += f" ...({day['total_available']}h total)"
-        status = "FULL" if day['is_fully_booked'] else "OPEN"
-        print(f"  {day['day_name']:6s} | {day['date']:10s} | {hours_str:20s} | {status}")
+    threads = [threading.Thread(target=race, args=(c,)) for c in racers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"8 concurrent holds on one slot -> {len(won)} succeeded")
 
 
 if __name__ == "__main__":

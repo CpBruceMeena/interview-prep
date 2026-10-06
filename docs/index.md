@@ -11,7 +11,7 @@
         </p>
         <div class="hero-stats">
             <div class="hero-stat">
-                <span class="hero-stat-number">26</span>
+                <span class="hero-stat-number">30</span>
                 <span class="hero-stat-label">LLD Projects</span>
             </div>
             <div class="hero-stat">
@@ -209,6 +209,8 @@
 | 20 | **Web Crawler** | Concurrency, worker pool, rate limiting | [Go Code](golang-low-level-design/web-crawler/CODE.md) |
 | 21 | **KV Store** | TTL, eviction policies, snapshots | [Go Code](golang-low-level-design/kv-store/CODE.md) |
 | 22 | **Task Queue** | Priority queue, retry, graceful shutdown | [Go Code](golang-low-level-design/task-queue/CODE.md) |
+| 23 | **Circuit Breaker / Logging Framework** | Resilience state machines, async bounded queues | [Breaker](python-low-level-design/circuit-breaker/CODE.md) + [Logger](python-low-level-design/logging-framework/CODE.md) |
+| 24 | **Food Delivery / Order Matching Engine** | Sagas, dispatch without double-assignment, single-writer sequencing | [Food Delivery](python-low-level-design/food-delivery/CODE.md) + [Matching Engine](python-low-level-design/order-matching-engine/CODE.md) |
 
 ### Phase 4: Distributed Systems & Architecture (2-3 weeks)
 
@@ -263,7 +265,7 @@
 |-------|----------|-------|
 | **Phase 1** | 2-3 weeks | CS Fundamentals — build the base |
 | **Phase 2** | 2-3 weeks | Language Deep-Dive — master your stack |
-| **Phase 3** | 3-4 weeks | Low-Level Design — 18+ projects |
+| **Phase 3** | 3-4 weeks | Low-Level Design — 30 projects |
 | **Phase 4** | 2-3 weeks | Distributed Systems — think at scale |
 | **Phase 5** | 2-3 weeks | AI Engineering — emerging hot topic |
 | **Phase 6** | 1-2 weeks | Cloud & Tools — fill gaps |
@@ -290,8 +292,8 @@
         <span class="module-card-title">Python LLD</span>
     </div>
     <div class="module-card-body">
-        <span class="module-card-count">18 projects</span>
-        <span class="module-card-desc">SOLID design patterns, Python implementations, HLD architecture docs. Parking Lot → Payment Processing.</span>
+        <span class="module-card-count">24 projects</span>
+        <span class="module-card-desc">SOLID design patterns, Python implementations, HLD architecture docs. Parking Lot → Order Matching Engine.</span>
     </div>
     <div class="module-card-footer">
         <span class="module-card-tag">OOD</span>

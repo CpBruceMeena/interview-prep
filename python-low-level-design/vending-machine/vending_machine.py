@@ -1,479 +1,558 @@
 """
-Vending Machine System - Low Level Design
-------------------------------------------
-Design Principles: SOLID, State Pattern, Strategy Pattern
+Vending Machine - Low Level Design
+----------------------------------
+Money is integer cents everywhere. Floats can't represent 0.10 exactly, and
+"balance >= price" on floats is how machines eat a customer's dime.
+
+Flow:      IDLE --select--> AWAITING_PAYMENT --(enough cash | card ok)--> vend --> IDLE
+                                   |--cancel--> refund escrow --> IDLE
+           any --enter_maintenance--> OUT_OF_SERVICE (refunds an open transaction)
+
+Key rules (each one is a real failure mode when ignored):
+  * Inserted cash sits in ESCROW and is returned as the exact same pieces on
+    cancel; it only moves into the cash box once the product has dropped.
+  * Before accepting a piece that overpays, the machine checks it can make
+    change (bounded coin change, not greedy). If it can't, the piece is
+    rejected on the spot instead of taking the money and short-changing.
+  * Card: authorize -> dispense -> capture. A failed dispense voids the
+    authorization, so the customer is never charged for nothing.
+  * A dispenser jam refunds the customer and does not decrement stock.
+
+Thread-safety: one re-entrant lock per machine guards state, stock and cash.
+The physical keypad is single-user, but the admin/telemetry thread (restock,
+collect cash, maintenance) and remote app purchases run concurrently with it.
 """
 
+from __future__ import annotations
+
+import threading
 from abc import ABC, abstractmethod
+from collections import Counter
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Mapping, Optional
 
 
-class Coin(Enum):
-    PENNY = (0.01, "Penny")
-    NICKEL = (0.05, "Nickel")
-    DIME = (0.10, "Dime")
-    QUARTER = (0.25, "Quarter")
-    HALF_DOLLAR = (0.50, "Half Dollar")
+# --- Money ----------------------------------------------------------------
 
-    def __init__(self, value: float, name: str):
-        self._value = value
-        self._name = name
+class Denomination(Enum):
+    """Accepted cash: (cents, is_coin). Only coins are paid out as change.
+    Values are tuples so DOLLAR_COIN and ONE_NOTE don't become Enum aliases."""
+    NICKEL = (5, True)
+    DIME = (10, True)
+    QUARTER = (25, True)
+    DOLLAR_COIN = (100, True)
+    ONE_NOTE = (100, False)
+    FIVE_NOTE = (500, False)
 
-    @property
-    def value(self) -> float:
-        return self._value
-
-    @property
-    def display_name(self) -> str:
-        return self._name
+    def __init__(self, cents: int, is_coin: bool):
+        self.cents = cents
+        self.is_coin = is_coin
 
 
-class Note(Enum):
-    ONE = (1.0, "One Dollar")
-    FIVE = (5.0, "Five Dollars")
-    TEN = (10.0, "Ten Dollars")
-    TWENTY = (20.0, "Twenty Dollars")
-
-    def __init__(self, value: float, name: str):
-        self._value = value
-        self._name = name
-
-    @property
-    def value(self) -> float:
-        return self._value
-
-    @property
-    def display_name(self) -> str:
-        return self._name
+def fmt(cents: int) -> str:
+    return f"${cents // 100}.{cents % 100:02d}"
 
 
-class PaymentMethod(Enum):
-    CASH = "Cash"
-    CARD = "Card"
-    MOBILE = "Mobile Payment"
+def _sum(pieces: Mapping[Denomination, int]) -> int:
+    return sum(d.cents * n for d, n in pieces.items())
 
 
-# --- Product (SRP) ---
+# --- Errors ---------------------------------------------------------------
 
+class VendingError(Exception):
+    pass
+
+
+class InvalidStateError(VendingError):
+    pass
+
+
+class UnknownSlotError(VendingError):
+    pass
+
+
+class SoldOutError(VendingError):
+    pass
+
+
+class ChangeUnavailableError(VendingError):
+    """Raised when a piece is rejected because change can't be made."""
+
+
+class PaymentDeclinedError(VendingError):
+    pass
+
+
+class DispenseFailedError(VendingError):
+    """The product didn't drop; the customer has been refunded."""
+
+
+# --- Catalogue & stock ----------------------------------------------------
+
+@dataclass(frozen=True)
 class Product:
-    """Single Responsibility: Represents a product"""
+    sku: str
+    name: str
+    price_cents: int
 
-    def __init__(self, product_id: str, name: str, price: float, category: str = "General"):
-        self._product_id = product_id
-        self._name = name
-        self._price = price
-        self._category = category
-
-    @property
-    def product_id(self) -> str:
-        return self._product_id
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def price(self) -> float:
-        return self._price
-
-    @property
-    def category(self) -> str:
-        return self._category
-
-    def __str__(self) -> str:
-        return f"{self._name} (${self._price:.2f})"
+    def __post_init__(self):
+        if self.price_cents <= 0:
+            raise ValueError("price must be positive")
 
 
-# --- Inventory (SRP) ---
+@dataclass
+class Slot:
+    code: str
+    product: Product
+    quantity: int
+    capacity: int
+
+    def __post_init__(self):
+        if not 0 <= self.quantity <= self.capacity:
+            raise ValueError(f"slot {self.code}: quantity must be in 0..{self.capacity}")
+
 
 class Inventory:
-    """Single Responsibility: Manages product stock"""
-
     def __init__(self):
-        self._products: Dict[str, Product] = {}
-        self._stock: Dict[str, int] = {}
+        self._slots: dict[str, Slot] = {}
 
-    def add_product(self, product: Product, quantity: int) -> None:
-        self._products[product.product_id] = product
-        self._stock[product.product_id] = self._stock.get(product.product_id, 0) + quantity
+    def add_slot(self, code: str, product: Product, quantity: int, capacity: int = 10) -> None:
+        if code in self._slots:
+            raise ValueError(f"slot {code} already exists")
+        self._slots[code] = Slot(code, product, quantity, capacity)
 
-    def get_product(self, product_id: str) -> Optional[Product]:
-        return self._products.get(product_id)
+    def slot(self, code: str) -> Slot:
+        try:
+            return self._slots[code]
+        except KeyError:
+            raise UnknownSlotError(code) from None
 
-    def is_available(self, product_id: str) -> bool:
-        return self._stock.get(product_id, 0) > 0
+    def restock(self, code: str, qty: int) -> int:
+        slot = self.slot(code)
+        if qty <= 0 or slot.quantity + qty > slot.capacity:
+            raise ValueError(f"slot {code}: can add 1..{slot.capacity - slot.quantity}")
+        slot.quantity += qty
+        return slot.quantity
 
-    def dispense(self, product_id: str) -> Optional[Product]:
-        if not self.is_available(product_id):
-            return None
-        self._stock[product_id] -= 1
-        return self._products.get(product_id)
-
-    def get_quantity(self, product_id: str) -> int:
-        return self._stock.get(product_id, 0)
-
-    def display_products(self) -> None:
-        print("\n=== Available Products ===")
-        for pid, product in self._products.items():
-            qty = self._stock.get(pid, 0)
-            status = f"In Stock ({qty})" if qty > 0 else "SOLD OUT"
-            print(f"  [{pid}] {product.name:20s} ${product.price:.2f} - {status}")
+    def snapshot(self) -> dict[str, int]:
+        return {code: s.quantity for code, s in self._slots.items()}
 
 
-# --- Payment Strategy (Strategy Pattern - OCP/DIP) ---
+# --- Cash box & change making ---------------------------------------------
 
-class PaymentStrategy(ABC):
-    """Interface Segregation: Specific to payment processing"""
+def make_change(amount: int, available: Mapping[Denomination, int]) -> Optional[Counter]:
+    """Fewest coins summing to `amount` using at most available[d] of each.
+
+    Bounded coin change by DP over reachable amounts. Greedy is NOT enough
+    here: even with canonical denominations a limited supply breaks it
+    (30c from {QUARTER: 1, DIME: 3}: greedy takes the quarter and is stuck,
+    three dimes work). O(amount/5 * total coins) for these denominations.
+    """
+    if amount == 0:
+        return Counter()
+    best: dict[int, Counter] = {0: Counter()}
+    for d in sorted((d for d in available if d.is_coin), key=lambda d: -d.cents):
+        layer = dict(best)
+        for reached, used in best.items():
+            for k in range(1, available[d] + 1):
+                total = reached + k * d.cents
+                if total > amount:
+                    break
+                cand = used + Counter({d: k})
+                prev = layer.get(total)
+                if prev is None or sum(cand.values()) < sum(prev.values()):
+                    layer[total] = cand
+        best = layer
+    return best.get(amount)
+
+
+class CashBox:
+    """Coins/notes the machine owns (change float + takings)."""
+
+    def __init__(self, initial: Optional[Mapping[Denomination, int]] = None):
+        self._counts: Counter = Counter(initial or {})
+
+    def deposit(self, pieces: Mapping[Denomination, int]) -> None:
+        self._counts.update(pieces)
+
+    def withdraw(self, pieces: Mapping[Denomination, int]) -> None:
+        for d, n in pieces.items():
+            if self._counts[d] < n:
+                raise ValueError(f"cash box has {self._counts[d]} x {d.name}, need {n}")
+        self._counts.subtract(pieces)
+
+    def counts(self) -> dict[Denomination, int]:
+        return {d: n for d, n in self._counts.items() if n}
+
+    def total(self) -> int:
+        return sum(d.cents * n for d, n in self._counts.items())
+
+
+# --- External hardware / services (ports) ---------------------------------
+
+class Dispenser(ABC):
+    @abstractmethod
+    def dispense(self, slot_code: str) -> bool:
+        """Drive the motor; True iff the drop sensor saw the product fall."""
+
+
+class ReliableDispenser(Dispenser):
+    def dispense(self, slot_code: str) -> bool:
+        return True
+
+
+class PaymentGateway(ABC):
+    """Card/mobile payments. Two-phase so we only charge for what dropped."""
 
     @abstractmethod
-    def process_payment(self, amount: float) -> bool:
-        pass
+    def authorize(self, token: str, amount_cents: int) -> str:
+        """Place a hold; returns an auth id. Raises PaymentDeclinedError."""
 
     @abstractmethod
-    def refund(self, amount: float) -> bool:
-        pass
+    def capture(self, auth_id: str) -> None: ...
+
+    @abstractmethod
+    def void(self, auth_id: str) -> None: ...
 
 
-class CashPayment(PaymentStrategy):
+class FakeGateway(PaymentGateway):
+    """In-memory gateway: tokens starting with 'declined' are refused."""
+
     def __init__(self):
-        self._inserted_amount = 0.0
-        self._coin_mechanism = CoinMechanism()
+        self._lock = threading.Lock()
+        self._next = 0
+        self.holds: dict[str, int] = {}
+        self.captured: dict[str, int] = {}
+        self.voided: dict[str, int] = {}
 
-    def insert_coin(self, coin: Coin) -> None:
-        self._inserted_amount += coin.value
-        self._coin_mechanism.add_coin(coin)
-        print(f"  Inserted {coin.display_name}. Total: ${self._inserted_amount:.2f}")
+    def authorize(self, token: str, amount_cents: int) -> str:
+        if token.startswith("declined"):
+            raise PaymentDeclinedError(token)
+        with self._lock:
+            self._next += 1
+            auth_id = f"auth-{self._next}"
+            self.holds[auth_id] = amount_cents
+            return auth_id
 
-    def insert_note(self, note: Note) -> None:
-        self._inserted_amount += note.value
-        print(f"  Inserted {note.display_name}. Total: ${self._inserted_amount:.2f}")
+    def capture(self, auth_id: str) -> None:
+        with self._lock:
+            self.captured[auth_id] = self.holds.pop(auth_id)
+
+    def void(self, auth_id: str) -> None:
+        with self._lock:
+            self.voided[auth_id] = self.holds.pop(auth_id)
+
+
+# --- Results --------------------------------------------------------------
+
+class PaymentMethod(Enum):
+    CASH = "cash"
+    CARD = "card"
+
+
+@dataclass(frozen=True)
+class Receipt:
+    slot_code: str
+    product: Product
+    method: PaymentMethod
+    paid_cents: int
+    change: dict[Denomination, int] = field(default_factory=dict)
 
     @property
-    def current_balance(self) -> float:
-        return self._inserted_amount
-
-    def process_payment(self, amount: float) -> bool:
-        if self._inserted_amount >= amount:
-            self._inserted_amount -= amount
-            return True
-        return False
-
-    def refund(self, amount: float) -> bool:
-        self._inserted_amount += amount
-        return True
-
-    def get_change(self) -> float:
-        change = self._inserted_amount
-        self._inserted_amount = 0.0
-        if change > 0:
-            print(f"  Returning change: ${change:.2f}")
-        return change
+    def change_cents(self) -> int:
+        return _sum(self.change)
 
 
-class CardPayment(PaymentStrategy):
-    def __init__(self, card_number: str):
-        self._card_number = card_number
-        self._authorized = False
+# --- States (State pattern) -----------------------------------------------
 
-    def process_payment(self, amount: float) -> bool:
-        print(f"  Processing card payment of ${amount:.2f}...")
-        # Simulate card processing
-        self._authorized = True
-        return True
+class MachineState(ABC):
+    """Every customer action is rejected unless a state allows it."""
+    name: str = "?"
 
-    def refund(self, amount: float) -> bool:
-        print(f"  Refunding ${amount:.2f} to card {self._card_number[-4:]}")
-        return True
+    def __init__(self, machine: VendingMachine):
+        self.m = machine
 
+    def select(self, code: str) -> Product:
+        raise InvalidStateError(f"can't select in {self.name}")
 
-class MobilePayment(PaymentStrategy):
-    def __init__(self, provider: str, phone: str):
-        self._provider = provider
-        self._phone = phone
+    def insert(self, piece: Denomination) -> Optional[Receipt]:
+        raise InvalidStateError(f"can't insert money in {self.name}")
 
-    def process_payment(self, amount: float) -> bool:
-        print(f"  Processing {self._provider} payment of ${amount:.2f}...")
-        return True
+    def pay_by_card(self, token: str) -> Receipt:
+        raise InvalidStateError(f"can't pay in {self.name}")
 
-    def refund(self, amount: float) -> bool:
-        print(f"  Refunding ${amount:.2f} via {self._provider}")
-        return True
+    def cancel(self) -> dict[Denomination, int]:
+        raise InvalidStateError(f"nothing to cancel in {self.name}")
 
 
-class CoinMechanism:
-    """Handles coin operations"""
+class IdleState(MachineState):
+    name = "IDLE"
 
-    def __init__(self):
-        self._coins: Dict[Coin, int] = {}
-
-    def add_coin(self, coin: Coin, count: int = 1) -> None:
-        self._coins[coin] = self._coins.get(coin, 0) + count
-
-    def has_change(self, amount: float) -> bool:
-        # Simple check - could use greedy algorithm
-        return self._get_total() >= amount
-
-    def dispense_change(self, amount: float) -> Dict[Coin, int]:
-        change: Dict[Coin, int] = {}
-        remaining = amount
-        # Greedy algorithm for change making
-        for coin in sorted([c for c in Coin], key=lambda c: c.value, reverse=True):
-            while remaining >= coin.value and self._coins.get(coin, 0) > 0:
-                change[coin] = change.get(coin, 0) + 1
-                self._coins[coin] -= 1
-                remaining = round(remaining - coin.value, 2)
-        if remaining > 0:
-            # Refund coins if insufficient change
-            for coin, count in change.items():
-                self._coins[coin] = self._coins.get(coin, 0) + count
-            raise ValueError("Insufficient change available")
-        return change
-
-    def _get_total(self) -> float:
-        return sum(coin.value * count for coin, count in self._coins.items())
+    def select(self, code: str) -> Product:
+        slot = self.m._inventory.slot(code)
+        if slot.quantity == 0:
+            raise SoldOutError(f"{slot.product.name} ({code}) is sold out")
+        self.m._selected = slot
+        self.m._set_state(self.m._awaiting)
+        return slot.product
 
 
-# --- Display (SRP / Observer) ---
+class AwaitingPaymentState(MachineState):
+    name = "AWAITING_PAYMENT"
 
-class VendingDisplay:
-    """Single Responsibility: Handles all display/output"""
+    def insert(self, piece: Denomination) -> Optional[Receipt]:
+        m = self.m
+        price = m._selected.product.price_cents
+        balance = m._escrow_total() + piece.cents
+        if balance < price:
+            m._escrow[piece] += 1
+            return None
+        # This piece completes payment. Accept it only if we can make change
+        # from the cash box plus everything in escrow (including this piece).
+        pool = Counter(m._cash.counts())
+        pool.update(m._escrow)
+        pool[piece] += 1
+        change = make_change(balance - price, pool)
+        if change is None:
+            raise ChangeUnavailableError(
+                f"can't make {fmt(balance - price)} change; {piece.name} returned, "
+                f"balance still {fmt(m._escrow_total())}")
+        m._escrow[piece] += 1
+        return m._vend_cash(change)
 
-    @staticmethod
-    def show_welcome() -> None:
-        print("\n=== Vending Machine ===")
-        print("Select a product or press 'q' to quit")
+    def pay_by_card(self, token: str) -> Receipt:
+        if self.m._escrow:
+            raise InvalidStateError("cash already inserted; finish with cash or cancel")
+        return self.m._vend_card(token)
 
-    @staticmethod
-    def show_insufficient_funds(product_name: str, price: float, balance: float) -> None:
-        print(f"  Insufficient funds for {product_name}: ${price:.2f} needed, ${balance:.2f} available")
-
-    @staticmethod
-    def show_dispense(product_name: str) -> None:
-        print(f"  🥤 Dispensing: {product_name}!")
-
-    @staticmethod
-    def show_transaction_complete() -> None:
-        print("  ✅ Transaction complete. Thank you!")
-
-    @staticmethod
-    def show_refund(amount: float) -> None:
-        print(f"  💰 Refund issued: ${amount:.2f}")
-
-
-# --- Vending Machine States (State Pattern) ---
-
-class VendingState(ABC):
-    """Abstract state - Open/Closed for new states"""
-
-    def __init__(self, machine: 'VendingMachine'):
-        self._machine = machine
-
-    @abstractmethod
-    def select_product(self, product_id: str) -> None:
-        pass
-
-    @abstractmethod
-    def insert_coin(self, coin: Coin) -> None:
-        pass
-
-    @abstractmethod
-    def insert_note(self, note: Note) -> None:
-        pass
-
-    @abstractmethod
-    def dispense_product(self) -> None:
-        pass
-
-    @abstractmethod
-    def cancel_transaction(self) -> None:
-        pass
+    def cancel(self) -> dict[Denomination, int]:
+        return self.m._refund_and_reset()
 
 
-class IdleState(VendingState):
-    def select_product(self, product_id: str) -> None:
-        product = self._machine._inventory.get_product(product_id)
-        if not product:
-            print(f"  Product not found: {product_id}")
-            return
-        if not self._machine._inventory.is_available(product_id):
-            print(f"  {product.name} is sold out")
-            return
-        self._machine._selected_product = product
-        self._machine._current_balance = 0.0
-        self._machine._payment_strategy = CashPayment()
-        print(f"  Selected: {product.name} - ${product.price:.2f}")
-        print(f"  Please insert money")
-        self._machine._state = self._machine._waiting_for_money_state
-
-    def insert_coin(self, coin: Coin) -> None:
-        print("  Please select a product first")
-
-    def insert_note(self, note: Note) -> None:
-        print("  Please select a product first")
-
-    def dispense_product(self) -> None:
-        print("  Please select a product first")
-
-    def cancel_transaction(self) -> None:
-        print("  No transaction to cancel")
+class OutOfServiceState(MachineState):
+    name = "OUT_OF_SERVICE"
 
 
-class WaitingForMoneyState(VendingState):
-    def select_product(self, product_id: str) -> None:
-        print("  Already selected a product. Insert money or cancel.")
-
-    def insert_coin(self, coin: Coin) -> None:
-        self._machine._payment_strategy.insert_coin(coin)
-        self._machine._current_balance = self._machine._payment_strategy.current_balance
-        self._check_balance()
-
-    def insert_note(self, note: Note) -> None:
-        self._machine._payment_strategy.insert_note(note)
-        self._machine._current_balance = self._machine._payment_strategy.current_balance
-        self._check_balance()
-
-    def _check_balance(self) -> None:
-        if self._machine._current_balance >= self._machine._selected_product.price:
-            self._machine._state = self._machine._ready_to_dispense_state
-            print(f"  ✅ Sufficient funds! Press 'dispense' to receive your {self._machine._selected_product.name}")
-        else:
-            needed = self._machine._selected_product.price - self._machine._current_balance
-            print(f"  💵 Need ${needed:.2f} more")
-
-    def dispense_product(self) -> None:
-        print("  Insufficient funds. Insert more money or cancel.")
-
-    def cancel_transaction(self) -> None:
-        if self._machine._current_balance > 0:
-            self._machine._payment_strategy.refund(self._machine._current_balance)
-            self._machine._current_balance = 0.0
-        self._machine._selected_product = None
-        self._machine._state = self._machine._idle_state
-        print("  Transaction cancelled")
-
-
-class ReadyToDispenseState(VendingState):
-    def select_product(self, product_id: str) -> None:
-        print("  Complete current transaction first or cancel")
-
-    def insert_coin(self, coin: Coin) -> None:
-        print("  Already have sufficient funds. Dispense or cancel.")
-
-    def insert_note(self, note: Note) -> None:
-        print("  Already have sufficient funds. Dispense or cancel.")
-
-    def dispense_product(self) -> None:
-        self._machine._payment_strategy.process_payment(self._machine._selected_product.price)
-        product = self._machine._inventory.dispense(self._machine._selected_product.product_id)
-        VendingDisplay.show_dispense(product.name)
-
-        # Return change
-        change = self._machine._current_balance - product.price
-        if change > 0:
-            try:
-                self._machine._payment_strategy.get_change()
-            except ValueError as e:
-                print(f"  ⚠️ {e}")
-                # Still dispensed the product
-
-        self._machine._selected_product = None
-        self._machine._current_balance = 0.0
-        self._machine._state = self._machine._idle_state
-        VendingDisplay.show_transaction_complete()
-
-    def cancel_transaction(self) -> None:
-        self._machine._payment_strategy.refund(self._machine._current_balance)
-        self._machine._current_balance = 0.0
-        self._machine._selected_product = None
-        self._machine._state = self._machine._idle_state
-        print("  Transaction cancelled. Money refunded.")
-
-
-# --- Vending Machine (Facade) ---
+# --- Machine (facade) -----------------------------------------------------
 
 class VendingMachine:
-    """Facade for the entire vending machine system"""
-
-    def __init__(self):
+    def __init__(self, dispenser: Optional[Dispenser] = None,
+                 gateway: Optional[PaymentGateway] = None,
+                 change_float: Optional[Mapping[Denomination, int]] = None):
         self._inventory = Inventory()
-        self._display = VendingDisplay()
+        self._cash = CashBox(change_float)
+        self._dispenser = dispenser or ReliableDispenser()
+        self._gateway = gateway or FakeGateway()
+        self._lock = threading.RLock()
 
-        # States
-        self._idle_state = IdleState(self)
-        self._waiting_for_money_state = WaitingForMoneyState(self)
-        self._ready_to_dispense_state = ReadyToDispenseState(self)
-        self._state = self._idle_state
+        self._idle = IdleState(self)
+        self._awaiting = AwaitingPaymentState(self)
+        self._out_of_service = OutOfServiceState(self)
+        self._state: MachineState = self._idle
 
-        self._selected_product: Optional[Product] = None
-        self._current_balance = 0.0
-        self._payment_strategy: PaymentStrategy = CashPayment()
+        self._selected: Optional[Slot] = None
+        self._escrow: Counter = Counter()
+
+    # ---- customer API (each call is atomic) ----
+    def select(self, code: str) -> Product:
+        with self._lock:
+            return self._state.select(code)
+
+    def insert(self, piece: Denomination) -> Optional[Receipt]:
+        """Returns a Receipt once enough money is in, else None."""
+        with self._lock:
+            return self._state.insert(piece)
+
+    def pay_by_card(self, token: str) -> Receipt:
+        with self._lock:
+            return self._state.pay_by_card(token)
+
+    def cancel(self) -> dict[Denomination, int]:
+        """Returns the exact pieces inserted."""
+        with self._lock:
+            return self._state.cancel()
+
+    def purchase_with_card(self, code: str, token: str) -> Receipt:
+        """Remote/app purchase: select + pay as one atomic step."""
+        with self._lock:
+            self.select(code)
+            try:
+                return self.pay_by_card(token)
+            except PaymentDeclinedError:
+                self._refund_and_reset()
+                raise
+
+    # ---- operator API ----
+    def add_slot(self, code: str, product: Product, quantity: int, capacity: int = 10) -> None:
+        with self._lock:
+            self._inventory.add_slot(code, product, quantity, capacity)
+
+    def restock(self, code: str, qty: int) -> int:
+        with self._lock:
+            return self._inventory.restock(code, qty)
+
+    def load_change(self, pieces: Mapping[Denomination, int]) -> None:
+        with self._lock:
+            self._cash.deposit(pieces)
+
+    def collect_cash(self, keep_float: Mapping[Denomination, int]) -> dict[Denomination, int]:
+        """Empty the cash box down to `keep_float`; returns what was removed."""
+        with self._lock:
+            counts = self._cash.counts()
+            take = {d: n - keep_float.get(d, 0) for d, n in counts.items()
+                    if n > keep_float.get(d, 0)}
+            self._cash.withdraw(take)
+            return take
+
+    def enter_maintenance(self) -> dict[Denomination, int]:
+        """Takes the machine offline; refunds any open transaction."""
+        with self._lock:
+            refunded = self._refund_and_reset() if self._state is self._awaiting else {}
+            self._set_state(self._out_of_service)
+            return refunded
+
+    def exit_maintenance(self) -> None:
+        with self._lock:
+            if self._state is not self._out_of_service:
+                raise InvalidStateError("not in maintenance")
+            self._set_state(self._idle)
+
+    # ---- queries ----
+    @property
+    def state(self) -> str:
+        return self._state.name
 
     @property
-    def inventory(self) -> Inventory:
-        return self._inventory
+    def balance_cents(self) -> int:
+        with self._lock:
+            return self._escrow_total()
 
-    def select_product(self, product_id: str) -> None:
-        self._state.select_product(product_id)
+    def stock(self) -> dict[str, int]:
+        with self._lock:
+            return self._inventory.snapshot()
 
-    def insert_coin(self, coin: Coin) -> None:
-        self._state.insert_coin(coin)
+    def cash_total_cents(self) -> int:
+        with self._lock:
+            return self._cash.total()
 
-    def insert_note(self, note: Note) -> None:
-        self._state.insert_note(note)
+    # ---- internals (called with the lock held) ----
+    def _set_state(self, state: MachineState) -> None:
+        self._state = state
 
-    def dispense(self) -> None:
-        self._state.dispense_product()
+    def _escrow_total(self) -> int:
+        return _sum(self._escrow)
 
-    def cancel(self) -> None:
-        self._state.cancel_transaction()
+    def _refund_and_reset(self) -> dict[Denomination, int]:
+        returned = dict(self._escrow)
+        self._escrow.clear()
+        self._selected = None
+        self._set_state(self._idle)
+        return returned
 
-    def show_products(self) -> None:
-        self._inventory.display_products()
+    def _drop(self) -> bool:
+        return self._dispenser.dispense(self._selected.code)
+
+    def _vend_cash(self, change: Counter) -> Receipt:
+        slot = self._selected
+        if not self._drop():
+            returned = self._refund_and_reset()
+            raise DispenseFailedError(
+                f"{slot.product.name} did not drop; returned {fmt(_sum(returned))}")
+        paid = self._escrow_total()
+        # Commit: escrow -> cash box, then pay change out of it. make_change
+        # was computed over (cash box + escrow), so the withdraw can't fail.
+        self._cash.deposit(self._escrow)
+        self._cash.withdraw(change)
+        slot.quantity -= 1
+        receipt = Receipt(slot.code, slot.product, PaymentMethod.CASH, paid, dict(change))
+        self._escrow.clear()
+        self._selected = None
+        self._set_state(self._idle)
+        return receipt
+
+    def _vend_card(self, token: str) -> Receipt:
+        slot = self._selected
+        price = slot.product.price_cents
+        auth_id = self._gateway.authorize(token, price)   # may raise Declined
+        if not self._drop():
+            self._gateway.void(auth_id)
+            self._refund_and_reset()
+            raise DispenseFailedError(f"{slot.product.name} did not drop; card not charged")
+        slot.quantity -= 1
+        self._gateway.capture(auth_id)
+        self._selected = None
+        self._set_state(self._idle)
+        return Receipt(slot.code, slot.product, PaymentMethod.CARD, price)
 
 
-# --- Demo ---
+# --- Demo -----------------------------------------------------------------
 
-def setup_vending_machine() -> VendingMachine:
-    machine = VendingMachine()
-
-    # Add products
-    machine.inventory.add_product(Product("A1", "Coke", 1.50, "Drinks"), 10)
-    machine.inventory.add_product(Product("A2", "Pepsi", 1.50, "Drinks"), 8)
-    machine.inventory.add_product(Product("A3", "Water", 1.00, "Drinks"), 15)
-    machine.inventory.add_product(Product("B1", "Chips", 1.25, "Snacks"), 12)
-    machine.inventory.add_product(Product("B2", "Chocolate Bar", 1.75, "Snacks"), 10)
-    machine.inventory.add_product(Product("C1", "Gum", 0.75, "Candy"), 20)
-    machine.inventory.add_product(Product("C2", "Mints", 0.50, "Candy"), 25)
-
-    return machine
+def build_demo_machine(dispenser: Optional[Dispenser] = None,
+                       gateway: Optional[PaymentGateway] = None) -> VendingMachine:
+    vm = VendingMachine(dispenser, gateway,
+                        change_float={Denomination.QUARTER: 4, Denomination.DIME: 5,
+                                      Denomination.NICKEL: 4})
+    vm.add_slot("A1", Product("coke", "Coke", 150), 5)
+    vm.add_slot("A2", Product("water", "Water", 100), 1)
+    vm.add_slot("B1", Product("chips", "Chips", 125), 5)
+    vm.add_slot("C1", Product("gum", "Gum", 65), 5)
+    return vm
 
 
-def demo():
-    machine = setup_vending_machine()
+def demo() -> None:
+    def show_change(r: Receipt) -> str:
+        parts = ", ".join(f"{n} x {d.name}" for d, n in r.change.items())
+        return f"{fmt(r.change_cents)} ({parts})" if parts else "none"
 
-    # Interactive demo
-    print("=== Vending Machine Demo ===")
-    machine.show_products()
+    vm = build_demo_machine()
+    D = Denomination
+    print("=== Cash purchase with change ===")
+    print("  selected:", vm.select("C1").name, "for", fmt(65))
+    print("  insert QUARTER ->", vm.insert(D.QUARTER), "balance", fmt(vm.balance_cents))
+    r = vm.insert(D.ONE_NOTE)
+    print(f"  insert ONE_NOTE -> vended {r.product.name}, paid {fmt(r.paid_cents)}, "
+          f"change {show_change(r)}")
 
-    # Simulate a purchase
-    print("\n--- Customer 1 ---")
-    machine.select_product("A1")
-    machine.insert_coin(Coin.QUARTER)
-    machine.insert_coin(Coin.QUARTER)
-    machine.insert_coin(Coin.QUARTER)
-    machine.insert_coin(Coin.QUARTER)
-    machine.dispense()
+    print("\n=== Cancel returns the exact pieces ===")
+    vm.select("B1")
+    vm.insert(D.DIME)
+    vm.insert(D.QUARTER)
+    print("  cancel ->", {d.name: n for d, n in vm.cancel().items()}, "state", vm.state)
 
-    print("\n--- Customer 2 (Insufficient funds, then cancel) ---")
-    machine.select_product("B2")
-    machine.insert_coin(Coin.DIME)
-    machine.cancel()
+    print("\n=== Can't make change: the note is rejected, not swallowed ===")
+    vm.collect_cash(keep_float={})      # empty the cash box
+    vm.select("A1")
+    vm.insert(D.ONE_NOTE)
+    try:
+        vm.insert(D.FIVE_NOTE)
+    except ChangeUnavailableError as e:
+        print("  rejected:", e)
+    r = vm.insert(D.QUARTER) or vm.insert(D.QUARTER)
+    print(f"  exact money instead -> vended {r.product.name}, change {show_change(r)}")
 
-    print("\n--- Customer 3 ---")
-    machine.select_product("C1")
-    machine.insert_note(Note.ONE)
-    machine.dispense()
+    print("\n=== Card purchase (authorize -> dispense -> capture) ===")
+    gw = FakeGateway()
+    vm = build_demo_machine(gateway=gw)
+    r = vm.purchase_with_card("A2", "visa-4242")
+    print(f"  vended {r.product.name} by {r.method.value}; captured {gw.captured}")
+    try:
+        vm.select("A2")
+    except SoldOutError as e:
+        print("  next select:", e)
+
+    print("\n=== Jammed dispenser: card hold is voided ===")
+
+    class Jammed(Dispenser):
+        def dispense(self, slot_code: str) -> bool:
+            return False
+
+    gw = FakeGateway()
+    vm = build_demo_machine(dispenser=Jammed(), gateway=gw)
+    try:
+        vm.purchase_with_card("A1", "visa-4242")
+    except DispenseFailedError as e:
+        print(" ", e, "| voided:", gw.voided, "| stock A1:", vm.stock()["A1"])
 
 
 if __name__ == "__main__":

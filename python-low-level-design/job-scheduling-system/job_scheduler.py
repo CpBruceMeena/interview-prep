@@ -1,43 +1,58 @@
 """
 Job Scheduling System — Low Level Design
 =========================================
-Design Principles: SOLID, Strategy, Command, Observer, Producer-Consumer
 
-Core Computer Science Concepts Demonstrated:
-  • Concurrency vs Parallelism — asyncio (concurrent) vs multiprocessing (parallel)
-  • GIL (Global Interpreter Lock) — why threading is limited for CPU-bound work
-  • Race Conditions — demonstrated with and without locks
-  • Deadlock Prevention — lock ordering, timeouts, try-lock patterns
-  • Context Switching — cooperative (async/await) vs preemptive (threads)
-  • Semaphore / Bounded Semaphore — concurrency limiting
-  • Producer-Consumer — asyncio.Queue + multiple workers
-  • Cooperative Cancellation — asyncio.CancelledError, asyncio.Event
-  • Thread-safe vs Async-safe patterns
+An in-process job scheduler built on asyncio:
+
+  * one-shot, delayed and recurring (fixed-interval) jobs
+  * pluggable ordering: FIFO, priority, priority-with-aging, earliest-deadline-first
+  * per-job timeout, retries with capped exponential backoff + full jitter
+  * cancellation of pending and running jobs
+  * dependencies between jobs (a small DAG); upstream failure cancels dependents
+  * three execution models per job: ASYNC (event loop), THREAD (thread pool),
+    PROCESS (process pool, for CPU-bound work that must escape the GIL)
+  * graceful shutdown, and a thread-safe submit for producers on other threads
+
+Concurrency model of the scheduler itself
+-----------------------------------------
+All scheduler state (heaps, maps, counters) is owned by ONE event-loop thread.
+Every check-then-act sequence on that state runs without an `await` in the
+middle, so no other coroutine can interleave and no lock is needed. Work that
+leaves the loop (THREAD / PROCESS jobs) only returns a value; it never touches
+scheduler state. Producers on other threads must use `submit_threadsafe`, which
+hops onto the loop with `call_soon_threadsafe`.
+
+Patterns: Command (Job), Strategy (SchedulingStrategy), Observer (listeners),
+Producer-Consumer (submit -> ready heap -> worker coroutines).
+
+Run:   python3 job_scheduler.py
+Test:  python3 -m unittest test_job_scheduler
 """
 
-from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from datetime import datetime, timedelta
-from enum import Enum
-from typing import Dict, List, Optional, Callable, Any, Tuple
+from __future__ import annotations
+
 import asyncio
 import heapq
-import multiprocessing
-import os
-import signal
+import itertools
+import logging
+import math
+import random
 import time
-import threading
-import uuid
+from abc import ABC, abstractmethod
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  CORE CS CONCEPT: Enums for State Machines
+#  ENUMS + STATE MACHINE
 # ════════════════════════════════════════════════════════════════════════
-# Enums give us type-safe state representation. Each enum member is a
-# singleton, making equality checks O(1). The integer backing (.value)
-# enables comparison operations (<, >) used in priority ordering.
 
-class JobPriority(Enum):
+class JobPriority(IntEnum):
     LOW = 0
     MEDIUM = 1
     HIGH = 2
@@ -45,1179 +60,801 @@ class JobPriority(Enum):
 
 
 class JobStatus(Enum):
-    PENDING = "Pending"
-    RUNNING = "Running"
-    COMPLETED = "Completed"
-    FAILED = "Failed"
-    CANCELLED = "Cancelled"
-    RETRYING = "Retrying"
-    TIMEOUT = "Timeout"             # Job exceeded its time budget
+    PENDING = "pending"          # waiting for its run time, its dependencies, or a worker
+    RUNNING = "running"
+    RETRY_WAIT = "retry_wait"    # failed, waiting out its backoff delay
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in _TERMINAL
+
+
+_TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMED_OUT, JobStatus.CANCELLED}
+
+# Every legal edge. Anything else is a bug and raises InvalidTransitionError.
+_TRANSITIONS: Dict[JobStatus, Set[JobStatus]] = {
+    JobStatus.PENDING: {JobStatus.RUNNING, JobStatus.CANCELLED},
+    JobStatus.RUNNING: {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMED_OUT,
+                        JobStatus.CANCELLED, JobStatus.RETRY_WAIT},
+    JobStatus.RETRY_WAIT: {JobStatus.RUNNING, JobStatus.CANCELLED},
+}
 
 
 class ConcurrencyModel(Enum):
     """
-    CORE CS CONCEPT: Concurrency vs Parallelism
-
-    ASYNC  — Cooperative multitasking via event loop. Single thread,
-              single process. Best for I/O-bound workloads (network,
-              file I/O). Context switching is explicit (await points).
-
-    THREAD — Preemptive multitasking via OS threads. Shared memory space
-              but GIL-bound in CPython. Best for I/O-bound work that
-              doesn't have async libraries available.
-
-    PROCESS — True parallelism via separate processes. Each process has
-               its own GIL and memory space. Best for CPU-bound work.
-               Higher overhead (IPC, memory isolation).
+    ASYNC   — runs on the event loop. For I/O-bound code written with await.
+              Blocking calls here stall EVERY job, so never do CPU work in one.
+    THREAD  — runs in a ThreadPoolExecutor. For blocking I/O (sync DB drivers,
+              requests). Threads share the GIL, so CPU-bound Python gets ~no speedup.
+    PROCESS — runs in a ProcessPoolExecutor. Separate interpreter (and GIL) per
+              worker, so CPU-bound work runs in parallel. The job object and its
+              result are pickled across the process boundary.
     """
     ASYNC = "async"
     THREAD = "thread"
     PROCESS = "process"
 
 
-class RecurrenceType(Enum):
-    NONE = "None"
-    HOURLY = "Hourly"
-    DAILY = "Daily"
-    WEEKLY = "Weekly"
-    MONTHLY = "Monthly"
-    CRON = "Cron Expression"
+# ════════════════════════════════════════════════════════════════════════
+#  EXCEPTIONS
+# ════════════════════════════════════════════════════════════════════════
+
+class SchedulerError(Exception):
+    pass
+
+
+class InvalidTransitionError(SchedulerError):
+    pass
+
+
+class UnknownJobError(SchedulerError, KeyError):
+    pass
+
+
+class SchedulerStoppedError(SchedulerError):
+    pass
+
+
+class NonRetryableError(Exception):
+    """Raise from a job to fail it immediately, skipping remaining retries."""
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  CORE CS CONCEPT: Deadlock Prevention via Lock Ordering
+#  RETRY POLICY
 # ════════════════════════════════════════════════════════════════════════
-# To prevent deadlocks, we define a global lock ordering. Every component
-# that acquires multiple locks must acquire them in this order:
-#   1. resource_lock  (highest priority)
-#   2. state_lock
-#   3. queue_lock     (lowest priority)
-# Violating this order risks deadlock (circular wait).
 
-class DeadlockSafety:
-    """Mixin-style class documenting lock ordering discipline."""
-    LOCK_ORDER = ["resource_lock", "state_lock", "queue_lock"]
+@dataclass(frozen=True)
+class RetryPolicy:
+    """
+    Capped exponential backoff with optional "full jitter":
+        cap   = min(max_delay, base_delay * 2 ** (attempt - 1))
+        delay = uniform(0, cap)   if jitter else cap
+    `attempt` is the 1-based number of the attempt that just failed.
+    Full jitter spreads retries of many jobs that failed together (e.g. a
+    dependency outage) so they don't come back as a synchronized herd.
+    """
+    max_retries: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 60.0
+    jitter: bool = True
+
+    def delay(self, attempt: int, rng: random.Random) -> float:
+        cap = min(self.max_delay, self.base_delay * (2 ** (attempt - 1)))
+        return rng.uniform(0, cap) if self.jitter else cap
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  JOB — Command Pattern
+#  JOB — Command pattern
 # ════════════════════════════════════════════════════════════════════════
-# The Command Pattern encapsulates an action (execute) and its metadata
-# (priority, retries, timeout) into an object. The scheduler never needs
-# to know what the job *does* — it just calls execute().
-#
-# This is Dependency Inversion (D of SOLID): the scheduler depends on
-# the abstract Job protocol, not concrete implementations.
+
+_job_ids = itertools.count(1)
+
 
 class Job(ABC):
-    """Abstract job — the 'Command' in Command Pattern."""
+    """
+    What to run plus how to run it (priority, timeout, retry policy).
 
-    def __init__(self, job_id: str, name: str,
-                 priority: JobPriority = JobPriority.MEDIUM):
-        self._job_id = job_id
-        self._name = name
-        self._priority = priority
-        self._status = JobStatus.PENDING
-        self._created_at = datetime.now()
-        self._started_at: Optional[datetime] = None
-        self._completed_at: Optional[datetime] = None
-        self._error_message: Optional[str] = None
-        self._retry_count = 0
-        self._max_retries = 3
-        self._timeout_seconds = 300
-        self._concurrency_model = ConcurrencyModel.ASYNC  # Default
+    Execution state (status, attempts, timestamps, result) lives on the job
+    for simplicity but is written ONLY by the scheduler, on the loop thread.
+    A job must stay picklable (no locks, tasks or open handles as attributes)
+    so PROCESS jobs can be shipped to a worker process.
+    """
 
-    # ── Properties ──────────────────────────────────────────────
+    model: ClassVar[ConcurrencyModel]
 
-    @property
-    def job_id(self) -> str: return self._job_id
+    def __init__(self, name: str, *,
+                 priority: JobPriority = JobPriority.MEDIUM,
+                 timeout: Optional[float] = 30.0,
+                 retry: RetryPolicy = RetryPolicy(),
+                 deadline: Optional[float] = None) -> None:
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive or None")
+        self.job_id = f"job-{next(_job_ids)}"
+        self.name = name
+        self.priority = priority
+        self.timeout = timeout
+        self.retry = retry
+        self.deadline = deadline        # monotonic seconds; used by EDF only
 
-    @property
-    def name(self) -> str: return self._name
+        self.status = JobStatus.PENDING
+        self.attempts = 0
+        self.result: Any = None
+        self.last_error: Optional[str] = None
+        self.submitted_at: float = 0.0  # monotonic, set on submit
+        self.run_at: float = 0.0        # earliest monotonic time it may start
+        self.seq: int = 0               # submit order, the universal tie-breaker
+        self.started_at: Optional[float] = None
+        self.finished_at: Optional[float] = None
 
-    @property
-    def priority(self) -> JobPriority: return self._priority
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.job_id}, {self.name!r}, {self.status.value})"
 
-    @property
-    def status(self) -> JobStatus: return self._status
 
-    @status.setter
-    def status(self, value: JobStatus) -> None:
-        self._status = value
-
-    @property
-    def retry_count(self) -> int: return self._retry_count
-
-    @property
-    def max_retries(self) -> int: return self._max_retries
-
-    @max_retries.setter
-    def max_retries(self, value: int) -> None:
-        self._max_retries = value
-
-    @property
-    def timeout_seconds(self) -> int:
-        return self._timeout_seconds
-
-    @timeout_seconds.setter
-    def timeout_seconds(self, value: int) -> None:
-        self._timeout_seconds = value
-
-    @property
-    def concurrency_model(self) -> ConcurrencyModel:
-        return self._concurrency_model
-
-    @concurrency_model.setter
-    def concurrency_model(self, value: ConcurrencyModel) -> None:
-        self._concurrency_model = value
-
-    # ── Lifecycle Methods ───────────────────────────────────────
+class AsyncJob(Job):
+    model = ConcurrencyModel.ASYNC
 
     @abstractmethod
-    async def execute_async(self) -> bool:
-        """
-        Async execute — cooperative multitasking version.
-        Must use 'await' for any I/O. The event loop can schedule
-        other coroutines while this one is waiting.
-        """
-        pass
+    async def run(self) -> Any:
+        """Do the work. Return a result, or raise to fail this attempt."""
 
-    def execute_sync(self) -> bool:
-        """
-        Sync execute — for ThreadPoolExecutor / ProcessPoolExecutor.
-        This runs in a separate OS thread or process. For threading,
-        the GIL limits CPU-bound parallelism. For processes, we get
-        true parallelism at the cost of memory overhead.
-        """
-        # Default: wrap async in a new event loop
-        return asyncio.run(self.execute_async())
 
-    def on_success(self) -> None:
-        self._status = JobStatus.COMPLETED
-        self._completed_at = datetime.now()
+class BlockingJob(Job):
+    """Synchronous work, run off the event loop in the thread pool."""
+    model = ConcurrencyModel.THREAD
 
-    def on_failure(self, error: str) -> None:
-        self._error_message = error
-        if self._retry_count < self._max_retries:
-            self._retry_count += 1
-            self._status = JobStatus.RETRYING
-            print(f"  🔄 Retry {self._retry_count}/{self._max_retries}: {self}")
-        else:
-            self._status = JobStatus.FAILED
-        self._completed_at = datetime.now()
+    @abstractmethod
+    def run_sync(self) -> Any:
+        """Do the work. Return a result, or raise to fail this attempt."""
 
-    def on_timeout(self) -> None:
-        self._status = JobStatus.TIMEOUT
-        self._error_message = f"Job timed out after {self._timeout_seconds}s"
-        self._completed_at = datetime.now()
 
-    # ── Comparison (for heapq priority ordering) ────────────────
-
-    def __lt__(self, other: 'Job') -> bool:
-        if self.priority.value != other.priority.value:
-            return self.priority.value > other.priority.value
-        return self._created_at < other._created_at
-
-    def __str__(self) -> str:
-        return f"Job[{self._job_id[:8]}]: {self._name} ({self._status.value})"
+class CpuBoundJob(BlockingJob):
+    """Synchronous CPU-heavy work, run in the process pool (bypasses the GIL)."""
+    model = ConcurrencyModel.PROCESS
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  CONCRETE JOB IMPLEMENTATIONS
+#  SCHEDULING STRATEGIES — Strategy pattern
 # ════════════════════════════════════════════════════════════════════════
-# Each concrete job extends Job and implements execute_async().
-# Notice: no __init__ calls to super().__init__ with string literals
-# that don't reference instance variables.
+# A strategy turns a job into a sort key; the smallest key runs first. Keys are
+# computed once, when a job becomes runnable, and must therefore NOT depend on
+# the current time. That is what lets the ready queue be a heap (O(log n) push
+# and pop) instead of re-sorting every pending job on every dispatch.
 
-class EmailJob(Job):
-    """I/O-bound job — best suited for ASYNC model."""
+SortKey = Tuple[Any, ...]
 
-    def __init__(self, to_email: str, subject: str, body: str):
-        super().__init__(str(uuid.uuid4()), f"Send Email to {to_email}")
-        self._to = to_email
-        self._subject = subject
-        self._body = body
-        self._concurrency_model = ConcurrencyModel.ASYNC
-
-    async def execute_async(self) -> bool:
-        print(f"  📧 Sending email to {self._to}: {self._subject}")
-        # Simulate I/O: awaiting releases the GIL and lets other tasks run
-        await asyncio.sleep(0.5)
-        return True
-
-    def execute_sync(self) -> bool:
-        # Threaded fallback — blocks the OS thread but GIL is released
-        # during the actual sleep() call (time.sleep() releases GIL)
-        print(f"  📧 Sending email to {self._to}: {self._subject}")
-        time.sleep(0.5)
-        return True
-
-
-class DataProcessingJob(Job):
-    """
-    Mixed I/O + CPU job.
-    CSV parsing is CPU-bound; writing results is I/O-bound.
-    Best with THREAD model (GIL released during I/O).
-    """
-
-    def __init__(self, data_source: str, query: str):
-        super().__init__(str(uuid.uuid4()), f"Process Data: {data_source}")
-        self._source = data_source
-        self._query = query
-        self._concurrency_model = ConcurrencyModel.THREAD
-        self._timeout_seconds = 600  # Data processing takes longer
-
-    async def execute_async(self) -> bool:
-        print(f"  🔄 Processing data from {self._source}: {self._query}")
-        # Simulate CPU work in a thread executor to avoid blocking event loop
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, self._process_data)
-        return result
-
-    def execute_sync(self) -> bool:
-        """
-        Direct sync execution — avoids the double-executor nesting that
-        happens when the base class calls asyncio.run(self.execute_async())
-        which then calls loop.run_in_executor() again.
-        """
-        print(f"  🔄 Processing data from {self._source}: {self._query}")
-        return self._process_data()
-
-    def _process_data(self) -> bool:
-        """
-        CPU-bound work — runs in default ThreadPoolExecutor.
-        The GIL means only one thread executes Python bytecode at a time,
-        but for I/O-bound sections of this work, the GIL is released.
-        """
-        total = 0
-        # Simulate CPU-intensive computation (no GIL release)
-        for i in range(10_000_000):
-            total += i
-        print(f"  🔄 Data processed: {total} rows analyzed")
-        return True
-
-
-class ReportGenerationJob(Job):
-    """Lightweight I/O job — perfect for ASYNC model."""
-
-    def __init__(self, report_name: str, report_type: str):
-        super().__init__(str(uuid.uuid4()), f"Generate {report_name}")
-        self._report_name = report_name
-        self._report_type = report_type
-        self._concurrency_model = ConcurrencyModel.ASYNC
-
-    async def execute_async(self) -> bool:
-        print(f"  📊 Generating report: {self._report_name} ({self._report_type})")
-        await asyncio.sleep(0.3)
-        return True
-
-
-class FileUploadJob(Job):
-    """
-    I/O-bound with failure simulation.
-    Demonstrates retry mechanism and exponential backoff.
-    """
-
-    def __init__(self, file_path: str, destination: str):
-        super().__init__(str(uuid.uuid4()), f"Upload {file_path}")
-        self._file_path = file_path
-        self._destination = destination
-        self._concurrency_model = ConcurrencyModel.ASYNC
-
-    async def execute_async(self) -> bool:
-        print(f"  ☁️ Uploading {self._file_path} to {self._destination}")
-        await asyncio.sleep(2)
-        # Simulate failure
-        if "fail" in self._file_path.lower():
-            raise RuntimeError("Upload failed: Connection timeout")
-        return True
-
-    def execute_sync(self) -> bool:
-        print(f"  ☁️ Uploading {self._file_path} to {self._destination}")
-        time.sleep(2)
-        if "fail" in self._file_path.lower():
-            raise RuntimeError("Upload failed: Connection timeout")
-        return True
-
-
-class CpuIntensiveJob(Job):
-    """
-    CPU-bound job — best suited for PROCESS model.
-    CORE CS CONCEPT: This demonstrates WHY the GIL matters.
-    With THREAD model, 4 CPU-intensive jobs on 4 cores = ~1x speedup
-    With PROCESS model, 4 CPU-intensive jobs on 4 cores = ~4x speedup
-
-    NOTE: execute_async() delegates to execute_sync() so the
-    AsyncJobExecutor.PROCESS branch handles ProcessPoolExecutor
-    creation via the shared pool owned by the executor.
-    """
-
-    def __init__(self, name: str, iterations: int = 20_000_000):
-        super().__init__(str(uuid.uuid4()), f"CPU-Intensive: {name}")
-        self._iterations = iterations
-        self._concurrency_model = ConcurrencyModel.PROCESS
-        self._timeout_seconds = 120
-
-    async def execute_async(self) -> bool:
-        """
-        CORE CS CONCEPT: Running CPU-bound work in asyncio blocks the
-        event loop! The executor handles offloading via its shared
-        ProcessPoolExecutor — we just provide the sync version.
-        """
-        print(f"  🖥️ CPU-intensive ({self._name}): crunching {self._iterations:,} iterations")
-        # The actual CPU work is in execute_sync(), which runs via
-        # ProcessPoolExecutor in the AsyncJobExecutor.PROCESS branch.
-        # This avoids creating a new ProcessPoolExecutor per call.
-        return self._crunch_numbers()
-
-    def _crunch_numbers(self) -> bool:
-        """
-        Pure CPU computation. In THREAD mode, the GIL ensures only one
-        thread runs Python bytecode at a time. In PROCESS mode, each
-        process has its own GIL — true parallelism.
-        """
-        total = 0
-        for i in range(self._iterations):
-            total += i * i  # Pure CPU work
-        print(f"  🖥️ CPU work done: {total:,}")
-        return True
-
-    def execute_sync(self) -> bool:
-        return self._crunch_numbers()
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  CORE CS CONCEPT: Race Condition Demonstration
-# ════════════════════════════════════════════════════════════════════════
-# A race condition occurs when two threads access shared data without
-# synchronization, and the outcome depends on the unpredictable timing
-# of thread scheduling. Below are two versions of a counter:
-#
-#   UnsafeCounter — NO lock. Under heavy load, increments are lost
-#                   because += is NOT atomic (it's LOAD, ADD, STORE).
-#
-#   SafeCounter — WITH lock. The threading.Lock guarantees mutual
-#                 exclusion: only one thread can increment at a time.
-
-class UnsafeCounter:
-    """
-    CORE CS CONCEPT: Demonstrates a race condition.
-    self.count += 1 is three CPU instructions:
-        1. LOAD self.count into register
-        2. ADD 1 to register
-        3. STORE register back to self.count
-    A context switch between steps 1 and 3 by another thread causes
-    lost updates (the classic race condition).
-    """
-
-    def __init__(self):
-        self.count = 0
-
-    def increment(self, amount: int = 1) -> None:
-        # ⚠️ RACE CONDITION: Not thread-safe!
-        for _ in range(amount):
-            temp = self.count       # LOAD
-            # ⏳ Context switch here → another thread reads stale value
-            self.count = temp + 1   # ADD + STORE
-
-
-class SafeCounter:
-    """
-    Thread-safe counter using a lock for mutual exclusion.
-    The lock guarantees atomicity of the increment operation.
-    """
-
-    def __init__(self):
-        self.count = 0
-        self._lock = threading.Lock()
-
-    def increment(self, amount: int = 1) -> None:
-        with self._lock:  # Acquire → only one thread enters here at a time
-            for _ in range(amount):
-                self.count += 1
-        # Lock released automatically via context manager
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  SCHEDULING STRATEGIES — Strategy Pattern
-# ════════════════════════════════════════════════════════════════════════
 
 class SchedulingStrategy(ABC):
-    """Strategy pattern — different algorithms for job ordering."""
-
     @abstractmethod
-    def schedule(self, jobs: List[Job]) -> List[Job]:
-        """Order jobs for execution. Returns reordered list."""
-        pass
+    def key(self, job: Job) -> SortKey:
+        """Smaller runs first. Must be time-invariant (see note above)."""
 
 
-class PriorityScheduler(SchedulingStrategy):
+class FIFOStrategy(SchedulingStrategy):
+    """Submit order. No starvation, no prioritisation."""
+
+    def key(self, job: Job) -> SortKey:
+        return (job.seq,)
+
+
+class PriorityStrategy(SchedulingStrategy):
+    """Highest priority first, FIFO within a priority. Low priority can starve."""
+
+    def key(self, job: Job) -> SortKey:
+        return (-job.priority, job.seq)
+
+
+class AgingPriorityStrategy(SchedulingStrategy):
     """
-    Highest priority first. Secondary sort by creation time (FCFS).
-    ⚠️ Suffers from starvation: low-priority jobs may never run if
-    high-priority jobs keep arriving.
-    """
-
-    def schedule(self, jobs: List[Job]) -> List[Job]:
-        return sorted(jobs, key=lambda j: (-j.priority.value, j._created_at))
-
-
-class FIFOScheduler(SchedulingStrategy):
-    """First-Come, First-Served. No starvation, no prioritization."""
-
-    def schedule(self, jobs: List[Job]) -> List[Job]:
-        return sorted(jobs, key=lambda j: j._created_at)
-
-
-class DeadlineAwareScheduler(SchedulingStrategy):
-    """
-    Priority first, then FCFS within the same priority.
-    A simplified EDF (Earliest Deadline First).
-    """
-
-    def schedule(self, jobs: List[Job]) -> List[Job]:
-        return sorted(jobs, key=lambda j: (j.priority.value, j._created_at))
-
-
-class WeightedFairScheduler(SchedulingStrategy):
-    """
-    CORE CS CONCEPT: Anti-Starvation with Aging.
-    Implements priority aging: the longer a job waits, the higher
-    its effective priority becomes. This prevents starvation.
+    Priority with aging, which bounds starvation:
+        effective(now) = priority + age_rate * (now - submitted_at)
+    Every waiting job ages at the same rate, so comparing two jobs at any
+    `now` gives the same answer as comparing (priority - age_rate * submitted_at).
+    That expression is time-invariant, so it still works as a heap key.
+    With age_rate=0.1, a LOW job outranks a newly submitted HIGH job after
+    waiting 20 s (2 priority levels / 0.1 per second).
     """
 
-    def __init__(self, age_factor: float = 0.1):
-        self._age_factor = age_factor
+    def __init__(self, age_rate: float = 0.1) -> None:
+        if age_rate <= 0:
+            raise ValueError("age_rate must be positive")
+        self._age_rate = age_rate
 
-    def schedule(self, jobs: List[Job]) -> List[Job]:
-        now = datetime.now()
+    def key(self, job: Job) -> SortKey:
+        return (-(job.priority - self._age_rate * job.submitted_at), job.seq)
 
-        def effective_priority(job: Job) -> float:
-            """Base priority + age bonus (waiting time in seconds * factor)."""
-            wait_seconds = (now - job._created_at).total_seconds()
-            age_bonus = wait_seconds * self._age_factor
-            return job.priority.value + age_bonus
 
-        return sorted(jobs, key=lambda j: (-effective_priority(j), j._created_at))
+class EarliestDeadlineFirstStrategy(SchedulingStrategy):
+    """Earliest deadline first; jobs without a deadline go last, by priority."""
+
+    def key(self, job: Job) -> SortKey:
+        deadline = job.deadline if job.deadline is not None else math.inf
+        return (deadline, -job.priority, job.seq)
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  RECURRING JOB — Decorator Pattern (wraps a job factory with a schedule)
+#  RECURRING SCHEDULE
 # ════════════════════════════════════════════════════════════════════════
 
-class RecurringJob:
-    """Wraps a job factory with recurrence/interval logic."""
-
-    def __init__(self, job_factory: Callable[[], Job],
-                 recurrence: RecurrenceType,
-                 interval_seconds: int = 3600,
-                 cron_expression: str = ""):
-        self._job_factory = job_factory
-        self._recurrence = recurrence
-        self._interval = interval_seconds
-        self._cron = cron_expression
-        self._next_run = datetime.now()
-        self._is_active = True
-
-    @property
-    def next_run(self) -> datetime:
-        return self._next_run
-
-    @property
-    def is_active(self) -> bool:
-        return self._is_active
-
-    def create_job(self) -> Job:
-        return self._job_factory()
-
-    def update_next_run(self) -> None:
-        if self._recurrence == RecurrenceType.HOURLY:
-            self._next_run = datetime.now() + timedelta(hours=1)
-        elif self._recurrence == RecurrenceType.DAILY:
-            self._next_run = datetime.now() + timedelta(days=1)
-        elif self._recurrence == RecurrenceType.WEEKLY:
-            self._next_run = datetime.now() + timedelta(weeks=1)
-        else:
-            self._next_run = datetime.now() + timedelta(seconds=self._interval)
-
-    def cancel(self) -> None:
-        self._is_active = False
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  ASYNC JOB EXECUTOR — Runs jobs with configurable concurrency
-# ════════════════════════════════════════════════════════════════════════
-# Uses an asyncio.Semaphore to limit concurrent async executions.
-# Also maintains a ThreadPoolExecutor and ProcessPoolExecutor for
-# jobs that specify those concurrency models.
-
-class AsyncJobExecutor:
+class RecurringSchedule:
     """
-    CORE CS CONCEPT: Semaphore-based concurrency limiting.
+    Fires `factory()` every `interval` seconds.
 
-    An asyncio.Semaphore is like a thread-safe counter. Each acquire()
-    decrements the counter. If the counter is 0, the coroutine blocks
-    (yields to the event loop) until another task calls release().
-
-    This is different from a threading.Semaphore because:
-    - It's cooperative (not preemptive) — the task yields at await points
-    - No GIL involvement — all tasks run on the same thread
-    - No risk of deadlock from the semaphore itself (asyncio timeout)
+    * Fixed-rate, not fixed-delay: the next fire time is computed from the
+      previous SCHEDULED time, so slow ticks don't make the schedule drift.
+    * Missed fires are coalesced: if the ticker wakes up 3 intervals late, the
+      job fires once and the schedule jumps to the next future slot.
+    * allow_overlap=False skips a fire while the previous instance is unfinished.
     """
 
-    def __init__(self, max_concurrent: int = 3,
-                 max_thread_workers: int = 4,
-                 max_process_workers: int = 4):
-        self._max_concurrent = max_concurrent
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._thread_pool = ThreadPoolExecutor(
-            max_workers=max_thread_workers,
-            thread_name_prefix="job-thread"
-        )
-        self._process_pool = ProcessPoolExecutor(
-            max_workers=max_process_workers
-        )
-        self._active_jobs: Dict[str, asyncio.Task] = {}
-        self._lock = asyncio.Lock()  # Lock for _active_jobs dict
+    _ids = itertools.count(1)
 
-    @property
-    def thread_pool(self) -> ThreadPoolExecutor:
-        return self._thread_pool
+    def __init__(self, factory: Callable[[], Job], interval: float,
+                 first_run: float, allow_overlap: bool = False) -> None:
+        if interval <= 0:
+            raise ValueError("interval must be positive")
+        self.schedule_id = f"sched-{next(self._ids)}"
+        self.factory = factory
+        self.interval = interval
+        self.next_run = first_run
+        self.allow_overlap = allow_overlap
+        self.active = True
+        self.last_job_id: Optional[str] = None
+        self.fired = 0
+        self.skipped = 0
 
-    @property
-    def process_pool(self) -> ProcessPoolExecutor:
-        return self._process_pool
-
-    async def execute(self, job: Job) -> bool:
-        """
-        Execute a job using its preferred concurrency model.
-
-        CORE CS CONCEPT: Triple Dispatch by Concurrency Model.
-        ASYNC  → run in event loop (cooperative multitasking)
-        THREAD → run_in_executor(ThreadPoolExecutor)
-        PROCESS → run_in_executor(ProcessPoolExecutor)
-        """
-        async with self._semaphore:
-            async with self._lock:
-                task = asyncio.current_task()
-                self._active_jobs[job.job_id] = task
-
-            job.status = JobStatus.RUNNING
-            job._started_at = datetime.now()
-
-            try:
-                print(f"  ▶️ [{job.concurrency_model.value.upper():7}] {job}")
-
-                if job.concurrency_model == ConcurrencyModel.ASYNC:
-                    # Cooperative multitasking: runs on the event loop thread
-                    # The GIL is released during await points (I/O waits)
-                    success = await asyncio.wait_for(
-                        job.execute_async(),
-                        timeout=job.timeout_seconds
-                    )
-
-                elif job.concurrency_model == ConcurrencyModel.THREAD:
-                    """
-                    CORE CS CONCEPT: GIL Behavior in ThreadPoolExecutor
-
-                    When a thread runs Python code, it holds the GIL.
-                    The GIL is released during:
-                      - I/O operations (sleep, read, write, connect)
-                      - C-extension calls that release it (NumPy, Pandas)
-                      - Thread waits (Lock.acquire(), Queue.get())
-
-                    In THREAD mode, CPU-bound code still contends for the GIL.
-                    The effective speedup on N cores is roughly:
-                      speedup = time_in_io / total_time * N
-                    """
-                    loop = asyncio.get_running_loop()
-                    success = await asyncio.wait_for(
-                        loop.run_in_executor(self._thread_pool, job.execute_sync),
-                        timeout=job.timeout_seconds
-                    )
-
-                elif job.concurrency_model == ConcurrencyModel.PROCESS:
-                    """
-                    CORE CS CONCEPT: ProcessPoolExecutor Bypasses the GIL
-
-                    Each process gets its own Python interpreter and GIL.
-                    This is TRUE PARALLELISM for CPU-bound work.
-                    Trade-offs:
-                      + Linear speedup for CPU-bound work (up to N cores)
-                      + Memory isolation (no shared state bugs)
-                      - Higher memory overhead (each process ~10-50MB)
-                      - IPC overhead for passing data between processes
-                    """
-                    loop = asyncio.get_running_loop()
-                    success = await asyncio.wait_for(
-                        loop.run_in_executor(self._process_pool, job.execute_sync),
-                        timeout=job.timeout_seconds
-                    )
-                else:
-                    success = False
-
-                if success:
-                    job.on_success()
-                    print(f"  ✅ [{job.concurrency_model.value.upper():7}] {job}")
-                else:
-                    job.on_failure("Job returned False")
-                    print(f"  ❌ [{job.concurrency_model.value.upper():7}] {job}")
-
-            except asyncio.TimeoutError:
-                """
-                CORE CS CONCEPT: Cooperative Cancellation
-
-                When asyncio.wait_for() times out, it cancels the task:
-                  1. asyncio.CancelledError is raised inside the coroutine
-                  2. The coroutine can catch it to clean up resources
-                  3. If uncaught, the task stops immediately
-
-                For ThreadPoolExecutor/ProcessPoolExecutor:
-                  - The thread/process is NOT killed (in-progress work continues)
-                  - We log the timeout and move on
-                  - The future is cancelled, but the underlying thread completes
-                    in the background (orphaned)
-                """
-                job.on_timeout()
-                print(f"  ⏰ [{job.concurrency_model.value.upper():7}] TIMEOUT: {job} after {job.timeout_seconds}s")
-
-            except asyncio.CancelledError:
-                """
-                CORE CS CONCEPT: Graceful Cancellation
-
-                When the scheduler is shutting down, it cancels all
-                running tasks. We catch CancelledError to update job
-                status before re-raising.
-                """
-                job.status = JobStatus.CANCELLED
-                job._completed_at = datetime.now()
-                print(f"  🛑 [{job.concurrency_model.value.upper():7}] CANCELLED: {job}")
-                raise  # Re-raise to propagate cancellation
-
-            except Exception as e:
-                job.on_failure(str(e))
-                print(f"  ❌ [{job.concurrency_model.value.upper():7}] ERROR: {job} — {e}")
-
-            finally:
-                async with self._lock:
-                    self._active_jobs.pop(job.job_id, None)
-
-            return job.status == JobStatus.COMPLETED
-
-    async def cancel_job(self, job_id: str) -> bool:
-        """Cancel a running job by cancelling its asyncio task."""
-        async with self._lock:
-            task = self._active_jobs.get(job_id)
-            if task and not task.done():
-                task.cancel()
-                return True
-            return False
-
-    async def cancel_all(self) -> None:
-        """
-        Cancel all running jobs (for graceful shutdown).
-
-        CORE CS CONCEPT: Deadlock Prevention
-        We snapshot the task references under the lock, then cancel
-        OUTSIDE the lock. This prevents a deadlock when cancelled
-        tasks try to acquire the lock in their finally blocks
-        (asyncio.Lock is NOT reentrant!).
-        """
-        async with self._lock:
-            tasks = list(self._active_jobs.values())
-        # Cancel outside the lock to avoid deadlock on reentrancy
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-
-    async def shutdown(self) -> None:
-        """Graceful shutdown: cancel all jobs, shutdown pools."""
-        await self.cancel_all()
-        self._thread_pool.shutdown(wait=False)
-        self._process_pool.shutdown(wait=False)
+    def advance(self, now: float) -> None:
+        missed = int((now - self.next_run) // self.interval) + 1
+        self.next_run += max(missed, 1) * self.interval
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  RACE CONDITION DEMONSTRATION
+#  JOB EXECUTOR — routes a job to the event loop, a thread, or a process
 # ════════════════════════════════════════════════════════════════════════
 
-def demonstrate_race_condition(iterations: int = 100_000):
+class JobExecutor:
     """
-    CORE CS CONCEPT: Live demonstration of a race condition.
+    Owns the thread and process pools. Pools are created lazily, so a
+    scheduler that only runs ASYNC jobs never forks a process.
 
-    Two threads increment the same counter 100,000 times each.
-    Expected result: 200,000.
-    Actual result (UnsafeCounter): ~150,000-180,000 (depends on timing)
-    Actual result (SafeCounter): 200,000 (always correct)
+    Size the thread pool >= the scheduler's worker count: a job that times out
+    in a thread keeps running there (Python cannot kill a thread), and until
+    it returns it occupies a pool slot.
     """
-    print("\n  ┌─ RACE CONDITION DEMONSTRATION ─────────────────────┐")
 
-    # Unsafe version
-    unsafe = UnsafeCounter()
-    t1 = threading.Thread(target=unsafe.increment, args=(iterations,))
-    t2 = threading.Thread(target=unsafe.increment, args=(iterations,))
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-    lost = (2 * iterations) - unsafe.count
-    print(f"  │ UNSAFE counter: {unsafe.count:,} "
-          f"(lost {lost:,} updates — {lost/(2*iterations)*100:.1f}%) │")
+    def __init__(self, max_threads: int = 4, max_processes: int = 2) -> None:
+        self._max_threads = max_threads
+        self._max_processes = max_processes
+        self._threads: Optional[ThreadPoolExecutor] = None
+        self._processes: Optional[ProcessPoolExecutor] = None
 
-    # Safe version
-    safe = SafeCounter()
-    t1 = threading.Thread(target=safe.increment, args=(iterations,))
-    t2 = threading.Thread(target=safe.increment, args=(iterations,))
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-    print(f"  │ SAFE   counter: {safe.count:,} "
-          f"(expected {2*iterations:,})                      │")
-    print("  └────────────────────────────────────────────────────┘")
-    return lost
+    async def invoke(self, job: Job) -> Any:
+        if isinstance(job, AsyncJob):
+            return await job.run()
+        if not isinstance(job, BlockingJob):
+            raise TypeError(f"{type(job).__name__} must extend AsyncJob or BlockingJob")
+        loop = asyncio.get_running_loop()
+        if job.model is ConcurrencyModel.PROCESS:
+            if self._processes is None:
+                self._processes = ProcessPoolExecutor(max_workers=self._max_processes)
+            # Pickles `job` (bound method) into the worker; only the return
+            # value comes back. State the job mutates over there is lost.
+            return await loop.run_in_executor(self._processes, job.run_sync)
+        if self._threads is None:
+            self._threads = ThreadPoolExecutor(max_workers=self._max_threads,
+                                               thread_name_prefix="job")
+        return await loop.run_in_executor(self._threads, job.run_sync)
+
+    def shutdown(self) -> None:
+        # Don't block the loop on stragglers (e.g. a timed-out thread job);
+        # drop work that never started.
+        for pool in (self._threads, self._processes):
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+        self._threads = self._processes = None
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  ASYNC JOB SCHEDULER — Facade Pattern
+#  JOB SCHEDULER
 # ════════════════════════════════════════════════════════════════════════
-# The Facade Pattern provides a unified interface to a complex subsystem.
-# JobScheduler hides the async executor, scheduling strategies, recurring
-# job management, and worker pools behind a simple API:
-#
-#   scheduler.add_job(job)
-#   scheduler.start()
-#   scheduler.stop()
+
+JobListener = Callable[[Job, JobStatus, JobStatus], None]
+
 
 class JobScheduler:
     """
-    Facade for the async job scheduling system.
+    Data structures (all owned by the event-loop thread):
 
-    Uses Producer-Consumer pattern:
-      Producer — add_job(), recurring job checker
-      Consumer — worker coroutines that pull from the queue
+      _ready      heap of (strategy key, job)     runnable now
+      _delayed    heap of (run_at, seq, job)      delayed first run or retry backoff
+      _blocked    job_id -> unmet dependency ids
+      _dependents job_id -> ids of jobs waiting on it
+      _attempts   job_id -> asyncio.Task of the attempt in flight
+
+    Cancelled jobs are not removed from the heaps (that would be O(n)); they
+    are skipped when popped ("lazy deletion").
     """
 
-    def __init__(self, scheduler_strategy: Optional[SchedulingStrategy] = None,
-                 max_concurrent: int = 3,
-                 num_workers: int = 2):
-        self._executor = AsyncJobExecutor(max_concurrent=max_concurrent)
-        self._scheduler = scheduler_strategy or PriorityScheduler()
-
-        # asyncio.Queue: thread-safe producer-consumer channel
-        self._job_queue: asyncio.Queue = asyncio.Queue()
-
-        self._pending: List[Job] = []
-        self._history: List[Job] = []
-        self._recurring: List[RecurringJob] = []
-
-        self._running = False
-        self._stop_event = asyncio.Event()
+    def __init__(self, strategy: Optional[SchedulingStrategy] = None, *,
+                 num_workers: int = 4,
+                 executor: Optional[JobExecutor] = None,
+                 rng: Optional[random.Random] = None,
+                 history_limit: int = 10_000) -> None:
+        if num_workers < 1:
+            raise ValueError("num_workers must be >= 1")
+        self._strategy = strategy or PriorityStrategy()
         self._num_workers = num_workers
-        self._workers: List[asyncio.Task] = []
+        self._executor = executor or JobExecutor(max_threads=num_workers)
+        self._rng = rng or random.Random()
+        self._history_limit = history_limit
 
-    def add_job(self, job: Job) -> None:
+        self._jobs: Dict[str, Job] = {}
+        self._ready: List[Tuple[SortKey, Job]] = []
+        self._delayed: List[Tuple[float, int, Job]] = []
+        self._blocked: Dict[str, Set[str]] = {}
+        self._dependents: Dict[str, List[str]] = {}
+        self._attempts: Dict[str, asyncio.Task] = {}
+        self._cancel_requested: Set[str] = set()
+        self._finished: deque = deque()           # terminal job ids, oldest first
+        self._recurring: Dict[str, RecurringSchedule] = {}
+        self._listeners: List[JobListener] = []
+        self._seq = itertools.count()
+
+        self._unfinished = 0
+        self._running_count = 0
+        self.peak_running = 0                     # observability + tests
+
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._work_available = asyncio.Event()
+        self._ticker_wakeup = asyncio.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._tasks: List[asyncio.Task] = []
+        self._started = False
+        self._stopping = False
+
+    # ── Public API (call on the loop thread unless noted) ─────────────
+
+    def add_listener(self, listener: JobListener) -> None:
+        """Observer hook: called as listener(job, old_status, new_status)."""
+        self._listeners.append(listener)
+
+    def submit(self, job: Job, *, delay: float = 0.0,
+               depends_on: Iterable[str] = ()) -> str:
+        """Queue a job. Returns its id. Dependencies must already be submitted."""
+        if self._stopping:
+            raise SchedulerStoppedError("scheduler is stopping")
+        if job.job_id in self._jobs or job.status is not JobStatus.PENDING or job.attempts:
+            raise SchedulerError(f"{job.job_id} was already submitted")
+        deps = set(depends_on)
+        unknown = [d for d in deps if d not in self._jobs]
+        if unknown:
+            # Requiring deps to exist first also makes cycles impossible.
+            raise UnknownJobError(f"unknown dependencies: {sorted(unknown)}")
+
+        now = time.monotonic()
+        job.seq = next(self._seq)
+        job.submitted_at = now
+        job.run_at = now + max(0.0, delay)
+        self._jobs[job.job_id] = job
+        self._unfinished += 1
+        self._idle.clear()
+
+        failed_dep = next((d for d in deps if self._jobs[d].status.is_terminal
+                           and self._jobs[d].status is not JobStatus.COMPLETED), None)
+        if failed_dep is not None:
+            self._finish(job, JobStatus.CANCELLED, error=f"upstream {failed_dep} did not complete")
+            return job.job_id
+        unmet = {d for d in deps if self._jobs[d].status is not JobStatus.COMPLETED}
+        if unmet:
+            self._blocked[job.job_id] = unmet
+            for d in unmet:
+                self._dependents.setdefault(d, []).append(job.job_id)
+        else:
+            self._enqueue(job)
+        return job.job_id
+
+    def submit_threadsafe(self, job: Job, **kwargs: Any) -> str:
         """
-        Add a job to the pending list.
-
-        CORE CS CONCEPT: append() on a Python list is an atomic
-        operation at the C level for single appends, so this is
-        safe without a lock for CPython. However, for production
-        code, you'd use a proper lock or asyncio.Queue to be safe
-        across Python implementations.
+        Submit from ANY thread. The real submit runs on the loop thread, so the
+        scheduler's data structures are still touched by one thread only.
+        asyncio objects (Event, Task, heaps we own) are not thread-safe.
         """
-        self._pending.append(job)
+        if self._loop is None:
+            raise SchedulerError("start() the scheduler before submitting from other threads")
+        self._loop.call_soon_threadsafe(self._submit_logged, job, kwargs)
+        return job.job_id
 
-    def add_recurring(self, recurring: RecurringJob) -> None:
-        """Register a recurring job."""
-        self._recurring.append(recurring)
+    def schedule_recurring(self, factory: Callable[[], Job], interval: float, *,
+                           start_in: float = 0.0, allow_overlap: bool = False) -> str:
+        sched = RecurringSchedule(factory, interval, time.monotonic() + start_in, allow_overlap)
+        self._recurring[sched.schedule_id] = sched
+        self._ticker_wakeup.set()
+        return sched.schedule_id
 
-    def set_scheduler(self, strategy: SchedulingStrategy) -> None:
-        """Swap scheduling strategy at runtime."""
-        self._scheduler = strategy
+    def cancel_recurring(self, schedule_id: str) -> bool:
+        sched = self._recurring.get(schedule_id)
+        if sched is None or not sched.active:
+            return False
+        sched.active = False
+        return True
+
+    def cancel(self, job_id: str) -> bool:
+        """
+        Cancel a job. Returns False if it is unknown or already finished.
+        A queued job is cancelled immediately. A running ASYNC job gets
+        CancelledError at its next await. A running THREAD/PROCESS job is
+        abandoned: its status becomes CANCELLED but the thread or process
+        finishes the call anyway (neither can be interrupted safely).
+        """
+        job = self._jobs.get(job_id)
+        if job is None or job.status.is_terminal:
+            return False
+        if job.status is JobStatus.RUNNING:
+            self._cancel_requested.add(job_id)      # the worker settles the final status
+            attempt = self._attempts.get(job_id)
+            if attempt is not None:
+                attempt.cancel()
+        else:
+            self._finish(job, JobStatus.CANCELLED, error="cancelled")
+        return True
+
+    def get(self, job_id: str) -> Job:
+        try:
+            return self._jobs[job_id]
+        except KeyError:
+            raise UnknownJobError(job_id) from None
+
+    def jobs(self) -> List[Job]:
+        return list(self._jobs.values())
+
+    async def join(self) -> None:
+        """Wait until every submitted job has reached a terminal state."""
+        await self._idle.wait()
 
     async def start(self) -> None:
+        if self._started:
+            raise SchedulerError("already started")
+        self._started = True
+        self._loop = asyncio.get_running_loop()
+        self._tasks = [asyncio.create_task(self._worker(i), name=f"job-worker-{i}")
+                       for i in range(self._num_workers)]
+        self._tasks.append(asyncio.create_task(self._ticker(), name="job-ticker"))
+
+    async def stop(self, *, cancel_running: bool = False) -> None:
         """
-        Start the scheduler: spawn worker coroutines and the
-        scheduler loop. Uses asyncio.create_task() for true
-        cooperative multitasking.
+        Graceful shutdown. New submits are rejected; workers finish the job
+        they are on (or cancel it if cancel_running) and exit; queued jobs are
+        left PENDING (a durable store would hand them to the next instance).
         """
-        self._running = True
-        self._stop_event.clear()
+        self._stopping = True
+        if cancel_running:
+            for job_id in list(self._attempts):
+                self.cancel(job_id)
+        self._work_available.set()
+        self._ticker_wakeup.set()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._executor.shutdown()
 
-        # Spawn worker tasks (Producer-Consumer pattern)
-        for i in range(self._num_workers):
-            worker = asyncio.create_task(
-                self._worker_loop(i),
-                name=f"scheduler-worker-{i}"
-            )
-            self._workers.append(worker)
+    # ── Internals: queueing ───────────────────────────────────────────
 
-        # Spawn scheduler loop
-        self._scheduler_task = asyncio.create_task(
-            self._scheduler_loop(),
-            name="scheduler-loop"
-        )
-        print(f"  🟢 Scheduler started ({self._num_workers} workers, "
-              f"max {self._executor._max_concurrent} concurrent)")
+    def _submit_logged(self, job: Job, kwargs: Dict[str, Any]) -> None:
+        try:
+            self.submit(job, **kwargs)
+        except SchedulerError:
+            logger.exception("threadsafe submit of %s failed", job.job_id)
 
-    async def stop(self) -> None:
-        """
-        Graceful shutdown:
+    def _enqueue(self, job: Job) -> None:
+        if job.run_at > time.monotonic():
+            heapq.heappush(self._delayed, (job.run_at, job.seq, job))
+        else:
+            heapq.heappush(self._ready, (self._strategy.key(job), job))
+        self._work_available.set()
 
-        1. Signal stop (asyncio.Event)
-        2. Wait for scheduler loop to finish
-        3. Cancel all running jobs
-        4. Cancel all workers
-        5. Shutdown thread/process pools
-        """
-        print("  🔴 Scheduler shutting down...")
-        self._running = False
-        self._stop_event.set()
+    def _promote_due(self, now: float) -> None:
+        while self._delayed and self._delayed[0][0] <= now:
+            _, _, job = heapq.heappop(self._delayed)
+            if not job.status.is_terminal:
+                heapq.heappush(self._ready, (self._strategy.key(job), job))
 
-        # Wait for scheduler loop
-        if hasattr(self, '_scheduler_task'):
-            self._scheduler_task.cancel()
+    def _take_next(self) -> Optional[Job]:
+        """Pop the best runnable job and mark it RUNNING. No await inside, so atomic."""
+        self._promote_due(time.monotonic())
+        while self._ready:
+            _, job = heapq.heappop(self._ready)
+            if job.status.is_terminal:          # lazily deleted (cancelled while queued)
+                continue
+            self._transition(job, JobStatus.RUNNING)
+            return job
+        return None
+
+    def _next_wakeup_in(self) -> Optional[float]:
+        if not self._delayed:
+            return None
+        return max(0.0, self._delayed[0][0] - time.monotonic())
+
+    # ── Internals: workers ────────────────────────────────────────────
+
+    async def _worker(self, worker_id: int) -> None:
+        while True:
+            job = None if self._stopping else self._take_next()
+            if job is None:
+                if self._stopping:
+                    return
+                # Clear-then-wait is safe: nothing can set the event between
+                # _take_next() returning None and clear(), because there is no
+                # await in between. Every waiter wakes on set() and re-checks.
+                self._work_available.clear()
+                try:
+                    await asyncio.wait_for(self._work_available.wait(), self._next_wakeup_in())
+                except asyncio.TimeoutError:
+                    pass
+                continue
             try:
-                await self._scheduler_task
+                await self._run_attempt(job)
             except asyncio.CancelledError:
+                raise                               # the worker itself is being torn down
+            except Exception:                       # a bug in our own bookkeeping
+                logger.exception("worker %d crashed on %s", worker_id, job.job_id)
+
+    async def _run_attempt(self, job: Job) -> None:
+        job.attempts += 1
+        job.started_at = time.monotonic()
+        self._running_count += 1
+        self.peak_running = max(self.peak_running, self._running_count)
+
+        # Run the attempt as its own task so cancel(job_id) can target it without
+        # cancelling the worker, and so the timeout below is unambiguous.
+        attempt = asyncio.create_task(self._executor.invoke(job))
+        self._attempts[job.job_id] = attempt
+        try:
+            done, _ = await asyncio.wait({attempt}, timeout=job.timeout)
+            if not done:                            # timed out: stop waiting for it
+                attempt.cancel()
+                await asyncio.gather(attempt, return_exceptions=True)
+        except asyncio.CancelledError:
+            attempt.cancel()
+            self._finish(job, JobStatus.CANCELLED, error="scheduler shut down")
+            raise
+        finally:
+            self._attempts.pop(job.job_id, None)
+            self._running_count -= 1
+
+        if job.job_id in self._cancel_requested or (done and attempt.cancelled()):
+            self._finish(job, JobStatus.CANCELLED, error="cancelled")
+        elif not done:
+            self._after_failure(job, f"timed out after {job.timeout}s", timed_out=True)
+        elif attempt.exception() is not None:
+            exc = attempt.exception()
+            self._after_failure(job, f"{type(exc).__name__}: {exc}",
+                                retryable=not isinstance(exc, NonRetryableError))
+        else:
+            job.result = attempt.result()
+            self._finish(job, JobStatus.COMPLETED)
+
+    def _after_failure(self, job: Job, error: str, *,
+                       retryable: bool = True, timed_out: bool = False) -> None:
+        job.last_error = error
+        if retryable and job.attempts <= job.retry.max_retries and not self._stopping:
+            backoff = job.retry.delay(job.attempts, self._rng)
+            job.run_at = time.monotonic() + backoff
+            self._transition(job, JobStatus.RETRY_WAIT)
+            self._enqueue(job)
+        else:
+            self._finish(job, JobStatus.TIMED_OUT if timed_out else JobStatus.FAILED, error=error)
+
+    # ── Internals: recurring ──────────────────────────────────────────
+
+    async def _ticker(self) -> None:
+        while not self._stopping:
+            now = time.monotonic()
+            for sched in list(self._recurring.values()):
+                if not sched.active:
+                    del self._recurring[sched.schedule_id]
+                elif sched.next_run <= now:
+                    try:
+                        self._fire(sched, now)
+                    except Exception:               # a broken factory must not kill the ticker
+                        logger.exception("recurring %s failed to fire", sched.schedule_id)
+            next_due = min((s.next_run for s in self._recurring.values()), default=None)
+            timeout = None if next_due is None else max(0.0, next_due - time.monotonic())
+            self._ticker_wakeup.clear()
+            try:
+                await asyncio.wait_for(self._ticker_wakeup.wait(), timeout)
+            except asyncio.TimeoutError:
                 pass
 
-        # Cancel workers
-        for worker in self._workers:
-            worker.cancel()
-        await asyncio.gather(*self._workers, return_exceptions=True)
+    def _fire(self, sched: RecurringSchedule, now: float) -> None:
+        sched.advance(now)
+        previous = self._jobs.get(sched.last_job_id) if sched.last_job_id else None
+        if previous is not None and not previous.status.is_terminal and not sched.allow_overlap:
+            sched.skipped += 1
+            return
+        sched.last_job_id = self.submit(sched.factory())
+        sched.fired += 1
 
-        # Shutdown executor
-        await self._executor.shutdown()
-        print("  🔴 Scheduler stopped")
+    # ── Internals: state changes ──────────────────────────────────────
 
-    async def _scheduler_loop(self) -> None:
-        """
-        Scheduler loop — the 'Producer' in Producer-Consumer.
-
-        Periodically checks for:
-        1. Recurring jobs that need instantiation
-        2. Pending jobs that need dispatching to the queue
-
-        Runs on the event loop (cooperative) — yields via asyncio.sleep.
-        """
-        while self._running and not self._stop_event.is_set():
-            now = datetime.now()
-
-            # Process recurring jobs
-            for rec in self._recurring:
-                if rec.is_active and rec.next_run <= now:
-                    job = rec.create_job()
-                    self.add_job(job)
-                    rec.update_next_run()
-
-            # Dispatch pending jobs to the queue
-            # Note: using 'await' with the async context manager
-            async with self._lock_pending() as pl:
-                if pl:
-                    ordered = self._scheduler.schedule(pl)
-                    for job in ordered:
-                        await self._job_queue.put(job)
-                    pl.clear()
-
-            # Yield control back to the event loop
-            # This is cooperative multitasking in action:
-            # the scheduler yields at this await point, allowing
-            # worker tasks to process jobs from the queue.
+    def _transition(self, job: Job, new: JobStatus) -> None:
+        old = job.status
+        if new not in _TRANSITIONS.get(old, set()):
+            raise InvalidTransitionError(f"{job.job_id}: {old.value} -> {new.value}")
+        job.status = new
+        for listener in self._listeners:
             try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=0.5
-                )
-                break  # stop event was set
-            except asyncio.TimeoutError:
-                pass  # Normal: no stop signal, continue loop
+                listener(job, old, new)
+            except Exception:                       # a bad listener must not kill a worker
+                logger.exception("listener failed for %s", job.job_id)
 
-    async def _worker_loop(self, worker_id: int) -> None:
-        """
-        Worker loop — the 'Consumer' in Producer-Consumer.
+    def _finish(self, job: Job, status: JobStatus, *, error: Optional[str] = None) -> None:
+        if job.status.is_terminal:
+            return
+        if error is not None:
+            job.last_error = error
+        job.finished_at = time.monotonic()
+        self._transition(job, status)
+        self._cancel_requested.discard(job.job_id)
+        self._blocked.pop(job.job_id, None)
 
-        Pulls jobs from the queue and executes them via the executor.
-        Multiple workers run concurrently (cooperatively).
-
-        CORE CS CONCEPT: When a worker awaits job.execute(), it yields
-        control to the event loop. Another worker (or the scheduler loop)
-        gets to run. This is how concurrency is achieved with a single
-        thread.
-        """
-        while self._running and not self._stop_event.is_set():
-            try:
-                # Block until a job is available (with timeout for
-                # responsiveness during shutdown)
-                try:
-                    job = await asyncio.wait_for(
-                        self._job_queue.get(),
-                        timeout=1.0
-                    )
-                except asyncio.TimeoutError:
-                    continue  # No job available, loop to check shutdown
-
-                # Execute the job (MUST await — this is an async def!)
-                try:
-                    await self._executor.execute(job)
-                except asyncio.CancelledError:
-                    self._job_queue.task_done()
-                    raise  # Re-raise to stop this worker
-                finally:
-                    self._history.append(job)
-                    # Always mark task as done for proper Queue cleanup
-                    self._job_queue.task_done()
-
-            except asyncio.CancelledError:
-                # Worker is being shut down — exit gracefully
-                break
-
-            except Exception as e:
-                print(f"  ⚠️ Worker {worker_id} error: {e}")
+        for dep_id in self._dependents.pop(job.job_id, []):
+            dependent = self._jobs.get(dep_id)
+            if dependent is None or dependent.status.is_terminal:
                 continue
+            if status is JobStatus.COMPLETED:
+                unmet = self._blocked.get(dep_id)
+                if unmet is not None:
+                    unmet.discard(job.job_id)
+                    if not unmet:
+                        del self._blocked[dep_id]
+                        self._enqueue(dependent)
+            else:                                   # cascade: upstream did not complete
+                self._finish(dependent, JobStatus.CANCELLED,
+                             error=f"upstream {job.job_id} {status.value}")
 
-    def _lock_pending(self):
-        """
-        Context manager for async-safe access to pending list.
+        self._unfinished -= 1
+        if self._unfinished == 0:
+            self._idle.set()
+        self._remember_finished(job.job_id)
 
-        Uses asyncio.Lock instead of threading.Lock because this is
-        called from async context. A threading.Lock would block the
-        entire event loop thread! asyncio.Lock yields cooperatively
-        to other coroutines when contended.
-        """
-        return _AsyncPendingLock(self._pending)
-
-
-class _AsyncPendingLock:
-    """
-    Async-safe context manager for list access.
-    Uses asyncio.Lock which is cooperative (non-blocking to the thread).
-    """
-
-    def __init__(self, pending: List):
-        self._pending = pending
-        self._lock = asyncio.Lock()
-
-    async def __aenter__(self):
-        await self._lock.acquire()
-        return self._pending
-
-    async def __aexit__(self, *args):
-        self._lock.release()
+    def _remember_finished(self, job_id: str) -> None:
+        # Bound memory: a recurring job would otherwise grow _jobs forever.
+        self._finished.append(job_id)
+        while len(self._finished) > self._history_limit:
+            old = self._finished.popleft()
+            self._jobs.pop(old, None)
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  CORE CS CONCEPT: Exponential Backoff Utility
+#  EXAMPLE JOBS (used by the demo and the tests)
 # ════════════════════════════════════════════════════════════════════════
 
-def exponential_backoff(attempt: int, base_delay: float = 1.0,
-                        max_delay: float = 3600.0, jitter: bool = True) -> float:
-    """
-    Calculate retry delay with exponential backoff and optional jitter.
+class EmailJob(AsyncJob):
+    """I/O-bound: awaits the network, so it belongs on the event loop."""
 
-    Formula: delay = min(base * 2^attempt, max_delay)
-    With jitter: delay = random(0, delay) — prevents thundering herd
+    def __init__(self, to: str, subject: str, latency: float = 0.05, **kw: Any) -> None:
+        super().__init__(f"email {to}: {subject}", **kw)
+        self.to = to
+        self.latency = latency
 
-    CORE CS CONCEPT: Exponential Backoff prevents:
-    - Thundering herd (all clients retry simultaneously)
-    - Resource exhaustion from rapid retries
-    - Cascading failures (one failure triggers more failures)
-    """
-    import random
-    delay = min(base_delay * (2 ** attempt), max_delay)
-    if jitter:
-        delay = random.uniform(0, delay)
-    return delay
+    async def run(self) -> str:
+        await asyncio.sleep(self.latency)
+        return f"sent to {self.to}"
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  CORE CS CONCEPT: Context Manager for Timing
-# ════════════════════════════════════════════════════════════════════════
+class FlakyUploadJob(AsyncJob):
+    """Fails its first `failures` attempts, then succeeds. Exercises retries."""
 
-class TimingContext:
-    """
-    Context manager that measures elapsed time.
-    Useful for profiling job execution.
+    def __init__(self, path: str, failures: int, **kw: Any) -> None:
+        super().__init__(f"upload {path}", **kw)
+        self.failures = failures
 
-    CORE CS CONCEPT: Context managers provide deterministic
-    resource cleanup (via __exit__), which is crucial for:
-    - Lock release (avoid deadlocks)
-    - File handles (avoid fd leaks)
-    - Database connections (avoid connection pool exhaustion)
-    """
+    async def run(self) -> str:
+        await asyncio.sleep(0.01)
+        if self.attempts <= self.failures:
+            raise ConnectionError(f"attempt {self.attempts}: connection reset")
+        return "uploaded"
 
-    def __init__(self, label: str = ""):
-        self.label = label
-        self.elapsed: float = 0.0
 
-    def __enter__(self):
-        self._start = time.perf_counter()
-        return self
+class SleepJob(AsyncJob):
+    def __init__(self, name: str, seconds: float, **kw: Any) -> None:
+        super().__init__(name, **kw)
+        self.seconds = seconds
 
-    def __exit__(self, *args):
-        self.elapsed = time.perf_counter() - self._start
-        if self.label:
-            print(f"  ⏱️  {self.label}: {self.elapsed:.3f}s")
+    async def run(self) -> float:
+        await asyncio.sleep(self.seconds)
+        return self.seconds
+
+
+class CsvExportJob(BlockingJob):
+    """Blocking I/O (a sync DB driver, say): runs in the thread pool."""
+
+    def __init__(self, table: str, rows: int = 1_000, **kw: Any) -> None:
+        super().__init__(f"export {table}", **kw)
+        self.rows = rows
+
+    def run_sync(self) -> int:
+        time.sleep(0.02)                            # releases the GIL while "waiting on the DB"
+        return self.rows
+
+
+class PrimeCountJob(CpuBoundJob):
+    """CPU-bound: counts primes below n. Runs in a separate process."""
+
+    def __init__(self, n: int, **kw: Any) -> None:
+        super().__init__(f"count primes < {n}", **kw)
+        self.n = n
+
+    def run_sync(self) -> int:
+        sieve = bytearray([1]) * self.n
+        sieve[:2] = b"\x00\x00"
+        for i in range(2, int(self.n ** 0.5) + 1):
+            if sieve[i]:
+                sieve[i * i::i] = bytearray(len(range(i * i, self.n, i)))
+        return sum(sieve)
 
 
 # ════════════════════════════════════════════════════════════════════════
 #  DEMO
 # ════════════════════════════════════════════════════════════════════════
 
-async def async_demo():
-    """Full demo showcasing all concurrency models and CS concepts."""
-    print("=" * 62)
-    print("  JOB SCHEDULING SYSTEM — Async + Concurrency Deep Dive")
-    print("=" * 62)
+async def _demo() -> None:
+    scheduler = JobScheduler(PriorityStrategy(), num_workers=3, rng=random.Random(7))
+    fast_retry = RetryPolicy(max_retries=3, base_delay=0.02, jitter=False)
 
-    # ── Section 1: Race Condition Demo ────────────────────────
-    print("\n  ┌─ SECTION 1: RACE CONDITION DEMONSTRATION ────────┐")
-    print("  │  Shows why threading.Lock() is necessary           │")
-    demonstrate_race_condition(100_000)
+    export = CsvExportJob("orders", rows=4_200)
+    primes = PrimeCountJob(200_000, timeout=30)
+    report = EmailJob("finance@corp", "daily report")
+    alert = EmailJob("oncall@corp", "disk 91%", priority=JobPriority.CRITICAL)
+    flaky = FlakyUploadJob("s3://bucket/report.csv", failures=2, retry=fast_retry)
+    dead = FlakyUploadJob("s3://bucket/broken.csv", failures=99, retry=fast_retry)
+    slow = SleepJob("slow-endpoint", 5.0, timeout=0.1, retry=RetryPolicy(max_retries=0))
+    notify = EmailJob("team@corp", "upload done")
+    later = EmailJob("me@corp", "reminder")
 
-    # ── Section 2: GIL Demo ───────────────────────────────────
-    print("\n  ┌─ SECTION 2: GIL & CONCURRENCY MODELS ────────────┐")
-    print("  │  ASYNC   → Cooperative, single-thread, I/O-bound  │")
-    print("  │  THREAD  → Preemptive, GIL-bound, mixed workloads │")
-    print("  │  PROCESS → True parallelism, CPU-bound             │")
-    print("  └────────────────────────────────────────────────────┘")
+    for job in (export, primes, alert, flaky, dead, slow, later):
+        scheduler.submit(job)
+    scheduler.submit(report, depends_on=[export.job_id, primes.job_id])
+    scheduler.submit(notify, depends_on=[dead.job_id])  # upstream will fail -> cancelled
+    scheduler.cancel(later.job_id)
 
-    # ── Section 3: Job Execution ──────────────────────────────
-    print("\n  ┌─ SECTION 3: SCHEDULING JOBS ──────────────────────┐")
-    scheduler = JobScheduler(
-        scheduler_strategy=WeightedFairScheduler(),
-        max_concurrent=4,
-        num_workers=3
-    )
+    # Recurring: stop after the third heartbeat completes (fires at ~0, 0.1, 0.2 s).
+    beats_done = asyncio.Event()
+    beats: List[Job] = []
 
-    # Add one-time jobs with various concurrency models
-    scheduler.add_job(EmailJob("alice@email.com", "Welcome!", "Thanks for joining"))
-    scheduler.add_job(DataProcessingJob("users_db", "SELECT * FROM active_users"))
+    def count_heartbeats(job: Job, old: JobStatus, new: JobStatus) -> None:
+        if job.name == "email ops@corp: heartbeat" and new is JobStatus.COMPLETED:
+            beats.append(job)
+            if len(beats) == 3:
+                beats_done.set()
 
-    # ASYNC model: lightweight I/O
-    report = ReportGenerationJob("Daily Sales", "CSV")
+    scheduler.add_listener(count_heartbeats)
+    heartbeat = scheduler.schedule_recurring(lambda: EmailJob("ops@corp", "heartbeat"),
+                                             interval=0.1)
 
-    # THREAD model: mixed workload
-    data_job = DataProcessingJob("logs", "CLEANUP old entries")
-
-    # PROCESS model: CPU-intensive (true parallelism)
-    cpu_job = CpuIntensiveJob("Matrix Multiply", iterations=10_000_000)
-    cpu_job2 = CpuIntensiveJob("Histogram", iterations=10_000_000)
-
-    scheduler.add_job(report)
-    scheduler.add_job(data_job)
-    scheduler.add_job(cpu_job)
-    scheduler.add_job(cpu_job2)
-
-    # Add high priority job (will skip ahead in queue)
-    critical_job = EmailJob("admin@system.com", "CRITICAL: Server Alert", "CPU > 90%")
-    critical_job._priority = JobPriority.CRITICAL
-    scheduler.add_job(critical_job)
-
-    # Add a recurring job (hourly cleanup)
-    cleanup = RecurringJob(
-        lambda: DataProcessingJob("logs", "CLEANUP temp files"),
-        RecurrenceType.HOURLY
-    )
-    scheduler.add_recurring(cleanup)
-
-    # ── Section 4: Run ───────────────────────────────────────
     await scheduler.start()
-
-    # Wait for jobs to complete: first give the scheduler loop time to
-    # dispatch pending jobs to the queue, then wait for queue drain.
-    # Note: a small initial sleep is needed because create_task() schedules
-    # the scheduler loop "soon" but not immediately — the queue may be
-    # empty at start(). After that, queue.join() blocks until all
-    # dispatched jobs are processed. Then we wait briefly for stragglers.
-    await asyncio.sleep(0.5)                     # Let scheduler dispatch
-    await scheduler._job_queue.join()            # Wait for queue drain
-    await asyncio.sleep(0.5)                     # Straggler window
+    await beats_done.wait()
+    scheduler.cancel_recurring(heartbeat)
+    await scheduler.join()
     await scheduler.stop()
 
-    # ── Section 5: Stats ─────────────────────────────────────
-    print(f"\n  ┌─ SECTION 4: SCHEDULER STATS ─────────────────────┐")
-    completed = sum(1 for j in scheduler._history if j.status == JobStatus.COMPLETED)
-    failed = sum(1 for j in scheduler._history if j.status == JobStatus.FAILED)
-    cancelled = sum(1 for j in scheduler._history if j.status == JobStatus.CANCELLED)
-    timeout = sum(1 for j in scheduler._history if j.status == JobStatus.TIMEOUT)
-    print(f"  │ Total     : {len(scheduler._history):3d} jobs                │")
-    print(f"  │ Completed : {completed:3d} jobs                │")
-    print(f"  │ Failed    : {failed:3d} jobs                │")
-    print(f"  │ Cancelled : {cancelled:3d} jobs                │")
-    print(f"  │ Timeout   : {timeout:3d} jobs                │")
-    print(f"  │ Recurring : {len(scheduler._recurring):3d} schedules           │")
-    print(f"  └────────────────────────────────────────────────────┘")
-
-    # ── Section 6: History ───────────────────────────────────
-    print(f"\n  ┌─ SECTION 5: JOB HISTORY ──────────────────────────┐")
-    for job in scheduler._history[-10:]:
-        dur = ""
-        if job._started_at and job._completed_at:
-            d = (job._completed_at - job._started_at).total_seconds()
-            dur = f" ({d:.1f}s)"
-        print(f"  │ {str(job):55s}{dur} │")
-    print(f"  └────────────────────────────────────────────────────┘")
-
-    print(f"\n{'=' * 62}")
-    print(f"  Demo complete — see source for CS concept annotations")
-    print(f"{'=' * 62}\n")
+    print("=" * 72)
+    print("  JOB SCHEDULER DEMO")
+    print("=" * 72)
+    shown = [export, primes, report, alert, flaky, dead, slow, notify, later]
+    for job in shown:
+        detail = job.result if job.status is JobStatus.COMPLETED else job.last_error
+        print(f"  {job.name:<34} {job.status.value:<10} attempts={job.attempts}  {detail}")
+    print(f"  recurring heartbeat completed {len(beats)} runs, then was cancelled")
+    print(f"  peak concurrent jobs: {scheduler.peak_running} (workers: 3)")
 
 
-def demo():
-    """Entry point: runs the async demo."""
-    asyncio.run(async_demo())
+def main() -> None:
+    logging.basicConfig(level=logging.WARNING)
+    asyncio.run(_demo())
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  CORE CS CONCEPTS SUMMARY (for documentation)
-# ════════════════════════════════════════════════════════════════════════
-#
-# 1. GIL (Global Interpreter Lock)
-#    - Only one thread executes Python bytecode at a time
-#    - Released during I/O, C-extension calls, and lock waits
-#    - ProcessPoolExecutor bypasses GIL (separate interpreters)
-#
-# 2. Race Conditions
-#    - Occur when non-atomic operations are interrupted mid-way
-#    - Prevented by locks (mutual exclusion), atomic operations
-#    - Demonstrated: UnsafeCounter vs SafeCounter
-#
-# 3. Deadlocks
-#    - Circular wait: Thread A holds Lock 1, waits for Lock 2
-#                     Thread B holds Lock 2, waits for Lock 1
-#    - Prevention: Lock ordering, timeouts, lock hierarchy
-#
-# 4. Concurrency vs Parallelism
-#    - Concurrency: Multiple tasks making progress (interleaved)
-#    - Parallelism: Multiple tasks running simultaneously
-#    - asyncio = concurrency, multiprocessing = parallelism
-#
-# 5. Semaphore
-#    - Resource counter for limiting concurrent access
-#    - asyncio.Semaphore for async, threading.Semaphore for threads
-#
-# 6. Producer-Consumer
-#    - asyncio.Queue decouples job creation from execution
-#    - Multiple workers consume from the same queue
-#
-# 7. Cooperative Cancellation
-#    - asyncio.CancelledError allows clean resource cleanup
-#    - asyncio.Event signals shutdown across multiple coroutines
-#
-# 8. Context Managers
-#    - Deterministic resource cleanup via __enter__/__exit__
-#    - Used for locks, file handles, timing, connections
-#
-# 9. Exponential Backoff
-#    - Prevents thundering herd in retry scenarios
-#    - Jitter distributes retry timing randomly
-#
-# 10. State Machine (Enum-based)
-#     - Type-safe state transitions
-#     - O(1) comparison for equality checks
-#     - Prevents invalid states (e.g., COMPLETED → PENDING)
 
 if __name__ == "__main__":
-    demo()
+    main()

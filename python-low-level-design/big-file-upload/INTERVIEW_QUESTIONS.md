@@ -1,6 +1,6 @@
 # 📋 Big File Upload — Staff-Level Interview Questions
 
-> *12 questions covering upload architecture, resumability, async processing, and edge cases — every question expects principal engineer-level depth.*
+> *12 questions covering upload architecture, resumability, async processing, and edge cases, then the follow-ups interviewers push on, common mistakes, and what separates senior from staff answers.*
 
 ---
 
@@ -18,6 +18,9 @@
 10. [Garbage Collection & Lifecycle Management](#10-garbage-collection-lifecycle-management)
 11. [Download & CDN Delivery Strategy](#11-download-cdn-delivery-strategy)
 12. [Monitoring & Debugging Upload Failures](#12-monitoring-debugging-upload-failures)
+13. [Follow-ups Interviewers Push On](#13-follow-ups-interviewers-push-on)
+14. [Common Mistakes](#14-common-mistakes)
+15. [Senior vs Staff Signal](#15-senior-vs-staff-signal)
 
 ---
 
@@ -66,11 +69,12 @@ Without chunking (naive approach):
                           │  • Server bandwidth = bottleneck
 
 With chunking + pre-signed URLs (scalable approach):
-  Client ──PATCH chunk_0──► S3 (direct, via pre-signed URL)
-  Client ──PATCH chunk_1──► S3
-  Client ──PATCH chunk_2──► S3
-  Client ──PATCH chunk_N──► S3
-  Client ──POST complete──► Server (only metadata)
+  Client ──PUT part 1──► S3 (direct, via pre-signed UploadPart URL)
+  Client ──PUT part 2──► S3
+  Client ──PUT part 3──► S3
+  Client ──PUT part N──► S3
+  Client ──POST complete──► Server (only metadata; server calls
+                            ListParts + CompleteMultipartUpload)
   
   Benefits:
    • Server handles ZERO bytes of file data
@@ -78,6 +82,9 @@ With chunking + pre-signed URLs (scalable approach):
    • Resume from last successful chunk
    • S3 handles durability (99.999999999%)
 ```
+
+!!! warning "The chunk-size trap"
+    S3 multipart allows at most **10,000 parts** of 5 MiB–5 GiB each (the last part may be smaller). A fixed 5 MiB chunk caps the file at ~48.8 GiB. For 100 GiB, compute `chunk = max(5 MiB, ceil(size / 10,000))` ≈ 10.24 MiB. Interviewers love this one because "5 MB chunks, up to 100 GB" sounds fine until you multiply.
 
 ### 🔍 Staff-Level Evaluation
 
@@ -125,40 +132,53 @@ Client                                    Server
   │                                         │
   │ (repeat until all bytes sent)           │
   │                                         │
-  │──── POST /upload/{id}/complete ────────►│  Finalize upload
-  │◄─── {status: completed}                 │
+  │ (upload is complete when                │
+  │  Upload-Offset == Upload-Length)        │
 ```
+
+**What real TUS does (and doesn't):**
+
+- `POST` with `Upload-Length` creates the upload; `HEAD` returns `Upload-Offset`; `PATCH` with `Upload-Offset` appends bytes. If the client's offset doesn't equal the server's, the server answers **409 Conflict**. Core TUS is strictly sequential.
+- There is no `/complete` call: the upload is done when the offset reaches the length. (A separate `complete` step is the S3 multipart model; this LLD uses that because it supports parallel chunks.)
+- Parallel upload in TUS is the **concatenation** extension: several partial uploads, then a final `POST` with `Upload-Concat: final;...`.
+- Other extensions worth naming: `checksum` (`Upload-Checksum` header; mismatch → 460), `expiration` (`Upload-Expires`), `termination` (`DELETE`).
+- With parallel chunks, "offset" must be the **contiguous** prefix. Chunks {0, 2} received means resume at the end of chunk 0, not at "total bytes received". The LLD exposes both `get_offset()` (contiguous) and `missing_chunks()`.
 
 **Duplicate Chunk Handling:**
 
 ```python
-# Idempotency: chunks are uniquely identified by (upload_id, offset_start)
-# If a chunk with the same upload_id AND same offset_start already exists:
-#   → Skip storage (idempotent)
-#   → Return the existing offset (don't advance)
+# Idempotency key: (upload_id, chunk_number). The chunk's bytes are fixed by
+# its index, so a retry must carry the SAME checksum. Same → no-op success.
+# Different → 409, never a silent overwrite.
 
-async def receive_chunk(upload_id: str, offset: int, data: bytes):
-    # Check if chunk was already received
-    existing = await db.fetch_one("""
-        SELECT offset_start, offset_end, checksum
-        FROM chunks
-        WHERE upload_id = $1 AND offset_start = $2
-    """, upload_id, offset)
+async def receive_chunk(upload_id: str, index: int, data: bytes, sha256: str):
+    if hashlib.sha256(data).hexdigest() != sha256:
+        raise ChecksumMismatch()                              # 400 / TUS 460
+    upload = await db.fetch_one("SELECT chunk_size, file_size FROM uploads WHERE id = $1", upload_id)
+    start = index * upload["chunk_size"]
+    if len(data) != min(upload["chunk_size"], upload["file_size"] - start):
+        raise BadChunkSize()                                  # chunks can't overlap or overrun
 
-    if existing:
-        # Client retried — confirm receipt without re-storing
-        logger.info(f"Duplicate chunk received: {upload_id} @ {offset}")
-        return {"offset": existing["offset_end"]}
+    # Store under a deterministic key FIRST: an overwrite with identical bytes is harmless.
+    key = f"temp-chunks/{upload_id}/chunk_{index}"
+    await store_chunk(key, data)
 
-    # New chunk — store it
-    checksum = hashlib.sha256(data).hexdigest()
-    await store_chunk(upload_id, offset, data)
-    await db.execute("""
-        INSERT INTO chunks (upload_id, chunk_number, offset_start, offset_end, size, checksum)
-        VALUES ($1, $2, $3, $4, $5, $6)
-    """, upload_id, offset // CHUNK_SIZE, offset, offset + len(data), len(data), checksum)
-
-    return {"offset": offset + len(data)}
+    # Then record it. ON CONFLICT closes the check-then-insert race between two
+    # concurrent retries that a SELECT-then-INSERT would leave open.
+    row = await db.fetch_one("""
+        INSERT INTO chunks (upload_id, chunk_number, offset_start, offset_end,
+                            size, checksum, storage_path)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (upload_id, chunk_number) DO NOTHING
+        RETURNING chunk_number
+    """, upload_id, index, start, start + len(data), len(data), sha256, key)
+    if row is None:                                           # someone recorded it already
+        existing = await db.fetch_val(
+            "SELECT checksum FROM chunks WHERE upload_id = $1 AND chunk_number = $2", upload_id, index)
+        if existing != sha256:
+            raise ChunkConflict()                             # 409
+        return {"index": index, "duplicate": True}
+    return {"index": index, "duplicate": False}
 ```
 
 **Abandoned Upload Retention:**
@@ -185,7 +205,7 @@ Edge case: What if user resumes on day 6?
 | **HEAD/PATCH semantics** | Understands TUS protocol: HEAD gets offset, PATCH sends data from that offset |
 | **Idempotency** | Handles duplicate chunks without corruption |
 | **Expiry policy** | Has concrete retention period with justification |
-| **Edge cases** | Mentions concurrent PATCH requests, overlap handling |
+| **Edge cases** | Concurrent requests for the same chunk, different bytes on retry, resume offset with gaps |
 
 ---
 
@@ -201,8 +221,9 @@ Edge case: What if user resumes on day 6?
 
 ```yaml
 Factors affecting chunk size:
-  1. Network MTU: ~1500 bytes (minimum)
-  2. S3 multipart minimum: 5MB (except last chunk)
+  1. S3 multipart: 5 MiB minimum part (except the last), 10,000 parts max
+     → chunk >= max(5 MiB, file_size / 10,000)
+  2. (MTU, ~1500 bytes, is irrelevant at this level: TCP segments for you)
   3. Browser memory: 5MB chunks × 6 parallel = 30MB in-flight
   4. Retry granularity: smaller chunks = less re-transmit on failure
   5. HTTP overhead: more chunks = more HTTP requests = more latency
@@ -224,8 +245,10 @@ Adaptive chunk sizing:
 ```yaml
 Browser connection limits per origin:
   - HTTP/1.1: 6 concurrent connections (Chrome)
-  - HTTP/2: 100+ concurrent streams
-  - HTTP/3: unlimited (QUIC)
+  - HTTP/2: one connection, concurrent streams capped by the server's
+            SETTINGS_MAX_CONCURRENT_STREAMS (commonly 100–128)
+  - HTTP/3: same idea, stream limits negotiated by QUIC (not unlimited);
+            avoids TCP head-of-line blocking between streams
 
 Recommendation:
   - Max 3-6 parallel chunk uploads (balance speed vs reliability)
@@ -585,11 +608,11 @@ CREATE TABLE chunks (
     UNIQUE(upload_id, chunk_number)
 );
 
--- Partition chunks by month (for scale)
-CREATE TABLE chunks_2026_07 PARTITION OF chunks
-    FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
-CREATE TABLE chunks_2026_08 PARTITION OF chunks
-    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+-- ⚠️ Partitioning note: a partitioned table must be declared with
+-- PARTITION BY, and every UNIQUE/PK constraint must include the partition key.
+-- Partitioning chunks by received_at would force UNIQUE(upload_id,
+-- chunk_number, received_at), which no longer stops duplicates. If you
+-- partition at all, use PARTITION BY HASH (upload_id).
 
 -- Processed file metadata
 CREATE TABLE files (
@@ -632,10 +655,13 @@ Chunks table growth:
   - 10K files/day × 10K chunks = 100M chunk rows/day
   - Need partition by month OR use append-only time-series DB
   
-Solution:
-  1. Partition chunks by month (as shown above)
-  2. Archive old partitions to cold storage (S3 + Athena queries)
-  3. Delete expired upload chunks after 7 days (reduces rows)
+Better: don't keep chunk rows after the upload finishes.
+  1. Chunk rows only matter while an upload is in flight. Delete them on
+     complete/cancel/expiry. Live rows = in-flight uploads × chunks, not history.
+  2. Or skip per-chunk rows: keep a received-parts bitmap on the uploads row
+     (10,000 parts = 1.25 KB) and let S3 ListParts be the source of truth.
+  3. If you must keep history, PARTITION BY HASH (upload_id) for even writes,
+     and archive finished uploads to the warehouse.
   
 uploads table:
   - Much smaller (1 row per upload)
@@ -674,10 +700,16 @@ Pre-signed URLs:
     ✓ Lower cost (no server bandwidth)
   
   Cons:
-    ✗ Need to manage URL expiry (15 min default)
+    ✗ Need to manage URL expiry (you pick it; SigV4 max is 7 days, but keep
+      it short and re-issue per part on resume)
     ✗ Harder to enforce business logic mid-stream
-    ✗ S3 events are eventually consistent (up to 60s delay)
-    ✗ Client can bypass server validation (upload to wrong path)
+    ✗ S3 reads are strongly consistent, but event notifications are
+      asynchronous: usually seconds, occasionally longer, and at-least-once.
+      Make the handler idempotent; don't block the user on the event.
+    ✗ The URL is bound to one key (and part number), so the client can't
+      write elsewhere, but it CAN upload any bytes and any size. Use a
+      presigned POST policy with content-length-range, or verify size and
+      checksum (ListParts / HeadObject) before accepting.
 
 Proxy Uploads:
   How:  Client POSTs to server, server streams to S3
@@ -745,63 +777,47 @@ Hybrid Approach (best of both):
 
 ```python
 class UploadRateLimiter:
-    """Three levels of rate limiting for uploads."""
+    """
+    Three limits, each enforced atomically in Redis. Two bugs to avoid:
+      * Check-then-increment across separate commands races between servers.
+      * Running the three checks independently: if the quota check fails after
+        the concurrency counter was incremented, the slot leaks forever.
+    """
 
-    def __init__(self, redis):
-        self.redis = redis
+    # Concurrency slots as a ZSET of upload_id -> lease expiry. A crashed client
+    # can't leak a slot: expired members are dropped on every check.
+    START = """
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])           -- drop expired leases
+    if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 'CONCURRENCY' end
+    local used = tonumber(redis.call('GET', KEYS[2]) or '0')
+    if used + tonumber(ARGV[4]) > tonumber(ARGV[5]) then return 'QUOTA' end
+    redis.call('ZADD', KEYS[1], ARGV[6], ARGV[3])                      -- take the slot
+    redis.call('INCRBY', KEYS[2], ARGV[4])                             -- reserve the quota
+    redis.call('EXPIRE', KEYS[2], 172800)
+    return 'OK'
+    """
 
-    async def check_limits(self, user_id: str, file_size: int) -> bool:
-        """Check all rate limits. Returns True if allowed."""
-        checks = [
-            self._check_concurrent_uploads(user_id),
-            self._check_throughput(user_id, file_size),
-            self._check_daily_quota(user_id, file_size),
-        ]
-        results = await asyncio.gather(*checks)
-        return all(results)
+    async def start_upload(self, user_id, upload_id, size):
+        now = time.time()
+        result = await self.redis.eval(
+            self.START, 2,
+            f"uploads:active:{user_id}", f"uploads:quota:{user_id}:{date.today()}",
+            now, 10, upload_id, size, 100 * 1024**3, now + 3600)
+        if result != "OK":
+            raise RateLimitError(result)                        # 429 + Retry-After
 
-    async def _check_concurrent_uploads(self, user_id: str) -> bool:
-        """Level 1: Max concurrent uploads per user."""
-        key = f"ratelimit:concurrent:{user_id}"
-        current = await self.redis.incr(key)
-        await self.redis.expire(key, 3600)  # 1 hour TTL
-        if current > 10:  # Max 10 concurrent uploads
-            raise RateLimitError("Too many concurrent uploads (max: 10)")
-        return True
+    async def finish_upload(self, user_id, upload_id, refund=0):
+        # ZREM is idempotent: completing twice can't free two slots.
+        if await self.redis.zrem(f"uploads:active:{user_id}", upload_id) and refund:
+            await self.redis.decrby(f"uploads:quota:{user_id}:{date.today()}", refund)
 
-    async def _check_throughput(self, user_id: str, file_size: int) -> bool:
-        """Level 2: Throughput limit per user."""
-        key = f"ratelimit:throughput:{user_id}"
-        current = await self.redis.get(key) or 0
-        new_total = int(current) + file_size
-
-        # Convert to MB/s over 60s window
-        window_bytes = int(self.redis.ttl(key) or 60)
-        mb_per_s = new_total / window_bytes / 1024 / 1024
-
-        if mb_per_s > 50:  # Max 50 MB/s sustained
-            raise RateLimitError("Upload throughput exceeded (max: 50 MB/s)")
-        
-        await self.redis.incrby(key, file_size)
-        if not await self.redis.exists(key):
-            await self.redis.expire(key, 60)
-        return True
-
-    async def _check_daily_quota(self, user_id: str, file_size: int) -> bool:
-        """Level 3: Daily storage quota per user."""
-        key = f"ratelimit:daily:{user_id}:{datetime.utcnow().date()}"
-
-        current = await self.redis.get(key) or 0
-        new_total = int(current) + file_size
-
-        if new_total > 100 * 1024**3:  # 100 GB/day per user
-            raise RateLimitError("Daily upload quota exceeded (max: 100 GB)")
-
-        await self.redis.incrby(key, file_size)
-        if not await self.redis.exists(key):
-            await self.redis.expire(key, 86400)  # 24 hours
-        return True
+    # Bandwidth: a token bucket per user, charged per CHUNK (one Lua script:
+    # refill by elapsed time, take len(chunk) or return the wait). Don't charge
+    # the declared file size up front: 5 GB against "50 MB/s over 60 s"
+    # rejects every file over 3 GB forever.
 ```
+
+Heartbeat each chunk to extend the slot's lease (`ZADD` with a new expiry), so an active upload keeps its slot and an abandoned one loses it within an hour.
 
 **Server-Side Resource Management:**
 
@@ -855,16 +871,20 @@ Layer 2: Per-chunk (during upload)
   → sent as header on each PATCH: X-Chunk-Checksum: <hash>
   Server verifies chunk checksum before storing
 
-Layer 3: Multipart upload ETags
-  S3's ETag is MD5 of the part (for single-part)
-  For multipart: ETag = MD5(all_part_md5s_concat)-numParts
-  Can verify at complete time
+Layer 3: Storage-side checksums
+  ETag: MD5 of the object for single-part uploads (NOT for SSE-KMS objects);
+  for multipart it's MD5(concat of binary part MD5s) + "-N", not a file hash.
+  Better: S3 additional checksums. Send x-amz-checksum-sha256 (or CRC32C)
+  per part; S3 rejects a part whose bytes don't match, and stores a
+  composite checksum (hash of the part hashes) for the object.
 
-Layer 4: Post-assembly verification
-  After assembling all chunks, server downloads first/last
-  few bytes and verifies against expected checksums
-  Better: stream entire assembled file through SHA-256
-  and compare with client's provided hash
+Layer 4: Whole-file verification
+  A full-file SHA-256 needs one sequential pass over all bytes. On S3 that's
+  a 50 GB re-download, which is slow and costs money. Options:
+    - Composite checksum: client and server both compute hash(part hashes);
+      parallel on both sides, no re-read (what S3 multipart does).
+    - Full hash where you already stream the bytes anyway (the LLD's
+      complete() re-hashes each chunk and the file in one ordered pass).
 
 Layer 5: Periodic integrity check (background)
   Background job re-checks checksums of stored files
@@ -919,6 +939,7 @@ class IntegrityVerifier:
 
     async def handle_corruption(self, upload_id: str):
         """Handle corrupted file after assembly."""
+        upload = await db.fetch_one("SELECT user_id FROM uploads WHERE id = $1", upload_id)
         await db.execute(
             "UPDATE uploads SET status = 'failed', failure_reason = 'checksum_mismatch' "
             "WHERE id = $1", upload_id
@@ -1007,11 +1028,19 @@ class GarbageCollector:
 
     async def _clean_abandoned_uploads(self):
         """Delete uploads that haven't received a chunk in 7 days."""
+        # Claim a batch in one statement. A bare SELECT ... FOR UPDATE SKIP
+        # LOCKED in autocommit mode releases its locks as soon as it returns,
+        # so two GC workers would still process the same rows.
         stale = await db.fetch("""
-            SELECT id FROM uploads
-            WHERE status IN ('initiated', 'in_progress')
-            AND updated_at < NOW() - INTERVAL '7 days'
-            FOR UPDATE SKIP LOCKED
+            UPDATE uploads SET status = 'expired'     -- claim + mark in one step
+            WHERE id IN (
+                SELECT id FROM uploads
+                WHERE status IN ('initiated', 'in_progress')
+                  AND expires_at < NOW()              -- sliding: bumped on every chunk
+                ORDER BY expires_at
+                LIMIT 500
+                FOR UPDATE SKIP LOCKED)
+            RETURNING id, storage_key, storage_upload_id
         """)
         for upload in stale:
             upload_id = upload["id"]
@@ -1022,7 +1051,7 @@ class GarbageCollector:
             if upload.get("storage_upload_id"):
                 await s3_client.abort_multipart_upload(
                     Bucket=UPLOAD_BUCKET,
-                    Key=f"temp-chunks/{upload_id}/",
+                    Key=upload["storage_key"],        # the object key used in CreateMultipartUpload
                     UploadId=upload["storage_upload_id"],
                 )
 
@@ -1072,6 +1101,9 @@ class GarbageCollector:
 ```
 
 **S3 Lifecycle Policy (for infrastructure-level GC):**
+
+!!! warning "Lifecycle rules count from object creation, not last activity"
+    `Expiration: 7 days` on `temp-chunks/` deletes chunk 0 seven days after *it* was written, even if the user resumed on day 6 and the app extended the session. Either set the lifecycle window comfortably longer than the app's sliding TTL (e.g. 14 days vs 7) so it's only a backstop, or let the app GC own deletion. `AbortIncompleteMultipartUpload` likewise counts from initiation. Also use `Filter: {Prefix: ...}`; the top-level `Prefix` field is deprecated.
 
 ```json
 {
@@ -1250,28 +1282,29 @@ if upload["status"] == "in_progress":
         ORDER BY chunk_number DESC
         LIMIT 1
     """, upload_id)
-    # → Last chunk: #194, offset: 1,017,282,560, received: 15 min ago
-    # → Missing: #195 (last one!), due to timeout
+    # 10 GiB / 5 MiB = 2,048 chunks; "failed at 95%" ≈ 1,946 received
+    # → 1,946 of 2,048 chunks received; first missing: #1,946
+    # → last activity 15 min ago, status still in_progress (resumable!)
 
 # Step 2: Check the client-side logs (via WebSocket)
 # If client was sending progress events:
 client_logs = await get_client_events(upload_id)
-# → "Chunk 194 sent, awaiting ack..."
+# → "Chunk 1946 sent, awaiting ack..."
 # → "Network error: Socket timeout"
-# → "Retrying chunk 194... (attempt 2/3)"
-# → "Retry exhausted: giving up on chunk 194"
+# → "Retrying chunk 1946... (attempt 2/3)"
+# → "Retry exhausted: giving up on chunk 1946"
 
 # Step 3: Check server-side logs
 logs = await query_logs(
     service="upload-service",
     filter={"upload_id": upload_id},
 )
-# → "Received chunk 193, checksum OK"
-# → "Received chunk 194, checksum OK"
-# → "Error storing chunk 194 in S3: ConnectionResetError"
-# → "Retry 1/3: storing chunk 194..."
+# → "Received chunk 1945, checksum OK"
+# → "Received chunk 1946, checksum OK"
+# → "Error storing chunk 1946 in S3: ConnectionResetError"
+# → "Retry 1/3: storing chunk 1946..."
 # → "Error: S3 bucket throttling (503 SlowDown)"
-# → "Marked chunk 194 as failed"
+# → "Marked chunk 1946 as failed"
 
 # Step 4: Check metrics
 metrics = await query_metrics(
@@ -1281,8 +1314,12 @@ metrics = await query_metrics(
 # → S3 latency p99 jumped from 50ms to 2s at time of failure
 # → S3 503 errors spiked — bucket was being rate-limited
 
-# Root cause: S3 bucket request rate limit exceeded
-# (S3 has 3,500 PUT/s per prefix limit)
+# Root cause: S3 request rate limit exceeded
+# (S3 supports ~3,500 PUT/COPY/POST/DELETE per second per partitioned prefix,
+#  and scales partitions up gradually; a sudden spike on one prefix gets 503 SlowDown)
+# Fix: retry 503s with backoff + jitter (the client gave up after 3 tries, too few),
+#      spread keys across prefixes, and tell the user "resume" rather than "failed":
+#      the 1,946 chunks already stored are still there.
 ```
 
 **Key Metrics Dashboard:**
@@ -1335,6 +1372,69 @@ Warning alerts (Slack):
 | **Metric correlation** | Correlates failure with infrastructure metrics (S3 latency, 503s) |
 | **Root cause identification** | Identifies S3 bucket throttling as a specific cause |
 | **Actionable alerts** | Defines concrete thresholds for alerting |
+
+---
+
+## 13. Follow-ups Interviewers Push On
+
+### "Two requests upload the same chunk at the same time. What happens?"
+
+In the LLD: the first reserves the index in `inflight` under the per-upload lock; the second sees it and gets `ChunkInProgressError` (409, retryable). Exactly one storage write. With a DB instead of a lock: deterministic storage key (identical bytes overwrite harmlessly) + `INSERT … ON CONFLICT (upload_id, chunk_number) DO NOTHING`, then compare checksums on conflict.
+
+### "complete() is called while a chunk is still being written."
+
+Refuse it (`ChunkInProgressError`) rather than assembling a file that's missing a chunk the client thinks it sent. Then `complete()` moves the upload to `ASSEMBLING` under the lock, so later chunk writes, `cancel()` and a second `complete()` are refused while verification and composition run without the lock. If storage fails mid-compose, go back to `IN_PROGRESS`; otherwise the upload is stuck forever.
+
+### "The client retries complete() after a timeout, but the first call actually succeeded."
+
+`complete()` must be idempotent: if the upload is already `COMPLETED`/`READY`, return the same result. Same for the post-processing event: publish it through an outbox in the same transaction as the status change, and make consumers idempotent on `upload_id`.
+
+### "A stored chunk got corrupted at rest. How do you find it and recover?"
+
+Re-hash each chunk at `complete()` against the checksum recorded on upload. Drop the bad ones, go back to `IN_PROGRESS`, and return their indices so the client re-sends only those (the LLD's `ChunkCorruptedError`). If every chunk verifies but the whole-file hash doesn't match, the client sent the wrong file or the wrong hash: fail it.
+
+### "How do you test this?"
+
+- **Protocol:** out-of-order + parallel chunks assemble to the exact bytes; 0-byte file; last-chunk size; index out of range.
+- **Idempotency:** same chunk twice → `duplicate`; different bytes → conflict; `complete()` twice → same result.
+- **Resume:** a fake network that drops and then "crashes" the client; a new client resumes and sends exactly `missing_chunks()`.
+- **Integrity:** flip bytes in storage → `ChunkCorruptedError` → re-send → success; wrong whole-file hash → `FAILED`.
+- **Concurrency:** gated/slow storage doubles to force the same-chunk race, complete-during-write, cancel-during-write; assert parallel chunks of one upload overlap in time.
+- **Failure:** storage error during compose → back to `IN_PROGRESS`.
+- **Limits and expiry:** fake clock; token bucket `retry_after`; quota refund on cancel; GC deletes chunks and frees the slot; activity slides expiry.
+
+See `test_big_file_upload.py` (23 tests, < 1 s).
+
+### "Now dedupe identical uploads."
+
+Content-addressed storage: key chunks (or whole files) by SHA-256 and reference-count them. Two catches: the client claiming "I have hash X, skip the upload" proves nothing, so either scope dedup per user or require proof of possession (hash a server-chosen range). And deletes need reference counting and a delayed GC.
+
+---
+
+## 14. Common Mistakes
+
+1. **Fixed 5 MB chunks with a 100 GB limit.** That's 20,480 parts; S3 allows 10,000.
+2. **Resume offset = total bytes received.** Wrong with out-of-order chunks: it skips the gap.
+3. **"Idempotent" duplicate handling that ignores the bytes.** A retry with different content must be a conflict, not success.
+4. **Accepting any chunk length / any offset.** Overlapping or oversized chunks corrupt the assembled file.
+5. **Holding the upload's lock during the storage write.** Chunks of one upload serialise; parallel upload becomes sequential.
+6. **No intermediate state for `complete()`.** Two `complete()` calls both assemble; chunk writes race assembly.
+7. **A `complete()` that verifies nothing.** The client's whole-file checksum must actually be compared.
+8. **Rate-limit checks that leak.** Incrementing a counter before a later check fails; never decrementing on cancel/expiry.
+9. **Charging bandwidth on declared file size.** Big files can never start.
+10. **Lifecycle expiry shorter than the app's sliding TTL.** Storage deletes chunks of uploads the app still thinks are resumable.
+11. **Building storage paths from the user's filename.** Path traversal; use server-generated ids.
+12. **Blocking file I/O on the event loop** in an async server.
+
+---
+
+## 15. Senior vs Staff Signal
+
+| Level | What it looks like |
+|-------|-------------------|
+| **Senior (hire)** | Chunked, resumable protocol with exact chunk bounds; per-chunk checksum; idempotent retries; correct resume point; a state machine that covers cancel/expiry; storage behind an interface; tests for out-of-order, duplicate and resume. |
+| **Staff (strong hire)** | Does the arithmetic (10,000 parts → chunk size; 10 GB at 50 Mbps ≈ 27 min of pure transfer). Designs the races out (in-flight reservation, `ASSEMBLING`, rollback on storage failure) and says which errors are retryable. Moves bytes off the servers (pre-signed parts, S3-side checksums, composite hash) and knows what that costs: you must verify with `ListParts`, not trust the client. Covers the lifecycle end to end: sliding TTL vs lifecycle rules, outbox for the scan event, quota refunds, observability that turns "it failed at 95%" into "resume". |
+| **No hire** | Single `POST` of the whole file; no resume; trusts client-declared sizes and checksums; can't explain what happens when the same chunk arrives twice. |
 
 ---
 

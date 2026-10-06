@@ -15,4 +15,4 @@ A low-level design worked end to end in Go — from the reasoning you'd show an 
 
 ---
 
-**Runnable source:** `task_queue.go`
+**Runnable source:** `task_queue.go`, `task_queue_test.go`

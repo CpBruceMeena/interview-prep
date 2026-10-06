@@ -102,377 +102,83 @@ Response:
 ### 3.2 API Schema
 
 ```sql
--- Notifications table
+-- Postgres. On a partitioned table every PRIMARY KEY / UNIQUE constraint must include
+-- the partition key, so idempotency keys live in their own small, unpartitioned table.
+CREATE TABLE idempotency_keys (
+    api_key_id        VARCHAR(64)  NOT NULL,
+    idempotency_key   VARCHAR(128) NOT NULL,
+    notification_id   UUID         NOT NULL,
+    created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),   -- purge after 24h
+    PRIMARY KEY (api_key_id, idempotency_key)
+);
+
 CREATE TABLE notifications (
-    notification_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    notification_id   UUID NOT NULL DEFAULT gen_random_uuid(),
     api_key_id        VARCHAR(64) NOT NULL,
-    template_id       VARCHAR(128),
-    recipient_count   INTEGER NOT NULL,
-    channels          JSONB NOT NULL,         -- ["email", "sms", "push"]
-    priority          VARCHAR(16) DEFAULT 'normal',
-    status            VARCHAR(16) DEFAULT 'pending',
-    schedule_at       TIMESTAMPTZ,             -- NULL = send immediately
-    metadata          JSONB DEFAULT '{}',
-    idempotency_key   VARCHAR(128) UNIQUE,
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    completed_at      TIMESTAMPTZ,
-    
-    INDEX idx_notif_status (status, created_at),
-    INDEX idx_notif_schedule (schedule_at) WHERE schedule_at IS NOT NULL
+    user_id           VARCHAR(64) NOT NULL,
+    template_id       VARCHAR(128) NOT NULL,
+    params            JSONB NOT NULL DEFAULT '{}',
+    priority          SMALLINT NOT NULL DEFAULT 2,          -- 0 critical .. 3 low
+    category          VARCHAR(16) NOT NULL,                 -- transactional | marketing
+    send_at           TIMESTAMPTZ,                          -- NULL = now
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (notification_id, created_at)
 ) PARTITION BY RANGE (created_at);
 
--- Individual messages
-CREATE TABLE notification_messages (
-    message_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    notification_id   UUID NOT NULL REFERENCES notifications(notification_id),
-    channel           VARCHAR(16) NOT NULL,    -- email, sms, push, webhook
-    recipient         VARCHAR(256) NOT NULL,   -- email address or phone
-    content           TEXT NOT NULL,
-    status            VARCHAR(16) DEFAULT 'pending',
-    -- Email specific
-    email_provider_id VARCHAR(256),            -- SES message ID
-    -- SMS specific
-    sms_provider_id   VARCHAR(256),            -- SNS message ID
-    -- Delivery tracking
-    delivery_attempts INTEGER DEFAULT 0,
-    last_error        TEXT,
-    sent_at           TIMESTAMPTZ,
-    delivered_at      TIMESTAMPTZ,
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    
-    INDEX idx_msg_notif (notification_id),
-    INDEX idx_msg_status (status, channel, created_at)
+CREATE TABLE deliveries (
+    delivery_id         UUID NOT NULL DEFAULT gen_random_uuid(),
+    notification_id     UUID NOT NULL,
+    channel             VARCHAR(16) NOT NULL,               -- email | sms | push
+    address             VARCHAR(256) NOT NULL,
+    status              VARCHAR(16) NOT NULL DEFAULT 'queued',
+    attempts            SMALLINT NOT NULL DEFAULT 0,
+    ready_at            TIMESTAMPTZ NOT NULL,               -- next eligible send time
+    provider_message_id VARCHAR(256),                       -- maps provider callbacks back
+    last_error          TEXT,
+    sent_at             TIMESTAMPTZ,
+    delivered_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (delivery_id, created_at)
 ) PARTITION BY RANGE (created_at);
+CREATE INDEX ON deliveries (status, ready_at);               -- scheduler / retry poller
+CREATE INDEX ON deliveries (provider_message_id);           -- receipt lookups
+CREATE INDEX ON deliveries (notification_id);
+
+CREATE TABLE user_preferences (
+    user_id              VARCHAR(64) PRIMARY KEY,
+    contacts             JSONB NOT NULL,                    -- {"email": ..., "sms": ...}
+    opted_out_channels   TEXT[] NOT NULL DEFAULT '{}',
+    opted_out_categories TEXT[] NOT NULL DEFAULT '{}',
+    quiet_start          TIME, quiet_end TIME,
+    timezone             TEXT NOT NULL DEFAULT 'UTC'        -- IANA name, not an offset
+);
 ```
 
 ---
 
 ## 4. IMPLEMENTATION
 
-### 4.1 Core Components
+### 4.1 Components
 
-```python
-from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
-from typing import Optional, List, Dict
-import uuid
-import json
-import asyncio
+The in-process version of every component below is in [CODE.md](CODE.md); this section is about how they map onto a fleet.
 
-class NotificationChannel(Enum):
-    EMAIL = "email"
-    SMS = "sms"
-    PUSH = "push"
-    WEBHOOK = "webhook"
+| Component | Responsibility | Production shape |
+|-----------|----------------|------------------|
+| API / orchestrator | Validate, claim idempotency key, load preferences, render templates, fan out to deliveries, apply opt-outs | Stateless service; one DB transaction writes the notification, deliveries and an outbox row per ready delivery |
+| Channel queues | Decouple API from providers; isolate channels and priorities | Kafka topic or SQS queue per (channel, priority band). OTPs never share a queue with campaigns |
+| Workers | Quiet hours, rate limits, send, classify errors, retry/DLQ | Consumer group per channel, sized from provider limits, not CPU |
+| Rate limiter | Per user+channel, per provider, per tenant buckets | Redis token buckets updated by one Lua script per check (atomic refill + take) |
+| Scheduler / retry poller | Re-enqueue deliveries whose `ready_at` has passed (scheduled sends, backoff, deferrals) | `SELECT ... WHERE status='queued' AND ready_at <= now() FOR UPDATE SKIP LOCKED LIMIT 500`, or a Redis sorted set (4.4) |
+| Receipt ingester | Provider callbacks → DELIVERED / BOUNCED; invalidate dead contacts | Webhook endpoint, dedupe on provider event id, ignore out-of-order regressions |
+| DLQ + replay | Inspect and re-drive failures after a fix | Separate queue/table; replay tool reuses the original delivery id |
 
-class NotificationPriority(Enum):
-    LOW = 0
-    NORMAL = 1
-    HIGH = 2
-    URGENT = 3
+### 4.2 Provider notes that change the design
 
-class MessageStatus(Enum):
-    PENDING = "pending"
-    QUEUED = "queued"
-    SENDING = "sending"
-    SENT = "sent"
-    DELIVERED = "delivered"
-    FAILED = "failed"
-    BOUNCED = "bounced"
+- **Email (SES):** `SendBulkTemplatedEmail` takes up to 50 destinations per call, so batching cuts API calls ~50×, not 100×. Sending rate and daily quota are per account and region (new production accounts commonly start around 14 messages/s and are raised on request). Hard bounces and complaints arrive via SNS; ignoring them gets the account paused. `boto3` is synchronous, so in an asyncio worker run it in a thread pool or use an async client.
+- **SMS:** price varies by destination country by more than 10×; sender IDs and templates must be pre-registered in some countries (e.g. DLT in India). Throughput is per sending number / sender ID. SMS pumping fraud makes per-user and per-country limits mandatory.
+- **Push (FCM/APNs):** free, high throughput, but tokens rotate; an `UNREGISTERED` / `410 Gone` response means delete the token, not retry. FCM gives no delivery receipt.
 
-@dataclass
-class NotificationRequest:
-    """Incoming notification request."""
-    notification_id: str
-    template_id: Optional[str]
-    recipients: List[Dict]
-    channels: List[str]
-    schedule_at: Optional[datetime]
-    priority: str
-    metadata: dict
-    idempotency_key: Optional[str]
-
-@dataclass
-class NotificationMessage:
-    """Individual message to a single recipient via a single channel."""
-    message_id: str
-    notification_id: str
-    channel: str
-    recipient: str
-    content: str
-    status: str
-```
-
-### 4.2 Queue-Based Architecture
-
-```python
-import asyncio
-from collections import defaultdict
-import time
-
-class NotificationOrchestrator:
-    """
-    Orchestrates notification submission, queuing, and dispatch.
-    Uses in-memory queues for low latency, persisted to DB for durability.
-    """
-    
-    def __init__(self, db_pool, redis_client):
-        self.db = db_pool
-        self.redis = redis_client
-        self.queues = defaultdict(asyncio.Queue)  # Per-channel queues
-        self.workers = {}
-        self.dedup_cache = set()  # Idempotency check (in-memory LRU)
-    
-    async def submit(self, request: NotificationRequest) -> dict:
-        """Submit a notification request."""
-        
-        # Idempotency check
-        if request.idempotency_key:
-            if request.idempotency_key in self.dedup_cache:
-                return {
-                    "notification_id": "DUPLICATE",
-                    "status": "already_processed"
-                }
-            self.dedup_cache.add(request.idempotency_key)
-        
-        # For scheduled notifications, store and don't queue yet
-        if request.schedule_at and request.schedule_at > datetime.utcnow():
-            await self._schedule_notification(request)
-            return {
-                "notification_id": request.notification_id,
-                "status": "scheduled",
-                "estimated_delivery": request.schedule_at.isoformat()
-            }
-        
-        # Generate messages for each recipient/channel combo
-        messages = await self._generate_messages(request)
-        
-        # Persist to database
-        await self._persist_notification(request, messages)
-        
-        # Enqueue for immediate dispatch
-        for msg in messages:
-            await self.queues[msg.channel].put(msg)
-        
-        return {
-            "notification_id": request.notification_id,
-            "status": "queued",
-            "recipient_count": len(messages),
-            "channel_breakdown": self._count_by_channel(messages)
-        }
-    
-    async def _generate_messages(self, request: NotificationRequest) -> List[NotificationMessage]:
-        """Generate individual messages using templates."""
-        messages = []
-        
-        for recipient in request.recipients:
-            for channel in request.channels:
-                if channel not in recipient:
-                    continue  # Skip if recipient doesn't have this channel
-                
-                content = await self._render_template(
-                    request.template_id,
-                    channel,
-                    recipient,
-                    request.metadata
-                )
-                
-                messages.append(NotificationMessage(
-                    message_id=f"msg_{uuid.uuid4().hex[:12]}",
-                    notification_id=request.notification_id,
-                    channel=channel,
-                    recipient=recipient.get(channel),
-                    content=content,
-                    status=MessageStatus.QUEUED.value
-                ))
-        
-        return messages
-    
-    async def start_workers(self):
-        """Start per-channel worker pools."""
-        worker_configs = {
-            "email": {"count": 10, "batch_size": 100, "rate_limit": 50},   # 50/sec
-            "sms": {"count": 5, "batch_size": 1, "rate_limit": 10},        # 10/sec
-            "push": {"count": 10, "batch_size": 50, "rate_limit": 100},    # 100/sec
-            "webhook": {"count": 3, "batch_size": 1, "rate_limit": 30},    # 30/sec
-        }
-        
-        for channel, config in worker_configs.items():
-            for i in range(config["count"]):
-                worker = NotificationWorker(
-                    channel=channel,
-                    queue=self.queues[channel],
-                    batch_size=config["batch_size"],
-                    rate_limit=config["rate_limit"],
-                    db=self.db
-                )
-                self.workers[f"{channel}_{i}"] = worker
-                asyncio.create_task(worker.run())
-
-class NotificationWorker:
-    """Processes messages from a channel queue."""
-    
-    def __init__(self, channel: str, queue: asyncio.Queue,
-                 batch_size: int, rate_limit: int, db_pool):
-        self.channel = channel
-        self.queue = queue
-        self.batch_size = batch_size
-        self.rate_limit = rate_limit
-        self.db = db_pool
-        self.rate_limiter = TokenBucket(rate=rate_limit, burst=rate_limit)
-    
-    async def run(self):
-        """Main worker loop."""
-        while True:
-            try:
-                # Collect batch
-                batch = []
-                while len(batch) < self.batch_size:
-                    try:
-                        msg = await asyncio.wait_for(
-                            self.queue.get(), timeout=1.0
-                        )
-                        batch.append(msg)
-                    except asyncio.TimeoutError:
-                        break
-                
-                if not batch:
-                    await asyncio.sleep(0.1)
-                    continue
-                
-                # Rate limit
-                await self.rate_limiter.acquire(len(batch))
-                
-                # Send batch
-                await self._dispatch_batch(batch)
-                
-            except Exception as e:
-                print(f"Worker error ({self.channel}): {e}")
-                await asyncio.sleep(1)
-    
-    async def _dispatch_batch(self, batch: List[NotificationMessage]):
-        """Dispatch a batch of messages via appropriate provider."""
-        
-        if self.channel == "email":
-            await self._send_email_batch(batch)
-        elif self.channel == "sms":
-            await self._send_sms_batch(batch)
-        elif self.channel == "push":
-            await self._send_push_batch(batch)
-        elif self.channel == "webhook":
-            await self._send_webhook_batch(batch)
-```
-
-### 4.3 Provider Abstraction (Cost-Effective)
-
-```python
-class EmailProvider:
-    """
-    Abstraction over email providers.
-    Default: Amazon SES (cheapest at $0.10/1000 emails)
-    Fallback: SendGrid
-    """
-    
-    PROVIDERS = {
-        "ses": {
-            "cost_per_1000": 0.10,
-            "daily_limit": 50000,
-            "rate_limit": 14  # emails/second
-        },
-        "sendgrid": {
-            "cost_per_1000": 0.30,
-            "daily_limit": 100000,
-            "rate_limit": 100
-        }
-    }
-    
-    def __init__(self, primary="ses", fallback="sendgrid"):
-        self.primary = primary
-        self.fallback = fallback
-        self.current = primary
-        self.daily_count = 0
-        self.reset_time = time.time() + 86400
-    
-    async def send_batch(self, messages: List[dict]) -> List[dict]:
-        """Send batch with automatic failover."""
-        try:
-            return await self._send_via(self.current, messages)
-        except Exception as e:
-            if self.current != self.fallback:
-                print(f"Failing over to {self.fallback}: {e}")
-                self.current = self.fallback
-                return await self._send_via(self.current, messages)
-            raise
-    
-    async def _send_via(self, provider: str, messages: List[dict]) -> List[dict]:
-        """Send via specific provider."""
-        if provider == "ses":
-            return await self._send_ses(messages)
-        elif provider == "sendgrid":
-            return await self._send_sendgrid(messages)
-    
-    async def _send_ses(self, messages: List[dict]) -> List[dict]:
-        """Send via Amazon SES (bulk API for cost efficiency)."""
-        # SES bulk send supports up to 50 recipients per call
-        # Cost: $0.10 per 1000 emails + $0.12 per GB of attachments
-        import boto3
-        client = boto3.client('ses', region_name='us-east-1')
-        
-        results = []
-        # Batch in groups of 50 (SES bulk limit)
-        for i in range(0, len(messages), 50):
-            batch = messages[i:i+50]
-            
-            response = await client.send_bulk_templated_email(
-                Source="notifications@example.com",
-                Template="default_template",
-                Destinations=[
-                    {
-                        'Destination': {'ToAddresses': [msg['recipient']]},
-                        'ReplacementTemplateData': json.dumps(msg.get('data', {}))
-                    }
-                    for msg in batch
-                ]
-            )
-            
-            for j, status in enumerate(response.get('Status', [])):
-                results.append({
-                    "message_id": batch[j]['message_id'],
-                    "provider_id": status.get('MessageId'),
-                    "status": "sent" if status.get('Status') == 'Success' else "failed",
-                    "error": status.get('Error')
-                })
-        
-        return results
-
-class SMSProvider:
-    """
-    SMS provider abstraction.
-    Default: Amazon SNS ($0.00645/SMS in US)
-    Fallback: Twilio
-    """
-    
-    async def send(self, phone: str, message: str) -> dict:
-        import boto3
-        sns = boto3.client('sns')
-        
-        response = await sns.publish(
-            PhoneNumber=phone,
-            Message=message,
-            MessageAttributes={
-                'AWS.SNS.SMS.SenderID': {'DataType': 'String', 'StringValue': 'Notify'},
-                'AWS.SNS.SMS.SMSType': {'DataType': 'String', 'StringValue': 'Transactional'}
-            }
-        )
-        
-        return {
-            "provider_id": response['MessageId'],
-            "status": "sent"
-        }
-```
-
-### 4.4 Scheduling Engine (Second-Level Precision)
+### 4.3 Scheduling Engine (Second-Level Precision)
 
 ```python
 class ScheduleManager:
@@ -497,7 +203,7 @@ class ScheduleManager:
     async def process_due(self):
         """
         Process all notifications due for sending.
-        Called by a cron job every 1 second.
+        Called by the scheduler loop below every second (cron cannot run sub-minute).
         """
         now = time.time()
         
@@ -528,6 +234,12 @@ async def scheduler_loop(schedule_manager: ScheduleManager):
             print(f"Scheduler error: {e}")
         await asyncio.sleep(1)
 ```
+
+Correctness notes on this sketch:
+
+- **Checking `ZREM`'s return value** is what makes multiple pollers safe: only the one that removed the member processes it. A Lua script doing `ZRANGEBYSCORE ... LIMIT` + `ZREM` atomically is the batched equivalent.
+- **Remove-then-process loses work on a crash** between the two steps. Either keep the DB row as the source of truth (status `scheduled`, `ready_at`) and have the poller re-scan rows whose Redis entry vanished, or move due members into a "processing" set with a lease and delete them only after enqueueing.
+- **Don't re-run the due notification through `submit()`** with its original idempotency key: the key is already recorded, so it would be treated as a duplicate and never sent (the earlier version of the LLD code had exactly this bug). Enqueue the already-created deliveries instead.
 
 ---
 
@@ -575,7 +287,28 @@ class BatchOptimizer:
 
 ---
 
-## 6. MONITORING & ALERTS
+## 6. RELIABILITY & FAILURE MODES
+
+**Delivery guarantee:** at-least-once from submit to provider acceptance; duplicates suppressed by idempotency key, content dedup window and worker claims, with a small residual window when a provider accepted a message but its ack was lost.
+
+| Failure | Handling |
+|---------|----------|
+| Client retries the API call | Idempotency key (unique per API key) returns the original notification id |
+| Upstream fires the same event twice with different keys | Content dedup window on (user, template, params) |
+| API commits to DB but crashes before enqueueing | Outbox row in the same transaction; a relay enqueues it. No "saved but never sent" |
+| Worker dies mid-send | Queue visibility timeout / lease expires; another worker retries. May duplicate if the provider already accepted |
+| Provider 5xx / throttling | Backoff with full jitter, honour `Retry-After`; circuit breaker opens and traffic fails over to the secondary provider |
+| Provider permanent error | No retry; mark contact invalid (hard bounce, unregistered token) so future sends are suppressed |
+| Retries exhausted | DLQ with last error; alert on growth; replay tool |
+| Message too old to matter (OTP after 10 min) | Per-template TTL; expired deliveries are dropped, not sent late |
+| Redis (rate limiter) unavailable | Fail open for CRITICAL with a conservative local in-process limit; fail closed (defer) for marketing |
+| Campaign spike at 9:00 local time | Producer-side pacing per timezone; campaigns use LOW queues with capped consumer share |
+
+**Capacity:** 1M notifications/day ≈ 12/s average, ~120/s at a 10× peak, i.e. a few hundred DB writes per second including deliveries and status updates. One Postgres primary with daily/monthly partitions (dropping old partitions instead of `DELETE`) is enough; deliveries at ~1 KB/row are ~1 GB/day per million.
+
+---
+
+## 7. MONITORING & ALERTS
 
 ```python
 # Key metrics

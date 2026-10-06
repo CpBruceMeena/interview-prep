@@ -156,7 +156,11 @@ class CoreManager:
                  overcommit_ratio: float = 1.5):
         self.total_cores = total_cores or psutil.cpu_count(logical=True)
         self.overcommit_ratio = overcommit_ratio  # Allow 1.5x virtual allocation
+        # Total allocatable = physical + overcommit headroom. With 4 cores and
+        # 1.5x that is 6 slots: 4 physical + 2 "virtual". The headroom, not the
+        # total, is what virtual allocations are counted against.
         self.max_virtual_cores = int(self.total_cores * overcommit_ratio)
+        self.overcommit_slots = self.max_virtual_cores - self.total_cores
         
         # Track cores
         self.cores = [
@@ -174,13 +178,18 @@ class CoreManager:
         Allocate cores for a job instance.
         Returns True if successful, False if insufficient resources.
         
-        ⚠️ The check combines physical + virtual capacity.
+        ⚠️ The check combines physical + overcommit capacity.
            Using OR (individual check) would reject jobs that
-           could be satisfied by a mix of physical + virtual.
-           Example: 2 free physical + 3 free virtual = 5 total.
-           A job needing 4 cores should succeed, but
-           `4 <= 2 or 4 <= 3` → False (wrong!).
-           `4 <= 2 + 3` → True (correct!).
+           could be satisfied by a mix of the two.
+           Example: 1 free physical + 2 free overcommit = 3 total.
+           A job needing 3 cores should succeed, but
+           `3 <= 1 or 3 <= 2` → False (wrong!).
+           `3 <= 1 + 2` → True (correct!).
+
+        ⚠️ "Allocating core 3" is bookkeeping, not CPU pinning. To actually
+           confine a job, set affinity (os.sched_setaffinity on Linux) or,
+           better, a cgroup CPU quota (cpu.max), which is what Kubernetes
+           requests/limits do.
         """
         async with self._lock:
             # Count free physical cores
@@ -188,13 +197,12 @@ class CoreManager:
                 1 for c in self.cores if c.status == "free"
             )
             
-            # Count current virtual allocations
-            virtual_free = self.max_virtual_cores - self.virtual_allocations
+            # Overcommit headroom left. NOT max_virtual_cores - allocations:
+            # max_virtual_cores already includes the physical cores, so that
+            # would count them twice (4 cores at 1.5x would admit 10, not 6).
+            virtual_free = self.overcommit_slots - self.virtual_allocations
             
-            # Can we allocate? Check COMBINED capacity, not individual!
-            # If either physical or virtual individually has enough,
-            # the combined always will too. But the reverse isn't true:
-            # combined might have enough when neither individual does.
+            # Can we allocate? Check COMBINED capacity, not individual.
             if cores_needed <= free_physical + virtual_free:
                 # Allocate physical cores first (best effort)
                 allocated = 0
@@ -317,11 +325,23 @@ class SchedulerEngine:
                     try:
                         if scheduled.next_run and now >= scheduled.next_run:
                             await self._trigger_job(job_id)
-                            
-                            # Calculate next run
-                            scheduled.next_run = self._calculate_next_run(
-                                scheduled.job, now
-                            )
+                            scheduled.last_run = now
+                            scheduled.run_count += 1
+
+                            if scheduled.job.schedule_type == ScheduleType.ONCE:
+                                # _calculate_next_run(ONCE) returns start_date,
+                                # which is already past: without this the job
+                                # would re-fire on every 15 s tick.
+                                scheduled.next_run = None
+                            else:
+                                # Computed from `now`, so missed fires after
+                                # downtime are coalesced into one. INTERVAL
+                                # schedules drift by the loop's lateness (up to
+                                # 15 s per fire); compute from the previous
+                                # next_run instead if that matters.
+                                scheduled.next_run = self._calculate_next_run(
+                                    scheduled.job, now
+                                )
                     except asyncio.CancelledError:
                         raise  # Always propagate cancellation!
                     except Exception as e:
@@ -507,6 +527,7 @@ class JobExecutor:
                     
             except asyncio.TimeoutError:
                 process.kill()
+                await process.wait()   # reap it, or it lingers as a zombie
                 instance.status = JobStatus.TIMEOUT
                 instance.error = f"Job timed out after {job.timeout_seconds}s"
         
@@ -526,6 +547,14 @@ class JobExecutor:
             shutil.rmtree(workspace, ignore_errors=True)
 ```
 
+!!! warning "Gaps in this executor (say them before the interviewer does)"
+    - **`subprocess.run(["pip", "install", ...])` blocks the event loop** for up to 120 s and installs into the scheduler's own environment, so jobs can break each other's (and the scheduler's) dependencies. Build a per-job virtualenv or container image ahead of time, and run any install with `asyncio.create_subprocess_exec`.
+    - **`QUEUED` is a dead end:** when cores aren't available the instance is saved as `QUEUED` and nothing ever picks it up again. Put it on a pending queue that `release_cores()` drains, or re-enqueue it with a delay.
+    - **`process.kill()` only kills the direct child.** Start it with `start_new_session=True` and kill the process group (`os.killpg`) so grandchildren die too.
+    - **Cancellation leaks the process:** `asyncio.CancelledError` is not an `Exception`, so the `except` doesn't see it. The `finally` releases the cores while the script keeps running. Catch it, kill the process, re-raise.
+    - **`communicate()` buffers all output in memory.** A chatty job can OOM the scheduler. Stream to a file and keep only the tail.
+    - **`CPU_LIMIT` / `MEMORY_LIMIT_MB` are only environment variables.** Nothing enforces them. Use `resource.setrlimit` in a `preexec_fn`, or cgroups.
+
 ### 2.5 Job Store — Persistence Layer
 
 ```python
@@ -540,9 +569,16 @@ class JobStore:
     ⚠️ Uses a persistent connection opened during initialize().
     Creating a new aiosqlite.connect() per query is expensive —
     each connection opens a file handle and creates a new
-    SQLite transaction context. A persistent connection avoids
-    this overhead and is safe because aiosqlite connections
-    are async-context safe (only one coroutine executes at a time).
+    SQLite transaction context. aiosqlite runs every call on one
+    background thread, so calls never execute in parallel, but
+    calls from different coroutines can still interleave between
+    an execute() and its commit(). Keep each write a single
+    execute+commit (as below) or guard multi-statement
+    transactions with an asyncio.Lock.
+
+    ⚠️ INSERT OR REPLACE deletes and re-inserts the row, which
+    resets any column not listed (e.g. is_active, created_at).
+    Prefer INSERT ... ON CONFLICT(job_id) DO UPDATE SET ...
     """
     
     def __init__(self, db_path: str = "jobs.db"):
@@ -595,6 +631,7 @@ class JobStore:
                 error TEXT,
                 retry_count INTEGER DEFAULT 0,
                 scheduled_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,  -- used by the index + ORDER BY below
                 FOREIGN KEY (job_id) REFERENCES jobs(job_id)
             );
             
@@ -665,7 +702,18 @@ class JobStore:
             (job_id, limit)
         )
         rows = await cursor.fetchall()
-        return [JobInstance(**dict(row)) for row in rows]
+        return [self._row_to_instance(row) for row in rows]
+
+    @staticmethod
+    def _row_to_instance(row) -> JobInstance:
+        """SQLite hands back strings; JobInstance wants enums and datetimes."""
+        d = dict(row)
+        d.pop("created_at", None)                 # not a JobInstance field
+        d["status"] = JobStatus(d["status"])
+        for key in ("started_at", "completed_at", "scheduled_at"):
+            if d[key]:
+                d[key] = datetime.fromisoformat(d[key])
+        return JobInstance(**d)
     
     async def close(self):
         """Close the persistent database connection."""
@@ -814,7 +862,7 @@ Jobs submitted:
 Job A (2 cores):  Allocate 2 physical → Running on cores [0, 1]
 Job B (1 core):   Allocate 1 physical → Running on core [2]
 Job C (2 cores):  Allocate 1 physical [3] + 1 virtual → Running
-Job D (3 cores):  Only 1 virtual left (6−3=3 used) → Queued!
+Job D (3 cores):  0 physical + 1 virtual free (5 of 6 slots used) → Queued!
                   ↑ Will run when a job completes
 
 When Job A completes:
@@ -870,14 +918,17 @@ async def check_schedule():
     now = time.time()
     # ZRANGEBYSCORE returns jobs with score between 0 and now
     due_jobs = await redis.zrangebyscore(
-        "scheduler:queue", 0, now
+        "scheduler:queue", 0, now, start=0, num=100
     )
     for job_data in due_jobs:
-        job = json.loads(job_data)
-        await execute_job(job)
-        # Remove from sorted set
-        await redis.zrem("scheduler:queue", job_data)
+        # Claim BEFORE executing. ZREM returns 1 for exactly one caller, so
+        # with several scheduler instances only the winner runs the job.
+        # (Reading, executing, then removing lets every instance run it.)
+        if await redis.zrem("scheduler:queue", job_data) == 1:
+            await enqueue_for_worker(json.loads(job_data))
 ```
+
+A claimed job that crashes before it's handed off is lost. For at-least-once, move it atomically to a "processing" ZSET scored by a lease deadline (a small Lua script, or `ZPOPMIN` + `ZADD` in `MULTI`), and have a reaper return expired entries.
 
 ### Q2: How do you handle a missed schedule (scheduler was down)?
 
@@ -915,6 +966,8 @@ async def check_dependencies(instance: JobInstance) -> bool:
     
     return True
 ```
+
+⚠️ "The latest instance of the upstream succeeded" is the wrong test for recurring jobs: today's run of B could be released by yesterday's success of A. Airflow scopes dependencies to a **DAG run** (one logical date): B's instance for date D waits on A's instance for date D. Store the logical date on each instance and match on it. Also, when an upstream fails terminally, mark dependents `upstream_failed` instead of leaving them waiting forever.
 
 ---
 

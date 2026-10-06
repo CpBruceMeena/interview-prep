@@ -1,35 +1,54 @@
 /**
- * Elevator System - Low Level Design (Java)
- * -------------------------------------------
- * Design Principles: SOLID, State Pattern, Strategy Pattern, Observer Pattern
+ * Elevator System - Low Level Design (Java 17+)
+ * ----------------------------------------------
+ * Run:  java ElevatorSystem.java      (single-file source launcher; main self-checks and
+ *                                       throws AssertionError if any behaviour breaks)
  *
- * Key Design Decisions:
- * - Elevator state machine using ENUM + State pattern (OCP)
- * - Request dispatching using Strategy pattern (SCAN, FCFS, Nearest-Car)
- * - Event-driven updates via Observer pattern for display/monitoring
- * - Immutable request objects for thread safety
- * - Emergency handling with priority overrides
- * - Maintenance scheduling with downtime tracking
+ * Scope: a bank of N cars serving floors [minFloor, maxFloor].
+ *   - Hall calls (floor + UP/DOWN button) are dispatched to ONE car by a pluggable strategy.
+ *   - Car calls (button inside the cab) go straight to that car.
+ *   - Each car schedules its own stops with LOOK: keep going in the current direction while
+ *     there is work ahead, then reverse; a hall call is only answered when the car is
+ *     travelling in the direction the passenger asked for (or is turning around there).
+ *   - Cars can be taken out of service; their outstanding hall calls are re-dispatched.
+ *
+ * Key design decisions:
+ *   - Time is discrete. Elevator.step() performs ONE action (move a floor, open doors,
+ *     close doors). A ScheduledExecutorService drives step() in real time; tests call
+ *     tick() directly, so every scenario is deterministic. No Thread.sleep under a lock.
+ *   - Each Elevator guards its state with its own lock. Listener callbacks fire AFTER the
+ *     lock is released, so a listener can call back into the controller without creating
+ *     a lock-order cycle.
+ *   - The controller serialises dispatch with one lock (hall calls arrive at human speed,
+ *     so throughput is a non-issue) and keeps a HallCall -> car map so repeated presses of
+ *     the same button are idempotent. Lock order is always controller -> elevator.
  */
 
-import java.time.*;
-import java.time.format.DateTimeFormatter;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.stream.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+
+/** Entry point. Must be the first top-level class: `java File.java` runs the first class it finds. */
+public class ElevatorSystem {
+    public static void main(String[] args) throws Exception {
+        ElevatorDemo.run();
+    }
+}
 
 // ============================================================
-// ENUMS & VALUE OBJECTS
+// VALUE TYPES
 // ============================================================
 
 enum Direction {
     UP(1), DOWN(-1), IDLE(0);
 
-    private final int value;
-    Direction(int value) { this.value = value; }
-    public int getValue() { return value; }
+    final int delta;
+    Direction(int delta) { this.delta = delta; }
 
-    public Direction opposite() {
+    Direction opposite() {
         return switch (this) {
             case UP -> DOWN;
             case DOWN -> UP;
@@ -38,1014 +57,580 @@ enum Direction {
     }
 }
 
-enum DoorState {
-    OPEN, CLOSED, OPENING, CLOSING, OBSTRUCTED
-}
+/** Per-car state machine: IDLE -> MOVING -> DOORS_OPEN -> (MOVING | IDLE); any -> MAINTENANCE. */
+enum ElevatorState { IDLE, MOVING, DOORS_OPEN, MAINTENANCE }
 
-enum ElevatorStatus {
-    MOVING, STOPPED, DOOR_OPEN, DOOR_CLOSED,
-    MAINTENANCE, OUT_OF_SERVICE, EMERGENCY_STOP,
-    FIRE_MODE, POWER_FAILURE
-}
-
-enum EmergencyType {
-    FIRE_ALARM, POWER_FAILURE, MEDICAL_EMERGENCY,
-    EARTHQUAKE, BOMB_THREAT
-}
-
-record Floor(int number, String label) {
-    public Floor(int number) { this(number, "F" + number); }
-
-    public boolean isBasement() { return number < 0; }
-    public boolean isGroundFloor() { return number == 0; }
-    public boolean isTopFloor(int maxFloor) { return number == maxFloor; }
-}
-
-record Request(int floor, Direction direction, long timestamp, UUID requestId) {
-    public Request(int floor, Direction direction) {
-        this(floor, direction, System.currentTimeMillis(), UUID.randomUUID());
-    }
-
-    public boolean isUrgent() { return false; } // Base requests are not urgent
-}
-
-record UrgentRequest(int floor, Direction direction, EmergencyType type,
-                     long timestamp, UUID requestId) {
-    public UrgentRequest(int floor, Direction direction, EmergencyType type) {
-        this(floor, direction, type, System.currentTimeMillis(), UUID.randomUUID());
-    }
-
-    public boolean isFireRelated() {
-        return type == EmergencyType.FIRE_ALARM;
+/** A hall button press. Equality is (floor, direction), which is what makes presses idempotent. */
+record HallCall(int floor, Direction direction) {
+    HallCall {
+        if (direction == Direction.IDLE) throw new IllegalArgumentException("hall call needs UP or DOWN");
     }
 }
 
-record MaintenanceRecord(LocalDateTime scheduledAt, String technician,
-                         String description, Duration estimatedDuration) {
-    public boolean isOverdue() {
-        return LocalDateTime.now().isAfter(scheduledAt);
-    }
-}
+/** Immutable view of a car, taken under its lock, so strategies never see torn state. */
+record ElevatorSnapshot(String id, int floor, Direction direction, ElevatorState state,
+                        int pendingStops, int lowestStop, int highestStop) {}
 
-record TripPlan(int targetFloor, Direction direction) {}
-
-// ============================================================
-// OBSERVER INTERFACE
-// ============================================================
-
-interface ElevatorObserver {
-    void onElevatorStopped(Elevator elevator, int floor);
-    void onDoorStateChanged(Elevator elevator, DoorState state);
-    void onFloorPassed(Elevator elevator, int floor);
-    void onRequestProcessed(Request request);
-    void onOverload(Elevator elevator, int currentLoad, int capacity);
-    void onEmergency(Elevator elevator, EmergencyType type, String message);
-    void onMaintenanceRequired(Elevator elevator, String reason);
-    void onDoorObstructed(Elevator elevator);
-    void onVIPModeActivated(Elevator elevator, boolean active);
-    void onStatisticsUpdated(Elevator elevator, ElevatorStats stats);
+/** Observer hook. Callbacks run on the thread that called step(), outside the car's lock. */
+interface ElevatorListener {
+    default void onStopped(String elevatorId, int floor) {}
+    default void onHallCallServed(String elevatorId, HallCall call) {}
 }
 
 // ============================================================
-// STATISTICS COLLECTOR
+// DISPATCH STRATEGIES (Strategy pattern)
 // ============================================================
 
-record ElevatorStats(long totalTrips, long totalFloorsPassed,
-                     long totalDoorCycles, double avgWaitTimeMs,
-                     long emergencyStops, long maintenanceHours,
-                     double uptimePercentage, long energyConsumptionKwh) {
+interface DispatchStrategy {
+    /** Pick a car for the call from in-service candidates; empty if none is suitable. */
+    Optional<ElevatorSnapshot> choose(HallCall call, List<ElevatorSnapshot> candidates);
+}
 
-    public String formattedReport() {
-        return String.format("""
-            ╔══════════════════════════════════╗
-            ║       ELEVATOR STATISTICS         ║
-            ╠══════════════════════════════════╣
-            ║ Trips:          %10d       ║
-            ║ Floors Passed:  %10d       ║
-            ║ Door Cycles:    %10d       ║
-            ║ Avg Wait:       %10.2f ms   ║
-            ║ Emergencies:    %10d       ║
-            ║ Maint Hours:    %10d       ║
-            ║ Uptime:         %10.2f%%    ║
-            ║ Energy:         %10d kWh   ║
-            ╚══════════════════════════════════╝""",
-            totalTrips, totalFloorsPassed, totalDoorCycles,
-            avgWaitTimeMs, emergencyStops, maintenanceHours,
-            uptimePercentage * 100, energyConsumptionKwh);
+/** Baseline: closest car by distance, ignoring direction. Causes bunching and wrong-way pickups. */
+final class NearestCarStrategy implements DispatchStrategy {
+    @Override
+    public Optional<ElevatorSnapshot> choose(HallCall call, List<ElevatorSnapshot> candidates) {
+        return candidates.stream().min(Comparator
+                .comparingInt((ElevatorSnapshot s) -> Math.abs(s.floor() - call.floor()))
+                .thenComparing(ElevatorSnapshot::id));
     }
 }
 
-class StatisticsCollector {
-    private final AtomicLong totalTrips = new AtomicLong(0);
-    private final AtomicLong totalFloorsPassed = new AtomicLong(0);
-    private final AtomicLong totalDoorCycles = new AtomicLong(0);
-    private final AtomicLong totalWaitTimeMs = new AtomicLong(0);
-    private final AtomicLong emergencyStops = new AtomicLong(0);
-    private final AtomicLong maintenanceMinutes = new AtomicLong(0);
-    private final AtomicLong energyConsumption = new AtomicLong(0);
-    private final AtomicLong totalRequests = new AtomicLong(0);
-    private volatile long startTime = System.currentTimeMillis();
-
-    public void recordTrip() { totalTrips.incrementAndGet(); }
-    public void recordFloorPassed() { totalFloorsPassed.incrementAndGet(); }
-    public void recordDoorCycle() { totalDoorCycles.incrementAndGet(); }
-    public void recordWaitTime(long ms) { totalWaitTimeMs.addAndGet(ms); }
-    public void recordEmergency() { emergencyStops.incrementAndGet(); }
-    public void recordMaintenance(long minutes) { maintenanceMinutes.addAndGet(minutes); }
-    public void recordEnergy(long kwh) { energyConsumption.addAndGet(kwh); }
-    public void recordRequest() { totalRequests.incrementAndGet(); }
-
-    public ElevatorStats getStats() {
-        long uptimeMs = System.currentTimeMillis() - startTime;
-        double uptimePercentage = uptimeMs > 0
-            ? (double)(uptimeMs - maintenanceMinutes.get() * 60 * 1000) / uptimeMs
-            : 1.0;
-        double avgWait = totalRequests.get() > 0
-            ? (double) totalWaitTimeMs.get() / totalRequests.get()
-            : 0.0;
-
-        return new ElevatorStats(
-            totalTrips.get(), totalFloorsPassed.get(), totalDoorCycles.get(),
-            avgWait, emergencyStops.get(), maintenanceMinutes.get() / 60,
-            uptimePercentage, energyConsumption.get()
-        );
-    }
-}
-
-// ============================================================
-// WEIGHT SENSOR
-// ============================================================
-
-class WeightSensor {
-    private static final double MAX_WEIGHT_KG = 1000.0;
-    private static final double OVERLOAD_THRESHOLD = 0.95; // 95% triggers warning
-    private static final double CRITICAL_THRESHOLD = 1.0;  // 100% triggers alarm
-    private volatile double currentWeight = 0.0;
-    private final List<Runnable> overloadListeners = new CopyOnWriteArrayList<>();
-
-    public void addOverloadListener(Runnable listener) {
-        overloadListeners.add(listener);
+/**
+ * Direction-aware: estimate how many floors each car must travel under LOOK before it can
+ * pick this passenger up, and choose the minimum. A car already heading toward the call in
+ * the same direction is cheap; a car moving away pays for its whole sweep and the return.
+ * (Ignores dwell time at intermediate stops; add a per-stop penalty if that matters.)
+ */
+final class LookEtaStrategy implements DispatchStrategy {
+    @Override
+    public Optional<ElevatorSnapshot> choose(HallCall call, List<ElevatorSnapshot> candidates) {
+        return candidates.stream().min(Comparator
+                .comparingInt((ElevatorSnapshot s) -> eta(s, call))
+                .thenComparing(ElevatorSnapshot::id));
     }
 
-    public synchronized boolean addPassenger(double weightKg) {
-        double newWeight = currentWeight + weightKg;
-        if (newWeight > MAX_WEIGHT_KG * CRITICAL_THRESHOLD) {
-            overloadListeners.forEach(Runnable::run);
-            return false; // Passenger cannot board
+    static int eta(ElevatorSnapshot s, HallCall c) {
+        return switch (s.direction()) {
+            case IDLE -> Math.abs(s.floor() - c.floor());
+            case UP -> etaGoingUp(s.floor(), s.lowestStop(), s.highestStop(), c.floor(), c.direction());
+            // Mirror the building (floor -> -floor) so DOWN reuses the UP formula.
+            case DOWN -> etaGoingUp(-s.floor(), -s.highestStop(), -s.lowestStop(), -c.floor(),
+                                    c.direction().opposite());
+        };
+    }
+
+    private static int etaGoingUp(int at, int lowest, int highest, int callFloor, Direction callDir) {
+        if (callDir == Direction.UP && callFloor >= at) return callFloor - at;     // on the way
+        int peak = Math.max(highest, at);
+        if (callDir == Direction.DOWN) {
+            peak = Math.max(peak, callFloor);                                     // reverses there
+            return (peak - at) + (peak - callFloor);
         }
-        currentWeight = newWeight;
-        if (currentWeight > MAX_WEIGHT_KG * OVERLOAD_THRESHOLD) {
-            overloadListeners.forEach(Runnable::run);
-        }
-        return true;
-    }
-
-    public synchronized void removePassenger(double weightKg) {
-        currentWeight = Math.max(0, currentWeight - weightKg);
-    }
-
-    public double getCurrentWeight() { return currentWeight; }
-    public double getMaxWeight() { return MAX_WEIGHT_KG; }
-    public double getUtilization() { return currentWeight / MAX_WEIGHT_KG; }
-    public boolean isOverloaded() { return currentWeight > MAX_WEIGHT_KG * OVERLOAD_THRESHOLD; }
-}
-
-// ============================================================
-// DOOR OBSTRUCTION DETECTOR
-// ============================================================
-
-class DoorObstructionDetector {
-    private static final int MAX_OBSTRUCTION_RETRIES = 3;
-    private static final Duration OBSTRUCTION_TIMEOUT = Duration.ofSeconds(10);
-    private volatile int obstructionCount = 0;
-    private volatile boolean permanentlyObstructed = false;
-    private final List<Runnable> obstructionListeners = new CopyOnWriteArrayList<>();
-
-    public void addObstructionListener(Runnable listener) {
-        obstructionListeners.add(listener);
-    }
-
-    public synchronized boolean detectObstruction() {
-        if (permanentlyObstructed) return true;
-
-        // Simulate obstruction detection
-        boolean obstructed = ThreadLocalRandom.current().nextDouble() < 0.05; // 5% chance
-        if (obstructed) {
-            obstructionCount++;
-            if (obstructionCount >= MAX_OBSTRUCTION_RETRIES) {
-                permanentlyObstructed = true;
-                obstructionListeners.forEach(Runnable::run);
-            }
-        }
-        return obstructed;
-    }
-
-    public void clearObstruction() {
-        obstructionCount = 0;
-        permanentlyObstructed = false;
-    }
-
-    public boolean isPermanentlyObstructed() { return permanentlyObstructed; }
-    public int getObstructionCount() { return obstructionCount; }
-}
-
-// ============================================================
-// DISPATCHING STRATEGY (Strategy Pattern - OCP/DIP)
-// ============================================================
-
-interface DispatchingStrategy {
-    Elevator assignElevator(Request request, List<Elevator> elevators);
-}
-
-class NearestCarStrategy implements DispatchingStrategy {
-    @Override
-    public Elevator assignElevator(Request request, List<Elevator> elevators) {
-        return elevators.stream()
-            .filter(e -> e.getStatus() != ElevatorStatus.MAINTENANCE
-                       && e.getStatus() != ElevatorStatus.OUT_OF_SERVICE
-                       && e.getStatus() != ElevatorStatus.EMERGENCY_STOP
-                       && e.getStatus() != ElevatorStatus.FIRE_MODE
-                       && e.getStatus() != ElevatorStatus.POWER_FAILURE)
-            .min(Comparator.comparingInt(e ->
-                Math.abs(e.getCurrentFloor() - request.floor())))
-            .orElseThrow(() -> new IllegalStateException("No available elevators"));
-    }
-}
-
-class ScanStrategy implements DispatchingStrategy {
-    @Override
-    public Elevator assignElevator(Request request, List<Elevator> elevators) {
-        return elevators.stream()
-            .filter(e -> e.getStatus() != ElevatorStatus.MAINTENANCE
-                       && e.getStatus() != ElevatorStatus.OUT_OF_SERVICE
-                       && e.getStatus() != ElevatorStatus.EMERGENCY_STOP
-                       && e.getStatus() != ElevatorStatus.FIRE_MODE
-                       && e.getStatus() != ElevatorStatus.POWER_FAILURE)
-            .filter(e -> e.getDirection() == Direction.IDLE
-                       || e.getDirection() == request.direction())
-            .min(Comparator.comparingInt(e ->
-                Math.abs(e.getCurrentFloor() - request.floor())))
-            .orElseGet(() -> new NearestCarStrategy().assignElevator(request, elevators));
-    }
-}
-
-class LoadBalancingStrategy implements DispatchingStrategy {
-    @Override
-    public Elevator assignElevator(Request request, List<Elevator> elevators) {
-        return elevators.stream()
-            .filter(e -> e.getStatus() != ElevatorStatus.MAINTENANCE
-                       && e.getStatus() != ElevatorStatus.OUT_OF_SERVICE
-                       && e.getStatus() != ElevatorStatus.EMERGENCY_STOP
-                       && e.getStatus() != ElevatorStatus.FIRE_MODE
-                       && e.getStatus() != ElevatorStatus.POWER_FAILURE)
-            .min(Comparator.comparingInt(e ->
-                e.getPendingRequests().size() * 5
-                + Math.abs(e.getCurrentFloor() - request.floor())))
-            .orElseThrow(() -> new IllegalStateException("No available elevators"));
-    }
-}
-
-class ZoneBasedStrategy implements DispatchingStrategy {
-    private final int totalFloors;
-
-    public ZoneBasedStrategy(int totalFloors) {
-        this.totalFloors = totalFloors;
-    }
-
-    @Override
-    public Elevator assignElevator(Request request, List<Elevator> elevators) {
-        int numElevators = (int) elevators.stream()
-            .filter(e -> e.getStatus() != ElevatorStatus.MAINTENANCE
-                       && e.getStatus() != ElevatorStatus.OUT_OF_SERVICE)
-            .count();
-        if (numElevators == 0) throw new IllegalStateException("No available elevators");
-
-        int zoneSize = totalFloors / Math.max(1, numElevators);
-        int requestZone = request.floor() / Math.max(1, zoneSize);
-
-        // Find elevators in the same zone
-        return elevators.stream()
-            .filter(e -> e.getStatus() != ElevatorStatus.MAINTENANCE
-                       && e.getStatus() != ElevatorStatus.OUT_OF_SERVICE)
-            .filter(e -> {
-                int elevatorZone = e.getCurrentFloor() / Math.max(1, zoneSize);
-                return elevatorZone == requestZone;
-            })
-            .min(Comparator.comparingInt(e ->
-                Math.abs(e.getCurrentFloor() - request.floor())))
-            .orElseGet(() -> new NearestCarStrategy().assignElevator(request, elevators));
+        int bottom = Math.min(lowest, callFloor);                                 // UP call behind us
+        return (peak - at) + (peak - bottom) + (callFloor - bottom);
     }
 }
 
 // ============================================================
-// ELEVATOR (State Machine)
+// ELEVATOR (per-car state machine + LOOK scheduling)
 // ============================================================
 
-class Elevator {
+final class Elevator {
     private final String id;
-    private final int maxCapacity;     // Max passengers
-    private volatile int currentFloor;
-    private volatile Direction direction;
-    private volatile DoorState doorState;
-    private volatile ElevatorStatus status;
     private final int minFloor, maxFloor;
-    private final NavigableSet<Integer> stops;
-    private final Queue<Integer> pendingStops;
-    private final List<ElevatorObserver> observers;
-    private final Set<Integer> requestedFloors;
-    private int currentLoad;           // Number of passengers
-    private final ScheduledExecutorService scheduler;
-    private volatile boolean running;
-    private final WeightSensor weightSensor;
-    private final DoorObstructionDetector doorDetector;
-    private final StatisticsCollector stats;
-    private volatile boolean vipMode = false;
-    private EmergencyType activeEmergency;
-    private final Deque<Integer> priorityStops = new ConcurrentLinkedDeque<>();
-    private long lastMaintenanceDate;
-    private static final long MAINTENANCE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000L; // 7 days
+    private final List<ElevatorListener> listeners = new CopyOnWriteArrayList<>();
 
-    public Elevator(String id, int minFloor, int maxFloor, int maxCapacity) {
+    private final ReentrantLock lock = new ReentrantLock();
+    // ---- guarded by lock ----
+    private int floor;
+    private Direction direction = Direction.IDLE;
+    private ElevatorState state = ElevatorState.IDLE;
+    private final TreeSet<Integer> carStops = new TreeSet<>();
+    private final TreeSet<Integer> upCalls = new TreeSet<>();
+    private final TreeSet<Integer> downCalls = new TreeSet<>();
+
+    Elevator(String id, int minFloor, int maxFloor, int startFloor) {
+        if (minFloor >= maxFloor) throw new IllegalArgumentException("need at least two floors");
+        if (startFloor < minFloor || startFloor > maxFloor) throw new IllegalArgumentException("bad start floor");
         this.id = id;
         this.minFloor = minFloor;
         this.maxFloor = maxFloor;
-        this.maxCapacity = maxCapacity;
-        this.currentFloor = 0;        // Ground floor
-        this.direction = Direction.IDLE;
-        this.doorState = DoorState.CLOSED;
-        this.status = ElevatorStatus.STOPPED;
-        this.stops = new ConcurrentSkipListSet<>();
-        this.pendingStops = new ConcurrentLinkedQueue<>();
-        this.observers = new CopyOnWriteArrayList<>();
-        this.requestedFloors = ConcurrentHashMap.newKeySet();
-        this.currentLoad = 0;
-        this.scheduler = Executors.newSingleThreadScheduledExecutor();
-        this.running = true;
-        this.weightSensor = new WeightSensor();
-        this.doorDetector = new DoorObstructionDetector();
-        this.stats = new StatisticsCollector();
-        this.lastMaintenanceDate = System.currentTimeMillis();
-
-        // Wire up safety listeners
-        this.weightSensor.addOverloadListener(() ->
-            notifyOverload(currentLoad, maxCapacity));
-        this.doorDetector.addObstructionListener(() ->
-            notifyDoorObstructed());
+        this.floor = startFloor;
     }
 
-    // --- Public API ---
+    String id() { return id; }
+    void addListener(ElevatorListener l) { listeners.add(l); }
 
-    public String getId() { return id; }
-    public int getCurrentFloor() { return currentFloor; }
-    public Direction getDirection() { return direction; }
-    public DoorState getDoorState() { return doorState; }
-    public ElevatorStatus getStatus() { return status; }
-    public int getCurrentLoad() { return currentLoad; }
-    public List<Integer> getPendingRequests() { return List.copyOf(stops); }
-    public WeightSensor getWeightSensor() { return weightSensor; }
-    public StatisticsCollector getStats() { return stats; }
-    public boolean isVipMode() { return vipMode; }
-    public EmergencyType getActiveEmergency() { return activeEmergency; }
-    public boolean isMaintenanceDue() {
-        return (System.currentTimeMillis() - lastMaintenanceDate) > MAINTENANCE_INTERVAL_MS;
-    }
-
-    public void addObserver(ElevatorObserver observer) {
-        observers.add(observer);
-    }
-
-    public synchronized void addRequest(Request request) {
-        if (!isOperational()) {
-            System.out.println("Elevator " + id + " is " + status + ". Request rejected.");
-            return;
-        }
-        if (currentLoad >= maxCapacity) {
-            notifyOverload(currentLoad, maxCapacity);
-            return;
-        }
-        stats.recordRequest();
-        stops.add(request.floor());
-        requestedFloors.add(request.floor());
-        notifyRequestProcessed(request);
-
-        if (direction == Direction.IDLE) {
-            direction = (request.floor() > currentFloor) ? Direction.UP : Direction.DOWN;
-            startMoving();
-        }
-    }
-
-    public synchronized void addUrgentRequest(UrgentRequest request) {
-        if (status == ElevatorStatus.MAINTENANCE || status == ElevatorStatus.OUT_OF_SERVICE) {
-            return;
-        }
-
-        // Emergency override — clear all normal stops, go to emergency floor
-        stops.clear();
-        requestedFloors.clear();
-        priorityStops.addFirst(request.floor());
-        activeEmergency = request.type();
-        status = ElevatorStatus.EMERGENCY_STOP;
-        direction = (request.floor() > currentFloor) ? Direction.UP : Direction.DOWN;
-        notifyEmergency(this, request.type(), "Emergency dispatch to floor " + request.floor());
-        startMoving();
-    }
-
-    public synchronized void addInternalRequest(int floor) {
-        if (!isOperational()) return;
-        if (floor < minFloor || floor > maxFloor) {
-            System.out.println("Invalid floor: " + floor);
-            return;
-        }
-        if (vipMode) {
-            priorityStops.add(floor);
-        } else {
-            stops.add(floor);
-            requestedFloors.add(floor);
-        }
-
-        if (direction == Direction.IDLE) {
-            direction = (floor > currentFloor) ? Direction.UP : Direction.DOWN;
-            startMoving();
-        }
-    }
-
-    public synchronized void openDoor() {
-        if (doorState == DoorState.CLOSED || doorState == DoorState.OBSTRUCTED) {
-            doorState = DoorState.OPENING;
-            notifyDoorStateChanged();
-            sleep(1000);
-
-            // Check for obstruction
-            if (doorDetector.detectObstruction()) {
-                doorState = DoorState.OBSTRUCTED;
-                status = ElevatorStatus.STOPPED;
-                notifyDoorStateChanged();
-                notifyDoorObstructed();
-                return;
+    ElevatorSnapshot snapshot() {
+        lock.lock();
+        try {
+            int pending = carStops.size() + upCalls.size() + downCalls.size();
+            int lo = floor, hi = floor;
+            for (TreeSet<Integer> s : List.of(carStops, upCalls, downCalls)) {
+                if (!s.isEmpty()) { lo = Math.min(lo, s.first()); hi = Math.max(hi, s.last()); }
             }
-
-            doorState = DoorState.OPEN;
-            status = ElevatorStatus.DOOR_OPEN;
-            notifyDoorStateChanged();
+            return new ElevatorSnapshot(id, floor, direction, state, pending, lo, hi);
+        } finally {
+            lock.unlock();
         }
     }
 
-    public synchronized void closeDoor() {
-        if (doorState == DoorState.OPEN) {
-            doorState = DoorState.CLOSING;
-            notifyDoorStateChanged();
-            sleep(1000);
-
-            // Re-check obstruction during closing
-            if (doorDetector.detectObstruction()) {
-                doorState = DoorState.OPEN; // Re-open
-                status = ElevatorStatus.DOOR_OPEN;
-                notifyDoorStateChanged();
-                notifyDoorObstructed();
-                return;
-            }
-
-            doorState = DoorState.CLOSED;
-            status = ElevatorStatus.DOOR_CLOSED;
-            stats.recordDoorCycle();
-            notifyDoorStateChanged();
+    /** @return false if the car cannot take the call (out of service); the caller re-dispatches. */
+    boolean addHallCall(HallCall call) {
+        checkFloor(call.floor());
+        lock.lock();
+        try {
+            if (state == ElevatorState.MAINTENANCE) return false;
+            (call.direction() == Direction.UP ? upCalls : downCalls).add(call.floor());
+            return true;
+        } finally {
+            lock.unlock();
         }
     }
 
-    public synchronized void setMaintenanceMode(boolean maintenance) {
-        if (maintenance) {
-            status = ElevatorStatus.MAINTENANCE;
+    void addCarCall(int target) {
+        checkFloor(target);
+        lock.lock();
+        try {
+            if (state == ElevatorState.MAINTENANCE) throw new IllegalStateException(id + " is out of service");
+            if (target == floor && state == ElevatorState.DOORS_OPEN) return;   // already there, doors open
+            carStops.add(target);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Take the car out of service. Returns hall calls it owed so the controller can reassign them. */
+    List<HallCall> enterMaintenance() {
+        lock.lock();
+        try {
+            List<HallCall> orphaned = new ArrayList<>();
+            upCalls.forEach(f -> orphaned.add(new HallCall(f, Direction.UP)));
+            downCalls.forEach(f -> orphaned.add(new HallCall(f, Direction.DOWN)));
+            upCalls.clear();
+            downCalls.clear();
+            carStops.clear();
             direction = Direction.IDLE;
-            stops.clear();
-            priorityStops.clear();
-            stats.recordMaintenance(60); // Log 1 hour of maintenance
-        } else {
-            status = ElevatorStatus.STOPPED;
-            lastMaintenanceDate = System.currentTimeMillis();
+            state = ElevatorState.MAINTENANCE;
+            return orphaned;
+        } finally {
+            lock.unlock();
         }
     }
 
-    public synchronized void activateFireMode() {
-        status = ElevatorStatus.FIRE_MODE;
-        direction = Direction.IDLE;
-        stops.clear();
-        priorityStops.clear();
-        activeEmergency = EmergencyType.FIRE_ALARM;
-        notifyEmergency(this, EmergencyType.FIRE_ALARM, "Fire mode activated — returning to ground floor");
-
-        // In fire mode, elevator goes to ground floor and stays with doors open
-        goToFloor(0);
-        openDoor();
-        status = ElevatorStatus.FIRE_MODE;
-    }
-
-    public synchronized void activatePowerFailureMode() {
-        status = ElevatorStatus.POWER_FAILURE;
-        activeEmergency = EmergencyType.POWER_FAILURE;
-        notifyEmergency(this, EmergencyType.POWER_FAILURE, "Power failure — stopping at nearest floor");
-
-        // Stop at nearest floor and open doors
-        stopAtCurrentFloor();
-        openDoor();
-        // Keep doors open with emergency lighting
-        status = ElevatorStatus.POWER_FAILURE;
-    }
-
-    public synchronized void setVipMode(boolean active) {
-        this.vipMode = active;
-        notifyVIPModeActivated(active);
-    }
-
-    public void start() {
-        running = true;
-        scheduler.scheduleAtFixedRate(this::processNextStop, 0, 500, TimeUnit.MILLISECONDS);
-    }
-
-    public void shutdown() {
-        running = false;
-        scheduler.shutdown();
-    }
-
-    // --- Internal State Machine ---
-
-    private boolean isOperational() {
-        return status != ElevatorStatus.MAINTENANCE
-            && status != ElevatorStatus.OUT_OF_SERVICE
-            && status != ElevatorStatus.FIRE_MODE
-            && status != ElevatorStatus.POWER_FAILURE;
-    }
-
-    private void startMoving() {
-        status = ElevatorStatus.MOVING;
-        notifyElevatorStopped(this, currentFloor);
-    }
-
-    private void goToFloor(int targetFloor) {
-        if (targetFloor < minFloor || targetFloor > maxFloor) return;
-        direction = (targetFloor > currentFloor) ? Direction.UP : Direction.DOWN;
-        status = ElevatorStatus.MOVING;
-
-        while (currentFloor != targetFloor && running) {
-            currentFloor += direction.getValue();
-            stats.recordFloorPassed();
-            notifyFloorPassed(currentFloor);
-            sleep(500); // Time to move one floor
+    void exitMaintenance() {
+        lock.lock();
+        try {
+            if (state == ElevatorState.MAINTENANCE) state = ElevatorState.IDLE;
+        } finally {
+            lock.unlock();
         }
-
-        stopAtCurrentFloor();
     }
 
-    private synchronized void processNextStop() {
-        if (!running) return;
-        if (!isOperational()) return;
-
-        // Check maintenance due
-        if (isMaintenanceDue() && stops.isEmpty() && priorityStops.isEmpty()) {
-            notifyMaintenanceRequired("Regular maintenance interval reached");
-            return;
-        }
-
-        // Check for priority stops first
-        Integer priorityStop = priorityStops.peekFirst();
-        if (priorityStop != null) {
-            if (currentFloor == priorityStop) {
-                priorityStops.pollFirst();
-                stopAtCurrentFloor();
-                return;
+    /** Advance the state machine by one action. Events are published after the lock is released. */
+    void step() {
+        List<Runnable> events = new ArrayList<>();
+        lock.lock();
+        try {
+            switch (state) {
+                case MAINTENANCE -> { }
+                case DOORS_OPEN -> {                         // close doors, decide what is next
+                    if (hasAnyStop()) {
+                        state = ElevatorState.MOVING;
+                    } else {
+                        state = ElevatorState.IDLE;
+                        direction = Direction.IDLE;
+                    }
+                }
+                case IDLE, MOVING -> {
+                    if (serveCurrentFloor(events)) {
+                        state = ElevatorState.DOORS_OPEN;
+                    } else {
+                        direction = chooseDirection();
+                        if (direction == Direction.IDLE) {
+                            state = ElevatorState.IDLE;
+                        } else {
+                            floor += direction.delta;        // never leaves [min,max]: stops are validated
+                            state = ElevatorState.MOVING;
+                        }
+                    }
+                }
             }
-            // Move towards priority stop
-            direction = (priorityStop > currentFloor) ? Direction.UP : Direction.DOWN;
+        } finally {
+            lock.unlock();
         }
+        events.forEach(Runnable::run);
+    }
 
-        if (stops.isEmpty() && priorityStops.isEmpty()) {
-            if (direction != Direction.IDLE) {
-                direction = Direction.IDLE;
-                status = ElevatorStatus.STOPPED;
+    // ---- LOOK internals (caller holds lock) ----
+
+    /** Opens doors here if a car stop or a hall call we can accept in our direction is at this floor. */
+    private boolean serveCurrentFloor(List<Runnable> events) {
+        boolean carStop = carStops.remove(floor);
+        Direction preferred = direction != Direction.IDLE ? direction
+                : upCalls.contains(floor) ? Direction.UP : Direction.DOWN;
+        Direction served = null;
+        if (removeHallCall(preferred)) {
+            served = preferred;
+        } else if (!hasStopAhead(preferred) && removeHallCall(preferred.opposite())) {
+            served = preferred.opposite();                   // end of sweep: turn around here
+        }
+        if (!carStop && served == null) return false;
+
+        if (served != null) {
+            direction = served;                              // lantern shows the direction we'll go
+            HallCall call = new HallCall(floor, served);
+            listeners.forEach(l -> events.add(() -> l.onHallCallServed(id, call)));
+        }
+        int at = floor;
+        listeners.forEach(l -> events.add(() -> l.onStopped(id, at)));
+        return true;
+    }
+
+    private boolean removeHallCall(Direction d) {
+        return (d == Direction.UP ? upCalls : downCalls).remove(floor);
+    }
+
+    private Direction chooseDirection() {
+        boolean above = hasStopAhead(Direction.UP), below = hasStopAhead(Direction.DOWN);
+        return switch (direction) {
+            case UP -> above ? Direction.UP : below ? Direction.DOWN : Direction.IDLE;
+            case DOWN -> below ? Direction.DOWN : above ? Direction.UP : Direction.IDLE;
+            case IDLE -> {
+                if (!above && !below) yield Direction.IDLE;
+                if (!below) yield Direction.UP;
+                if (!above) yield Direction.DOWN;
+                yield nearest(Direction.UP) - floor <= floor - nearest(Direction.DOWN) ? Direction.UP : Direction.DOWN;
             }
-            return;
+        };
+    }
+
+    private boolean hasStopAhead(Direction d) {
+        if (d == Direction.IDLE) return false;
+        for (TreeSet<Integer> s : List.of(carStops, upCalls, downCalls)) {
+            if ((d == Direction.UP ? s.higher(floor) : s.lower(floor)) != null) return true;
         }
+        return false;
+    }
 
-        // Determine next stop based on direction
-        Integer nextStop = findNextStop();
-        if (nextStop == null) {
-            // Change direction if no more stops in current direction
-            direction = direction.opposite();
-            nextStop = findNextStop();
-            if (nextStop == null) {
-                direction = Direction.IDLE;
-                status = ElevatorStatus.STOPPED;
-                return;
-            }
+    private int nearest(Direction d) {
+        int best = d == Direction.UP ? Integer.MAX_VALUE : Integer.MIN_VALUE;
+        for (TreeSet<Integer> s : List.of(carStops, upCalls, downCalls)) {
+            Integer f = d == Direction.UP ? s.higher(floor) : s.lower(floor);
+            if (f != null) best = d == Direction.UP ? Math.min(best, f) : Math.max(best, f);
         }
-
-        // Move towards next stop
-        int step = direction.getValue();
-        int newFloor = currentFloor + step;
-
-        if (newFloor >= minFloor && newFloor <= maxFloor) {
-            currentFloor = newFloor;
-            stats.recordFloorPassed();
-            notifyFloorPassed(currentFloor);
-
-            // Check if we need to stop at this floor
-            if (requestedFloors.contains(currentFloor) || currentFloor == nextStop) {
-                stopAtCurrentFloor();
-            }
-        }
+        return best;
     }
 
-    private Integer findNextStop() {
-        if (direction == Direction.UP) {
-            return stops.stream().filter(f -> f >= currentFloor).findFirst().orElse(null);
-        } else if (direction == Direction.DOWN) {
-            return stops.stream().filter(f -> f <= currentFloor)
-                       .max(Integer::compareTo).orElse(null);
-        }
-        return stops.isEmpty() ? null : stops.first();
+    private boolean hasAnyStop() {
+        return !carStops.isEmpty() || !upCalls.isEmpty() || !downCalls.isEmpty();
     }
 
-    private synchronized void stopAtCurrentFloor() {
-        requestedFloors.remove(currentFloor);
-        stops.remove(currentFloor);
-
-        status = ElevatorStatus.STOPPED;
-        stats.recordTrip();
-        notifyElevatorStopped(this, currentFloor);
-
-        openDoor();
-        // Simulate passenger exchange
-        sleep(2000);
-
-        // Check weight after passenger exchange
-        if (weightSensor.isOverloaded()) {
-            notifyOverload(currentLoad, maxCapacity);
-        }
-
-        closeDoor();
-    }
-
-    private void sleep(long ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    // --- Observer notifications ---
-
-    private void notifyElevatorStopped(Elevator e, int floor) {
-        observers.forEach(o -> o.onElevatorStopped(e, floor));
-    }
-
-    private void notifyDoorStateChanged() {
-        observers.forEach(o -> o.onDoorStateChanged(this, doorState));
-    }
-
-    private void notifyFloorPassed(int floor) {
-        observers.forEach(o -> o.onFloorPassed(this, floor));
-    }
-
-    private void notifyRequestProcessed(Request request) {
-        observers.forEach(o -> o.onRequestProcessed(request));
-    }
-
-    private void notifyOverload(int load, int capacity) {
-        observers.forEach(o -> o.onOverload(this, load, capacity));
-    }
-
-    private void notifyEmergency(Elevator e, EmergencyType type, String message) {
-        observers.forEach(o -> o.onEmergency(e, type, message));
-    }
-
-    private void notifyMaintenanceRequired(String reason) {
-        observers.forEach(o -> o.onMaintenanceRequired(this, reason));
-    }
-
-    private void notifyDoorObstructed() {
-        observers.forEach(o -> o.onDoorObstructed(this));
-    }
-
-    private void notifyVIPModeActivated(boolean active) {
-        observers.forEach(o -> o.onVIPModeActivated(this, active));
-    }
-
-    private void notifyStatisticsUpdated() {
-        observers.forEach(o -> o.onStatisticsUpdated(this, stats.getStats()));
-    }
-
-    public void notifyEmergency(String message) {
-        observers.forEach(o -> o.onEmergency(this, EmergencyType.FIRE_ALARM, message));
+    private void checkFloor(int f) {
+        if (f < minFloor || f > maxFloor) throw new IllegalArgumentException("floor " + f + " out of range");
     }
 
     @Override
     public String toString() {
-        return String.format("Elevator[%s] Floor=%d Dir=%s Door=%s Status=%s Stops=%d Load=%d/%d",
-            id, currentFloor, direction, doorState, status, stops.size(),
-            currentLoad, maxCapacity);
-    }
-
-    public String detailedReport() {
-        return toString() + "\n" + stats.getStats().formattedReport();
+        ElevatorSnapshot s = snapshot();
+        return "%s[floor=%d dir=%s state=%s pending=%d]".formatted(id, s.floor(), s.direction(), s.state(), s.pendingStops());
     }
 }
 
 // ============================================================
-// ELEVATOR CONTROLLER (Facade + Observer)
+// CONTROLLER (Facade: dispatch, maintenance, real-time driver)
 // ============================================================
 
-class ElevatorController implements ElevatorObserver {
-    private final List<Elevator> elevators;
-    private final DispatchingStrategy strategy;
-    private final Queue<Request> pendingRequests;
-    private final ScheduledExecutorService scheduler;
-    private final Map<String, List<String>> emergencyLog;
-    private volatile boolean emergencyMode = false;
+final class ElevatorController implements AutoCloseable {
+    private final Map<String, Elevator> elevators;          // insertion-ordered, immutable after construction
+    private final int minFloor, maxFloor;
+    private final DispatchStrategy strategy;
 
-    public ElevatorController(int numElevators, int minFloor, int maxFloor,
-                             int capacity, DispatchingStrategy strategy) {
-        this.strategy = strategy;
-        this.pendingRequests = new ConcurrentLinkedQueue<>();
-        this.elevators = new CopyOnWriteArrayList<>();
-        this.scheduler = Executors.newSingleThreadScheduledExecutor();
-        this.emergencyLog = new ConcurrentHashMap<>();
+    private final ReentrantLock dispatchLock = new ReentrantLock();
+    private final Map<HallCall, String> assignments = new HashMap<>();   // guarded by dispatchLock
+    private ScheduledExecutorService ticker;                             // guarded by this
 
-        for (int i = 0; i < numElevators; i++) {
-            Elevator e = new Elevator("E" + (i + 1), minFloor, maxFloor, capacity);
-            e.addObserver(this);
-            e.start();
-            elevators.add(e);
-        }
-
-        // Process pending requests periodically
-        scheduler.scheduleAtFixedRate(this::processPendingRequests, 1, 1, TimeUnit.SECONDS);
-        // Generate statistics reports periodically
-        scheduler.scheduleAtFixedRate(this::generateStatisticsReport, 1, 1, TimeUnit.MINUTES);
-    }
-
-    // --- External API ---
-
-    public void requestElevator(int floor, Direction direction) {
-        Request request = new Request(floor, direction);
-        pendingRequests.add(request);
-        System.out.println("📞 Request: Floor=" + floor + " Direction=" + direction);
-    }
-
-    public void requestUrgentElevator(int floor, EmergencyType type) {
-        UrgentRequest urgent = new UrgentRequest(floor, Direction.IDLE, type);
-        System.out.println("🚨 URGENT: " + type + " — dispatching to floor " + floor);
-
-        // Assign to nearest elevator regardless of strategy
-        Elevator nearest = elevators.stream()
-            .filter(e -> e.getStatus() != ElevatorStatus.MAINTENANCE
-                       && e.getStatus() != ElevatorStatus.OUT_OF_SERVICE)
-            .min(Comparator.comparingInt(e ->
-                Math.abs(e.getCurrentFloor() - floor)))
-            .orElse(null);
-
-        if (nearest != null) {
-            nearest.addUrgentRequest(urgent);
-        }
-    }
-
-    public void activateFireAlarm() {
-        System.out.println("🔥 FIRE ALARM ACTIVATED — All elevators returning to ground floor");
-        emergencyMode = true;
-        elevators.forEach(Elevator::activateFireMode);
-    }
-
-    public void activatePowerFailure() {
-        System.out.println("⚡ POWER FAILURE DETECTED — All elevators stopping at nearest floor");
-        emergencyMode = true;
-        elevators.forEach(Elevator::activatePowerFailureMode);
-    }
-
-    public void clearEmergency() {
-        System.out.println("✅ Emergency cleared — Resuming normal operation");
-        emergencyMode = false;
-        elevators.forEach(e -> e.setMaintenanceMode(false));
-    }
-
-    public void setVipMode(String elevatorId, boolean active) {
-        elevators.stream()
-            .filter(e -> e.getId().equals(elevatorId))
-            .findFirst()
-            .ifPresent(e -> e.setVipMode(active));
-    }
-
-    public void scheduleMaintenance(String elevatorId) {
-        elevators.stream()
-            .filter(e -> e.getId().equals(elevatorId))
-            .findFirst()
-            .ifPresent(e -> {
-                System.out.println("🔧 Scheduling maintenance for " + elevatorId);
-                e.setMaintenanceMode(true);
+    ElevatorController(int cars, int minFloor, int maxFloor, DispatchStrategy strategy) {
+        this.minFloor = minFloor;
+        this.maxFloor = maxFloor;
+        this.strategy = Objects.requireNonNull(strategy);
+        Map<String, Elevator> m = new LinkedHashMap<>();
+        for (int i = 1; i <= cars; i++) {
+            Elevator e = new Elevator("E" + i, minFloor, maxFloor, minFloor);
+            e.addListener(new ElevatorListener() {
+                @Override public void onHallCallServed(String elevatorId, HallCall call) { release(call, elevatorId); }
             });
-    }
-
-    public void shutdown() {
-        elevators.forEach(Elevator::shutdown);
-        scheduler.shutdown();
-    }
-
-    public void displayStatus() {
-        System.out.println("\n" + "=".repeat(60));
-        System.out.println("           ELEVATOR FLEET STATUS");
-        System.out.println("=".repeat(60));
-        elevators.forEach(e -> System.out.println("  " + e));
-        System.out.println("Pending requests: " + pendingRequests.size() + " | " +
-            "Emergency mode: " + (emergencyMode ? "🟥 ACTIVE" : "🟢 NORMAL"));
-        System.out.println("=".repeat(60));
-    }
-
-    public void displayDetailedStatus() {
-        System.out.println("\n" + "=".repeat(70));
-        System.out.println("           ELEVATOR FLEET — DETAILED REPORT");
-        System.out.println("=".repeat(70));
-        elevators.forEach(e -> {
-            System.out.println("  " + e);
-            if (e.isMaintenanceDue()) {
-                System.out.println("    ⚠️ MAINTENANCE DUE");
-            }
-            System.out.println("    Weight: " + String.format("%.0f", e.getWeightSensor().getUtilization() * 100) + "%");
-
-            if (e.getActiveEmergency() != null) {
-                System.out.println("    🚨 Emergency: " + e.getActiveEmergency());
-            }
-        });
-        System.out.println("Pending requests: " + pendingRequests.size());
-        System.out.println("=".repeat(70));
-    }
-
-    // --- Internal ---
-
-    private void processPendingRequests() {
-        if (emergencyMode) return; // Don't process normal requests during emergency
-
-        Request request;
-        while ((request = pendingRequests.poll()) != null) {
-            try {
-                Elevator assigned = strategy.assignElevator(request, elevators);
-                assigned.addRequest(request);
-                System.out.println("  Assigned " + assigned.getId() + " to " + request);
-            } catch (IllegalStateException e) {
-                System.out.println("  ⏳ No elevator available for " + request + " — queued");
-                pendingRequests.add(request); // Re-queue
-            }
+            m.put(e.id(), e);
         }
+        this.elevators = Collections.unmodifiableMap(m);
     }
 
-    private void generateStatisticsReport() {
-        System.out.println("\n📊 === STATISTICS REPORT ===");
-        elevators.forEach(e -> {
-            ElevatorStats stats = e.getStats();
-            System.out.printf("  %s: %.1f%% uptime, %d trips, %d emergencies%n",
-                e.getId(), stats.uptimePercentage() * 100,
-                stats.totalTrips(), stats.emergencyStops());
-        });
-    }
+    void addListener(ElevatorListener l) { elevators.values().forEach(e -> e.addListener(l)); }
 
-    // --- Observer callbacks ---
-
-    @Override
-    public void onElevatorStopped(Elevator elevator, int floor) {}
-
-    @Override
-    public void onDoorStateChanged(Elevator elevator, DoorState state) {
-        if (state == DoorState.OBSTRUCTED) {
-            System.out.println("⚠️ " + elevator.getId() + ": Door obstructed at floor " + elevator.getCurrentFloor());
+    /** Press a hall button. Thread-safe and idempotent: re-pressing returns the car already assigned. */
+    String requestElevator(int floor, Direction direction) {
+        if (floor < minFloor || floor > maxFloor) throw new IllegalArgumentException("floor " + floor + " out of range");
+        if ((floor == maxFloor && direction == Direction.UP) || (floor == minFloor && direction == Direction.DOWN)) {
+            throw new IllegalArgumentException("no " + direction + " button on floor " + floor);
         }
-    }
-
-    @Override
-    public void onFloorPassed(Elevator elevator, int floor) {}
-
-    @Override
-    public void onRequestProcessed(Request request) {}
-
-    @Override
-    public void onOverload(Elevator elevator, int currentLoad, int capacity) {
-        System.out.println("⚠️ WARNING: " + elevator.getId() + " overloaded (" + currentLoad + "/" + capacity + ")");
-        // Dispatch another elevator to help
+        HallCall call = new HallCall(floor, direction);
+        dispatchLock.lock();
         try {
-            Elevator backup = new NearestCarStrategy().assignElevator(
-                new Request(elevator.getCurrentFloor(), elevator.getDirection()), elevators);
-            if (backup != elevator) {
-                System.out.println("  Dispatching " + backup.getId() + " to assist");
-            }
-        } catch (IllegalStateException e) {
-            System.out.println("  No backup elevator available");
+            return dispatchLocked(call);
+        } finally {
+            dispatchLock.unlock();
         }
     }
 
-    @Override
-    public void onEmergency(Elevator elevator, EmergencyType type, String message) {
-        System.out.println("🚨 EMERGENCY: " + elevator.getId() + " — " + message);
-        emergencyLog.computeIfAbsent(elevator.getId(), k -> new CopyOnWriteArrayList<>())
-            .add(LocalDateTime.now() + ": " + type + " — " + message);
+    /** Press a button inside a car. */
+    void selectFloor(String elevatorId, int floor) { car(elevatorId).addCarCall(floor); }
+
+    void setMaintenance(String elevatorId, boolean on) {
+        Elevator e = car(elevatorId);
+        if (!on) { e.exitMaintenance(); return; }
+        dispatchLock.lock();
+        try {
+            for (HallCall orphan : e.enterMaintenance()) {
+                assignments.remove(orphan, elevatorId);
+                try {
+                    dispatchLocked(orphan);
+                } catch (IllegalStateException noCar) {
+                    // Whole bank is down: the call is dropped and the hall lamp goes dark (passenger re-presses).
+                }
+            }
+        } finally {
+            dispatchLock.unlock();
+        }
+    }
+
+    /** One simulation step for every car. Called by the ticker, or directly by tests. */
+    void tick() { elevators.values().forEach(Elevator::step); }
+
+    synchronized void start(Duration period) {
+        if (ticker != null) return;
+        ticker = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "elevator-ticker");
+            t.setDaemon(true);
+            return t;
+        });
+        // Wrap so one unexpected exception doesn't silently cancel the periodic task.
+        ticker.scheduleAtFixedRate(() -> {
+            try { tick(); } catch (RuntimeException ex) { ex.printStackTrace(); }
+        }, 0, period.toNanos(), TimeUnit.NANOSECONDS);
     }
 
     @Override
-    public void onMaintenanceRequired(Elevator elevator, String reason) {
-        System.out.println("🔧 MAINTENANCE: " + elevator.getId() + " — " + reason);
-        elevator.setMaintenanceMode(true);
+    public synchronized void close() {
+        if (ticker != null) { ticker.shutdownNow(); ticker = null; }
     }
 
-    @Override
-    public void onDoorObstructed(Elevator elevator) {
-        System.out.println("⚠️ " + elevator.getId() + ": Persistent door obstruction detected. Maintenance required.");
-        elevator.setMaintenanceMode(true);
+    boolean isQuiescent() {
+        dispatchLock.lock();
+        try {
+            if (!assignments.isEmpty()) return false;
+        } finally {
+            dispatchLock.unlock();
+        }
+        return elevators.values().stream().map(Elevator::snapshot)
+                .allMatch(s -> s.pendingStops() == 0 && s.state() != ElevatorState.DOORS_OPEN
+                        && s.state() != ElevatorState.MOVING);
     }
 
-    @Override
-    public void onVIPModeActivated(Elevator elevator, boolean active) {
-        System.out.println("👑 " + elevator.getId() + ": VIP mode " + (active ? "ACTIVATED" : "DEACTIVATED"));
+    ElevatorSnapshot status(String elevatorId) { return car(elevatorId).snapshot(); }
+
+    int outstandingHallCalls() {
+        dispatchLock.lock();
+        try { return assignments.size(); } finally { dispatchLock.unlock(); }
     }
 
-    @Override
-    public void onStatisticsUpdated(Elevator elevator, ElevatorStats stats) {}
+    // ---- internals ----
+
+    private String dispatchLocked(HallCall call) {
+        String existing = assignments.get(call);
+        if (existing != null) return existing;
+        Set<String> rejected = new HashSet<>();
+        while (true) {
+            List<ElevatorSnapshot> candidates = elevators.values().stream()
+                    .map(Elevator::snapshot)
+                    .filter(s -> s.state() != ElevatorState.MAINTENANCE && !rejected.contains(s.id()))
+                    .collect(Collectors.toList());
+            ElevatorSnapshot pick = strategy.choose(call, candidates)
+                    .orElseThrow(() -> new IllegalStateException("no elevator in service"));
+            // Snapshot may be stale by now; addHallCall re-checks under the car's lock.
+            if (car(pick.id()).addHallCall(call)) {
+                assignments.put(call, pick.id());
+                return pick.id();
+            }
+            rejected.add(pick.id());
+        }
+    }
+
+    /** Called from Elevator.step() after the car released its lock: lock order stays controller -> car. */
+    private void release(HallCall call, String elevatorId) {
+        dispatchLock.lock();
+        try {
+            assignments.remove(call, elevatorId);
+        } finally {
+            dispatchLock.unlock();
+        }
+    }
+
+    private Elevator car(String id) {
+        Elevator e = elevators.get(id);
+        if (e == null) throw new IllegalArgumentException("unknown elevator " + id);
+        return e;
+    }
 }
 
 // ============================================================
-// DEMO
+// DEMO + SELF-CHECKS
 // ============================================================
 
-public class ElevatorSystem {
-    public static void main(String[] args) throws InterruptedException {
-        System.out.println("╔══════════════════════════════════╗");
-        System.out.println("║     ELEVATOR SYSTEM DEMO        ║");
-        System.out.println("╚══════════════════════════════════╝\n");
+final class ElevatorDemo {
 
-        System.out.println("🏢 Building: 40 floors (3 basements), 6 elevators\n");
+    /** Records the order of stops per car so tests can assert LOOK ordering. */
+    static final class StopRecorder implements ElevatorListener {
+        final Map<String, List<Integer>> stops = new ConcurrentHashMap<>();
+        final Map<HallCall, AtomicInteger> served = new ConcurrentHashMap<>();
+        @Override public void onStopped(String id, int floor) {
+            stops.computeIfAbsent(id, k -> Collections.synchronizedList(new ArrayList<>())).add(floor);
+        }
+        @Override public void onHallCallServed(String id, HallCall call) {
+            served.computeIfAbsent(call, k -> new AtomicInteger()).incrementAndGet();
+        }
+        List<Integer> of(String id) { return stops.getOrDefault(id, List.of()); }
+    }
 
-        // Create controller with 6 elevators, floors -3 to 40, capacity 15
-        DispatchingStrategy strategy = new ScanStrategy();
-        ElevatorController controller = new ElevatorController(6, -3, 40, 15, strategy);
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        System.out.println("  ok  " + what);
+    }
 
-        // ---- NORMAL OPERATION ----
-        System.out.println("--- NORMAL OPERATION ---");
-        controller.requestElevator(5, Direction.UP);
-        Thread.sleep(500);
-        controller.requestElevator(12, Direction.DOWN);
-        Thread.sleep(300);
-        controller.requestElevator(3, Direction.UP);
-        Thread.sleep(200);
-        controller.requestElevator(15, Direction.DOWN);
-        controller.requestElevator(0, Direction.UP);
-        controller.requestElevator(20, Direction.DOWN);
+    static void runUntilQuiet(ElevatorController c, int maxTicks) {
+        for (int i = 0; i < maxTicks; i++) {
+            c.tick();
+            if (c.isQuiescent()) return;
+        }
+        throw new AssertionError("system did not settle within " + maxTicks + " ticks");
+    }
 
-        Thread.sleep(4000);
-        controller.displayStatus();
-
-        // ---- VIP MODE ----
-        System.out.println("\n--- VIP MODE ---");
-        controller.setVipMode("E2", true);
-        controller.requestElevator(10, Direction.UP);
-        controller.requestElevator(25, Direction.DOWN);
-
-        Thread.sleep(2000);
-        controller.setVipMode("E2", false);
-
-        // ---- EMERGENCY SCENARIOS ----
-        System.out.println("\n--- FIRE ALARM DRILL ---");
-        controller.activateFireAlarm();
-        Thread.sleep(2000);
-        controller.displayStatus();
-
-        System.out.println("\n--- CLEARING EMERGENCY ---");
-        controller.clearEmergency();
-        Thread.sleep(1000);
-
-        // ---- OVERLOAD SCENARIO ----
-        System.out.println("\n--- HEAVY TRAFFIC — MULTIPLE REQUESTS ---");
-        for (int i = 0; i < 20; i++) {
-            int from = ThreadLocalRandom.current().nextInt(0, 30);
-            Direction dir = ThreadLocalRandom.current().nextBoolean() ? Direction.UP : Direction.DOWN;
-            controller.requestElevator(from, dir);
+    static void run() throws Exception {
+        System.out.println("== 1. LOOK ordering of car calls ==");
+        try (ElevatorController c = new ElevatorController(1, 0, 10, new LookEtaStrategy())) {
+            StopRecorder rec = new StopRecorder();
+            c.addListener(rec);
+            c.selectFloor("E1", 5);
+            c.selectFloor("E1", 2);
+            c.tick(); c.tick();                     // car now moving up from 0
+            c.selectFloor("E1", 8);
+            c.selectFloor("E1", 1);                 // behind the car: served after the up sweep
+            runUntilQuiet(c, 100);
+            check(rec.of("E1").equals(List.of(2, 5, 8, 1)), "car visits 2,5,8 on the way up then 1: " + rec.of("E1"));
         }
 
-        Thread.sleep(3000);
+        System.out.println("== 2. Hall calls respect direction ==");
+        try (ElevatorController c = new ElevatorController(1, 0, 10, new LookEtaStrategy())) {
+            StopRecorder rec = new StopRecorder();
+            c.addListener(rec);
+            c.selectFloor("E1", 9);
+            c.tick();                               // leaves floor 0 going up
+            c.requestElevator(4, Direction.DOWN);   // wrong direction: skip on the way up
+            c.requestElevator(6, Direction.UP);     // same direction: pick up on the way
+            c.requestElevator(10, Direction.DOWN);  // top of sweep: turn around there
+            runUntilQuiet(c, 100);
+            check(rec.of("E1").equals(List.of(6, 9, 10, 4)), "stops 6(up),9,10(turn),4(down): " + rec.of("E1"));
+            check(c.outstandingHallCalls() == 0, "all hall-call assignments released");
+        }
 
-        // ---- POWER FAILURE ----
-        System.out.println("\n--- POWER FAILURE SCENARIO ---");
-        controller.activatePowerFailure();
-        Thread.sleep(1500);
-        controller.clearEmergency();
+        System.out.println("== 3. Dispatch: ETA beats nearest-car ==");
+        {
+            ElevatorSnapshot upAt9 = new ElevatorSnapshot("E1", 9, Direction.UP, ElevatorState.MOVING, 1, 9, 20);
+            ElevatorSnapshot idleAt0 = new ElevatorSnapshot("E2", 0, Direction.IDLE, ElevatorState.IDLE, 0, 0, 0);
+            HallCall down8 = new HallCall(8, Direction.DOWN);
+            HallCall up12 = new HallCall(12, Direction.UP);
+            List<ElevatorSnapshot> cars = List.of(upAt9, idleAt0);
+            check(new NearestCarStrategy().choose(down8, cars).orElseThrow().id().equals("E1"),
+                  "nearest-car picks E1 for DOWN@8 although E1 must go to 20 first");
+            check(LookEtaStrategy.eta(upAt9, down8) == 23 && LookEtaStrategy.eta(idleAt0, down8) == 8,
+                  "ETA: E1 = (20-9)+(20-8) = 23 floors, E2 = 8 floors");
+            check(new LookEtaStrategy().choose(down8, cars).orElseThrow().id().equals("E2"),
+                  "LOOK-ETA picks the idle E2 for DOWN@8");
+            check(new LookEtaStrategy().choose(up12, cars).orElseThrow().id().equals("E1"),
+                  "LOOK-ETA picks E1 for UP@12 (on its way)");
+        }
 
-        // ---- MAINTENANCE ----
-        System.out.println("\n--- SCHEDULED MAINTENANCE ---");
-        controller.scheduleMaintenance("E1");
-        controller.scheduleMaintenance("E5");
+        System.out.println("== 4. Idempotent presses, validation ==");
+        try (ElevatorController c = new ElevatorController(3, 0, 10, new LookEtaStrategy())) {
+            String first = c.requestElevator(7, Direction.UP);
+            check(c.requestElevator(7, Direction.UP).equals(first) && c.outstandingHallCalls() == 1,
+                  "pressing UP@7 twice yields one assignment");
+            check(throwsIAE(() -> c.requestElevator(11, Direction.DOWN)), "floor out of range rejected");
+            check(throwsIAE(() -> c.requestElevator(10, Direction.UP)), "no UP button on the top floor");
+        }
 
-        Thread.sleep(1000);
-        controller.displayDetailedStatus();
+        System.out.println("== 5. Maintenance re-dispatches orphaned hall calls ==");
+        try (ElevatorController c = new ElevatorController(2, 0, 10, new LookEtaStrategy())) {
+            StopRecorder rec = new StopRecorder();
+            c.addListener(rec);
+            String owner = c.requestElevator(5, Direction.UP);
+            String other = owner.equals("E1") ? "E2" : "E1";
+            c.setMaintenance(owner, true);
+            check(c.status(owner).state() == ElevatorState.MAINTENANCE, owner + " is in maintenance");
+            check(throwsISE(() -> c.selectFloor(owner, 3)), "car calls rejected while in maintenance");
+            runUntilQuiet(c, 100);
+            check(rec.of(other).contains(5) && rec.of(owner).isEmpty(), "UP@5 served by " + other + " instead");
+            c.setMaintenance("E1", true);
+            c.setMaintenance("E2", true);
+            check(throwsISE(() -> c.requestElevator(3, Direction.UP)), "whole bank down -> request fails loudly");
+            c.setMaintenance("E1", false);
+            check(c.requestElevator(3, Direction.UP).equals("E1"), "E1 back in service takes calls");
+        }
 
-        // ---- FINAL REPORT ----
-        System.out.println("\n📋 FINAL FLEET REPORT:");
-        controller.displayStatus();
+        System.out.println("== 6. Concurrency: 8 threads pressing buttons while the ticker runs ==");
+        try (ElevatorController c = new ElevatorController(4, 0, 30, new LookEtaStrategy())) {
+            StopRecorder rec = new StopRecorder();
+            c.addListener(rec);
+            c.start(Duration.ofMillis(1));
+            Set<HallCall> pressed = ConcurrentHashMap.newKeySet();
+            ExecutorService pool = Executors.newFixedThreadPool(8);
+            CountDownLatch go = new CountDownLatch(1);
+            List<Future<?>> futures = new ArrayList<>();
+            for (int t = 0; t < 8; t++) {
+                final long seed = t;
+                futures.add(pool.submit(() -> {
+                    Random rnd = new Random(seed);
+                    go.await();
+                    for (int i = 0; i < 200; i++) {
+                        int floor = 1 + rnd.nextInt(29);                       // 1..29 has both buttons
+                        Direction d = rnd.nextBoolean() ? Direction.UP : Direction.DOWN;
+                        c.requestElevator(floor, d);
+                        pressed.add(new HallCall(floor, d));
+                        if (i % 50 == 0) c.selectFloor("E" + (1 + rnd.nextInt(4)), rnd.nextInt(31));
+                    }
+                    return null;
+                }));
+            }
+            go.countDown();
+            for (Future<?> f : futures) f.get(10, TimeUnit.SECONDS);   // rethrows any worker exception
+            pool.shutdown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!c.isQuiescent()) {
+                if (System.nanoTime() > deadline) throw new AssertionError("did not drain: " + c.outstandingHallCalls());
+                Thread.sleep(5);
+            }
+            check(rec.served.keySet().containsAll(pressed), "every distinct hall call pressed (" + pressed.size() + ") was served");
+            check(c.outstandingHallCalls() == 0, "assignment map drained (no leaked or deadlocked calls)");
+        }
 
-        // Shutdown
-        controller.shutdown();
-        System.out.println("\n╔══════════════════════════════════╗");
-        System.out.println("║       DEMO COMPLETE             ║");
-        System.out.println("╚══════════════════════════════════╝");
+        System.out.println("\nAll elevator checks passed.");
+    }
+
+    private static boolean throwsIAE(Runnable r) {
+        try { r.run(); return false; } catch (IllegalArgumentException e) { return true; }
+    }
+
+    private static boolean throwsISE(Runnable r) {
+        try { r.run(); return false; } catch (IllegalStateException e) { return true; }
     }
 }
