@@ -634,6 +634,8 @@ Global cluster:
 
 ## 5. DynamoDB: Data Modeling, Partitioning, Hot Keys
 
+> For the full walkthrough (indexes, single-table design, capacity math, bulk update/read scenarios), see the [DynamoDB Deep Dive](../../cs-interview/database-systems/DYNAMODB_DEEP_DIVE.md).
+
 **Q:** "Design a DynamoDB table for a social media feed service: 10K writes/second (new posts), 100K reads/second (feed queries), each user has up to 1000 followers. How do you model the data for efficient access patterns? What happens when a celebrity posts and 1M followers query simultaneously? How do you prevent hot keys?"
 
 **What They're Really Testing:** Whether you understand DynamoDB's partition mechanics — how partition key design affects throughput, and how to use access patterns to drive table design (single-table design).

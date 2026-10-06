@@ -18,7 +18,9 @@ cs-interview/
 │   └── INTERVIEW_QUESTIONS.md          (12 questions)
 │
 ├── database-systems/                   ← B-Trees vs LSM, MVCC, replication, sharding
-│   └── INTERVIEW_QUESTIONS.md          (14 questions)
+│   ├── INTERVIEW_QUESTIONS.md          (14 questions)
+│   ├── POSTGRESQL_DEEP_DIVE.md         (internals, tuning, operations)
+│   └── DYNAMODB_DEEP_DIVE.md           (keys, indexes, single-table design, bulk scenarios)
 │
 ├── distributed-systems/                ← CAP, Raft, gossip, distributed transactions
 │   └── INTERVIEW_QUESTIONS.md          (12 questions)
