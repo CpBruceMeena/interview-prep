@@ -1,8 +1,8 @@
-# Web Crawler
+# Food Delivery
 
-> Concurrent crawling, politeness, deduplication, graceful shutdown
+> Order lifecycle as a saga across payment, order and dispatch; real-time partner location ingestion; geo-sharded dispatch; peak-hour surge
 
-A low-level design worked end to end in Go — from the reasoning you'd show an interviewer through to the production architecture.
+A low-level design worked end to end in Python — from the reasoning you'd show an interviewer through to the production architecture.
 
 ---
 
@@ -10,9 +10,10 @@ A low-level design worked end to end in Go — from the reasoning you'd show an 
 |------|--------------|
 | **[Thought Process](THOUGHT_PROCESS.md)** | How to reason about this design in an interview |
 | **[Implementation](CODE.md)** | Full annotated source with the patterns called out |
+| **[Database Schema](DB_SCHEMA.md)** | Tables, indexes and the constraints that matter |
 | **[High-Level Design](HIGH_LEVEL_DESIGN.md)** | Architecture, scaling and failure modes |
 | **[Interview Questions](INTERVIEW_QUESTIONS.md)** | Follow-up questions with worked answers |
 
 ---
 
-**Runnable source:** `web_crawler.go`, `web_crawler_test.go`
+**Runnable source:** `food_delivery.py`

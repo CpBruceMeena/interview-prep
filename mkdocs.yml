@@ -2,7 +2,7 @@
 site_name: Interview Prep
 site_description: >-
   Comprehensive interview preparation for Staff/Principal backend engineers.
-  26 LLD projects across Python, Java, and Go with SOLID design patterns,
+  30 LLD projects across Python, Java, and Go with SOLID design patterns,
   RAG chatbot implementation, language deep-dives (Python/Go/Java),
   and 8 CS core topics with 90+ staff-level questions.
 site_url: https://cpbrucemeena.github.io/interview-prep/
@@ -115,8 +115,6 @@ extra_javascript:
   - assets/javascripts/mathjax.js
   - assets/javascripts/sidebar-click.js
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
-  - https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js
-  - assets/javascripts/mermaid-init.js
 
 
 
@@ -125,6 +123,7 @@ nav:
 
   - 🐍 Python Low-Level Design:
     - Overview: python-low-level-design/README.md
+    - 🎯 Interview Playbook: python-low-level-design/LLD_INTERVIEW_PLAYBOOK.md
     - Parking Lot:
       - python-low-level-design/parking-lot/index.md
       - Thought Process: python-low-level-design/parking-lot/THOUGHT_PROCESS.md
@@ -251,6 +250,32 @@ nav:
       - Code: python-low-level-design/big-file-upload/CODE.md
       - HLD: python-low-level-design/big-file-upload/HIGH_LEVEL_DESIGN.md
       - Questions: python-low-level-design/big-file-upload/INTERVIEW_QUESTIONS.md
+    - Order Matching Engine:
+      - python-low-level-design/order-matching-engine/index.md
+      - Thought Process: python-low-level-design/order-matching-engine/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/order-matching-engine/CODE.md
+      - Schema: python-low-level-design/order-matching-engine/DB_SCHEMA.md
+      - HLD: python-low-level-design/order-matching-engine/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/order-matching-engine/INTERVIEW_QUESTIONS.md
+    - Circuit Breaker & Resilience:
+      - python-low-level-design/circuit-breaker/index.md
+      - Thought Process: python-low-level-design/circuit-breaker/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/circuit-breaker/CODE.md
+      - HLD: python-low-level-design/circuit-breaker/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/circuit-breaker/INTERVIEW_QUESTIONS.md
+    - Food Delivery:
+      - python-low-level-design/food-delivery/index.md
+      - Thought Process: python-low-level-design/food-delivery/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/food-delivery/CODE.md
+      - Schema: python-low-level-design/food-delivery/DB_SCHEMA.md
+      - HLD: python-low-level-design/food-delivery/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/food-delivery/INTERVIEW_QUESTIONS.md
+    - Logging Framework:
+      - python-low-level-design/logging-framework/index.md
+      - Thought Process: python-low-level-design/logging-framework/THOUGHT_PROCESS.md
+      - Code: python-low-level-design/logging-framework/CODE.md
+      - HLD: python-low-level-design/logging-framework/HIGH_LEVEL_DESIGN.md
+      - Questions: python-low-level-design/logging-framework/INTERVIEW_QUESTIONS.md
 
   - ☕ Java Low-Level Design:
     - Overview: java-low-level-design/README.md

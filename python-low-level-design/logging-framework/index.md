@@ -1,8 +1,8 @@
-# Web Crawler
+# Logging Framework
 
-> Concurrent crawling, politeness, deduplication, graceful shutdown
+> From in-process logger to fleet-wide pipeline: node agents, Kafka buffering, hot/cold storage, sampling, PII redaction and back-pressure
 
-A low-level design worked end to end in Go — from the reasoning you'd show an interviewer through to the production architecture.
+A low-level design worked end to end in Python — from the reasoning you'd show an interviewer through to the production architecture.
 
 ---
 
@@ -15,4 +15,4 @@ A low-level design worked end to end in Go — from the reasoning you'd show an 
 
 ---
 
-**Runnable source:** `web_crawler.go`, `web_crawler_test.go`
+**Runnable source:** `logging_framework.py`

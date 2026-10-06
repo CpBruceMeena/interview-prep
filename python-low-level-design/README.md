@@ -1,6 +1,6 @@
 # 🐍 Python Low Level Design Problems
 
-A comprehensive collection of **18 Low-Level Design (LLD)** problems implemented in **Python**, following **SOLID principles** and **design patterns** — curated for **6+ years experienced backend developer** interviews.
+A comprehensive collection of **24 Low-Level Design (LLD)** problems implemented in **Python**, following **SOLID principles** and **design patterns** — curated for **6+ years experienced backend developer** interviews.
 
 > 🆕 Also check out our [Java Low-Level Designs](../java-low-level-design/) and [Golang Low-Level Designs](../golang-low-level-design/)!
 
@@ -27,7 +27,22 @@ A comprehensive collection of **18 Low-Level Design (LLD)** problems implemented
 | 15 | [Inventory Management](inventory-management/INTERVIEW_QUESTIONS.md) | Stock, Reorder, Warehouse | Strategy, Observer, Facade |
 | 16 | [Payment Processing](payment-processing-system/INTERVIEW_QUESTIONS.md) | Payments, Refunds, Fraud | Strategy, Chain of Responsibility |
 | 17 | [Job Scheduling](job-scheduling-system/INTERVIEW_QUESTIONS.md) | Scheduling, Recurring Jobs | Command, Strategy, Observer |
-| 18 | [Search Platform](search-platform/INTERVIEW_QUESTIONS.md) | Indexing, Ranking, TF-IDF | Strategy, Facade, Decorator |
+| 18 | [Search Platform](search-platform/INTERVIEW_QUESTIONS.md) | Indexing, Ranking, BM25 | Strategy, Facade |
+| 19 | [Notification Service](notification-service/INTERVIEW_QUESTIONS.md) | Multi-channel delivery, Retries, Quiet Hours | Strategy, Observer |
+| 20 | [Big File Upload](big-file-upload/INTERVIEW_QUESTIONS.md) | Resumable Chunked Uploads (TUS) | Strategy, Repository, State Machine |
+| 21 | [Order Matching Engine](order-matching-engine/INTERVIEW_QUESTIONS.md) | Order Book, Price-Time Priority, Sequencer | Command, Event Sourcing |
+| 22 | [Circuit Breaker & Resilience](circuit-breaker/INTERVIEW_QUESTIONS.md) | Retry, Backoff, Bulkhead, Timeout | State, Decorator |
+| 23 | [Food Delivery](food-delivery/INTERVIEW_QUESTIONS.md) | Order State Machine, Dispatch, Idempotent Checkout | State, Strategy, Observer |
+| 24 | [Logging Framework](logging-framework/INTERVIEW_QUESTIONS.md) | Logger Hierarchy, Async Handlers, Correlation IDs | Chain of Responsibility, Strategy |
+
+> 🎯 **New:** start with the [LLD Interview Playbook](LLD_INTERVIEW_PLAYBOOK.md): time-boxed round script, Senior vs Staff signals, a concurrency toolkit for Python/Java/Go, and a 3-week practice plan.
+
+Every project ships a `test_<module>.py` (stdlib `unittest`):
+
+```bash
+cd python-low-level-design/<project-name>
+python -m unittest test_<module>
+```
 
 ---
 

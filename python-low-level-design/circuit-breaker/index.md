@@ -1,8 +1,8 @@
-# Web Crawler
+# Circuit Breaker & Resilience
 
-> Concurrent crawling, politeness, deduplication, graceful shutdown
+> Resilience library for service-to-service calls: circuit breaking, retry budgets and jittered backoff, bulkheads and timeouts, and how they compare to Resilience4j and Envoy
 
-A low-level design worked end to end in Go — from the reasoning you'd show an interviewer through to the production architecture.
+A low-level design worked end to end in Python — from the reasoning you'd show an interviewer through to the production architecture.
 
 ---
 
@@ -15,4 +15,4 @@ A low-level design worked end to end in Go — from the reasoning you'd show an 
 
 ---
 
-**Runnable source:** `web_crawler.go`, `web_crawler_test.go`
+**Runnable source:** `circuit_breaker.py`
