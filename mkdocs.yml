@@ -15,6 +15,12 @@ edit_uri: edit/main/docs/
 
 docs_dir: docs/
 
+# The theme override directory lives inside docs_dir, so MkDocs would copy
+# main.html into the built site and serve the raw Jinja template at
+# /overrides/main.html. It is a template, not a page.
+exclude_docs: |
+  overrides/
+
 theme:
   name: material
   custom_dir: docs/overrides
