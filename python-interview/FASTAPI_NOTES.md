@@ -7,19 +7,19 @@
 
 ## Table of Contents
 
-1. [FastAPI Architecture & Philosophy](#1-fastapi-architecture--philosophy)
-2. [Path Operations & Routing](#2-path-operations--routing)
-3. [Pydantic Models & Validation](#3-pydantic-models--validation)
+1. [FastAPI Architecture & Philosophy](#1-fastapi-architecture-philosophy)
+2. [Path Operations & Routing](#2-path-operations-routing)
+3. [Pydantic Models & Validation](#3-pydantic-models-validation)
 4. [Dependency Injection System](#4-dependency-injection-system)
-5. [Async Support & Concurrency](#5-async-support--concurrency)
-6. [Middleware & Lifecycle Events](#6-middleware--lifecycle-events)
-7. [Security & Authentication](#7-security--authentication)
-8. [Database Integration & Sessions](#8-database-integration--sessions)
-9. [Background Tasks & WebSockets](#9-background-tasks--websockets)
+5. [Async Support & Concurrency](#5-async-support-concurrency)
+6. [Middleware & Lifecycle Events](#6-middleware-lifecycle-events)
+7. [Security & Authentication](#7-security-authentication)
+8. [Database Integration & Sessions](#8-database-integration-sessions)
+9. [Background Tasks & WebSockets](#9-background-tasks-websockets)
 10. [Testing FastAPI Applications](#10-testing-fastapi-applications)
 11. [Performance Optimization](#11-performance-optimization)
 12. [Production Deployment](#12-production-deployment)
-13. [OpenAPI & Documentation Customization](#13-openapi--documentation-customization)
+13. [OpenAPI & Documentation Customization](#13-openapi-documentation-customization)
 14. [FastAPI Design Patterns](#14-fastapi-design-patterns)
 15. [FastAPI Interview Questions](#15-fastapi-interview-questions)
 

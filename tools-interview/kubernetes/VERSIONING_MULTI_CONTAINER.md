@@ -9,10 +9,10 @@
 
 1. [Why Versioning Matters in Multi-Container Setups](#1-why-versioning-matters-in-multi-container-setups)
 2. [API Versioning Strategies](#2-api-versioning-strategies)
-3. [Database Schema Versioning & Migrations](#3-database-schema-versioning--migrations)
+3. [Database Schema Versioning & Migrations](#3-database-schema-versioning-migrations)
 4. [Container Image Versioning](#4-container-image-versioning)
-5. [Kubernetes Deployment Versioning & Rollbacks](#5-kubernetes-deployment-versioning--rollbacks)
-6. [Service Mesh Versioning (Canary & Blue-Green)](#6-service-mesh-versioning-canary--blue-green)
+5. [Kubernetes Deployment Versioning & Rollbacks](#5-kubernetes-deployment-versioning-rollbacks)
+6. [Service Mesh Versioning (Canary & Blue-Green)](#6-service-mesh-versioning-canary-blue-green)
 7. [Handling Breaking Changes Across Services](#7-handling-breaking-changes-across-services)
 8. [Code Examples: End-to-End Versioning Pipeline](#8-code-examples-end-to-end-versioning-pipeline)
 

@@ -7,19 +7,19 @@
 
 ## Table of Contents
 
-1. [Core Concepts & Terminology](#1-core-concepts--terminology)
+1. [Core Concepts & Terminology](#1-core-concepts-terminology)
 2. [Async/Await Protocol Under the Hood](#2-asyncawait-protocol-under-the-hood)
 3. [Event Loop Internals](#3-event-loop-internals)
-4. [Running & Managing the Event Loop](#4-running--managing-the-event-loop)
+4. [Running & Managing the Event Loop](#4-running-managing-the-event-loop)
 5. [Coroutines Deep Dive](#5-coroutines-deep-dive)
-6. [Tasks & Futures](#6-tasks--futures)
+6. [Tasks & Futures](#6-tasks-futures)
 7. [Synchronization Primitives](#7-synchronization-primitives)
-8. [Async Generators & Async Context Managers](#8-async-generators--async-context-managers)
-9. [Streams, Subprocesses & Networking](#9-streams-subprocesses--networking)
+8. [Async Generators & Async Context Managers](#8-async-generators-async-context-managers)
+9. [Streams, Subprocesses & Networking](#9-streams-subprocesses-networking)
 10. [Advanced Patterns](#10-advanced-patterns)
 11. [Performance Optimization](#11-performance-optimization)
 12. [Production Patterns](#12-production-patterns)
-13. [Common Pitfalls & Debugging](#13-common-pitfalls--debugging)
+13. [Common Pitfalls & Debugging](#13-common-pitfalls-debugging)
 14. [asyncio vs Threading vs Multiprocessing](#14-asyncio-vs-threading-vs-multiprocessing)
 15. [Interview Questions](#15-interview-questions)
 

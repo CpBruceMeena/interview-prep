@@ -10,21 +10,21 @@
 
 ## Table of Contents
 
-1. [Pod Lifecycle: Phase, Conditions & Container States](#1-pod-lifecycle-phase-conditions--container-states)
-2. [Init Containers, Sidecars & Ephemeral Containers](#2-init-containers-sidecars--ephemeral-containers)
-3. [Probes: Startup, Readiness & Liveness in Production](#3-probes-startup-readiness--liveness-in-production)
-4. [Pod QoS Classes & Resource Management](#4-pod-qos-classes--resource-management)
-5. [Pod Priority, Preemption & Disruption Budgets](#5-pod-priority-preemption--disruption-budgets)
-6. [Pod Security: Standards, Contexts & Admission](#6-pod-security-standards-contexts--admission)
+1. [Pod Lifecycle: Phase, Conditions & Container States](#1-pod-lifecycle-phase-conditions-container-states)
+2. [Init Containers, Sidecars & Ephemeral Containers](#2-init-containers-sidecars-ephemeral-containers)
+3. [Probes: Startup, Readiness & Liveness in Production](#3-probes-startup-readiness-liveness-in-production)
+4. [Pod QoS Classes & Resource Management](#4-pod-qos-classes-resource-management)
+5. [Pod Priority, Preemption & Disruption Budgets](#5-pod-priority-preemption-disruption-budgets)
+6. [Pod Security: Standards, Contexts & Admission](#6-pod-security-standards-contexts-admission)
 7. [Kubernete Monitoring Stack: kubelet, cAdvisor, Metrics Server](#7-kubernetes-monitoring-stack-kubelet-cadvisor-metrics-server)
-8. [kube-state-metrics & Node Exporter](#8-kube-state-metrics--node-exporter)
-9. [Prometheus Operator: ServiceMonitor, PodMonitor & Rules](#9-prometheus-operator-servicemonitor-podmonitor--rules)
-10. [Custom Metrics, KEDA & Event-Driven Autoscaling](#10-custom-metrics-keda--event-driven-autoscaling)
+8. [kube-state-metrics & Node Exporter](#8-kube-state-metrics-node-exporter)
+9. [Prometheus Operator: ServiceMonitor, PodMonitor & Rules](#9-prometheus-operator-servicemonitor-podmonitor-rules)
+10. [Custom Metrics, KEDA & Event-Driven Autoscaling](#10-custom-metrics-keda-event-driven-autoscaling)
 11. [Pod Logging: Fluentd, Loki, Structured Logging](#11-pod-logging-fluentd-loki-structured-logging)
-12. [Kubernetes Events & Audit Logs](#12-kubernetes-events--audit-logs)
+12. [Kubernetes Events & Audit Logs](#12-kubernetes-events-audit-logs)
 13. [Grafana Dashboards for Kubernetes](#13-grafana-dashboards-for-kubernetes)
-14. [Pod Alerting Rules & Runbooks](#14-pod-alerting-rules--runbooks)
-15. [eBPF Observability: Cilium Hubble & Pixie](#15-ebpf-observability-cilium-hubble--pixie)
+14. [Pod Alerting Rules & Runbooks](#14-pod-alerting-rules-runbooks)
+15. [eBPF Observability: Cilium Hubble & Pixie](#15-ebpf-observability-cilium-hubble-pixie)
 
 ---
 

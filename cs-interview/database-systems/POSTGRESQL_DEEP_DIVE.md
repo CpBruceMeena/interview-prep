@@ -7,17 +7,17 @@
 ## Table of Contents
 
 1. [Architecture Overview](#1-architecture-overview)
-2. [Process & Memory Architecture](#2-process--memory-architecture)
+2. [Process & Memory Architecture](#2-process-memory-architecture)
 3. [Storage Internals](#3-storage-internals)
-4. [MVCC & Vacuum](#4-mvcc--vacuum)
-5. [WAL & Checkpoints](#5-wal--checkpoints)
+4. [MVCC & Vacuum](#4-mvcc-vacuum)
+5. [WAL & Checkpoints](#5-wal-checkpoints)
 6. [Query Execution Pipeline](#6-query-execution-pipeline)
 7. [Indexing In Depth](#7-indexing-in-depth)
-8. [Partitioning & Sharding](#8-partitioning--sharding)
+8. [Partitioning & Sharding](#8-partitioning-sharding)
 9. [Performance Tuning](#9-performance-tuning)
 10. [Production Operations](#10-production-operations)
 11. [Staff-Level Interview Questions](#11-staff-level-interview-questions)
-12. [Common Pitfalls & Anti-Patterns](#12-common-pitfalls--anti-patterns)
+12. [Common Pitfalls & Anti-Patterns](#12-common-pitfalls-anti-patterns)
 
 ---
 

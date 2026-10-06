@@ -7,7 +7,7 @@
 ## Table of Contents
 
 1. [Lock-Free Data Structures & Hazard Pointers](#1-lock-free-data-structures-hazard-pointers)
-2. [Memory Models: Happens-Before & Ordering](#2-memory-models-happens-before-ordering)
+2. [Memory Models: Happens-Before & Ordering](#2-memory-models-happens-before)
 3. [Amdahl's Law & Universal Scalability Law](#3-amdahls-law-universal-scalability-law)
 4. [Deadlock Analysis & Prevention](#4-deadlock-analysis-prevention)
 5. [Work-Stealing Schedulers](#5-work-stealing-schedulers)

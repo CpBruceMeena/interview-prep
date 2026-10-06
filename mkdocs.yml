@@ -374,26 +374,26 @@ nav:
 
   - 🐍 Python DSA (167 Questions):
     - Overview: python-dsa/index.md
-    - Arrays: python-dsa/01_arrays/
-    - Strings: python-dsa/02_strings/
-    - Stacks: python-dsa/03_stacks/
-    - Queues: python-dsa/04_queues/
-    - Hashing: python-dsa/05_hashing/
-    - Linked Lists: python-dsa/06_linked_lists/
-    - Trees: python-dsa/07_trees/
-    - Graphs: python-dsa/08_graphs/
-    - Dynamic Programming: python-dsa/09_dynamic_programming/
-    - Sorting & Searching: python-dsa/10_sorting_searching/
-    - Backtracking: python-dsa/11_backtracking/
-    - Trie: python-dsa/12_trie/
-    - Heaps: python-dsa/13_heaps/
-    - Bit Manipulation: python-dsa/14_bit_manipulation/
-    - Advanced Strings: python-dsa/15_advanced_strings/
-    - Advanced Trees: python-dsa/16_advanced_trees/
-    - Sliding Window: python-dsa/17_sliding_window/
-    - Greedy: python-dsa/18_greedy/
-    - Math & Number Theory: python-dsa/19_math_number_theory/
-    - Design Problems: python-dsa/20_design_problems/
+    - Arrays: python-dsa/01_arrays/index.md
+    - Strings: python-dsa/02_strings/index.md
+    - Stacks: python-dsa/03_stacks/index.md
+    - Queues: python-dsa/04_queues/index.md
+    - Hashing: python-dsa/05_hashing/index.md
+    - Linked Lists: python-dsa/06_linked_lists/index.md
+    - Trees: python-dsa/07_trees/index.md
+    - Graphs: python-dsa/08_graphs/index.md
+    - Dynamic Programming: python-dsa/09_dynamic_programming/index.md
+    - Sorting & Searching: python-dsa/10_sorting_searching/index.md
+    - Backtracking: python-dsa/11_backtracking/index.md
+    - Trie: python-dsa/12_trie/index.md
+    - Heaps: python-dsa/13_heaps/index.md
+    - Bit Manipulation: python-dsa/14_bit_manipulation/index.md
+    - Advanced Strings: python-dsa/15_advanced_strings/index.md
+    - Advanced Trees: python-dsa/16_advanced_trees/index.md
+    - Sliding Window: python-dsa/17_sliding_window/index.md
+    - Greedy: python-dsa/18_greedy/index.md
+    - Math & Number Theory: python-dsa/19_math_number_theory/index.md
+    - Design Problems: python-dsa/20_design_problems/index.md
 
   - 🖥️ CS Core:
     - Overview: cs-interview/README.md

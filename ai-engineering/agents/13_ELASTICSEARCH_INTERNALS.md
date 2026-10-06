@@ -336,4 +336,4 @@ User Query: "Harry Poter"
 ---
 
 > **Previous:** [Search Autocorrect & Misspelling Handling](12_SEARCH_AUTOCORRECT.md)
-> **Next:** See [Job Scheduling Design](../../low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md) for the Airflow-like job scheduler LLD.
+> **Next:** See [Job Scheduling Design](../../python-low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md) for the Airflow-like job scheduler LLD.

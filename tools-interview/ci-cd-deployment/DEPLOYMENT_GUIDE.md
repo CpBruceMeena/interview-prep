@@ -7,7 +7,7 @@
 ## Table of Contents
 
 1. [Core Concepts](#1-core-concepts)
-2. [End-to-End Flow: Repository → Production](#2-end-to-end-flow-repository--production)
+2. [End-to-End Flow: Repository → Production](#2-end-to-end-flow-repository-production)
 3. [Deployment Strategies](#3-deployment-strategies)
 4. [Frontend Deployment](#4-frontend-deployment)
 5. [Backend Deployment by Language](#5-backend-deployment-by-language)
