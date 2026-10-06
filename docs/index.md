@@ -11,11 +11,11 @@
         </p>
         <div class="hero-stats">
             <div class="hero-stat">
-                <span class="hero-stat-number">24</span>
+                <span class="hero-stat-number">26</span>
                 <span class="hero-stat-label">LLD Projects</span>
             </div>
             <div class="hero-stat">
-                <span class="hero-stat-number">167+</span>
+                <span class="hero-stat-number">171</span>
                 <span class="hero-stat-label">DSA Questions</span>
             </div>
             <div class="hero-stat">

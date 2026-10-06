@@ -1,6 +1,6 @@
 # Sorting & Searching
 
-> Python implementation — 12 questions covering core concepts and interview patterns.
+> Python implementation — 9 questions covering core concepts and interview patterns.
 
 SORTING & SEARCHING — Core Concepts & Interview Questions
 

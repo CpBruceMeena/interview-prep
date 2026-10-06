@@ -37,29 +37,24 @@ CATEGORY_TITLES = {
     "20_design_problems": "Design Problems",
 }
 
-# Question count mapping
-QUESTION_COUNTS = {
-    "01_arrays": 10,
-    "02_strings": 10,
-    "03_stacks": 8,
-    "04_queues": 6,
-    "05_hashing": 8,
-    "06_linked_lists": 8,
-    "07_trees": 10,
-    "08_graphs": 10,
-    "09_dynamic_programming": 11,
-    "10_sorting_searching": 12,
-    "11_backtracking": 10,
-    "12_trie": 7,
-    "13_heaps": 9,
-    "14_bit_manipulation": 10,
-    "15_advanced_strings": 8,
-    "16_advanced_trees": 4,
-    "17_sliding_window": 8,
-    "18_greedy": 9,
-    "19_math_number_theory": 10,
-    "20_design_problems": 6,
-}
+# Each category marks its entries with a banner comment. Most use
+# "# QUESTION <n>"; the design-patterns category uses "# DESIGN <n>"; the
+# advanced-trees category is organised by named structure instead.
+ENTRY_MARKERS = (
+    re.compile(r"^#\s*QUESTION\s+\d+", re.M),
+    re.compile(r"^#\s*DESIGN\s+\d+", re.M),
+    re.compile(r"^#\s*(?:AVL|RED-BLACK|B-TREE|B\+ TREE)\b", re.M),
+)
+
+
+def count_entries(source: str) -> int:
+    """Count a category's questions from its source rather than a static map.
+
+    The counts used to be hardcoded here and drifted as questions were added
+    and removed, so the site advertised numbers that no longer matched the
+    code. Deriving them keeps the two in step.
+    """
+    return max(len(marker.findall(source)) for marker in ENTRY_MARKERS)
 
 
 def extract_module_docstring(content: str) -> str:
@@ -78,9 +73,8 @@ def generate_page(category: str) -> str:
         return ""
 
     title = CATEGORY_TITLES.get(category, category.replace("_", " ").title())
-    question_count = QUESTION_COUNTS.get(category, "?")
-
     content = src_file.read_text(encoding="utf-8")
+    question_count = count_entries(content)
     module_doc = extract_module_docstring(content)
 
     # Extract clean first-line summary from module docstring
