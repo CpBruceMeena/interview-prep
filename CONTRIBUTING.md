@@ -66,10 +66,26 @@ python-low-level-design/<project>/
 ├── HIGH_LEVEL_DESIGN.md    architecture, scaling, trade-offs
 ├── INTERVIEW_QUESTIONS.md  follow-up questions with answers
 ├── DB_SCHEMA.md            optional — only where persistence matters
-└── <project>.py            the runnable source
+├── <project>.py            the runnable source (demo in __main__, no input())
+└── test_<project>.py       stdlib unittest; Go uses <project>_test.go
 ```
 
-Add all of them to `mkdocs.yml` as a nested nav section.
+Add all of them to `mkdocs.yml` as a nested nav section, then generate the
+landing page with `python3 scripts/generate_lld_index_pages.py`.
+
+`CODE.md` embeds the source between markers, so it can't drift from the file:
+
+````markdown
+<!-- source: <project>.py -->
+```python
+(regenerated)
+```
+<!-- /source -->
+````
+
+After changing any LLD source, run `python3 scripts/sync_lld_code.py`. CI
+(`LLD Code` workflow) fails if an embed is stale, a demo crashes, a test
+fails, Java doesn't compile or Go fails `vet` / `test -race`.
 
 ### DSA questions
 
@@ -108,7 +124,8 @@ emits, and reports anything it can't resolve rather than guessing.
 | Script | Purpose |
 |---|---|
 | `scripts/generate_dsa_docs.py` | Rebuild DSA pages from `questions.py` |
-| `scripts/generate_lld_code_pages.py` | Embed `.py` source into `CODE.md` |
+| `scripts/sync_lld_code.py` | Refresh source embedded in LLD `CODE.md` (`--check` in CI) |
+| `scripts/generate_lld_index_pages.py` | Generate each LLD project's landing `index.md` |
 | `scripts/fix_toc_anchors.py` | Repair in-page TOC anchors |
 | `scripts/export_diagrams.sh` | Export `.drawio` to SVG/PNG (needs draw.io desktop) |
 | `remotion-lld/` | Renders the animated diagrams in `docs/assets/videos/` |

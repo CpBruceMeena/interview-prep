@@ -1,0 +1,128 @@
+# 🧪 Keep the LLD implementations working.
+#
+# Every LLD project ships runnable code, and the docs embed that code. This
+# gate checks both: the code builds, its demo runs and its tests pass, and the
+# copy embedded in each CODE.md is identical to the real file.
+
+name: LLD Code
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'python-low-level-design/**'
+      - 'java-low-level-design/**'
+      - 'golang-low-level-design/**'
+      - 'scripts/sync_lld_code.py'
+      - '.github/workflows/lld-code.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'python-low-level-design/**'
+      - 'java-low-level-design/**'
+      - 'golang-low-level-design/**'
+      - 'scripts/sync_lld_code.py'
+      - '.github/workflows/lld-code.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: lld-code-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  embeds:
+    name: CODE.md embeds in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 scripts/sync_lld_code.py --check
+
+  python:
+    name: Python (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run demos and tests
+        run: |
+          status=0
+          for dir in python-low-level-design/*/; do
+            for src in "$dir"*.py; do
+              name=$(basename "$src")
+              case "$name" in test_*) continue ;; esac
+              echo "::group::demo $src"
+              (cd "$dir" && timeout 120 python "$name" > /dev/null) || { echo "::error file=$src::demo failed"; status=1; }
+              echo "::endgroup::"
+            done
+            for test in "$dir"test_*.py; do
+              [ -e "$test" ] || continue
+              echo "::group::test $test"
+              (cd "$dir" && timeout 120 python -m unittest "$(basename "$test" .py)") || { echo "::error file=$test::tests failed"; status=1; }
+              echo "::endgroup::"
+            done
+          done
+          exit $status
+
+  java:
+    name: Java
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Compile and run each project
+        run: |
+          status=0
+          for src in java-low-level-design/*/*.java; do
+            echo "::group::$src"
+            out=$(mktemp -d)
+            if javac -Xlint:all -d "$out" "$src"; then
+              (cd "$(dirname "$src")" && timeout 120 java -ea "$(basename "$src")" > /dev/null) || { echo "::error file=$src::run failed"; status=1; }
+            else
+              echo "::error file=$src::compile failed"; status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Vet, test (race) and run each project
+        run: |
+          status=0
+          for dir in golang-low-level-design/*/; do
+            src=$(ls "$dir"*.go | grep -v '_test.go$' | head -n1)
+            [ -n "$src" ] || continue
+            name=$(basename "$src")
+            echo "::group::$src"
+            (
+              cd "$dir"
+              tests=$(ls *_test.go 2>/dev/null || true)
+              go vet "$name" $tests &&
+              { [ -z "$tests" ] || go test -race -count=1 "$name" $tests; } &&
+              timeout 120 go run "$name" > /dev/null
+            ) || { echo "::error file=$src::vet/test/run failed"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
