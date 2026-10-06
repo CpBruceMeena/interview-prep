@@ -8,11 +8,34 @@
 
 ![](splitwise-class-diagram.drawio)
 
+> The diagram predates the current code: it still shows `BalanceCalculator` and float amounts. The code uses `BalanceSheet`, `SettlementStrategy` and `Decimal`.
+
+---
+
+## ⏱️ How to Run This in a 45–60 min Interview
+
+| Time | Step | What to say out loud |
+|------|------|----------------------|
+| 0–7 min | **Clarify** | "Which split types? Groups only, or also one-off expenses between friends? Do we need settle-up and 'simplify debts'? Single currency? One payer per expense?" Write the answers down as scope. |
+| 7–15 min | **Entities + interfaces** | "`Expense` and `Payment` are immutable ledger entries. A `BalanceSheet` keeps net balance per user. Split rules and settlement algorithms are strategies." Sketch `SplitStrategy.calculate_shares` and `SettlementStrategy.settle` signatures first. |
+| 15–35 min | **Core code** | Money helpers and `allocate()` first, because every split depends on them. Then the four strategies, `Expense`, `BalanceSheet`, and the service's `add_expense` / `record_payment` / `get_group_balances`. Say the invariants: shares sum to the amount; balances sum to zero. |
+| 35–45 min | **Simplify debts + concurrency** | Greedy with heaps, then say plainly: "This is a heuristic; the true minimum is NP-hard. Here is the n − k argument and a bitmask DP for small groups." Add the service lock and explain what it makes atomic. |
+| 45–60 min | **Extension + tests** | Take whatever they add (multi-payer, delete/edit, currencies). Name the tests you would write: allocation sums, negative-share regression, settlement zeroes everything, concurrent adds keep sum zero. |
+
+**Clarifying questions worth asking**
+
+- Split types: equal, exact, percentage, shares? Can a payer be excluded from the split?
+- Is "simplify debts" required, and do we need the *minimum* number of transfers or just a reasonable plan?
+- Who absorbs the leftover cent when 100 does not divide by 3?
+- One currency or many? One payer or several per expense?
+- Can expenses be edited or deleted after the fact?
+- Is this a single-process library or a service with concurrent requests?
+
 ---
 
 ## Phase 0: Requirements Gathering
 
-How are expenses split? (Equal, exact amount, percentage?) Can users organize into groups? How to simplify debts?
+Expenses are split equally, by exact amount, by percentage or by share ratio. Users belong to groups; expenses can also be outside any group. Users can see net balances, get a settle-up plan, and record payments.
 
 ## Phase 1: Identify the Nouns
 
@@ -20,81 +43,60 @@ How are expenses split? (Equal, exact amount, percentage?) Can users organize in
 
 | Noun | Decision | Why |
 |------|----------|-----|
-| User | dataclass | Identity class, minimal behavior |
-| Group | Regular Class | Contains members + expenses |
-| Expense | Regular Class | Has payer, participants, split strategy |
-| SplitStrategy | ABC | Strategy for calculating shares |
-| BalanceCalculator | Regular (static) | Pure functions for balance computation |
-| SplitwiseService | Facade | Main entry point |
-| SplitType | Enum | EQUAL, EXACT, PERCENTAGE, SHARE |
-| ExpenseCategory | Enum | FOOD, TRAVEL, BILLS, etc. |
+| User | frozen dataclass | Identity only |
+| Group | Regular class | Members plus its own `BalanceSheet` |
+| Expense | frozen dataclass | Immutable once recorded; checks `sum(shares) == amount` |
+| Payment | frozen dataclass | A settle-up is a ledger entry too |
+| SplitStrategy | ABC | Equal / Exact / Percentage / Share |
+| BalanceSheet | Regular class | Running net balance per user |
+| SettlementStrategy | ABC | Greedy heuristic vs exact DP |
+| SplitwiseService | Facade | Validation, ids, locking |
+| SplitType / ExpenseCategory | Enums | Closed sets of values |
 
-## Phase 2: Enums First
+## Phase 2: Money Before Anything Else
 
-```python
-class SplitType(Enum):      EQUAL, EXACT, PERCENTAGE, SHARE, ADJUSTMENT
-class ExpenseCategory(Enum): FOOD, TRAVEL, ENTERTAINMENT, BILLS, SHOPPING, OTHER
-```
+Decide the money type before writing a single class, because it changes every signature:
 
-## Phase 3: dataclass vs `__init__`
+- `Decimal` quantized to cents (or integer cents). Never `float`: `0.1 + 0.2 != 0.3`, and a ledger that does not sum to exactly zero is wrong forever.
+- Reject floats at the boundary (`to_money` raises `TypeError`) so callers cannot smuggle them in.
+- Do the rounding in one function. `allocate()` uses the largest-remainder method: floor every exact share, then hand the leftover cents (always fewer than the number of participants) to the largest remainders.
 
-- **`User`**: `@dataclass` — it's a pure data holder (user_id, name, email, phone). No behavior.
-- **`Expense`**: Regular — has behavior (calculate shares via strategy)
-- **`Group`**: Regular — manages members + expenses
-- **`BalanceCalculator`**: Static methods — no instance needed, pure functions
-- **`SplitStrategy`**: ABC — each strategy calculates differently
-
-**Key insight:** `User` is a dataclass candidate because it has no behavior — just fields and a hash.
-
-## Phase 4: Assigning Responsibilities
+## Phase 3: Assigning Responsibilities
 
 | Action | Owner | Why |
 |--------|-------|-----|
-| Calculate shares | `SplitStrategy.calculate_shares()` | Strategy encapsulates split logic |
-| Create expense | `SplitwiseService.add_expense()` | Service uses factory + strategy |
-| Track group expenses | `Group.add_expense()` | Group holds its expenses |
-| Compute net balances | `BalanceCalculator.calculate_balances()` | Pure math function |
-| Simplify debts | `BalanceCalculator.simplify_debts()` | Minimizes transactions |
-| Get user balance | `SplitwiseService.get_balance()` | Queries across all expenses |
+| Compute shares | `SplitStrategy.calculate_shares()` | Each rule validates its own `values` |
+| Record an expense | `SplitwiseService.add_expense()` | Needs users, group membership, lock |
+| Update balances | `BalanceSheet.apply_expense()` / `apply_payment()` | O(participants) per entry |
+| Settle up | `SplitwiseService.record_payment()` | A payment is the inverse of a debt |
+| Undo | `SplitwiseService.delete_expense()` | Re-applies the expense with `sign=-1` |
+| Simplify debts | `SettlementStrategy.settle()` | Pure function of a balance snapshot |
 
-## Phase 5: Strategy Pattern for Splits
+## Phase 4: Strategy Pattern for Splits
 
 ```python
 class SplitStrategy(ABC):
-    def calculate_shares(self, amount, participants, values) -> Dict[str, float]
+    def calculate_shares(self, amount, participant_ids, values) -> Dict[str, Decimal]
 
-class EqualSplit(SplitStrategy):       # amount / N
-class ExactSplit(SplitStrategy):       # specific amounts per person
-class PercentageSplit(SplitStrategy):  # percentage of total
-class ShareSplit(SplitStrategy):       # ratio-based (2:3:1)
+class EqualSplit(SplitStrategy):       # allocate(amount, [1] * n)
+class ExactSplit(SplitStrategy):       # values must sum to amount exactly
+class PercentageSplit(SplitStrategy):  # values must sum to 100; allocate(amount, values)
+class ShareSplit(SplitStrategy):       # ratio 2:1:1; allocate(amount, values)
 ```
 
-## Phase 6: Balance Simplification Algorithm
+Three of the four are "proportional to some weights", so they share `_proportional()` and the rounding rule lives in one place.
 
-The `simplify_debts` method uses a greedy algorithm:
-1. Sort balances from most negative (debtor) to most positive (creditor)
-2. Match the biggest debtor with the biggest creditor
-3. Settle the partial amount
-4. Repeat until all debts are settled
+## Phase 5: Debt Simplification
 
-This minimizes the number of transactions.
+1. Net balance per user: `paid − owed` (already maintained by `BalanceSheet`).
+2. **Greedy:** pop the largest debtor and largest creditor, transfer `min(debt, credit)`, push back whoever has a remainder. At most n − 1 transfers, O(n log n).
+3. **Be honest that greedy is not optimal.** Minimum transfers = n − k, where k is the maximum number of disjoint zero-sum subgroups. That is NP-hard in general; a bitmask DP solves it exactly for small groups (`OptimalSettlement`, n ≤ 12).
 
-## Phase 7: Handling Rounding Errors
+## Phase 6: Quick Checklist
 
-```python
-# EqualSplit handles rounding by adding the difference to the first person
-share = round(total_amount / len(participants), 2)
-total = sum(result.values())
-diff = round(total_amount - total, 2)
-if diff != 0:
-    result[participants[0].user_id] = round(share + diff, 2)
-```
-
-This is a real-world detail that interviewers love.
-
-## Phase 8: Quick Checklist
-
-✅ **Strategy Pattern:** Split methods are extensible (add `CustomSplit`)
-✅ **SRP:** BalanceCalculator is pure math, Expense tracks data, Service orchestrates
-✅ **Encapsulation:** Each expense stores its own shares
-✅ **Round-trip accuracy:** Handles penny rounding issues
+✅ **Exact money:** `Decimal`, floats rejected, shares sum to the amount
+✅ **Invariant:** every ledger sums to zero, after any sequence of adds, deletes and payments
+✅ **Strategy pattern:** split rules and settlement algorithms are swappable
+✅ **Immutability:** `Expense` / `Payment` are frozen; edits are reversals
+✅ **Thread-safety:** one lock around validate → compute → store → update ledger
+✅ **Honest algorithm claims:** greedy ≤ n − 1 transfers, optimum is NP-hard

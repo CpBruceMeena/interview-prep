@@ -1,616 +1,553 @@
 """
-LRU Cache - Low Level Design
--------------------------------
-Design Principles: SOLID, O(1) operations
+LRU / LFU Cache with TTL - Low Level Design
+-------------------------------------------
+    BaseCache (ABC, template method)
+      owns: key -> node map, capacity, TTL (lazy + heap-driven purge), stats
+      hooks: _insert / _touch / _unlink / _victim   <- the eviction policy
+    LRUCache   hashmap + one doubly linked list             get/put O(1)
+    LFUCache   hashmap + one DLL per frequency + min_freq   get/put O(1)
+    ThreadSafeCache   one lock around any BaseCache, plus single-flight get_or_load
+    StripedCache      N independently locked shards, hash(key) % N
 
-Architecture:
-  - Node: Generic doubly-linked list node (key + value + prev/next pointers)
-  - EvictionStrategy (ABC): Pluggable eviction policy (Strategy pattern)
-    - LRUStrategy: HashMap + DoublyLinkedList for O(1) LRU eviction
-    - LFUStrategy: Frequency maps for O(1) amortized LFU eviction
-    - TTLStrategy: Time-based expiry with configurable TTL
-  - Cache: Generic facade that delegates eviction to plugged-in strategy
-  - CacheStats (SRP): Tracks hits/misses/evictions independently
-  - CacheWithStats: Decorator wrapping a Cache to add stats tracking
-  - ThreadSafeCache: Wraps any Cache with reentrant locks for thread safety
+Complexities (n = entries):
+    get / put / delete           O(1)  (+ O(log n) heap push when a TTL is set)
+    purge_expired                O(k log n) for k expired entries
+    LFU delete/expire of the     O(F) to recompute min_freq, F = distinct
+      last key at min_freq         frequencies; deferred until the next eviction
 
-Interview Discussion Points:
-  - Why HashMap + DLL for LRU? → O(1) get/put/evict
-  - Why abstract EvictionStrategy? → Open/Closed Principle — add FIFO, ARC, 2Q without modifying Cache
-  - Why separate CacheStats? → Single Responsibility — stats logic doesn't pollute Cache
-  - How to make it thread-safe? → RLock (or ReadWriteLock for higher concurrency)
-  - How does this scale to distributed? → Consistent hashing + lazy migration
+Not thread-safe on their own. Note that get() MUTATES (moves a node / bumps a
+frequency), so a read-write lock buys nothing for LRU/LFU: every call needs
+exclusive access. Scale with striping, not RW locks.
 """
 
+from __future__ import annotations
+
+import heapq
+import itertools
+import threading
+import time
 from abc import ABC, abstractmethod
-from threading import RLock
-from typing import Any, Dict, Optional, TypeVar, Generic
+from dataclasses import dataclass
+from typing import Callable, Generic, Hashable, Iterator, Optional, TypeVar
 
-K = TypeVar("K")
+K = TypeVar("K", bound=Hashable)
 V = TypeVar("V")
+Clock = Callable[[], float]
+
+_MISSING = object()
 
 
-# ---------------------------------------------------------------------------
-# Node — building block for the doubly linked list
-# ---------------------------------------------------------------------------
+# --- Doubly linked list with sentinels -----------------------------------
 
-class Node(Generic[K, V]):
-    """A node in the doubly linked list.
+class _Node(Generic[K, V]):
+    __slots__ = ("key", "value", "expires_at", "freq", "prev", "next")
 
-    The DLL gives us O(1) move-to-front and O(1) tail-removal, which is
-    exactly what LRU eviction needs.  The 'prev' / 'next' pointers let us
-    splice the node in/out without scanning the list.
-
-    Attributes:
-        key:   Cache key (also stored in the node so evict() can return it).
-        value: Cached value.
-        prev:  Previous node in the list (None if this is the head).
-        next:  Next node in the list (None if this is the tail).
-    """
-
-    def __init__(self, key: K, value: V):
+    def __init__(self, key, value, expires_at: Optional[float]):
         self.key = key
         self.value = value
-        self.prev: Optional["Node"] = None
-        self.next: Optional["Node"] = None
+        self.expires_at = expires_at
+        self.freq = 0
+        self.prev: Optional[_Node] = None
+        self.next: Optional[_Node] = None
 
 
-# ---------------------------------------------------------------------------
-# Eviction Strategy — abstract interface (Strategy Pattern → OCP)
-# ---------------------------------------------------------------------------
+class _DList:
+    """head <-> n1 <-> ... <-> tail. Front = most recent. Sentinels remove
+    every head/tail None check, which is where hand-rolled DLLs go wrong."""
 
-class EvictionStrategy(ABC):
-    """Pluggable eviction policy.
-
-    The Cache class depends on *this abstraction*, not on any concrete
-    strategy (Dependency Inversion Principle).  New strategies can be
-    added without touching Cache (Open/Closed Principle).
-    """
-
-    @abstractmethod
-    def access(self, key: Any, node: Node) -> None:
-        """Notify the strategy that *key* was just accessed (read or updated).
-
-        The *node* parameter carries the DLL node so LRUStrategy can
-        move it to the front of its list in O(1).  LFUStrategy and
-        TTLStrategy ignore it because they track metadata separately.
-        """
-        pass
-
-    @abstractmethod
-    def add(self, key: Any, node: Node) -> None:
-        """Notify the strategy that a brand-new key is being inserted."""
-        pass
-
-    @abstractmethod
-    def evict(self) -> Any:
-        """Choose a victim key and return it.
-
-        Raises ValueError when there is nothing to evict.
-        """
-        pass
-
-    @abstractmethod
-    def remove(self, key: Any) -> None:
-        """Remove *key* from internal bookkeeping (called on explicit delete)."""
-        pass
-
-
-# ---------------------------------------------------------------------------
-# LRU — Least Recently Used
-# ---------------------------------------------------------------------------
-
-class LRUStrategy(EvictionStrategy):
-    """Evicts the *least recently used* item.
-
-    Data structures:
-      - Doubly linked list (head = MRU, tail = LRU).
-      - _node_map: Dict[key → Node] for O(1) node lookup.
-
-    Every access() moves the node to the *head* (most-recently-used end).
-    evict() pops the *tail* (least-recently-used end).
-    """
+    __slots__ = ("_head", "_tail", "_len")
 
     def __init__(self):
-        # Head = most recently used, Tail = least recently used
-        self._head: Optional[Node] = None
-        self._tail: Optional[Node] = None
-        # Maps key → Node so we can find nodes in O(1)
-        self._node_map: Dict[Any, Node] = {}
+        self._head = _Node(None, None, None)
+        self._tail = _Node(None, None, None)
+        self._head.next = self._tail
+        self._tail.prev = self._head
+        self._len = 0
 
-    # -- helper: splice a node out of the list (O(1)) --
+    def push_front(self, node: _Node) -> None:
+        node.prev = self._head
+        node.next = self._head.next
+        self._head.next.prev = node
+        self._head.next = node
+        self._len += 1
 
-    def _remove_node(self, node: Node) -> None:
-        """Detach *node* from the doubly linked list by updating its neighbours."""
-        # Bypass the node in the forward direction
-        if node.prev:
-            node.prev.next = node.next
-        # Bypass the node in the backward direction
-        if node.next:
-            node.next.prev = node.prev
-        # Update head/tail if we are removing the current head or tail
-        if node == self._head:
-            self._head = node.next
-        if node == self._tail:
-            self._tail = node.prev
-        # Clear the node's own pointers so it's a standalone node again
-        node.prev = None
-        node.next = None
+    def remove(self, node: _Node) -> None:
+        node.prev.next = node.next
+        node.next.prev = node.prev
+        node.prev = node.next = None
+        self._len -= 1
 
-    # -- helper: prepend a node to the front (O(1)) --
+    def back(self) -> Optional[_Node]:
+        return None if self._len == 0 else self._tail.prev
 
-    def _add_to_front(self, node: Node) -> None:
-        """Insert *node* at the head (most-recently-used position)."""
-        node.next = self._head
-        node.prev = None
-        if self._head:
-            self._head.prev = node
-        self._head = node
-        if self._tail is None:
-            self._tail = node
+    def __len__(self) -> int:
+        return self._len
 
-    # -- interface methods --
-
-    def access(self, key: Any, node: Node) -> None:
-        """Move *node* to the front — O(1) pointer updates.
-
-        NOTE: The 'node' parameter is the DLL node associated with 'key'.
-        We check the key in _node_map (O(1) dict lookup) rather than
-        scanning _node_map.values() (which would be O(n)).
-        """
-        # Remove the node from its current position, then re-insert at front
-        if key in self._node_map:
-            self._remove_node(node)
-        self._add_to_front(node)
-
-    def add(self, key: Any, node: Node) -> None:
-        """Insert a new key → node mapping and prepend node to the DLL."""
-        self._add_to_front(node)
-        self._node_map[key] = node
-
-    def evict(self) -> Any:
-        """Evict the LRU item (tail of the list) — O(1)."""
-        if not self._tail:
-            raise ValueError("Nothing to evict")
-        key = self._tail.key
-        self._remove_node(self._tail)
-        del self._node_map[key]
-        return key
-
-    def remove(self, key: Any) -> None:
-        """Remove *key* from tracking (called on Cache.remove())."""
-        node = self._node_map.pop(key, None)
-        if node:
-            self._remove_node(node)
+    def __iter__(self) -> Iterator[_Node]:   # front (MRU) to back (LRU)
+        node = self._head.next
+        while node is not self._tail:
+            yield node
+            node = node.next
 
 
-# ---------------------------------------------------------------------------
-# LFU — Least Frequently Used
-# ---------------------------------------------------------------------------
+# --- Stats ----------------------------------------------------------------
 
-class LFUStrategy(EvictionStrategy):
-    """Evicts the *least frequently used* item.
-
-    Data structures:
-      - _freq_map: Dict[freq → Set[key]]  — keys grouped by access frequency
-      - _key_freq: Dict[key → freq]        — reverse lookup for O(1) access
-      - _min_freq: int                     — current minimum non-empty frequency
-
-    access() increments the frequency counter for a key.  evict() picks an
-    arbitrary key from the lowest-frequency bucket.
-
-    NOTE: The 'node' parameter passed to access/add is *unused* here because
-    LFUStrategy organises keys by frequency, not by insertion order.  It
-    is part of the EvictionStrategy interface so that LRUStrategy *can* use
-    it, keeping the interface uniform across all strategies.
-    """
-
-    def __init__(self):
-        # Frequency → set of keys at that frequency
-        self._freq_map: Dict[int, set] = {}
-        # Key → current frequency
-        self._key_freq: Dict[Any, int] = {}
-        # Tracks the smallest frequency that has at least one key
-        self._min_freq = 0
-
-    def access(self, key: Any, node: Node) -> None:
-        """Increment the access frequency for *key*.
-
-        The *node* parameter is unused here (see class docstring for why).
-        """
-        freq = self._key_freq.get(key, 0)
-
-        # If the key already had a frequency, remove it from the old bucket
-        if key in self._key_freq:
-            self._freq_map[freq].discard(key)
-            # If the old bucket is now empty and it was the min, advance _min_freq
-            if not self._freq_map.get(freq) and freq == self._min_freq:
-                while self._min_freq < max(self._key_freq.values(), default=0):
-                    self._min_freq += 1
-                    if self._freq_map.get(self._min_freq):
-                        break
-
-        new_freq = freq + 1
-        self._key_freq[key] = new_freq
-        self._freq_map.setdefault(new_freq, set()).add(key)
-        self._min_freq = (
-            new_freq if self._min_freq == 0 else min(self._min_freq, new_freq)
-        )
-
-    def add(self, key: Any, node: Node) -> None:
-        """Delegate to access() which handles first-time frequency = 0 → 1."""
-        self.access(key, node)
-
-    def evict(self) -> Any:
-        """Pick an arbitrary key from the lowest-frequency bucket."""
-        if self._min_freq not in self._freq_map or not self._freq_map[self._min_freq]:
-            raise ValueError("Nothing to evict")
-        # Pick any key from the min-frequency set (set iteration is O(1))
-        key = next(iter(self._freq_map[self._min_freq]))
-        self._freq_map[self._min_freq].discard(key)
-        del self._key_freq[key]
-        return key
-
-    def remove(self, key: Any) -> None:
-        """Remove *key* from frequency tracking."""
-        freq = self._key_freq.pop(key, None)
-        if freq and freq in self._freq_map:
-            self._freq_map[freq].discard(key)
-
-
-# ---------------------------------------------------------------------------
-# TTL — Time To Live
-# ---------------------------------------------------------------------------
-
-class TTLStrategy(EvictionStrategy):
-    """Evicts items whose TTL has expired.
-
-    Data structures:
-      - _expiry_map: Dict[key → absolute_expiry_timestamp]
-
-    NOTE: The 'node' parameter passed to access/add is *unused* (TTL is
-    solely based on time, not on access patterns — though some real-world
-    designs *do* extend TTL on access).
-    """
-
-    def __init__(self, default_ttl_seconds: int = 3600):
-        self._default_ttl = default_ttl_seconds
-        self._expiry_map: Dict[Any, float] = {}
-        import time
-
-        self._time = time
-
-    def access(self, key: Any, node: Node) -> None:
-        """No-op: TTL does not change on access in this implementation."""
-        pass
-
-    def add(self, key: Any, node: Node) -> None:
-        """Record the expiry time for *key*: now + default TTL."""
-        self._expiry_map[key] = self._time.time() + self._default_ttl
-
-    def evict(self) -> Any:
-        """Scan for an expired key and return it (first expired found).
-
-        This is O(n) in the number of tracked keys.  Production systems use
-        a **priority queue** (min-heap of expiry times) for O(log n) eviction.
-        """
-        now = self._time.time()
-        for key, expiry in list(self._expiry_map.items()):
-            if now >= expiry:
-                del self._expiry_map[key]
-                return key
-        raise ValueError("Nothing to evict")
-
-    def remove(self, key: Any) -> None:
-        """Remove *key* from expiry tracking."""
-        self._expiry_map.pop(key, None)
-
-    def is_expired(self, key: Any) -> bool:
-        """Check whether *key* has expired (used by Cache.get())."""
-        expiry = self._expiry_map.get(key)
-        return expiry is not None and self._time.time() >= expiry
-
-
-# ---------------------------------------------------------------------------
-# Cache — Generic facade with pluggable eviction
-# ---------------------------------------------------------------------------
-
-class Cache(Generic[K, V]):
-    """Generic cache that delegates eviction to a pluggable strategy.
-
-    Design:
-      - SRP: Cache only worries about key/value storage and routing to the
-        strategy.  Eviction logic lives in EvictionStrategy.
-      - DIP: Cache depends on the EvictionStrategy *abstraction*.
-      - OCP: New eviction strategies can be added without changing Cache.
-
-    The internal _cache dict maps keys → Node objects.  The Node objects are
-    shared with the strategy (LRUStrategy uses them as DLL nodes; LFU/TTL
-    ignore the node's neighbours).
-    """
-
-    def __init__(self, capacity: int, eviction_strategy: EvictionStrategy):
-        if capacity <= 0:
-            raise ValueError("Capacity must be positive")
-        self._capacity = capacity
-        self._strategy = eviction_strategy
-        # The primary data store: key → Node (which holds the value + DLL links)
-        self._cache: Dict[K, Node[K, V]] = {}
-
-    def get(self, key: K) -> Optional[V]:
-        """Retrieve the value for *key*, or None if missing/expired.
-
-        On a hit, the strategy's access() is called so it can update its
-        ordering (LRU moves to front, LFU increments frequency, etc.).
-        """
-        if key not in self._cache:
-            return None
-
-        node = self._cache[key]
-
-        # TTL check: if the key has expired, remove it and treat as a miss
-        if isinstance(self._strategy, TTLStrategy):
-            if self._strategy.is_expired(key):
-                self._strategy.remove(key)
-                del self._cache[key]
-                return None
-
-        # Notify the strategy that this key was accessed
-        self._strategy.access(key, node)
-        return node.value
-
-    def put(self, key: K, value: V) -> None:
-        """Insert or update a key-value pair.
-
-        If the cache is at capacity, the strategy chooses a victim to evict.
-        """
-        if key in self._cache:
-            # Update existing entry
-            node = self._cache[key]
-            node.value = value
-            self._strategy.access(key, node)
-            return
-
-        # Evict if full
-        if len(self._cache) >= self._capacity:
-            evicted_key = self._strategy.evict()
-            if evicted_key in self._cache:
-                del self._cache[evicted_key]
-
-        # Create a new Node and store it in both the cache dict and the strategy
-        node = Node(key, value)
-        self._cache[key] = node
-        self._strategy.add(key, node)
-
-    def remove(self, key: K) -> bool:
-        """Remove *key* from the cache. Returns True if key existed."""
-        if key not in self._cache:
-            return False
-        self._strategy.remove(key)
-        del self._cache[key]
-        return True
-
-    def clear(self) -> None:
-        """Remove all entries from the cache."""
-        while self._cache:
-            key = next(iter(self._cache))
-            self.remove(key)
+@dataclass
+class CacheStats:
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0      # live entries pushed out by capacity
+    expirations: int = 0    # entries removed because their TTL passed
 
     @property
-    def size(self) -> int:
-        return len(self._cache)
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total else 0.0
+
+    def __add__(self, other: CacheStats) -> CacheStats:
+        return CacheStats(self.hits + other.hits, self.misses + other.misses,
+                          self.evictions + other.evictions,
+                          self.expirations + other.expirations)
+
+
+# --- Base cache (template method) -----------------------------------------
+
+class BaseCache(ABC, Generic[K, V]):
+    def __init__(self, capacity: int, default_ttl: Optional[float] = None,
+                 clock: Clock = time.monotonic):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if default_ttl is not None and default_ttl <= 0:
+            raise ValueError("default_ttl must be positive")
+        self._capacity = capacity
+        self._default_ttl = default_ttl
+        self._clock = clock
+        self._map: dict[K, _Node] = {}
+        # (expires_at, seq, node). Entries go stale when a key is rewritten
+        # or deleted; we skip those on pop and compact when the heap gets big.
+        self._expiry_heap: list[tuple[float, int, _Node]] = []
+        self._seq = itertools.count()
+        self._stats = CacheStats()
+
+    # ---- public API ----
+    def get(self, key: K, default: Optional[V] = None) -> Optional[V]:
+        """Value for key, or `default` if absent or expired. Counts as a use."""
+        node = self._map.get(key)
+        if node is None:
+            self._stats.misses += 1
+            return default
+        if self._is_expired(node):
+            self._remove(node)
+            self._stats.expirations += 1
+            self._stats.misses += 1
+            return default
+        self._touch(node)
+        self._stats.hits += 1
+        return node.value
+
+    def put(self, key: K, value: V, ttl: Optional[float] = None) -> None:
+        """Insert or overwrite. ttl (seconds) overrides default_ttl for this key.
+        Overwriting counts as a use and resets the TTL."""
+        if ttl is not None and ttl <= 0:
+            raise ValueError("ttl must be positive")
+        ttl = ttl if ttl is not None else self._default_ttl
+        expires_at = self._clock() + ttl if ttl is not None else None
+
+        node = self._map.get(key)
+        if node is not None:
+            node.value = value
+            node.expires_at = expires_at
+            self._schedule(node)
+            self._touch(node)
+            return
+
+        if len(self._map) >= self._capacity:
+            # Reclaim dead entries before evicting a live one.
+            if self.purge_expired() == 0:
+                victim = self._victim()
+                self._remove(victim)
+                self._stats.evictions += 1
+        node = _Node(key, value, expires_at)
+        self._map[key] = node
+        self._insert(node)
+        self._schedule(node)
+
+    def delete(self, key: K) -> bool:
+        node = self._map.get(key)
+        if node is None:
+            return False
+        self._remove(node)
+        return True
+
+    def purge_expired(self) -> int:
+        """Drop every expired entry. Amortised O(log n) per removed entry."""
+        now = self._clock()
+        removed = 0
+        heap = self._expiry_heap
+        while heap and heap[0][0] <= now:
+            expires_at, _, node = heapq.heappop(heap)
+            if self._map.get(node.key) is node and node.expires_at == expires_at:
+                self._remove(node)
+                self._stats.expirations += 1
+                removed += 1
+        return removed
+
+    def __contains__(self, key: K) -> bool:
+        """Present and not expired. Does NOT count as a use."""
+        node = self._map.get(key)
+        return node is not None and not self._is_expired(node)
+
+    def __len__(self) -> int:
+        """Entries held, including expired ones not yet purged."""
+        return len(self._map)
 
     @property
     def capacity(self) -> int:
         return self._capacity
 
-    def contains(self, key: K) -> bool:
-        return key in self._cache
+    @property
+    def stats(self) -> CacheStats:
+        s = self._stats
+        return CacheStats(s.hits, s.misses, s.evictions, s.expirations)
 
-    def __contains__(self, key: K) -> bool:
-        return self.contains(key)
+    # ---- internals ----
+    def _is_expired(self, node: _Node) -> bool:
+        return node.expires_at is not None and node.expires_at <= self._clock()
+
+    def _schedule(self, node: _Node) -> None:
+        if node.expires_at is None:
+            return
+        heapq.heappush(self._expiry_heap, (node.expires_at, next(self._seq), node))
+        # Rewrites leave stale heap entries; keep the heap O(live entries).
+        if len(self._expiry_heap) > 2 * len(self._map) + 32:
+            self._expiry_heap = [(n.expires_at, next(self._seq), n)
+                                 for n in self._map.values() if n.expires_at is not None]
+            heapq.heapify(self._expiry_heap)
+
+    def _remove(self, node: _Node) -> None:
+        del self._map[node.key]
+        self._unlink(node)
+
+    # ---- policy hooks ----
+    @abstractmethod
+    def _insert(self, node: _Node) -> None:
+        """A new node entered the cache."""
+
+    @abstractmethod
+    def _touch(self, node: _Node) -> None:
+        """An existing node was read or overwritten."""
+
+    @abstractmethod
+    def _unlink(self, node: _Node) -> None:
+        """Forget a node (eviction, expiry or delete)."""
+
+    @abstractmethod
+    def _victim(self) -> _Node:
+        """The node to evict when full. Cache is non-empty."""
+
+    def _check_invariants(self) -> None:   # for tests
+        assert len(self._map) <= self._capacity
 
 
-# ---------------------------------------------------------------------------
-# CacheStats — Single Responsibility: track performance metrics
-# ---------------------------------------------------------------------------
+class LRUCache(BaseCache[K, V]):
+    """Evicts the least recently used entry. Front of the list = MRU."""
 
-class CacheStats:
-    """Tracks cache hit/miss/eviction metrics independently of the Cache class.
+    def __init__(self, capacity: int, default_ttl: Optional[float] = None,
+                 clock: Clock = time.monotonic):
+        super().__init__(capacity, default_ttl, clock)
+        self._order = _DList()
 
-    This follows SRP: if we need to add logging, alerting, or histogram
-    bucketing, we change *this* class, not the Cache class.
+    def _insert(self, node: _Node) -> None:
+        self._order.push_front(node)
+
+    def _touch(self, node: _Node) -> None:
+        self._order.remove(node)
+        self._order.push_front(node)
+
+    def _unlink(self, node: _Node) -> None:
+        self._order.remove(node)
+
+    def _victim(self) -> _Node:
+        return self._order.back()
+
+    def keys_mru_to_lru(self) -> list[K]:
+        return [n.key for n in self._order]
+
+    def _check_invariants(self) -> None:
+        super()._check_invariants()
+        listed = [n.key for n in self._order]
+        assert len(listed) == len(self._order) == len(self._map)
+        assert set(listed) == set(self._map)
+
+
+class LFUCache(BaseCache[K, V]):
+    """Evicts the least frequently used entry; ties go to the least recently
+    used among them. New entries start at freq 1.
+
+    _buckets[f] is a DLL of nodes used exactly f times (front = most recent).
+    _min_freq is the smallest non-empty f, or None when it must be recomputed.
     """
+
+    def __init__(self, capacity: int, default_ttl: Optional[float] = None,
+                 clock: Clock = time.monotonic):
+        super().__init__(capacity, default_ttl, clock)
+        self._buckets: dict[int, _DList] = {}
+        self._min_freq: Optional[int] = None
+
+    def _bucket(self, freq: int) -> _DList:
+        b = self._buckets.get(freq)
+        if b is None:
+            b = self._buckets[freq] = _DList()
+        return b
+
+    def _detach(self, node: _Node) -> bool:
+        """Remove from its bucket; True if that emptied the min bucket."""
+        b = self._buckets[node.freq]
+        b.remove(node)
+        if len(b) == 0:
+            del self._buckets[node.freq]
+            return node.freq == self._min_freq
+        return False
+
+    def _insert(self, node: _Node) -> None:
+        node.freq = 1
+        self._bucket(1).push_front(node)
+        self._min_freq = 1                       # nothing can be below 1
+
+    def _touch(self, node: _Node) -> None:
+        emptied_min = self._detach(node)
+        node.freq += 1
+        self._bucket(node.freq).push_front(node)
+        if emptied_min:
+            self._min_freq = node.freq           # it moved exactly one bucket up
+
+    def _unlink(self, node: _Node) -> None:
+        if self._detach(node):
+            self._min_freq = None                # recompute lazily in _victim
+
+    def _victim(self) -> _Node:
+        if self._min_freq is None:
+            self._min_freq = min(self._buckets)  # O(F); rare: only after a
+        return self._buckets[self._min_freq].back()  # delete/expire of the min
+
+    def frequency(self, key: K) -> int:
+        node = self._map.get(key)
+        return node.freq if node else 0
+
+    def _check_invariants(self) -> None:
+        super()._check_invariants()
+        assert sum(len(b) for b in self._buckets.values()) == len(self._map)
+        for f, b in self._buckets.items():
+            assert len(b) > 0 and all(n.freq == f for n in b)
+        if self._buckets and self._min_freq is not None:
+            assert self._min_freq == min(self._buckets)
+
+
+# --- Concurrency ----------------------------------------------------------
+
+class _Flight:
+    __slots__ = ("done", "value", "error")
 
     def __init__(self):
-        self._hits = 0
-        self._misses = 0
-        self._evictions = 0
-
-    def record_hit(self) -> None:
-        self._hits += 1
-
-    def record_miss(self) -> None:
-        self._misses += 1
-
-    def record_eviction(self) -> None:
-        self._evictions += 1
-
-    @property
-    def hit_rate(self) -> float:
-        total = self._hits + self._misses
-        return self._hits / total if total > 0 else 0.0
-
-    @property
-    def hits(self) -> int:
-        return self._hits
-
-    @property
-    def misses(self) -> int:
-        return self._misses
-
-    @property
-    def evictions(self) -> int:
-        return self._evictions
-
-    def report(self) -> str:
-        return (
-            f"Cache Stats:\n"
-            f"  Hits: {self._hits}\n"
-            f"  Misses: {self._misses}\n"
-            f"  Hit Rate: {self.hit_rate:.2%}\n"
-            f"  Evictions: {self._evictions}"
-        )
+        self.done = threading.Event()
+        self.value = None
+        self.error: Optional[BaseException] = None
 
 
-# ---------------------------------------------------------------------------
-# CacheWithStats — Decorator pattern
-# ---------------------------------------------------------------------------
+class ThreadSafeCache(Generic[K, V]):
+    """One mutex around a BaseCache. A plain Lock, not an RLock: nothing
+    re-enters, and not a read-write lock: get() mutates recency/frequency."""
 
-class CacheWithStats(Cache):
-    """Decorator that wraps a Cache and transparently records statistics.
-
-    Uses the Decorator pattern: same interface as Cache, but adds behaviour
-    (stats tracking) without modifying the Cache class.
-    """
-
-    def __init__(self, cache: Cache):
+    def __init__(self, cache: BaseCache[K, V]):
         self._cache = cache
-        self._stats = CacheStats()
+        self._lock = threading.Lock()
+        self._inflight: dict[K, _Flight] = {}
+
+    def get(self, key: K, default: Optional[V] = None) -> Optional[V]:
+        with self._lock:
+            return self._cache.get(key, default)
+
+    def put(self, key: K, value: V, ttl: Optional[float] = None) -> None:
+        with self._lock:
+            self._cache.put(key, value, ttl)
+
+    def delete(self, key: K) -> bool:
+        with self._lock:
+            return self._cache.delete(key)
+
+    def purge_expired(self) -> int:
+        with self._lock:
+            return self._cache.purge_expired()
+
+    def get_or_load(self, key: K, loader: Callable[[K], V],
+                    ttl: Optional[float] = None) -> V:
+        """Cache-aside with single-flight: on a miss, exactly one caller runs
+        loader(key) (outside the lock); concurrent callers for the same key
+        wait for its result instead of stampeding the backing store."""
+        with self._lock:
+            value = self._cache.get(key, _MISSING)
+            if value is not _MISSING:
+                return value
+            flight = self._inflight.get(key)
+            leader = flight is None
+            if leader:
+                flight = self._inflight[key] = _Flight()
+        if not leader:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            return flight.value
+        try:
+            flight.value = loader(key)
+        except BaseException as e:
+            flight.error = e
+            raise
+        finally:
+            with self._lock:
+                if flight.error is None:
+                    self._cache.put(key, flight.value, ttl)
+                del self._inflight[key]
+            flight.done.set()
+        return flight.value
+
+    def __contains__(self, key: K) -> bool:
+        with self._lock:
+            return key in self._cache
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
 
     @property
     def stats(self) -> CacheStats:
-        return self._stats
+        with self._lock:
+            return self._cache.stats
 
-    def get(self, key: K) -> Optional[V]:
-        value = self._cache.get(key)
-        if value is not None:
-            self._stats.record_hit()
-        else:
-            self._stats.record_miss()
-        return value
-
-    def put(self, key: K, value: V) -> None:
-        old_size = self._cache.size
-        self._cache.put(key, value)
-        # If size didn't increase and the key is new, an eviction must have happened
-        if self._cache.size <= old_size and key not in self._cache._cache:
-            self._stats.record_eviction()
-
-    def remove(self, key: K) -> bool:
-        return self._cache.remove(key)
-
-    def clear(self) -> None:
-        self._cache.clear()
-
-    @property
-    def size(self) -> int:
-        return self._cache.size
-
-    @property
-    def capacity(self) -> int:
-        return self._cache.capacity
+    def _check_invariants(self) -> None:
+        with self._lock:
+            self._cache._check_invariants()
 
 
-# ---------------------------------------------------------------------------
-# ThreadSafeCache — RLock wrapper for concurrent access
-# ---------------------------------------------------------------------------
+class StripedCache(Generic[K, V]):
+    """N shards, each its own cache + lock; a key lives in shard hash(key) % N.
 
-class ThreadSafeCache(Cache):
-    """Thread-safe wrapper around a Cache using a reentrant lock.
-
-    Why RLock (reentrant) instead of Lock?
-      - Some operations (e.g., get with TTL check) may call strategy methods
-        that themselves acquire the lock.  RLock allows the same thread to
-        re-enter.
-
-    For higher concurrency (read-heavy workloads):
-      - Replace RLock with a ReadWriteLock (Python's ``shared_memory`` or
-        a third-party RWLock).  Multiple readers can proceed in parallel;
-        writers get exclusive access.
-
-    For distributed systems:
-      - Use a distributed lock (Redis Redlock, ZooKeeper) + the local
-        ThreadSafeCache as a client-side guard.
+    Contention drops roughly N-fold because unrelated keys no longer share a
+    lock. The price: eviction is per shard (approximate global LRU/LFU), and
+    capacity is split evenly, so a hot shard evicts while others have room.
+    Under CPython's GIL pure-Python work is still serialised; striping pays
+    off with free-threaded builds or when the critical section releases the
+    GIL. In Java/Go/C++ this is the standard design (cf. Guava/Caffeine
+    segments, ConcurrentHashMap's per-bin locking).
     """
 
-    def __init__(self, capacity: int, eviction_strategy: EvictionStrategy):
-        super().__init__(capacity, eviction_strategy)
-        self._lock = RLock()
+    def __init__(self, capacity: int, stripes: int,
+                 factory: Callable[[int], BaseCache[K, V]]):
+        if stripes <= 0 or capacity < stripes:
+            raise ValueError("need 1 <= stripes <= capacity")
+        per_shard = -(-capacity // stripes)          # ceil
+        self._shards = [ThreadSafeCache(factory(per_shard)) for _ in range(stripes)]
 
-    def get(self, key: K) -> Optional[V]:
-        with self._lock:
-            return super().get(key)
+    def _shard(self, key: K) -> ThreadSafeCache[K, V]:
+        return self._shards[hash(key) % len(self._shards)]
 
-    def put(self, key: K, value: V) -> None:
-        with self._lock:
-            super().put(key, value)
+    def get(self, key: K, default: Optional[V] = None) -> Optional[V]:
+        return self._shard(key).get(key, default)
 
-    def remove(self, key: K) -> bool:
-        with self._lock:
-            return super().remove(key)
+    def put(self, key: K, value: V, ttl: Optional[float] = None) -> None:
+        self._shard(key).put(key, value, ttl)
 
-    def clear(self) -> None:
-        with self._lock:
-            super().clear()
+    def delete(self, key: K) -> bool:
+        return self._shard(key).delete(key)
 
-    # Properties are read-only and thread-safe by nature (dict access is atomic
-    # under CPython's GIL), but we lock for consistency across operations.
+    def get_or_load(self, key: K, loader: Callable[[K], V],
+                    ttl: Optional[float] = None) -> V:
+        return self._shard(key).get_or_load(key, loader, ttl)
+
+    def __contains__(self, key: K) -> bool:
+        return key in self._shard(key)
+
+    def __len__(self) -> int:
+        return sum(len(s) for s in self._shards)
+
     @property
-    def size(self) -> int:
-        with self._lock:
-            return super().size
+    def stats(self) -> CacheStats:
+        total = CacheStats()
+        for s in self._shards:
+            total = total + s.stats
+        return total
 
-    @property
-    def capacity(self) -> int:
-        with self._lock:
-            return super().capacity
+    def _check_invariants(self) -> None:
+        for s in self._shards:
+            s._check_invariants()
 
 
-# ---------------------------------------------------------------------------
-# Demo
-# ---------------------------------------------------------------------------
+# --- Demo -----------------------------------------------------------------
 
-def demo():
-    print("=== LRU Cache Demo ===")
-    cache = Cache[int, str](3, LRUStrategy())
+class ManualClock:
+    """Deterministic clock for demos and tests."""
 
-    cache.put(1, "One")
-    cache.put(2, "Two")
-    cache.put(3, "Three")
-    print(f"Cache: {[(k, cache.get(k)) for k in [1, 2, 3]]}")
+    def __init__(self, start: float = 0.0):
+        self.now = start
 
-    # Access 1, making 2 the LRU
-    print(f"Get 1: {cache.get(1)}")
-    cache.put(4, "Four")  # Should evict 2
-    print(f"Get 2: {cache.get(2)} (should be None)")
+    def __call__(self) -> float:
+        return self.now
 
-    print("\n=== LFU Cache Demo ===")
-    lfu = Cache[int, str](3, LFUStrategy())
-    lfu.put(1, "One")
-    lfu.put(2, "Two")
-    lfu.put(3, "Three")
-    lfu.get(1)  # freq: 1
-    lfu.get(1)  # freq: 2
-    lfu.put(4, "Four")  # Should evict 2 (freq 0) or 3 (freq 0)
-    print(f"Get 2: {lfu.get(2)} (should be None)")
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
-    print("\n=== TTL Cache Demo ===")
-    import time
 
-    ttl_cache = Cache[int, str](3, TTLStrategy(1))  # 1 second TTL
-    ttl_cache.put(1, "One")
-    print(f"Get 1 (before expiry): {ttl_cache.get(1)}")
-    time.sleep(1.1)
-    print(f"Get 1 (after expiry): {ttl_cache.get(1)} (should be None)")
+def demo() -> None:
+    print("=== LRU ===")
+    lru: LRUCache[str, int] = LRUCache(3)
+    for k, v in (("a", 1), ("b", 2), ("c", 3)):
+        lru.put(k, v)
+    lru.get("a")                    # a becomes MRU; b is now LRU
+    lru.put("d", 4)                 # evicts b
+    print("  order MRU->LRU:", lru.keys_mru_to_lru(), "| b present:", "b" in lru)
 
-    print("\n=== ThreadSafe Cache Demo ===")
-    safe_cache = ThreadSafeCache(3, LRUStrategy())
-    safe_cache.put(1, "One")
-    safe_cache.put(2, "Two")
-    safe_cache.put(3, "Three")
-    print(f"ThreadSafe size: {safe_cache.size}")
-    print(f"Get 1 from ThreadSafe: {safe_cache.get(1)}")
+    print("\n=== LFU (ties broken by recency) ===")
+    lfu: LFUCache[str, int] = LFUCache(3)
+    for k, v in (("a", 1), ("b", 2), ("c", 3)):
+        lfu.put(k, v)
+    lfu.get("a"); lfu.get("a"); lfu.get("c")
+    lfu.put("d", 4)                 # b has freq 1 and is the only one -> evicted
+    lfu.put("e", 5)                 # d (freq 1) evicted, not c (freq 2)
+    print("  freqs:", {k: lfu.frequency(k) for k in "abcde"})
+
+    print("\n=== TTL (manual clock) ===")
+    clock = ManualClock()
+    ttl_cache: LRUCache[str, str] = LRUCache(2, default_ttl=10, clock=clock)
+    ttl_cache.put("session", "alice")
+    ttl_cache.put("token", "xyz", ttl=2)
+    clock.advance(3)
+    print("  after 3s: token =", ttl_cache.get("token"), "| session =", ttl_cache.get("session"))
+    ttl_cache.put("x", "1")
+    clock.advance(8)                # session (t=10) expires; x (t=13) does not
+    ttl_cache.put("y", "2")         # full: purges expired 'session' instead of evicting x
+    print("  after 11s: keys =", ttl_cache.keys_mru_to_lru(), "|", ttl_cache.stats)
+
+    print("\n=== Thread-safe + single-flight loader ===")
+    calls = []
+    cache: ThreadSafeCache[int, str] = ThreadSafeCache(LRUCache(100))
+
+    def slow_load(key: int) -> str:
+        calls.append(key)
+        time.sleep(0.05)
+        return f"row-{key}"
+
+    threads = [threading.Thread(target=cache.get_or_load, args=(7, slow_load))
+               for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"  10 concurrent misses for key 7 -> loader ran {len(calls)} time(s);",
+          "value:", cache.get(7))
+
+    striped: StripedCache[int, int] = StripedCache(64, 8, LRUCache)
+    for i in range(200):
+        striped.put(i, i * i)
+    print(f"  striped: 8 shards x 8 slots, inserted 200 -> holds {len(striped)}")
 
 
 if __name__ == "__main__":

@@ -1,1338 +1,595 @@
 /**
- * Hotel Booking System - Low Level Design (Java)
- * -----------------------------------------------
- * Design Principles: SOLID, Strategy Pattern, Observer Pattern, Factory Pattern,
- *                    Decorator Pattern, State Pattern
+ * Hotel Booking System - Low Level Design (Java 17+)
+ * ---------------------------------------------------
+ * Run:  java HotelBookingSystem.java   (single-file source launcher; main self-checks and
+ *                                        throws AssertionError if any behaviour breaks)
  *
- * Key Design Decisions:
- * - Room inventory managed as date-range availability (not per-night)
- * - Strategy pattern for pricing (seasonal, loyalty, early-bird)
- * - Decorator pattern for composable pricing modifiers
- * - Observer pattern for notifications (confirmation, cancellation, upgrades)
- * - Waitlist management with priority queue and time-limited holds
- * - Group booking with room blocks and staggered cancellation policies
- * - Loyalty points tracking with points-earning and redemption
- * - Room upgrades based on availability and loyalty tier
- * - Cancellation policies with tiered refunds
+ * Scope: search availability by room type and dates, hold -> pay -> confirm, cancel with a
+ * refund policy, check in / check out, multi-room (group) bookings, hold expiry.
+ *
+ * Key design decisions:
+ *   - Stays are HALF-OPEN date ranges [checkIn, checkOut): a guest leaving on the 10th and one
+ *     arriving on the 10th do not conflict.
+ *   - Every booking is assigned specific rooms at hold time. Each room owns a RoomCalendar:
+ *     a TreeMap of non-overlapping reservations keyed by check-in date. Because existing
+ *     reservations never overlap, a new range can only collide with its floor and higher
+ *     neighbours, so the conflict check is O(log n).
+ *   - Double-booking prevention = check-and-insert under the ROOM's lock (tryReserve). No
+ *     global lock: bookings for different rooms never contend. This is the in-memory twin of
+ *     a DB exclusion constraint / unique index per (room, night).
+ *   - Two-phase booking: HELD (rooms reserved, price locked, expires after a TTL) ->
+ *     CONFIRMED after payment. Exactly one thread wins each state transition, and only that
+ *     thread releases the rooms, so rooms are never released twice.
+ *   - Money is BigDecimal (scale 2, HALF_EVEN). Time comes from an injected Clock so pricing,
+ *     refunds and expiry are deterministic in tests.
+ *   - Holds are idempotent per client key: retrying the same request returns the same booking.
  */
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.*;
-import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.stream.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+/** Entry point. Must be the first top-level class: `java File.java` runs the first class it finds. */
+public class HotelBookingSystem {
+    public static void main(String[] args) throws Exception {
+        HotelDemo.run();
+    }
+}
 
 // ============================================================
-// ENUMS & VALUE OBJECTS
+// VALUE TYPES
 // ============================================================
 
 enum RoomType {
-    SINGLE(1, 100.0), DOUBLE(2, 150.0), SUITE(4, 350.0),
-    PENTHOUSE(6, 800.0), DELUXE(2, 250.0), PRESIDENTIAL(8, 2000.0);
+    SINGLE("100.00"), DOUBLE("150.00"), SUITE("350.00");
 
-    private final int capacity;
-    private final double baseRate;
-
-    RoomType(int capacity, double baseRate) {
-        this.capacity = capacity;
-        this.baseRate = baseRate;
-    }
-
-    public int getCapacity() { return capacity; }
-    public double getBaseRate() { return baseRate; }
-
-    public RoomType upgrade() {
-        return switch (this) {
-            case SINGLE -> DOUBLE;
-            case DOUBLE -> DELUXE;
-            case DELUXE -> SUITE;
-            case SUITE -> PENTHOUSE;
-            case PENTHOUSE -> PRESIDENTIAL;
-            case PRESIDENTIAL -> PRESIDENTIAL;
-        };
-    }
+    final BigDecimal nightlyRate;
+    RoomType(String rate) { this.nightlyRate = new BigDecimal(rate); }
 }
 
-enum BookingStatus { CONFIRMED, CHECKED_IN, CHECKED_OUT, CANCELLED, NO_SHOW, WAITLIST, EXPIRED }
+enum LoyaltyTier {
+    NONE("0.00"), SILVER("0.05"), GOLD("0.10"), PLATINUM("0.15");
 
-enum PaymentStatus { PENDING, AUTHORIZED, CAPTURED, REFUNDED, FAILED, PARTIALLY_REFUNDED }
-
-enum LoyaltyTier { BRONZE(0, 0.05), SILVER(10, 0.10), GOLD(50, 0.15),
-                   PLATINUM(150, 0.25), DIAMOND(500, 0.35);
-
-    private final int pointsPerDollar;
-    private final double discountRate;
-
-    LoyaltyTier(int pointsPerDollar, double discountRate) {
-        this.pointsPerDollar = pointsPerDollar;
-        this.discountRate = discountRate;
-    }
-
-    public int getPointsPerDollar() { return pointsPerDollar; }
-    public double getDiscountRate() { return discountRate; }
-
-    public LoyaltyTier promote() {
-        return switch (this) {
-            case BRONZE -> SILVER;
-            case SILVER -> GOLD;
-            case GOLD -> PLATINUM;
-            case PLATINUM -> DIAMOND;
-            case DIAMOND -> DIAMOND;
-        };
-    }
-
-    public static LoyaltyTier fromPoints(int points) {
-        if (points >= 500) return DIAMOND;
-        if (points >= 150) return PLATINUM;
-        if (points >= 50) return GOLD;
-        if (points >= 10) return SILVER;
-        return BRONZE;
-    }
+    final BigDecimal discount;
+    LoyaltyTier(String d) { this.discount = new BigDecimal(d); }
 }
 
-enum CancellationPolicy { FLEXIBLE(48, 100.0, 0), MODERATE(72, 50.0, 0),
-                          STRICT(168, 0.0, 100.0), NON_REFUNDABLE(0, 0.0, 100.0);
+record Guest(String id, String name, LoyaltyTier tier) {}
 
-    private final int hoursBeforeCheckIn;
-    private final double refundPercentage;
-    private final double penaltyPercentage;
+record Room(String id, RoomType type, int floor) {}
 
-    CancellationPolicy(int hoursBeforeCheckIn, double refundPercentage, double penaltyPercentage) {
-        this.hoursBeforeCheckIn = hoursBeforeCheckIn;
-        this.refundPercentage = refundPercentage;
-        this.penaltyPercentage = penaltyPercentage;
-    }
-
-    public boolean isEligibleForRefund(LocalDateTime now, LocalDateTime checkIn) {
-        return ChronoUnit.HOURS.between(now, checkIn) >= hoursBeforeCheckIn;
-    }
-
-    public double getRefundPercentage(LocalDateTime now, LocalDateTime checkIn) {
-        return isEligibleForRefund(now, checkIn) ? refundPercentage : penaltyPercentage;
-    }
-
-    public double calculateRefund(double totalAmount) {
-        return totalAmount * refundPercentage / 100.0;
-    }
-}
-
-record Guest(String id, String name, String email, String phone,
-             LoyaltyTier tier, int loyaltyPoints, LocalDate memberSince) {
-    public Guest(String id, String name, String email, String phone, LoyaltyTier tier) {
-        this(id, name, email, phone, tier, 0, LocalDate.now());
-    }
-
-    public Guest withPoints(int newPoints) {
-        return new Guest(id, name, email, phone,
-            LoyaltyTier.fromPoints(newPoints), newPoints, memberSince);
-    }
-}
-
+/** Half-open [checkIn, checkOut). checkOut is the departure morning, not a night stayed. */
 record DateRange(LocalDate checkIn, LocalDate checkOut) {
-    public DateRange {
-        if (!checkOut.isAfter(checkIn)) {
-            throw new IllegalArgumentException("Check-out must be after check-in");
-        }
+    DateRange {
+        Objects.requireNonNull(checkIn);
+        Objects.requireNonNull(checkOut);
+        if (!checkOut.isAfter(checkIn)) throw new IllegalArgumentException("checkOut must be after checkIn");
     }
 
-    public long nights() { return ChronoUnit.DAYS.between(checkIn, checkOut); }
+    long nights() { return ChronoUnit.DAYS.between(checkIn, checkOut); }
 
-    public boolean overlaps(DateRange other) {
-        return !checkIn.isAfter(other.checkOut) && !other.checkIn.isAfter(checkOut);
-    }
-
-    public boolean contains(LocalDate date) {
-        return !date.isBefore(checkIn) && date.isBefore(checkOut);
-    }
-
-    public Stream<LocalDate> dates() {
-        return checkIn.datesUntil(checkOut);
+    boolean overlaps(DateRange o) {
+        return checkIn.isBefore(o.checkOut) && o.checkIn.isBefore(checkOut);
     }
 }
 
-record Room(String id, RoomType type, int floor, String view, String building, List<String> amenities) {
-    public Room(String id, RoomType type, int floor, String view) {
-        this(id, type, floor, view, "Main", List.of());
-    }
-
-    public boolean hasAmenity(String amenity) {
-        return amenities.contains(amenity);
-    }
+final class Money {
+    private Money() {}
+    static BigDecimal of(BigDecimal v) { return v.setScale(2, RoundingMode.HALF_EVEN); }
 }
 
 // ============================================================
-// PRICING STRATEGY (Strategy Pattern + Decorator Pattern)
+// PRICING (Strategy + Decorator)
 // ============================================================
 
 interface PricingStrategy {
-    double calculatePrice(RoomType roomType, DateRange stay, Guest guest);
-    String description();
+    /** Price for ONE room for the whole stay. */
+    BigDecimal price(RoomType type, DateRange stay, Guest guest);
 }
 
-class BaseRatePricing implements PricingStrategy {
-    @Override
-    public double calculatePrice(RoomType roomType, DateRange stay, Guest guest) {
-        return roomType.getBaseRate() * stay.nights();
-    }
+/** Nightly rate, plus a surcharge for Friday and Saturday nights. */
+final class NightlyRatePricing implements PricingStrategy {
+    private final BigDecimal weekendSurcharge;
+    NightlyRatePricing(BigDecimal weekendSurcharge) { this.weekendSurcharge = weekendSurcharge; }
 
     @Override
-    public String description() { return "Base rate"; }
-}
-
-class SeasonalPricing implements PricingStrategy {
-    private final PricingStrategy wrapped;
-    private final Map<Month, Double> seasonalMultipliers = Map.of(
-        Month.DECEMBER, 2.0, Month.JANUARY, 1.8,
-        Month.JUNE, 1.5, Month.JULY, 1.6, Month.AUGUST, 1.7,
-        Month.FEBRUARY, 1.3, Month.MARCH, 1.2
-    );
-
-    public SeasonalPricing(PricingStrategy wrapped) {
-        this.wrapped = wrapped;
-    }
-
-    @Override
-    public double calculatePrice(RoomType roomType, DateRange stay, Guest guest) {
-        double base = wrapped.calculatePrice(roomType, stay, guest);
-        double multiplier = stay.dates()
-            .map(d -> seasonalMultipliers.getOrDefault(d.getMonth(), 1.0))
-            .mapToDouble(Double::doubleValue)
-            .max().orElse(1.0);
-        return base * multiplier;
-    }
-
-    @Override
-    public String description() { return wrapped.description() + " → Seasonal adjustment"; }
-}
-
-class LoyaltyPricing implements PricingStrategy {
-    private final PricingStrategy wrapped;
-
-    public LoyaltyPricing(PricingStrategy wrapped) {
-        this.wrapped = wrapped;
-    }
-
-    @Override
-    public double calculatePrice(RoomType roomType, DateRange stay, Guest guest) {
-        double base = wrapped.calculatePrice(roomType, stay, guest);
-        return base * (1 - guest.tier().getDiscountRate());
-    }
-
-    @Override
-    public String description() { return wrapped.description() + " → Loyalty discount (" + description() + ")"; }
-}
-
-class EarlyBirdPricing implements PricingStrategy {
-    private final PricingStrategy wrapped;
-    private static final long EARLY_BIRD_DAYS = 30;
-
-    public EarlyBirdPricing(PricingStrategy wrapped) {
-        this.wrapped = wrapped;
-    }
-
-    @Override
-    public double calculatePrice(RoomType roomType, DateRange stay, Guest guest) {
-        double base = wrapped.calculatePrice(roomType, stay, guest);
-        long daysUntilCheckIn = ChronoUnit.DAYS.between(LocalDate.now(), stay.checkIn());
-        if (daysUntilCheckIn >= EARLY_BIRD_DAYS) {
-            return base * 0.85; // 15% discount for early booking
+    public BigDecimal price(RoomType type, DateRange stay, Guest guest) {
+        BigDecimal total = BigDecimal.ZERO;
+        for (LocalDate night = stay.checkIn(); night.isBefore(stay.checkOut()); night = night.plusDays(1)) {
+            DayOfWeek d = night.getDayOfWeek();
+            boolean weekend = d == DayOfWeek.FRIDAY || d == DayOfWeek.SATURDAY;
+            total = total.add(type.nightlyRate).add(weekend ? weekendSurcharge : BigDecimal.ZERO);
         }
-        return base;
+        return Money.of(total);
     }
-
-    @Override
-    public String description() { return wrapped.description() + " → Early bird"; }
 }
 
-class LastMinutePricing implements PricingStrategy {
-    private final PricingStrategy wrapped;
-    private static final long LAST_MINUTE_DAYS = 3;
-
-    public LastMinutePricing(PricingStrategy wrapped) {
-        this.wrapped = wrapped;
-    }
+/** Decorator: applies the guest's loyalty discount on top of whatever it wraps. */
+final class LoyaltyDiscountPricing implements PricingStrategy {
+    private final PricingStrategy inner;
+    LoyaltyDiscountPricing(PricingStrategy inner) { this.inner = inner; }
 
     @Override
-    public double calculatePrice(RoomType roomType, DateRange stay, Guest guest) {
-        double base = wrapped.calculatePrice(roomType, stay, guest);
-        long daysUntilCheckIn = ChronoUnit.DAYS.between(LocalDate.now(), stay.checkIn());
-        if (daysUntilCheckIn <= LAST_MINUTE_DAYS) {
-            return base * 0.75; // 25% discount for last-minute booking
-        }
-        return base;
+    public BigDecimal price(RoomType type, DateRange stay, Guest guest) {
+        BigDecimal base = inner.price(type, stay, guest);
+        return Money.of(base.multiply(BigDecimal.ONE.subtract(guest.tier().discount)));
     }
-
-    @Override
-    public String description() { return wrapped.description() + " → Last minute"; }
-}
-
-class WeekendSurchargePricing implements PricingStrategy {
-    private final PricingStrategy wrapped;
-
-    public WeekendSurchargePricing(PricingStrategy wrapped) {
-        this.wrapped = wrapped;
-    }
-
-    @Override
-    public double calculatePrice(RoomType roomType, DateRange stay, Guest guest) {
-        double base = wrapped.calculatePrice(roomType, stay, guest);
-        long weekendNights = stay.dates()
-            .filter(d -> d.getDayOfWeek() == DayOfWeek.FRIDAY
-                       || d.getDayOfWeek() == DayOfWeek.SATURDAY)
-            .count();
-        return base + (weekendNights * 30.0); // $30 surcharge per weekend night
-    }
-
-    @Override
-    public String description() { return wrapped.description() + " → Weekend surcharge"; }
-}
-
-class LongStayDiscountPricing implements PricingStrategy {
-    private final PricingStrategy wrapped;
-
-    public LongStayDiscountPricing(PricingStrategy wrapped) {
-        this.wrapped = wrapped;
-    }
-
-    @Override
-    public double calculatePrice(RoomType roomType, DateRange stay, Guest guest) {
-        double base = wrapped.calculatePrice(roomType, stay, guest);
-        long nights = stay.nights();
-        if (nights >= 30) return base * 0.60;  // 40% off for monthly
-        if (nights >= 14) return base * 0.75;  // 25% off for 2 weeks
-        if (nights >= 7) return base * 0.85;   // 15% off for weekly
-        return base;
-    }
-
-    @Override
-    public String description() { return wrapped.description() + " → Long stay discount"; }
 }
 
 // ============================================================
-// GROUP BOOKING
+// CANCELLATION POLICY
 // ============================================================
 
-class GroupBooking {
-    private final String groupId;
-    private final String groupName;
-    private final String contactEmail;
-    private final Map<String, Booking> bookings;
-    private final int minRooms, maxRooms;
-    private final CancellationPolicy groupPolicy;
-    private final LocalDateTime blockExpiry;
-    private final List<String> notes;
+enum CancellationPolicy {
+    /** Full refund up to 48h before check-in time, otherwise the first night is charged. */
+    FLEXIBLE(48),
+    /** Full refund up to 7 days before, otherwise the first night is charged. */
+    MODERATE(168),
+    NON_REFUNDABLE(-1);
 
-    public GroupBooking(String groupId, String groupName, String contactEmail,
-                        int minRooms, int maxRooms, CancellationPolicy groupPolicy,
-                        LocalDateTime blockExpiry) {
-        this.groupId = groupId;
-        this.groupName = groupName;
-        this.contactEmail = contactEmail;
-        this.bookings = new ConcurrentHashMap<>();
-        this.minRooms = minRooms;
-        this.maxRooms = maxRooms;
-        this.groupPolicy = groupPolicy;
-        this.blockExpiry = blockExpiry;
-        this.notes = new CopyOnWriteArrayList<>();
+    private final int freeCancelHours;
+    CancellationPolicy(int h) { this.freeCancelHours = h; }
+
+    BigDecimal refund(BigDecimal total, BigDecimal firstNight, Duration beforeCheckIn) {
+        if (this == NON_REFUNDABLE) return Money.of(BigDecimal.ZERO);
+        if (beforeCheckIn.toHours() >= freeCancelHours) return total;
+        return Money.of(total.subtract(firstNight).max(BigDecimal.ZERO));
     }
-
-    public synchronized boolean addBooking(Booking booking) {
-        if (bookings.size() >= maxRooms) {
-            return false; // Block is full
-        }
-        bookings.put(booking.getId(), booking);
-        return true;
-    }
-
-    public synchronized boolean canRelease() {
-        return bookings.size() >= minRooms;
-    }
-
-    public synchronized void releaseUnused() {
-        // Release block if minimum not met by expiry
-        if (LocalDateTime.now().isAfter(blockExpiry) && bookings.size() < minRooms) {
-            bookings.clear();
-            System.out.printf("  🗑️ Group block %s expired - releasing %d rooms%n",
-                groupId, maxRooms);
-        }
-    }
-
-    public String getGroupId() { return groupId; }
-    public int getCurrentRooms() { return bookings.size(); }
-    public int getMaxRooms() { return maxRooms; }
-    public int getMinRooms() { return minRooms; }
-    public CancellationPolicy getGroupPolicy() { return groupPolicy; }
-    public void addNote(String note) { notes.add(note); }
 }
 
 // ============================================================
-// WAITLIST
+// BOOKING (lifecycle state machine)
 // ============================================================
 
-class WaitlistEntry implements Comparable<WaitlistEntry> {
+enum BookingStatus {
+    HELD, CONFIRMED, CHECKED_IN, CHECKED_OUT, CANCELLED, EXPIRED;
+
+    boolean canMoveTo(BookingStatus next) {
+        return switch (this) {
+            case HELD -> next == CONFIRMED || next == CANCELLED || next == EXPIRED;
+            case CONFIRMED -> next == CHECKED_IN || next == CANCELLED;
+            case CHECKED_IN -> next == CHECKED_OUT;
+            case CHECKED_OUT, CANCELLED, EXPIRED -> false;
+        };
+    }
+}
+
+final class Booking {
     private final String id;
     private final Guest guest;
     private final RoomType roomType;
+    private final List<String> roomIds;
     private final DateRange stay;
-    private final LocalDateTime createdAt;
-    private final LoyaltyTier priorityTier;
+    private final BigDecimal total;           // price locked at hold time
+    private final BigDecimal firstNight;      // basis for late-cancellation penalty
+    private final CancellationPolicy policy;
+    private final Instant holdExpiresAt;
+    private BookingStatus status = BookingStatus.HELD;   // guarded by this
 
-    public WaitlistEntry(String id, Guest guest, RoomType roomType, DateRange stay) {
+    Booking(String id, Guest guest, RoomType roomType, List<String> roomIds, DateRange stay,
+            BigDecimal total, BigDecimal firstNight, CancellationPolicy policy, Instant holdExpiresAt) {
         this.id = id;
         this.guest = guest;
         this.roomType = roomType;
+        this.roomIds = List.copyOf(roomIds);
         this.stay = stay;
-        this.createdAt = LocalDateTime.now();
-        this.priorityTier = guest.tier();
+        this.total = total;
+        this.firstNight = firstNight;
+        this.policy = policy;
+        this.holdExpiresAt = holdExpiresAt;
     }
 
-    @Override
-    public int compareTo(WaitlistEntry other) {
-        // Higher loyalty tier first, then earlier creation
-        if (this.priorityTier.ordinal() != other.priorityTier.ordinal()) {
-            return other.priorityTier.ordinal() - this.priorityTier.ordinal();
-        }
-        return this.createdAt.compareTo(other.createdAt);
-    }
+    String id() { return id; }
+    Guest guest() { return guest; }
+    RoomType roomType() { return roomType; }
+    List<String> roomIds() { return roomIds; }
+    DateRange stay() { return stay; }
+    BigDecimal total() { return total; }
+    BigDecimal firstNight() { return firstNight; }
+    CancellationPolicy policy() { return policy; }
+    Instant holdExpiresAt() { return holdExpiresAt; }
+    synchronized BookingStatus status() { return status; }
 
-    public String getId() { return id; }
-    public Guest getGuest() { return guest; }
-    public RoomType getRoomType() { return roomType; }
-    public DateRange getStay() { return stay; }
-}
-
-class WaitlistManager {
-    private final Map<String, PriorityQueue<WaitlistEntry>> waitlists; // roomType -> queue
-    private static final Duration HOLD_DURATION = Duration.ofHours(24);
-    private final ScheduledExecutorService scheduler;
-
-    public WaitlistManager() {
-        this.waitlists = new ConcurrentHashMap<>();
-        this.scheduler = Executors.newSingleThreadScheduledExecutor();
-
-        // Initialize queues for each room type
-        for (RoomType type : RoomType.values()) {
-            waitlists.put(type.name(), new PriorityQueue<>());
-        }
-
-        // Periodic cleanup
-        scheduler.scheduleAtFixedRate(this::expireOldEntries, 1, 1, TimeUnit.HOURS);
-    }
-
-    public void addToWaitlist(WaitlistEntry entry) {
-        PriorityQueue<WaitlistEntry> queue = waitlists.get(entry.getRoomType().name());
-        synchronized (queue) {
-            queue.offer(entry);
-        }
-        System.out.printf("  ⏳ Added %s to waitlist for %s (tier: %s)%n",
-            entry.getGuest().name(), entry.getRoomType(), entry.getGuest().tier());
-    }
-
-    public Optional<WaitlistEntry> getNextAvailable(RoomType type) {
-        PriorityQueue<WaitlistEntry> queue = waitlists.get(type.name());
-        synchronized (queue) {
-            WaitlistEntry entry = queue.poll();
-            return Optional.ofNullable(entry);
-        }
-    }
-
-    public void removeFromWaitlist(String entryId) {
-        for (PriorityQueue<WaitlistEntry> queue : waitlists.values()) {
-            synchronized (queue) {
-                queue.removeIf(e -> e.getId().equals(entryId));
-            }
-        }
-    }
-
-    public int getWaitlistCount(RoomType type) {
-        return waitlists.get(type.name()).size();
-    }
-
-    private void expireOldEntries() {
-        for (PriorityQueue<WaitlistEntry> queue : waitlists.values()) {
-            synchronized (queue) {
-                queue.removeIf(e ->
-                    ChronoUnit.HOURS.between(e.getStay().checkIn(), LocalDateTime.now()) > 0);
-            }
-        }
-    }
-
-    public void shutdown() { scheduler.shutdown(); }
-}
-
-// ============================================================
-// INVENTORY MANAGER
-// ============================================================
-
-class InventoryManager {
-    private final Map<RoomType, NavigableMap<LocalDate, Integer>> availability;
-    private final Map<String, Room> rooms;
-
-    public InventoryManager(List<Room> rooms) {
-        this.rooms = rooms.stream().collect(Collectors.toMap(Room::id, r -> r));
-        this.availability = new ConcurrentHashMap<>();
-        for (RoomType type : RoomType.values()) {
-            availability.put(type, new ConcurrentSkipListMap<>());
-        }
-        initializeInventory();
-    }
-
-    private void initializeInventory() {
-        long countByType = rooms.stream()
-            .collect(Collectors.groupingBy(Room::type, Collectors.counting()));
-        LocalDate today = LocalDate.now();
-        for (RoomType type : RoomType.values()) {
-            NavigableMap<LocalDate, Integer> map = availability.get(type);
-            for (int i = 0; i < 365; i++) {
-                map.put(today.plusDays(i), countByType.getOrDefault(type, 0L).intValue());
-            }
-        }
-    }
-
-    public synchronized boolean checkAvailability(RoomType type, DateRange range) {
-        NavigableMap<LocalDate, Integer> inv = availability.get(type);
-        return range.dates().allMatch(d ->
-            inv.getOrDefault(d, 0) > 0
-        );
-    }
-
-    public synchronized boolean reserveRoom(RoomType type, DateRange range) {
-        if (!checkAvailability(type, range)) return false;
-        NavigableMap<LocalDate, Integer> inv = availability.get(type);
-        range.dates().forEach(d -> inv.merge(d, -1, Integer::sum));
+    /** Atomic compare-and-set on the status. Returns false if another thread got there first. */
+    synchronized boolean transition(BookingStatus expected, BookingStatus next) {
+        if (status != expected) return false;
+        if (!status.canMoveTo(next)) throw new IllegalStateException(status + " -> " + next + " not allowed");
+        status = next;
         return true;
     }
 
-    public synchronized void releaseRoom(RoomType type, DateRange range) {
-        NavigableMap<LocalDate, Integer> inv = availability.get(type);
-        range.dates().forEach(d -> inv.merge(d, 1, Integer::sum));
-    }
-
-    // Block reservation for group bookings
-    public synchronized boolean reserveBlock(RoomType type, DateRange range, int roomCount) {
-        NavigableMap<LocalDate, Integer> inv = availability.get(type);
-        boolean allAvailable = range.dates().allMatch(d ->
-            inv.getOrDefault(d, 0) >= roomCount
-        );
-        if (!allAvailable) return false;
-
-        range.dates().forEach(d -> inv.merge(d, -roomCount, Integer::sum));
-        return true;
-    }
-
-    public synchronized void releaseBlock(RoomType type, DateRange range, int roomCount) {
-        NavigableMap<LocalDate, Integer> inv = availability.get(type);
-        range.dates().forEach(d -> inv.merge(d, roomCount, Integer::sum));
-    }
-
-    public List<Room> findAvailableRooms(RoomType type, DateRange range) {
-        if (!checkAvailability(type, range)) return List.of();
-        return rooms.values().stream()
-            .filter(r -> r.type() == type)
-            .collect(Collectors.toList());
-    }
-
-    public int getAvailableCount(RoomType type, LocalDate date) {
-        return availability.get(type).getOrDefault(date, 0);
-    }
-
-    public RoomType suggestUpgrade(RoomType requested, DateRange range) {
-        // Check if a higher room type is available
-        RoomType current = requested;
-        for (int i = 0; i < 3; i++) {
-            RoomType upgraded = current.upgrade();
-            if (checkAvailability(upgraded, range)) {
-                return upgraded;
-            }
-            current = upgraded;
+    /** Transition from whatever the current state is, or throw if that move is illegal. */
+    synchronized BookingStatus moveTo(BookingStatus next) {
+        if (!status.canMoveTo(next)) {
+            throw new IllegalStateException("booking " + id + ": " + status + " -> " + next + " not allowed");
         }
-        return requested; // No upgrade available
-    }
-}
-
-// ============================================================
-// BOOKING
-// ============================================================
-
-class Booking {
-    private final String id;
-    private final Guest guest;
-    private final Room room;
-    private final DateRange stay;
-    private volatile BookingStatus status;
-    private volatile PaymentStatus paymentStatus;
-    private final double totalAmount;
-    private final double baseAmount;
-    private final double taxes;
-    private final CancellationPolicy cancellationPolicy;
-    private final LocalDateTime createdAt;
-    private final Map<String, Object> metadata;
-
-    public Booking(String id, Guest guest, Room room, DateRange stay,
-                   double amount, double taxes, CancellationPolicy policy) {
-        this.id = id;
-        this.guest = guest;
-        this.room = room;
-        this.stay = stay;
-        this.totalAmount = amount;
-        this.baseAmount = amount - taxes;
-        this.taxes = taxes;
-        this.cancellationPolicy = policy;
-        this.status = BookingStatus.CONFIRMED;
-        this.paymentStatus = PaymentStatus.PENDING;
-        this.createdAt = LocalDateTime.now();
-        this.metadata = new ConcurrentHashMap<>();
+        BookingStatus prev = status;
+        status = next;
+        return prev;
     }
 
-    // Getters
-    public String getId() { return id; }
-    public Guest getGuest() { return guest; }
-    public Room getRoom() { return room; }
-    public DateRange getStay() { return stay; }
-    public BookingStatus getStatus() { return status; }
-    public PaymentStatus getPaymentStatus() { return paymentStatus; }
-    public double getTotalAmount() { return totalAmount; }
-    public double getBaseAmount() { return baseAmount; }
-    public double getTaxes() { return taxes; }
-    public CancellationPolicy getCancellationPolicy() { return cancellationPolicy; }
-    public LocalDateTime getCreatedAt() { return createdAt; }
-
-    public void putMetadata(String key, Object value) { metadata.put(key, value); }
-    public Object getMetadata(String key) { return metadata.get(key); }
-
-    public synchronized double cancel() {
-        double refund = cancellationPolicy.calculateRefund(totalAmount);
-        this.status = BookingStatus.CANCELLED;
-        if (refund > 0) {
-            this.paymentStatus = refund >= totalAmount ?
-                PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED;
-        } else {
-            this.paymentStatus = PaymentStatus.CAPTURED;
-        }
-        return refund;
-    }
-
-    public synchronized void checkIn() { this.status = BookingStatus.CHECKED_IN; }
-    public synchronized void checkOut() { this.status = BookingStatus.CHECKED_OUT; }
-    public synchronized void markNoShow() { this.status = BookingStatus.NO_SHOW; }
-
-    public long nightsStayed() {
-        if (status == BookingStatus.CHECKED_OUT) {
-            return stay.nights();
-        }
-        if (status == BookingStatus.CHECKED_IN) {
-            return ChronoUnit.DAYS.between(stay.checkIn(), LocalDate.now());
-        }
-        return 0;
+    boolean sameRequest(Guest g, RoomType t, DateRange s, int count) {
+        return guest.id().equals(g.id()) && roomType == t && stay.equals(s) && roomIds.size() == count;
     }
 
     @Override
     public String toString() {
-        return String.format("Booking[%s] %s - %s: %s → %s ($%.2f) [%s]",
-            id, guest.name(), stay.checkIn(), stay.checkOut(),
-            status, totalAmount, room.type());
+        return "%s %s %s x%d %s..%s %s [%s]".formatted(id, guest.name(), roomType, roomIds.size(),
+                stay.checkIn(), stay.checkOut(), total, status());
     }
 }
 
+class NoAvailabilityException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    NoAvailabilityException(String msg) { super(msg); }
+}
+
 // ============================================================
-// LOYALTY POINTS TRACKER
+// PER-ROOM CALENDAR (interval set, O(log n) conflict check)
 // ============================================================
 
-class LoyaltyPointsTracker {
-    private final Map<String, Guest> guests;
-    private static final int POINTS_EXPIRY_DAYS = 365;
+record Reservation(String bookingId, DateRange range) {}
 
-    public LoyaltyPointsTracker() {
-        this.guests = new ConcurrentHashMap<>();
+final class RoomCalendar {
+    private final Room room;
+    private final TreeMap<LocalDate, Reservation> byCheckIn = new TreeMap<>();   // guarded by this
+
+    RoomCalendar(Room room) { this.room = room; }
+
+    Room room() { return room; }
+
+    synchronized boolean isFree(DateRange r) {
+        // Existing reservations never overlap each other, so only the reservation starting at or
+        // before r.checkIn and the first one starting after it can possibly overlap r.
+        Map.Entry<LocalDate, Reservation> before = byCheckIn.floorEntry(r.checkIn());
+        if (before != null && before.getValue().range().overlaps(r)) return false;
+        Map.Entry<LocalDate, Reservation> after = byCheckIn.higherEntry(r.checkIn());
+        return after == null || !after.getKey().isBefore(r.checkOut());
     }
 
-    public void registerGuest(Guest guest) {
-        guests.put(guest.id(), guest);
-    }
-
-    public int earnPoints(Guest guest, double amount) {
-        int points = (int)(amount * guest.tier().getPointsPerDollar());
-        Guest updated = guest.withPoints(guest.loyaltyPoints() + points);
-        guests.put(guest.id(), updated);
-
-        // Check for tier promotion
-        if (updated.tier() != guest.tier()) {
-            System.out.printf("  🏆 %s promoted to %s tier! (Points: %d)%n",
-                guest.name(), updated.tier(), updated.loyaltyPoints());
-        }
-
-        return points;
-    }
-
-    public boolean redeemPoints(Guest guest, int points, double amount) {
-        if (guest.loyaltyPoints() < points) return false;
-
-        // 100 points = $1 redemption value
-        double discount = points / 100.0;
-        if (discount > amount) discount = amount;
-
-        Guest updated = guest.withPoints(guest.loyaltyPoints() - (int)(discount * 100));
-        guests.put(guest.id(), updated);
+    /** Check-and-insert as one atomic step: the heart of double-booking prevention. */
+    synchronized boolean tryReserve(String bookingId, DateRange r) {
+        if (!isFree(r)) return false;
+        byCheckIn.put(r.checkIn(), new Reservation(bookingId, r));
         return true;
     }
 
-    public int getPoints(String guestId) {
-        Guest guest = guests.get(guestId);
-        return guest != null ? guest.loyaltyPoints() : 0;
+    synchronized void release(String bookingId, DateRange r) {
+        Reservation existing = byCheckIn.get(r.checkIn());
+        if (existing != null && existing.bookingId().equals(bookingId)) byCheckIn.remove(r.checkIn());
     }
 
-    public Guest getGuest(String guestId) {
-        return guests.get(guestId);
-    }
-
-    public LoyaltyTier getTier(String guestId) {
-        Guest guest = guests.get(guestId);
-        return guest != null ? guest.tier() : LoyaltyTier.BRONZE;
-    }
-}
-
-// ============================================================
-// REVENUE MANAGER
-// ============================================================
-
-class RevenueManager {
-    private final Map<RoomType, Map<LocalDate, Double>> dailyRevenue;
-    private final Map<RoomType, AtomicLong> totalBookings;
-
-    public RevenueManager() {
-        this.dailyRevenue = new ConcurrentHashMap<>();
-        this.totalBookings = new ConcurrentHashMap<>();
-        for (RoomType type : RoomType.values()) {
-            dailyRevenue.put(type, new ConcurrentHashMap<>());
-            totalBookings.put(type, new AtomicLong(0));
-        }
-    }
-
-    public void recordRevenue(RoomType type, LocalDate date, double amount) {
-        dailyRevenue.get(type).merge(date, amount, Double::sum);
-        totalBookings.get(type).incrementAndGet();
-    }
-
-    public double getDailyRevenue(RoomType type, LocalDate date) {
-        return dailyRevenue.get(type).getOrDefault(date, 0.0);
-    }
-
-    public double getTotalRevenue(RoomType type) {
-        return dailyRevenue.get(type).values().stream().mapToDouble(Double::doubleValue).sum();
-    }
-
-    public double getTotalRevenueAll() {
-        return dailyRevenue.values().stream()
-            .flatMap(m -> m.values().stream())
-            .mapToDouble(Double::doubleValue)
-            .sum();
-    }
-
-    public void printRevenueReport() {
-        System.out.println("\n" + "=".repeat(55));
-        System.out.println("           REVENUE REPORT");
-        System.out.println("=".repeat(55));
-        double grandTotal = 0;
-        for (RoomType type : RoomType.values()) {
-            double rev = getTotalRevenue(type);
-            long bookings = totalBookings.get(type).get();
-            if (bookings > 0) {
-                System.out.printf("  %-15s: $%.2f (%d bookings, avg $%.2f)%n",
-                    type, rev, bookings, rev / bookings);
-            }
-            grandTotal += rev;
-        }
-        System.out.printf("  %-15s: $%.2f%n", "TOTAL", grandTotal);
-        System.out.println("=".repeat(55));
-    }
-}
-
-// ============================================================
-// NOTIFICATION SERVICE (Observer Pattern)
-// ============================================================
-
-interface BookingObserver {
-    void onBookingCreated(Booking booking);
-    void onBookingCancelled(Booking booking, double refund);
-    void onCheckIn(Booking booking);
-    void onCheckOut(Booking booking);
-    void onNoShow(Booking booking);
-    void onUpgradeOffered(Booking booking, RoomType newType);
-    void onWaitlistNotified(WaitlistEntry entry);
-    void onLoyaltyPointsEarned(Guest guest, int points);
-    void onGroupBookingCreated(GroupBooking group);
-}
-
-class EmailNotificationService implements BookingObserver {
-    @Override
-    public void onBookingCreated(Booking booking) {
-        System.out.printf("📧 Email to %s: Booking %s confirmed for %s - %s ($%.2f)%n",
-            booking.getGuest().email(), booking.getId(),
-            booking.getStay().checkIn(), booking.getStay().checkOut(),
-            booking.getTotalAmount());
-    }
-
-    @Override
-    public void onBookingCancelled(Booking booking, double refund) {
-        System.out.printf("📧 Email to %s: Booking %s cancelled. Refund: $%.2f%n",
-            booking.getGuest().email(), booking.getId(), refund);
-    }
-
-    @Override
-    public void onCheckIn(Booking booking) {
-        System.out.printf("📧 Welcome email to %s: Enjoy your stay in %s!%n",
-            booking.getGuest().email(), booking.getRoom().id());
-    }
-
-    @Override
-    public void onCheckOut(Booking booking) {
-        System.out.printf("📧 Thank you email to %s: We hope you enjoyed your stay!%n",
-            booking.getGuest().email());
-    }
-
-    @Override
-    public void onNoShow(Booking booking) {
-        System.out.printf("📧 Email to %s: No-show penalty applied for booking %s ($%.2f)%n",
-            booking.getGuest().email(), booking.getId(), booking.getTotalAmount());
-    }
-
-    @Override
-    public void onUpgradeOffered(Booking booking, RoomType newType) {
-        System.out.printf("⭐ Upgrade available for %s: %s → %s (complimentary!)%n",
-            booking.getGuest().name(), booking.getRoom().type(), newType);
-    }
-
-    @Override
-    public void onWaitlistNotified(WaitlistEntry entry) {
-        System.out.printf("📧 Waitlist notification to %s: %s available for %s!%n",
-            entry.getGuest().email(), entry.getRoomType(),
-            entry.getStay().checkIn());
-    }
-
-    @Override
-    public void onLoyaltyPointsEarned(Guest guest, int points) {
-        System.out.printf("💎 %s earned %d loyalty points (Total: %d, Tier: %s)%n",
-            guest.name(), points, guest.loyaltyPoints(), guest.tier());
-    }
-
-    @Override
-    public void onGroupBookingCreated(GroupBooking group) {
-        System.out.printf("📧 Group booking created: %s (%d rooms, contact: %s)%n",
-            group.getGroupId(), group.getMaxRooms(), group.getGroupId());
-    }
+    synchronized List<Reservation> reservations() { return List.copyOf(byCheckIn.values()); }
 }
 
 // ============================================================
 // HOTEL BOOKING SERVICE (Facade)
 // ============================================================
 
-class HotelBookingService {
-    private final String hotelName;
-    private final InventoryManager inventory;
+final class HotelBookingService {
+    private static final LocalTime CHECK_IN_TIME = LocalTime.of(15, 0);
+
+    private final Map<RoomType, List<RoomCalendar>> calendarsByType;      // immutable after construction
+    private final Map<String, RoomCalendar> calendarsById;
     private final PricingStrategy pricing;
-    private final List<BookingObserver> observers;
-    private final Map<String, Booking> bookings;
-    private final Map<String, Guest> guests;
-    private final WaitlistManager waitlist;
-    private final LoyaltyPointsTracker loyalty;
-    private final RevenueManager revenue;
-    private final Map<String, GroupBooking> groupBookings;
-    private final ScheduledExecutorService scheduler;
-    private int bookingCounter;
-    private static final double TAX_RATE = 0.12;
+    private final Clock clock;
+    private final Duration holdTtl;
+    private final Map<String, Booking> bookings = new ConcurrentHashMap<>();
+    private final Map<String, Booking> byIdempotencyKey = new ConcurrentHashMap<>();
+    private final AtomicLong ids = new AtomicLong();
 
-    public HotelBookingService(String name, List<Room> rooms, PricingStrategy pricing) {
-        this.hotelName = name;
-        this.inventory = new InventoryManager(rooms);
+    HotelBookingService(List<Room> rooms, PricingStrategy pricing, Clock clock, Duration holdTtl) {
+        Map<RoomType, List<RoomCalendar>> byType = new EnumMap<>(RoomType.class);
+        Map<String, RoomCalendar> byId = new HashMap<>();
+        for (Room r : rooms) {
+            RoomCalendar cal = new RoomCalendar(r);
+            if (byId.put(r.id(), cal) != null) throw new IllegalArgumentException("duplicate room " + r.id());
+            byType.computeIfAbsent(r.type(), t -> new ArrayList<>()).add(cal);
+        }
+        byType.replaceAll((t, list) -> List.copyOf(list));
+        this.calendarsByType = Collections.unmodifiableMap(byType);
+        this.calendarsById = Map.copyOf(byId);
         this.pricing = pricing;
-        this.observers = new CopyOnWriteArrayList<>();
-        this.bookings = new ConcurrentHashMap<>();
-        this.guests = new ConcurrentHashMap<>();
-        this.waitlist = new WaitlistManager();
-        this.loyalty = new LoyaltyPointsTracker();
-        this.revenue = new RevenueManager();
-        this.groupBookings = new ConcurrentHashMap<>();
-        this.scheduler = Executors.newSingleThreadScheduledExecutor();
-        this.bookingCounter = 0;
-
-        // Add default observer
-        addObserver(new EmailNotificationService());
-
-        // Schedule no-show detection and waitlist processing
-        scheduler.scheduleAtFixedRate(this::checkNoShows, 1, 1, TimeUnit.HOURS);
-        scheduler.scheduleAtFixedRate(this::processWaitlist, 1, 5, TimeUnit.MINUTES);
+        this.clock = clock;
+        this.holdTtl = holdTtl;
     }
 
-    public void addObserver(BookingObserver observer) { observers.add(observer); }
-    public RevenueManager getRevenue() { return revenue; }
-
-    // --- Core API ---
-
-    public List<Room> searchRooms(RoomType type, DateRange stay) {
-        return inventory.findAvailableRooms(type, stay);
+    /** Rooms free right now. Advisory only: hold() re-checks under each room's lock. */
+    List<Room> searchAvailable(RoomType type, DateRange stay) {
+        return calendarsByType.getOrDefault(type, List.of()).stream()
+                .filter(c -> c.isFree(stay)).map(RoomCalendar::room).collect(Collectors.toList());
     }
 
-    public synchronized Booking createBooking(Guest guest, RoomType roomType, DateRange stay) {
-        // Register guest if new
-        guests.putIfAbsent(guest.id(), guest);
-        loyalty.registerGuest(guest);
-
-        // Check availability
-        if (!inventory.checkAvailability(roomType, stay)) {
-            // Add to waitlist
-            WaitlistEntry waitlistEntry = new WaitlistEntry(
-                "WL-" + UUID.randomUUID().toString().substring(0, 8),
-                guest, roomType, stay);
-            waitlist.addToWaitlist(waitlistEntry);
-            throw new IllegalStateException("No availability for " + roomType
-                + " on " + stay.checkIn() + " to " + stay.checkOut()
-                + " — added to waitlist");
+    /**
+     * Reserve {@code roomCount} rooms of a type, all-or-nothing, and lock the price.
+     * Idempotent: the same key returns the original booking (and rejects a different request).
+     */
+    Booking hold(String idempotencyKey, Guest guest, RoomType type, DateRange stay,
+                 int roomCount, CancellationPolicy policy) {
+        if (roomCount < 1) throw new IllegalArgumentException("roomCount must be >= 1");
+        if (stay.checkIn().isBefore(LocalDate.now(clock))) throw new IllegalArgumentException("check-in is in the past");
+        Booking b = byIdempotencyKey.computeIfAbsent(idempotencyKey,
+                k -> doHold(guest, type, stay, roomCount, policy));
+        if (!b.sameRequest(guest, type, stay, roomCount)) {
+            throw new IllegalArgumentException("idempotency key " + idempotencyKey + " reused for a different request");
         }
+        return b;
+    }
 
-        // Calculate price with all modifiers
-        double amount = pricing.calculatePrice(roomType, stay, guest);
-        double taxes = amount * TAX_RATE;
-        double total = amount + taxes;
-
-        // Reserve inventory
-        inventory.reserveRoom(roomType, stay);
-
-        // Find specific room
-        List<Room> available = inventory.findAvailableRooms(roomType, stay);
-        Room room = available.isEmpty() ? null : available.get(0);
-
-        // Check for upgrade
-        RoomType upgradedType = inventory.suggestUpgrade(roomType, stay);
-        if (upgradedType != roomType) {
-            notifyUpgradeOffered(new Booking("", guest, room, stay, total, taxes,
-                CancellationPolicy.FLEXIBLE), upgradedType);
+    private Booking doHold(Guest guest, RoomType type, DateRange stay, int roomCount, CancellationPolicy policy) {
+        String id = "BK-" + ids.incrementAndGet();
+        List<RoomCalendar> taken = new ArrayList<>();
+        for (RoomCalendar cal : calendarsByType.getOrDefault(type, List.of())) {
+            if (taken.size() == roomCount) break;
+            if (cal.tryReserve(id, stay)) taken.add(cal);
         }
-
-        // Create booking
-        bookingCounter++;
-        String bookingId = generateBookingId();
-        CancellationPolicy cancelPolicy = determineCancellationPolicy(guest, stay);
-        Booking booking = new Booking(bookingId, guest, room, stay, total, taxes, cancelPolicy);
-        bookings.put(bookingId, booking);
-        booking.putMetadata("created", LocalDateTime.now().toString());
-
-        // Track revenue and points
-        revenue.recordRevenue(roomType, stay.checkIn(), total);
-        int points = loyalty.earnPoints(guest, amount);
-        notifyLoyaltyPointsEarned(guest, points);
-
-        // Notify observers
-        notifyBookingCreated(booking);
-        return booking;
-    }
-
-    // --- Group Booking ---
-
-    public synchronized GroupBooking createGroupBooking(String groupId, String groupName,
-                                                         String contactEmail, RoomType roomType,
-                                                         DateRange stay, int minRooms, int maxRooms) {
-        // Reserve block of rooms
-        if (!inventory.reserveBlock(roomType, stay, maxRooms)) {
-            throw new IllegalStateException("Cannot reserve " + maxRooms
-                + " rooms of type " + roomType + " for " + stay);
+        if (taken.size() < roomCount) {
+            taken.forEach(c -> c.release(id, stay));      // compensate: all-or-nothing
+            throw new NoAvailabilityException("only " + taken.size() + " of " + roomCount + " " + type + " free for " + stay);
         }
-
-        GroupBooking group = new GroupBooking(groupId, groupName, contactEmail,
-            minRooms, maxRooms, CancellationPolicy.MODERATE,
-            LocalDateTime.now().plusDays(14));
-        groupBookings.put(groupId, group);
-
-        notifyGroupBookingCreated(group);
-        return group;
+        BigDecimal perRoom = pricing.price(type, stay, guest);
+        BigDecimal firstNight = pricing.price(type, new DateRange(stay.checkIn(), stay.checkIn().plusDays(1)), guest);
+        Booking b = new Booking(id, guest, type,
+                taken.stream().map(c -> c.room().id()).collect(Collectors.toList()), stay,
+                Money.of(perRoom.multiply(BigDecimal.valueOf(roomCount))),
+                Money.of(firstNight.multiply(BigDecimal.valueOf(roomCount))),
+                policy, clock.instant().plus(holdTtl));
+        bookings.put(id, b);
+        return b;
     }
 
-    public synchronized Booking addToGroupBooking(String groupId, Guest guest, RoomType roomType,
-                                                    DateRange stay) {
-        GroupBooking group = groupBookings.get(groupId);
-        if (group == null) throw new IllegalArgumentException("Group not found: " + groupId);
-
-        // Calculate price
-        double amount = pricing.calculatePrice(roomType, stay, guest);
-        double taxes = amount * TAX_RATE;
-        double total = amount + taxes;
-
-        Room room = inventory.findAvailableRooms(roomType, stay).stream().findFirst().orElse(null);
-
-        bookingCounter++;
-        String bookingId = generateBookingId();
-        Booking booking = new Booking(bookingId, guest, room, stay, total, taxes,
-            CancellationPolicy.MODERATE);
-        bookings.put(bookingId, booking);
-
-        // Track revenue and points
-        revenue.recordRevenue(roomType, stay.checkIn(), total);
-        loyalty.earnPoints(guest, amount);
-
-        group.addBooking(booking);
-        notifyBookingCreated(booking);
-        return booking;
-    }
-
-    // --- Cancellation ---
-
-    public synchronized double cancelBooking(String bookingId) {
-        Booking booking = bookings.get(bookingId);
-        if (booking == null) throw new IllegalArgumentException("Booking not found: " + bookingId);
-
-        double refund = booking.cancel();
-        inventory.releaseRoom(booking.getRoom().type(), booking.getStay());
-
-        // If refund is partial, some revenue is retained
-        revenue.recordRevenue(booking.getRoom().type(), booking.getStay().checkIn(),
-            -(refund));
-
-        notifyBookingCancelled(booking, refund);
-
-        // Notify waitlist
-        processWaitlistForRoomType(booking.getRoom().type());
-        return refund;
-    }
-
-    // --- Check-in / Check-out ---
-
-    public synchronized void checkIn(String bookingId) {
-        Booking booking = bookings.get(bookingId);
-        if (booking == null) throw new IllegalArgumentException("Booking not found: " + bookingId);
-        booking.checkIn();
-        booking.getGuest();
-        notifyCheckIn(booking);
-    }
-
-    public synchronized void checkOut(String bookingId) {
-        Booking booking = bookings.get(bookingId);
-        if (booking == null) throw new IllegalArgumentException("Booking not found: " + bookingId);
-        booking.checkOut();
-        inventory.releaseRoom(booking.getRoom().type(), booking.getStay());
-        notifyCheckOut(booking);
-    }
-
-    // --- Waitlist ---
-
-    public void addToWaitlist(Guest guest, RoomType roomType, DateRange stay) {
-        WaitlistEntry entry = new WaitlistEntry(
-            "WL-" + UUID.randomUUID().toString().substring(0, 8),
-            guest, roomType, stay);
-        waitlist.addToWaitlist(entry);
-    }
-
-    // --- Reporting ---
-
-    public void printAvailability(RoomType type, LocalDate from, int days) {
-        System.out.println("\n📊 AVAILABILITY for " + type + " (" + hotelName + ")");
-        System.out.println("-".repeat(50));
-        for (int i = 0; i < days; i++) {
-            LocalDate date = from.plusDays(i);
-            int count = inventory.getAvailableCount(type, date);
-            int waitlisted = waitlist.getWaitlistCount(type);
-            String bar = "█".repeat(Math.min(count, 20));
-            System.out.printf("  %s: %s %d rooms (waitlist: %d)%n", date, bar, count, waitlisted);
+    /** Called after payment succeeds. Fails if the hold already expired (rooms were released). */
+    Booking confirm(String bookingId) {
+        Booking b = get(bookingId);
+        if (!clock.instant().isBefore(b.holdExpiresAt())) {
+            if (b.transition(BookingStatus.HELD, BookingStatus.EXPIRED)) releaseRooms(b);
+            throw new IllegalStateException("hold " + bookingId + " expired; payment must be voided");
         }
-    }
-
-    public void printActiveBookings() {
-        System.out.println("\n📋 ACTIVE BOOKINGS");
-        System.out.println("=".repeat(60));
-        bookings.values().stream()
-            .filter(b -> b.getStatus() == BookingStatus.CONFIRMED
-                      || b.getStatus() == BookingStatus.CHECKED_IN)
-            .forEach(System.out::println);
-        System.out.println("=".repeat(60));
-    }
-
-    public void printGuestHistory(String guestId) {
-        Guest guest = loyalty.getGuest(guestId);
-        if (guest == null) {
-            System.out.println("Guest not found: " + guestId);
-            return;
+        if (!b.transition(BookingStatus.HELD, BookingStatus.CONFIRMED)) {
+            throw new IllegalStateException("booking " + bookingId + " is " + b.status() + ", cannot confirm");
         }
-        System.out.printf("""
-            ╔══════════════════════════════════╗
-            ║         GUEST PROFILE            ║
-            ╠══════════════════════════════════╣
-            ║ Name:   %-24s ║%n
-            ║ Tier:   %-24s ║%n
-            ║ Points: %-24d ║%n
-            ║ Member: %-24s ║%n
-            ╚══════════════════════════════════╝%n""",
-            guest.name(), guest.tier(), guest.loyaltyPoints(), guest.memberSince());
-
-        var guestBookings = bookings.values().stream()
-            .filter(b -> b.getGuest().id().equals(guestId))
-            .collect(Collectors.toList());
-        System.out.println("Recent bookings: " + guestBookings.size());
-        guestBookings.stream().limit(5).forEach(b ->
-            System.out.printf("  • %s: %s → %s ($%.2f, %s)%n",
-                b.getRoom().type(), b.getStay().checkIn(), b.getStay().checkOut(),
-                b.getTotalAmount(), b.getStatus()));
+        return b;
     }
 
-    // --- Internal ---
-
-    private String generateBookingId() {
-        return "BK-" + hotelName.substring(0, 2).toUpperCase()
-            + "-" + String.format("%05d", bookingCounter);
+    /** Cancels a HELD or CONFIRMED booking. Returns the refund (zero for an unpaid hold). */
+    BigDecimal cancel(String bookingId) {
+        Booking b = get(bookingId);
+        BookingStatus prev = b.moveTo(BookingStatus.CANCELLED);   // throws if not cancellable
+        releaseRooms(b);
+        if (prev == BookingStatus.HELD) return Money.of(BigDecimal.ZERO);
+        ZonedDateTime checkInAt = b.stay().checkIn().atTime(CHECK_IN_TIME).atZone(clock.getZone());
+        Duration before = Duration.between(clock.instant(), checkInAt.toInstant());
+        return b.policy().refund(b.total(), b.firstNight(), before);
     }
 
-    private CancellationPolicy determineCancellationPolicy(Guest guest, DateRange stay) {
-        long nights = stay.nights();
-        if (nights >= 30) return CancellationPolicy.STRICT;
-        if (guest.tier() == LoyaltyTier.DIAMOND || guest.tier() == LoyaltyTier.PLATINUM) {
-            return CancellationPolicy.FLEXIBLE;
-        }
-        return CancellationPolicy.MODERATE;
+    void checkIn(String bookingId) {
+        Booking b = get(bookingId);
+        if (LocalDate.now(clock).isBefore(b.stay().checkIn())) throw new IllegalStateException("too early to check in");
+        b.moveTo(BookingStatus.CHECKED_IN);
     }
 
-    private void checkNoShows() {
-        LocalDate today = LocalDate.now();
-        bookings.values().stream()
-            .filter(b -> b.getStatus() == BookingStatus.CONFIRMED)
-            .filter(b -> b.getStay().checkIn().isBefore(today))
-            .forEach(b -> {
-                b.markNoShow();
-                inventory.releaseRoom(b.getRoom().type(), b.getStay());
-                notifyNoShow(b);
-            });
-    }
+    /** Checkout keeps the reservation on the calendar: those nights were sold. */
+    void checkOut(String bookingId) { get(bookingId).moveTo(BookingStatus.CHECKED_OUT); }
 
-    private void processWaitlist() {
-        for (RoomType type : RoomType.values()) {
-            processWaitlistForRoomType(type);
-        }
-    }
-
-    private void processWaitlistForRoomType(RoomType type) {
-        while (true) {
-            Optional<WaitlistEntry> next = waitlist.getNextAvailable(type);
-            if (next.isEmpty()) break;
-
-            WaitlistEntry entry = next.get();
-            DateRange stay = entry.getStay();
-            if (inventory.checkAvailability(type, stay)) {
-                try {
-                    createBooking(entry.getGuest(), type, stay);
-                    notifyWaitlistNotified(entry);
-                } catch (IllegalStateException e) {
-                    // Still not available, re-add to waitlist
-                    waitlist.addToWaitlist(entry);
-                    break;
-                }
-            } else {
-                // Not available yet, re-add
-                waitlist.addToWaitlist(entry);
-                break;
+    /** Sweeper: expire unpaid holds. Safe to run concurrently with confirm(): one transition wins. */
+    int expireHolds() {
+        Instant now = clock.instant();
+        int n = 0;
+        for (Booking b : bookings.values()) {
+            if (!now.isBefore(b.holdExpiresAt()) && b.transition(BookingStatus.HELD, BookingStatus.EXPIRED)) {
+                releaseRooms(b);
+                n++;
             }
         }
+        return n;
     }
 
-    // --- Notifications ---
-
-    private void notifyBookingCreated(Booking b) { observers.forEach(o -> o.onBookingCreated(b)); }
-    private void notifyBookingCancelled(Booking b, double refund) {
-        observers.forEach(o -> o.onBookingCancelled(b, refund));
-    }
-    private void notifyCheckIn(Booking b) { observers.forEach(o -> o.onCheckIn(b)); }
-    private void notifyCheckOut(Booking b) { observers.forEach(o -> o.onCheckOut(b)); }
-    private void notifyNoShow(Booking b) { observers.forEach(o -> o.onNoShow(b)); }
-    private void notifyUpgradeOffered(Booking b, RoomType t) {
-        observers.forEach(o -> o.onUpgradeOffered(b, t));
-    }
-    private void notifyWaitlistNotified(WaitlistEntry e) {
-        observers.forEach(o -> o.onWaitlistNotified(e));
-    }
-    private void notifyLoyaltyPointsEarned(Guest g, int p) {
-        observers.forEach(o -> o.onLoyaltyPointsEarned(g, p));
-    }
-    private void notifyGroupBookingCreated(GroupBooking g) {
-        observers.forEach(o -> o.onGroupBookingCreated(g));
+    Booking get(String bookingId) {
+        Booking b = bookings.get(bookingId);
+        if (b == null) throw new NoSuchElementException("no booking " + bookingId);
+        return b;
     }
 
-    public void shutdown() {
-        scheduler.shutdown();
-        waitlist.shutdown();
+    /** For invariant checks: every reservation on every room. */
+    Map<String, List<Reservation>> reservationsByRoom() {
+        Map<String, List<Reservation>> m = new TreeMap<>();
+        calendarsById.forEach((id, cal) -> m.put(id, cal.reservations()));
+        return m;
+    }
+
+    private void releaseRooms(Booking b) {
+        b.roomIds().forEach(id -> calendarsById.get(id).release(b.id(), b.stay()));
     }
 }
 
 // ============================================================
-// DEMO
+// DEMO + SELF-CHECKS
 // ============================================================
 
-public class HotelBookingSystem {
-    public static void main(String[] args) {
-        System.out.println("╔══════════════════════════════════╗");
-        System.out.println("║    HOTEL BOOKING SYSTEM DEMO    ║");
-        System.out.println("╚══════════════════════════════════╝\n");
+/** A clock tests can move forward. */
+final class MutableClock extends Clock {
+    private volatile Instant now;
+    private final ZoneId zone;
+    MutableClock(Instant start, ZoneId zone) { this.now = start; this.zone = zone; }
+    void advance(Duration d) { now = now.plus(d); }
+    @Override public ZoneId getZone() { return zone; }
+    @Override public Clock withZone(ZoneId z) { return new MutableClock(now, z); }
+    @Override public Instant instant() { return now; }
+}
 
-        System.out.println("🏨 Hotel: Grand Plaza — 50 rooms, 6 types, 5 floors\n");
+final class HotelDemo {
+    static final ZoneId ZONE = ZoneId.of("UTC");
+    static final LocalDate TODAY = LocalDate.of(2026, 11, 2);   // a Monday
 
-        // Setup hotel with 50 rooms of various types
-        List<Room> rooms = new ArrayList<>();
-        int roomNum = 1;
-        // 15 SINGLE rooms
-        for (int i = 0; i < 15; i++) {
-            rooms.add(new Room("R" + String.format("%03d", roomNum++),
-                RoomType.SINGLE, (roomNum % 5) + 1,
-                roomNum % 2 == 0 ? "City" : "Garden", "Main",
-                List.of("WiFi", "TV"));
-        }
-        // 10 DOUBLE rooms
-        for (int i = 0; i < 10; i++) {
-            rooms.add(new Room("R" + String.format("%03d", roomNum++),
-                RoomType.DOUBLE, (roomNum % 5) + 1,
-                roomNum % 2 == 0 ? "City" : "Garden", "Main",
-                List.of("WiFi", "TV", "MiniBar"));
-        }
-        // 10 DELUXE rooms
-        for (int i = 0; i < 10; i++) {
-            rooms.add(new Room("R" + String.format("%03d", roomNum++),
-                RoomType.DELUXE, (roomNum % 5) + 1,
-                roomNum % 2 == 0 ? "Ocean" : "City", "Tower",
-                List.of("WiFi", "TV", "MiniBar", "RoomService", "Balcony")));
-        }
-        // 8 SUITE rooms
-        for (int i = 0; i < 8; i++) {
-            rooms.add(new Room("R" + String.format("%03d", roomNum++),
-                RoomType.SUITE, (roomNum % 5) + 1,
-                "Ocean", "Tower",
-                List.of("WiFi", "TV", "MiniBar", "RoomService", "Balcony", "Jacuzzi")));
-        }
-        // 5 PENTHOUSE rooms
-        for (int i = 0; i < 5; i++) {
-            rooms.add(new Room("R" + String.format("%03d", roomNum++),
-                RoomType.PENTHOUSE, 5,
-                "Panoramic", "Tower",
-                List.of("WiFi", "TV", "MiniBar", "RoomService", "Balcony",
-                        "Jacuzzi", "Butler", "PrivateElevator")));
-        }
-        // 2 PRESIDENTIAL rooms
-        for (int i = 0; i < 2; i++) {
-            rooms.add(new Room("R" + String.format("%03d", roomNum++),
-                RoomType.PRESIDENTIAL, 5,
-                "Panoramic", "Tower",
-                List.of("WiFi", "TV", "MiniBar", "RoomService", "Balcony",
-                        "Jacuzzi", "Butler", "PrivateElevator", "Sauna", "Kitchen")));
-        }
-
-        // Create hotel with composable pricing strategy
-        PricingStrategy pricing = new WeekendSurchargePricing(
-            new LongStayDiscountPricing(
-            new EarlyBirdPricing(
-            new LastMinutePricing(
-            new LoyaltyPricing(
-            new SeasonalPricing(
-            new BaseRatePricing()))))));
-
-        HotelBookingService hotel = new HotelBookingService("Grand Plaza", rooms, pricing);
-
-        // Create guests — various tiers
-        Guest alice = new Guest("G001", "Alice Johnson", "alice@email.com",
-            "555-0101", LoyaltyTier.GOLD, 150, LocalDate.now().minusMonths(6));
-        Guest bob = new Guest("G002", "Bob Smith", "bob@email.com",
-            "555-0102", LoyaltyTier.BRONZE, 5, LocalDate.now().minusDays(1));
-        Guest charlie = new Guest("G003", "Charlie Brown", "charlie@email.com",
-            "555-0103", LoyaltyTier.PLATINUM, 500, LocalDate.now().minusYears(2));
-        Guest diana = new Guest("G004", "Diana Prince", "diana@email.com",
-            "555-0104", LoyaltyTier.DIAMOND, 1200, LocalDate.now().minusYears(3));
-
-        // ---- BASIC BOOKING ----
-        System.out.println("--- BASIC BOOKINGS ---");
-        DateRange weekend = new DateRange(LocalDate.now().plusDays(7), LocalDate.now().plusDays(10));
-
-        System.out.println("Searching rooms for " + weekend + "...");
-        var available = hotel.searchRooms(RoomType.SUITE, weekend);
-        System.out.println("Available suites: " + available.size());
-
-        // Book rooms — compare pricing by tier
-        Booking b1 = hotel.createBooking(alice, RoomType.SUITE, weekend);
-        Booking b2 = hotel.createBooking(bob, RoomType.SINGLE,
-            new DateRange(LocalDate.now().plusDays(14), LocalDate.now().plusDays(16)));
-
-        System.out.println("\n💰 Pricing Comparison:");
-        System.out.printf("  Alice (Gold — 15%% off): $%.2f%n", b1.getTotalAmount());
-        System.out.printf("  Bob (Bronze — 5%% off): $%.2f%n", b2.getTotalAmount());
-
-        // ---- BOOKING WITH SPECIAL PRICING ----
-        System.out.println("\n--- SPECIAL PRICING ---");
-
-        // Early bird booking (30+ days ahead)
-        DateRange earlyBird = new DateRange(LocalDate.now().plusDays(45), LocalDate.now().plusDays(50));
-        Booking b3 = hotel.createBooking(charlie, RoomType.PENTHOUSE, earlyBird);
-        System.out.printf("  Charlie (Platinum, early bird): $%.2f%n", b3.getTotalAmount());
-
-        // Long stay (weekly discount)
-        DateRange longStay = new DateRange(LocalDate.now().plusDays(20), LocalDate.now().plusDays(27));
-        Booking b4 = hotel.createBooking(diana, RoomType.DELUXE, longStay);
-        System.out.printf("  Diana (Diamond, weekly stay): $%.2f%n", b4.getTotalAmount());
-
-        // ---- GROUP BOOKING ----
-        System.out.println("\n--- GROUP BOOKING ---");
-        DateRange conference = new DateRange(LocalDate.now().plusDays(60), LocalDate.now().plusDays(63));
-        GroupBooking group = hotel.createGroupBooking(
-            "GRP-001", "TechConf 2026", "organizer@techconf.com",
-            RoomType.DELUXE, conference, 5, 10);
-        System.out.printf("Group block created: %s (%d rooms held, min %d)%n",
-            group.getGroupId(), group.getMaxRooms(), group.getMinRooms());
-
-        // Add attendees to group
-        Booking groupB1 = hotel.addToGroupBooking("GRP-001", bob, RoomType.DELUXE, conference);
-        Booking groupB2 = hotel.addToGroupBooking("GRP-001", alice, RoomType.DELUXE, conference);
-        System.out.printf("Group bookings: %s, %s%n", groupB1.getId(), groupB2.getId());
-
-        // ---- CANCELLATION WITH REFUND ----
-        System.out.println("\n--- CANCELLATION ---");
-        double refund = hotel.cancelBooking(b2.getId());
-        System.out.printf("  Bob's booking cancelled — refund: $%.2f%n", refund);
-
-        // Check availability after cancellation
-        hotel.printAvailability(RoomType.SINGLE, LocalDate.now().plusDays(14), 5);
-
-        // ---- WAITLIST ----
-        System.out.println("\n--- WAITLIST ---");
-        // Book all single rooms for a date
-        DateRange popularDate = new DateRange(LocalDate.now().plusDays(3), LocalDate.now().plusDays(5));
-        for (int i = 0; i < 15; i++) {
-            try {
-                hotel.createBooking(bob, RoomType.SINGLE, popularDate);
-            } catch (IllegalStateException e) {
-                System.out.println("  All single rooms booked — " + e.getMessage());
-                break;
-            }
-        }
-
-        // This should trigger waitlist
-        try {
-            hotel.createBooking(diana, RoomType.SINGLE, popularDate);
-        } catch (IllegalStateException e) {
-            System.out.println("  ✅ " + e.getMessage());
-        }
-
-        // ---- CHECK IN / CHECK OUT ----
-        System.out.println("\n--- CHECK-IN / CHECK-OUT ---");
-        hotel.checkIn(b1.getId());
-        System.out.printf("  %s checked in to %s%n", b1.getGuest().name(), b1.getRoom().id());
-        hotel.checkOut(b1.getId());
-        System.out.printf("  %s checked out from %s%n", b1.getGuest().name(), b1.getRoom().id());
-
-        // ---- GUEST PROFILE ----
-        System.out.println("\n--- GUEST PROFILES ---");
-        hotel.printGuestHistory("G001"); // Alice
-        hotel.printGuestHistory("G004"); // Diana
-
-        // ---- REVENUE REPORT ----
-        hotel.getRevenue().printRevenueReport();
-
-        // ---- FINAL STATUS ----
-        hotel.printActiveBookings();
-        hotel.printAvailability(RoomType.PENTHOUSE, LocalDate.now(), 7);
-
-        hotel.shutdown();
-        System.out.println("\n╔══════════════════════════════════╗");
-        System.out.println("║       DEMO COMPLETE             ║");
-        System.out.println("╚══════════════════════════════════╝");
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        System.out.println("  ok  " + what);
     }
+
+    static DateRange stay(int fromDay, int toDay) {
+        return new DateRange(TODAY.withDayOfMonth(fromDay), TODAY.withDayOfMonth(toDay));
+    }
+
+    static HotelBookingService hotel(MutableClock clock, int singles, int suites) {
+        List<Room> rooms = new ArrayList<>();
+        for (int i = 1; i <= singles; i++) rooms.add(new Room("S" + i, RoomType.SINGLE, 1));
+        for (int i = 1; i <= suites; i++) rooms.add(new Room("X" + i, RoomType.SUITE, 9));
+        PricingStrategy pricing = new LoyaltyDiscountPricing(new NightlyRatePricing(new BigDecimal("30.00")));
+        return new HotelBookingService(rooms, pricing, clock, Duration.ofMinutes(15));
+    }
+
+    static MutableClock clock() { return new MutableClock(TODAY.atTime(9, 0).atZone(ZONE).toInstant(), ZONE); }
+
+    static void run() throws Exception {
+        Guest alice = new Guest("G1", "Alice", LoyaltyTier.GOLD);
+        Guest bob = new Guest("G2", "Bob", LoyaltyTier.NONE);
+
+        System.out.println("== 1. Half-open date ranges ==");
+        check(!stay(5, 8).overlaps(stay(8, 10)), "checkout 8th and check-in 8th do not overlap");
+        check(stay(5, 8).overlaps(stay(7, 9)) && stay(5, 10).overlaps(stay(6, 7)), "partial and nested stays overlap");
+        check(throwsIAE(() -> stay(8, 8)), "zero-night stay rejected");
+
+        System.out.println("== 2. Pricing is exact (BigDecimal) ==");
+        {
+            HotelBookingService h = hotel(clock(), 2, 1);
+            // Thu 5th, Fri 6th, Sat 7th = 3 nights, 2 weekend: 3*350 + 2*30 = 1110, GOLD -10% = 999.00
+            Booking b = h.hold("k-price", alice, RoomType.SUITE, stay(5, 8), 1, CancellationPolicy.FLEXIBLE);
+            check(b.total().equals(new BigDecimal("999.00")), "suite Thu-Sun for GOLD costs 999.00: " + b.total());
+            check(b.status() == BookingStatus.HELD && b.roomIds().equals(List.of("X1")), "hold reserves room X1");
+        }
+
+        System.out.println("== 3. No double booking; back-to-back stays allowed ==");
+        {
+            HotelBookingService h = hotel(clock(), 2, 0);
+            Booking b1 = h.hold("a", alice, RoomType.SINGLE, stay(5, 8), 1, CancellationPolicy.FLEXIBLE);
+            Booking b2 = h.hold("b", bob, RoomType.SINGLE, stay(6, 9), 1, CancellationPolicy.FLEXIBLE);
+            check(!b1.roomIds().equals(b2.roomIds()), "overlapping stays get different rooms");
+            check(throwsNoAvail(() -> h.hold("c", bob, RoomType.SINGLE, stay(7, 8), 1, CancellationPolicy.FLEXIBLE)),
+                  "third overlapping stay rejected when both rooms are taken");
+            Booking b4 = h.hold("d", bob, RoomType.SINGLE, stay(8, 10), 1, CancellationPolicy.FLEXIBLE);
+            check(b4.roomIds().equals(b1.roomIds()), "stay starting on b1's checkout day reuses b1's room");
+            check(h.searchAvailable(RoomType.SINGLE, stay(9, 11)).size() == 1, "search: one single free for 9th-11th");
+        }
+
+        System.out.println("== 4. Hold, confirm, expiry ==");
+        {
+            MutableClock clk = clock();
+            HotelBookingService h = hotel(clk, 1, 0);
+            Booking paid = h.hold("p", alice, RoomType.SINGLE, stay(5, 6), 1, CancellationPolicy.FLEXIBLE);
+            h.confirm(paid.id());
+            check(paid.status() == BookingStatus.CONFIRMED, "confirm within TTL succeeds");
+            Booking unpaid = h.hold("u", bob, RoomType.SINGLE, stay(10, 12), 1, CancellationPolicy.FLEXIBLE);
+            clk.advance(Duration.ofMinutes(16));
+            check(throwsISE(() -> h.confirm(unpaid.id())), "confirm after TTL fails");
+            check(unpaid.status() == BookingStatus.EXPIRED, "late confirm expires the hold");
+            check(h.searchAvailable(RoomType.SINGLE, stay(10, 12)).size() == 1, "expired hold released its room");
+            Booking again = h.hold("u2", bob, RoomType.SINGLE, stay(10, 12), 1, CancellationPolicy.FLEXIBLE);
+            clk.advance(Duration.ofMinutes(16));
+            check(h.expireHolds() == 1 && again.status() == BookingStatus.EXPIRED, "sweeper expires one stale hold");
+            check(h.expireHolds() == 0, "sweeper is idempotent");
+            check(paid.status() == BookingStatus.CONFIRMED, "sweeper leaves confirmed bookings alone");
+        }
+
+        System.out.println("== 5. Lifecycle rules and refunds ==");
+        {
+            MutableClock clk = clock();
+            HotelBookingService h = hotel(clk, 3, 0);
+            Booking early = h.hold("e", bob, RoomType.SINGLE, stay(10, 12), 1, CancellationPolicy.FLEXIBLE);
+            h.confirm(early.id());
+            check(h.cancel(early.id()).equals(new BigDecimal("200.00")), "cancel 8 days out on FLEXIBLE: full refund 200.00");
+            check(throwsISE(() -> h.cancel(early.id())), "cancelling twice is rejected (rooms released once)");
+
+            Booking late = h.hold("l", bob, RoomType.SINGLE, stay(3, 5), 1, CancellationPolicy.FLEXIBLE);
+            h.confirm(late.id());
+            check(h.cancel(late.id()).equals(new BigDecimal("100.00")), "cancel 30h before check-in: first night (100) kept");
+
+            Booking nr = h.hold("n", bob, RoomType.SINGLE, stay(20, 21), 1, CancellationPolicy.NON_REFUNDABLE);
+            h.confirm(nr.id());
+            check(h.cancel(nr.id()).signum() == 0, "non-refundable: zero refund");
+
+            Booking stayB = h.hold("s", alice, RoomType.SINGLE, stay(2, 4), 1, CancellationPolicy.FLEXIBLE);
+            check(throwsISE(() -> h.checkIn(stayB.id())), "cannot check in an unconfirmed hold");
+            h.confirm(stayB.id());
+            h.checkIn(stayB.id());
+            check(throwsISE(() -> h.cancel(stayB.id())), "cannot cancel after check-in");
+            h.checkOut(stayB.id());
+            check(stayB.status() == BookingStatus.CHECKED_OUT, "check-out completes the stay");
+            check(h.searchAvailable(RoomType.SINGLE, stay(2, 4)).size() == 2, "checked-out nights stay sold");
+        }
+
+        System.out.println("== 6. Idempotent hold and all-or-nothing group booking ==");
+        {
+            HotelBookingService h = hotel(clock(), 2, 0);
+            Booking first = h.hold("retry-1", alice, RoomType.SINGLE, stay(5, 7), 1, CancellationPolicy.FLEXIBLE);
+            Booking retry = h.hold("retry-1", alice, RoomType.SINGLE, stay(5, 7), 1, CancellationPolicy.FLEXIBLE);
+            check(first == retry && h.searchAvailable(RoomType.SINGLE, stay(5, 7)).size() == 1,
+                  "client retry with the same key returns the same booking, consumes no extra room");
+            check(throwsIAE(() -> h.hold("retry-1", alice, RoomType.SINGLE, stay(9, 10), 1, CancellationPolicy.FLEXIBLE)),
+                  "same key with a different request is rejected");
+            check(throwsNoAvail(() -> h.hold("grp", bob, RoomType.SINGLE, stay(5, 7), 2, CancellationPolicy.MODERATE)),
+                  "group of 2 fails when only 1 room is free");
+            check(h.searchAvailable(RoomType.SINGLE, stay(5, 7)).size() == 1, "failed group hold rolled back its partial room");
+            Booking grp = h.hold("grp2", bob, RoomType.SINGLE, stay(8, 9), 2, CancellationPolicy.MODERATE);
+            check(grp.roomIds().size() == 2 && grp.total().equals(new BigDecimal("200.00")), "group of 2 for one night: 200.00");
+        }
+
+        System.out.println("== 7. Concurrency: no room is ever double-booked ==");
+        {
+            HotelBookingService h = hotel(clock(), 5, 0);
+            int threads = 16;
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            CountDownLatch go = new CountDownLatch(1);
+            AtomicInteger won = new AtomicInteger(), lost = new AtomicInteger();
+            List<Future<?>> fs = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final int tid = t;
+                fs.add(pool.submit(() -> {
+                    go.await();
+                    // Everyone fights for the same 5 rooms on the same nights...
+                    try {
+                        h.hold("same-" + tid, bob, RoomType.SINGLE, stay(12, 15), 1, CancellationPolicy.FLEXIBLE);
+                        won.incrementAndGet();
+                    } catch (NoAvailabilityException e) {
+                        lost.incrementAndGet();
+                    }
+                    // ...then books random overlapping stays across the month.
+                    Random rnd = new Random(tid);
+                    for (int i = 0; i < 300; i++) {
+                        int from = 16 + rnd.nextInt(10);
+                        try {
+                            Booking b = h.hold("r-" + tid + "-" + i, bob, RoomType.SINGLE,
+                                    stay(from, from + 1 + rnd.nextInt(4)), 1 + rnd.nextInt(2), CancellationPolicy.FLEXIBLE);
+                            if (rnd.nextInt(3) == 0) h.cancel(b.id());
+                        } catch (NoAvailabilityException ignored) { }
+                    }
+                    return null;
+                }));
+            }
+            go.countDown();
+            for (Future<?> f : fs) f.get(20, TimeUnit.SECONDS);
+            pool.shutdown();
+            check(won.get() == 5 && lost.get() == threads - 5, "16 racers for 5 rooms: exactly 5 holds succeed");
+            boolean noOverlap = h.reservationsByRoom().values().stream().allMatch(HotelDemo::pairwiseDisjoint);
+            check(noOverlap, "after ~4800 concurrent holds/cancels every room calendar is overlap-free");
+        }
+
+        System.out.println("\nAll hotel booking checks passed.");
+    }
+
+    static boolean pairwiseDisjoint(List<Reservation> rs) {
+        for (int i = 0; i < rs.size(); i++)
+            for (int j = i + 1; j < rs.size(); j++)
+                if (rs.get(i).range().overlaps(rs.get(j).range())) return false;
+        return true;
+    }
+
+    static boolean throwsIAE(Runnable r) { try { r.run(); return false; } catch (IllegalArgumentException e) { return true; } }
+    static boolean throwsISE(Runnable r) { try { r.run(); return false; } catch (IllegalStateException e) { return true; } }
+    static boolean throwsNoAvail(Runnable r) { try { r.run(); return false; } catch (NoAvailabilityException e) { return true; } }
 }

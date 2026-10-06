@@ -47,7 +47,9 @@
 -- Database: PostgreSQL 16
 -- ============================================================
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- gen_random_uuid() is built in since PostgreSQL 13 (no uuid-ossp needed).
+-- btree_gist lets the reservation exclusion constraint use "=" on a UUID column.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 -- -----------------------------------------------------------
 -- 1. PARKING LOT
@@ -67,8 +69,8 @@ CREATE TABLE parking_lot (
 CREATE TABLE floor (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parking_lot_id UUID NOT NULL REFERENCES parking_lot(id) ON DELETE CASCADE,
-    floor_number INT NOT NULL CHECK (floor_number > 0),
-    label VARCHAR(50),  -- "B1", "B2", "1", "2", "R" (rooftop)
+    floor_number INT NOT NULL,  -- negative for basements: -1 = "B1"
+    label VARCHAR(50),          -- display label: "B1", "B2", "1", "2", "R" (rooftop)
     UNIQUE(parking_lot_id, floor_number)
 );
 
@@ -114,9 +116,12 @@ CREATE TABLE ticket (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_ticket_status ON ticket(status) WHERE status = 'ACTIVE';
+-- DB-enforced invariants (mirror the in-memory checks in parking_lot.py):
+-- a spot has at most one ACTIVE ticket, a plate is parked at most once.
+CREATE UNIQUE INDEX uq_ticket_active_spot  ON ticket(spot_id) WHERE status = 'ACTIVE';
+CREATE UNIQUE INDEX uq_ticket_active_plate ON ticket(vehicle_license_plate) WHERE status = 'ACTIVE';
 CREATE INDEX idx_ticket_entry ON ticket(entry_time DESC);
-CREATE INDEX idx_ticket_idempotency ON ticket(idempotency_key);
+-- No separate index on idempotency_key: the UNIQUE constraint already creates one.
 
 -- -----------------------------------------------------------
 -- 5. RATE CARD
@@ -169,19 +174,22 @@ CREATE TABLE reservation (
         CHECK (status IN ('PENDING', 'CONFIRMED', 'ACTIVE', 'COMPLETED', 'CANCELLED')),
     amount_charged DECIMAL(10,2),
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    -- Exclusion constraint prevents overlapping reservations for same spot
-    CONSTRAINT no_overlapping_reservation 
+    CHECK (reserved_to > reserved_from),
+    -- No overlapping live reservations for the same spot. Needs btree_gist
+    -- (for "=" on UUID). Cancelled/completed rows are excluded so they don't
+    -- block re-booking; NULL spot_id rows never conflict.
+    CONSTRAINT no_overlapping_reservation
         EXCLUDE USING gist (
             spot_id WITH =,
             tstzrange(reserved_from, reserved_to) WITH &&
-        )
+        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'ACTIVE'))
 );
 
 -- -----------------------------------------------------------
 -- 8. AUDIT LOG (for compliance and debugging)
 -- -----------------------------------------------------------
 CREATE TABLE audit_log (
-    id BIGSERIAL,
+    id BIGSERIAL PRIMARY KEY,
     entity_type VARCHAR(50) NOT NULL,  -- 'ticket', 'spot', 'payment'
     entity_id UUID NOT NULL,
     action VARCHAR(50) NOT NULL,  -- 'CREATED', 'UPDATED', 'PAID', 'LOST'
@@ -207,7 +215,12 @@ WHERE ps.status = 'AVAILABLE'
   AND f.parking_lot_id = 'lot-uuid'
 ORDER BY f.floor_number ASC, ps.spot_number ASC
 LIMIT 1
-FOR UPDATE SKIP LOCKED;  -- Skip already-locked rows for concurrency
+FOR UPDATE OF ps SKIP LOCKED;
+-- "OF ps" matters: a bare FOR UPDATE also locks the joined floor row, so a
+-- concurrent gate would SKIP every spot on that floor, not just this one.
+-- Then, in the same transaction:
+--   UPDATE parking_spot SET status = 'OCCUPIED', version = version + 1 WHERE id = :picked;
+--   INSERT INTO ticket (...);   -- uq_ticket_active_spot is the safety net
 
 -- Calculate revenue by spot type for the current month
 SELECT ps.spot_type, 
@@ -242,7 +255,7 @@ parking:{lot_id}:spot:{id}:lock          → STRING (distributed lock, TTL 5s)
 | 1 | `parking_lot` | — | `floor(parking_lot_id)`, `rate_card(parking_lot_id)`, `reservation(parking_lot_id)` | — |
 | 2 | `floor` | `parking_lot_id → parking_lot` | `parking_spot(floor_id)` | UNIQUE(lot_id, floor_number) |
 | 3 | `parking_spot` | `floor_id → floor` | `ticket(spot_id)`, `reservation(spot_id)` | (floor, type, status), available(partial) |
-| 4 | `ticket` | `spot_id → parking_spot` | `payment(ticket_id)` | active(partial), entry DESC, idempotency |
+| 4 | `ticket` | `spot_id → parking_spot` | `payment(ticket_id)` | UNIQUE active-per-spot / active-per-plate (partial), entry DESC, UNIQUE idempotency_key |
 | 5 | `rate_card` | `parking_lot_id → parking_lot` | — | UNIQUE(lot, type, effective_from) |
 | 6 | `payment` | `ticket_id → ticket` | — | idempotency_key |
 | 7 | `reservation` | `parking_lot_id → parking_lot`, `spot_id → parking_spot` | — | EXCLUDE(spot, tstzrange &&) |

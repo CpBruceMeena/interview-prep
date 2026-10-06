@@ -40,12 +40,12 @@
 ┌─────────────▼──────────────────▼─────────────┐
 │              PostgreSQL                        │
 │  - Products, Warehouses, Stock, Movements     │
-│  - Optimistic locking for stock updates       │
+│  - Conditional UPDATE for reservations        │
 └────────────────┬──────────────────────────────┘
                  │
 ┌────────────────▼──────────────────────────────┐
 │              Redis Cache                        │
-│  - Stock availability (write-through)          │
+│  - Product-page availability (stale-OK cache)  │
 │  - Reorder alerts (pub-sub)                    │
 └───────────────────────────────────────────────┘
 ```
@@ -66,31 +66,24 @@
 ## 3. KEY COMPONENTS & INTERVIEW Q&A
 
 ### Inventory Service (Python)
-- Stock CRUD with optimistic locking
+- Stock reservations via conditional UPDATE (no oversell)
 - Multi-warehouse support
 - Reorder point calculation (EOQ + safety stock)
 - Movement audit trail
 
 **🔴 Interview Question:** *"How do you prevent overselling when multiple orders hit the same product simultaneously?"*
 
-**✅ Answer:** Optimistic locking with version columns:
-```python
-def allocate_stock(product_id, warehouse_id, quantity):
-    updated = db.execute("""
-        UPDATE inventory_items 
-        SET reserved_qty = reserved_qty + ?,
-            version = version + 1
-        WHERE product_id = ? 
-          AND warehouse_id = ?
-          AND on_hand_qty - reserved_qty >= ?
-          AND version = ?
-    """, [quantity, product_id, warehouse_id, quantity, current_version])
-    
-    if updated == 0:
-        # Either insufficient stock or concurrent update won
-        raise InsufficientStockError()
+**✅ Answer:** A conditional update, which is atomic per row and needs no version column:
+```sql
+UPDATE inventory_items
+SET reserved_qty = reserved_qty + :q
+WHERE product_id = :pid
+  AND warehouse_id = :wh
+  AND on_hand_qty - reserved_qty >= :q;
+-- rowcount = 0  =>  insufficient stock. No retry loop: at READ COMMITTED Postgres re-evaluates the WHERE
+-- against the latest committed row version after waiting on a concurrent writer's row lock.
 ```
-`updated == 0` means another transaction already reserved the last unit. The calling code retries with recalculation.
+Optimistic locking (`AND version = :v`) also prevents overselling, but on a hot SKU most attempts lose the version race and retry even when plenty of stock is left; the conditional update only fails when stock really is short. Multi-line orders do one such update per line inside one transaction, in `(product_id, warehouse_id)` order to avoid deadlocks, and roll back if any line updates 0 rows. A `CHECK (reserved_qty >= 0 AND reserved_qty <= on_hand_qty)` constraint makes the invariant enforceable by the database, not just by code.
 
 ---
 
@@ -142,14 +135,24 @@ CREATE TABLE warehouses (
 );
 CREATE TABLE inventory_items (
     product_id UUID, warehouse_id UUID,
-    on_hand_qty INT DEFAULT 0, reserved_qty INT DEFAULT 0,
-    bin_location TEXT, version INT DEFAULT 1,
-    PRIMARY KEY (product_id, warehouse_id)
+    on_hand_qty INT NOT NULL DEFAULT 0, reserved_qty INT NOT NULL DEFAULT 0,
+    bin_location TEXT,
+    PRIMARY KEY (product_id, warehouse_id),
+    CHECK (reserved_qty >= 0 AND reserved_qty <= on_hand_qty)
 );
-CREATE TABLE inventory_movements (
-    id BIGSERIAL, product_id UUID, warehouse_id UUID,
-    type TEXT, quantity INT, reference TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE reservations (
+    id UUID PRIMARY KEY, order_id TEXT UNIQUE NOT NULL,   -- idempotency key
+    status TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX ON reservations (expires_at) WHERE status = 'ACTIVE';   -- sweeper scan
+CREATE TABLE reservation_lines (
+    reservation_id UUID, product_id UUID, warehouse_id UUID, qty INT NOT NULL CHECK (qty > 0),
+    PRIMARY KEY (reservation_id, product_id, warehouse_id)
+);
+CREATE TABLE inventory_movements (                    -- append-only ledger
+    id BIGSERIAL PRIMARY KEY, product_id UUID, warehouse_id UUID,
+    type TEXT, delta INT, on_hand_after INT, reference TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
@@ -175,7 +178,31 @@ def calculate_reorder(product, item):
 
 ---
 
-## 6. COST (Monthly)
+## 6. CONSISTENCY, IDEMPOTENCY & FAILURE MODES
+
+**Capacity check.** 50K orders/day ≈ 0.6 orders/s on average; even a 20× peak is ~12 orders/s, each a handful of single-row updates. One Postgres primary handles this comfortably. 1M movements/day ≈ 12 inserts/s average, ~0.4 TB/year at ~1 KB/row with indexes; partition the movements table by month. The real scaling risk is not throughput but **hot rows**: a flash sale concentrates thousands of updates per second on one `(product, warehouse)` row.
+
+| Concern | Choice |
+|---------|--------|
+| Source of truth for stock | Postgres row per (product, warehouse); strongly consistent writes |
+| Product-page availability | Cache or read replica; may be seconds stale. Never used to decide a reservation |
+| Reserve idempotency | `reservations.order_id UNIQUE`, inserted in the same transaction as the stock updates; a retry finds the row and returns it |
+| Commit / release idempotency | Status transition guarded by `UPDATE reservations SET status='COMMITTED' WHERE id=:id AND status='ACTIVE'`; 0 rows → already done (return stored result) or expired |
+| Events to other services | Transactional outbox: write `StockReserved` / `StockCommitted` rows in the same transaction, relay to Kafka. Consumers dedupe on event id (delivery is at-least-once) |
+
+| Failure | What happens / mitigation |
+|---------|---------------------------|
+| Client times out after reserve succeeded | Retry with the same `order_id` returns the existing reservation |
+| Payment succeeds, reservation already expired | Commit fails; order service re-reserves or refunds (saga compensation). Keep TTL comfortably above the payment timeout |
+| Sweeper down | Reservations stay ACTIVE past TTL, stock looks unavailable; commit still rejects expired ones. Alert on `count(ACTIVE AND expires_at < now() - 5 min)` |
+| Physical count lower than reserved (shrinkage) | Accept the count, flag affected reservations as short, re-allocate or notify the customer |
+| Hot SKU row contention | Split stock into N bucket rows and reserve from a random one, or an atomic Redis Lua counter reconciled to the DB, or a queue that admits buyers in order |
+| Deadlocks between multi-line orders | Always update rows in `(product_id, warehouse_id)` order; retry the rare abort |
+| Duplicate PO creation | Reorder job computes position = available + open PO qty in one query; run it as a single scheduled job (or under an advisory lock) |
+
+---
+
+## 7. COST (Monthly)
 
 | Component | Cost |
 |-----------|------|

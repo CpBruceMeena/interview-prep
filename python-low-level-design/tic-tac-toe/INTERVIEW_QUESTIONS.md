@@ -19,30 +19,33 @@ class Player(ABC):
 
 class HumanPlayer(Player):
     def get_move(self, board) -> Tuple[int, int]:
-        # Read from stdin with validation
+        ...  # read via injected input_fn, re-prompt on bad input
 
 class BotPlayer(Player):
     def get_move(self, board) -> Tuple[int, int]:
-        _, move = self._minimax(board, self._symbol, True)
-        return move
+        ...  # memoised minimax over a copy of the board
 ```
 
-**Why Strategy over if-else?** With if-else, adding a new AI difficulty means modifying the `get_move` method. With Strategy, you add a class — zero existing code changes (OCP).
+**Why Strategy over if-else?** With if-else, adding a new AI difficulty means modifying the `get_move` method. With Strategy, you add a class and the game loop doesn't change (OCP).
 
 **Board encapsulation:**
 ```python
 class Board:
-    def is_valid_move(self, pos) -> bool  # Guards
-    def place_move(self, pos, symbol)      # Mutators
-    def check_winner(self) -> Optional[symbol]  # Queries
-    def get_available_moves(self) -> List  # State
+    def is_valid_move(self, pos) -> bool                          # guard
+    def place_move(self, pos, symbol) -> Optional[PlayerSymbol]   # mutator; returns winner
+    def undo_move(self) -> Position                               # exact inverse
+    def check_winner(self) -> Optional[PlayerSymbol]              # O(1) query
+    def get_available_moves(self) -> List[Position]
 ```
+The game (`TicTacToeGame.make_move(symbol, pos)`) adds what the board shouldn't know: whose turn it is and whether the game is over.
 
 ### 💡 Technical Deep Dive: Win Detection
 
-For 3×3, checking all 8 lines is O(1). But the interviewer will ask: *"How would you generalize to N×N with K-in-a-row?"*
+**K = N (classic):** keep a running sum per row, column and the two diagonals (+1 for X, −1 for O). After placing at `(r, c)`, the move won iff `abs(rows[r]) == n or abs(cols[c]) == n or abs(diag) == n or abs(anti) == n`. O(1) per move, O(N) memory. This is what `Board._bump` does, and `undo` just subtracts.
 
-**Efficient K-in-a-row detection O(N²):**
+**K < N (gomoku-style):** sums don't work. Only lines through the *last move* can be new wins, so walk the 4 directions from it and count consecutive same symbols: O(K) per move.
+
+The full-board scan below is O(N²·K) per check. Correct, and fine to write first, but say why you'd replace it:
 ```python
 def check_win_nxn(board, N, K):
     for r in range(N):
@@ -68,7 +71,7 @@ def check_win_nxn(board, N, K):
 
 ### 🎯 Expected Answer
 
-**Minimax with Alpha-Beta Pruning:**
+**Minimax with Alpha-Beta Pruning** (the code uses memoisation instead; see below):
 ```python
 def minimax(board, symbol, is_maximizing, alpha=-inf, beta=inf):
     # Terminal states
@@ -90,14 +93,20 @@ def minimax(board, symbol, is_maximizing, alpha=-inf, beta=inf):
     # Minimizing player...
 ```
 
-**Alpha-beta pruning** reduces the search space from O(b^d) to O(b^(d/2)). For Tic-Tac-Toe (b=9, d=9), full minimax is 9! ≈ 362K nodes. With alpha-beta, typically < 10K nodes — real-time AI even for larger boards.
+**Numbers:** the full 3×3 game tree has 549,946 nodes (255,168 finished games; 9! = 362,880 is only an upper bound on 9-move sequences and ignores early wins). Alpha-beta with good ordering cuts that to a few thousand nodes. But there are only **5,478 distinct legal positions**, so memoising minimax on the position (a transposition table) is even simpler and exact. That is what `BotPlayer` does.
+
+Two details that separate a good answer:
+- **Prefer faster wins.** Plain ±1 scoring makes the bot indifferent between winning now and winning in three moves, and it sometimes "plays with its food". Score a win as `1 + empty cells left`.
+- **Memo keys must capture everything the value depends on.** Position + side to move is enough when scores depend only on the position. If you add a depth limit, the remaining depth must be in the key too.
+
+None of this scales to "larger boards": 4×4 already has ~10⁷ positions, so plain-Python exhaustive search isn't interactive. That is where depth limits and heuristics come in.
 
 ### 🔍 Trade-off Analysis: Optimal vs. Satisfying
 
 | Approach | Pros | Cons | When |
 |----------|------|------|------|
 | Minimax | Guaranteed optimal | O(b^d) exponential | 3×3 |
-| Alpha-Beta | Much faster | Same result | Up to 5×5 |
+| Alpha-Beta / memo | Much faster | Same result | 3×3; 4×4 only with a strong engine |
 | Monte Carlo | Handles large spaces | Probabilistic | 6×6+ |
 | Heuristic + depth limit | Fast, adjustable | May make suboptimal moves | N×N |
 
@@ -110,7 +119,7 @@ def minimax(board, symbol, is_maximizing, alpha=-inf, beta=inf):
 
 1. **Win condition becomes parameterized**: N-in-a-row instead of 3-in-a-row
 2. **Board representation**: Bitboard (int per player) for performance
-3. **AI complexity**: Minimax becomes infeasible after 4×4. Switch to:
+3. **AI complexity**: Exhaustive minimax is impractical from 4×4 up (≈10⁷ positions for 4×4, 3^25 ≈ 8.5 × 10¹¹ as an upper bound for 5×5). Switch to:
    - **Heuristic evaluation**: Evaluate board state without full search
    - **Monte Carlo Tree Search (MCTS)**: Simulate random playouts, choose best
    - **Opening book**: Pre-computed best moves for common openings
@@ -130,23 +139,64 @@ def minimax(board, symbol, is_maximizing, alpha=-inf, beta=inf):
 
 ## Question 5: Design Patterns
 
-| Pattern | Where | Why |
-|---------|-------|-----|
-| **Strategy** | HumanPlayer vs BotPlayer | Interchangeable AI difficulty |
-| **State** | GameStatus enum | Track game lifecycle |
-| **Command** | Move record | Undo/redo, replay |
-| **Observer** | Display refresh | UI updates on state change |
-| **Factory** | Player creation | Centralized player config |
-| **Memento** | Board snapshots | Save/restore mid-game |
+| Pattern | Where | In the code? |
+|---------|-------|--------------|
+| **Strategy** | `HumanPlayer` / `BotPlayer` / `ScriptedPlayer` | Yes |
+| **Facade** | `TicTacToeGame` | Yes |
+| **Command** | Move record for undo/redo/replay | The history list is enough here; a `Move` class earns its keep only with redo or networked replay |
+| **Observer** | UI refresh | `play(on_move=...)` is a single callback; promote to Observer only with several listeners |
+
+`GameStatus` is an enum, not the State pattern; a Factory for two player types is ceremony. Naming patterns the code doesn't need is a negative signal.
 
 ---
 
 ## Question 6: Testing Strategy
 
-**Unit tests to write:**
-1. Win detection — all 8 lines on 3×3
+**Unit tests to write** (all in `test_tic_tac_toe.py`):
+1. Win detection — every row, column and diagonal, for both symbols, on 3×3, 4×4 and 5×5
 2. Draw detection — full board, no winner
-3. AI correctness — AI as X should never lose on 3×3 (provably optimal)
-4. Invalid move rejection — occupied cell, out of bounds
-5. Undo/redo — verify state restoration
-6. Tournament mode — bracket elimination correctness
+3. AI correctness — the bot never loses as X *or* as O: enumerate every opponent reply at every turn (a few hundred games), not a handful of hand-picked ones
+4. Bot prefers an immediate win over a block, and blocks when it must
+5. Invalid move rejection — occupied cell, out of bounds, out of turn, after game over; a failed move doesn't advance the turn
+6. Undo — counters really reversed (place the opposite symbol afterwards and confirm no phantom win)
+7. Concurrency — 9 threads race to make X's first move; exactly one lands
+8. The demo runs with no stdin (guards against an `input()` regression)
+
+---
+
+## Question 7: The Follow-ups Interviewers Actually Push On
+
+**"Make it N×N with K in a row."**
+`Board(size)` already handles N×N with K = N via line sums. For K < N, check the four lines through the last move, O(K). Bot: depth-limited search plus a heuristic (open lines, threats), because exhaustive search is out.
+
+**"Two people tap at the same time" / "the request is retried."**
+`make_move(symbol, pos)` runs under a lock and checks turn order, so the second request fails with `NotYourTurnError` and changes nothing. For retries over a network, include the move number the client saw; a retry of an already-applied move returns the current state instead of an error.
+
+**"Add undo and redo."**
+Undo pops the history and reverses the counters. Redo needs a second stack that's cleared on any new move. If undo is available in multiplayer, decide who may undo (only the last mover, before the opponent replies).
+
+**"Add difficulty levels."**
+Easy: random legal move (seeded for tests). Medium: depth-limited minimax or "win if you can, block if you must, else random". Hard: full memoised minimax. All are `Player` strategies.
+
+**"Your bot sometimes delays a win."**
+±1 scoring makes all wins equal. Score by remaining empty cells (or `10 − depth`) so earlier wins score higher.
+
+**"How do you test something with `input()` in it?"**
+You don't. Inject `input_fn`/`output_fn`, keep the game loop free of I/O, and make the default demo scripted.
+
+---
+
+## ⚠️ Common Mistakes
+
+- `input()` inside the game or player logic, so nothing runs in CI.
+- Undo that clears the cell but not the derived state (history, counters, cached winner).
+- Win check that scans the whole board on every move without acknowledging it, or only checks rows and columns.
+- Allowing a move after the game is won, or out of turn.
+- Minimax with ±1 scoring (no preference for faster wins), or memo keys that miss side-to-move.
+- Claiming alpha-beta makes larger boards "real-time".
+- Listing State/Observer/Factory/Memento for a 200-line program.
+
+## 🎚️ Senior vs Staff Signal
+
+- **Senior:** clean Board/Player/Game split, O(1) win check, exceptions for invalid and out-of-turn moves, correct minimax, unit tests including "bot never loses".
+- **Staff:** also keeps I/O out of the domain and says why, gives players a copy of the board, makes `make_move` the single locked mutator, knows the real state-space numbers (5,478 positions; tree of 549,946 nodes) and picks memoisation over alpha-beta because of them, and frames the online version around idempotent, ordered moves rather than a bigger architecture diagram.

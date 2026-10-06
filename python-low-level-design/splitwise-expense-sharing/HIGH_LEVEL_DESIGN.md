@@ -64,38 +64,35 @@ Mobile App / Web (React/PWA)
 ### Expense Service (Python/FastAPI)
 - CRUD expenses with split calculation
 - Strategy pattern: Equal, Exact, Percentage, Share
-- Rounding management (pays rounding difference to payer)
+- Rounding: largest-remainder allocation in integer cents
 
 **🔴 Interview Question:** *"How do you handle rounding errors in expense splits?"*
 
-**✅ Answer:** Financial rounding is critical — cumulative errors lose money.
+**✅ Answer:** Never use floats, and do the rounding in one place. Allocate in integer cents with the largest-remainder method:
 ```python
-def equal_split(total, participants):
-    base = round(total / len(participants), 2)
-    shares = {u: base for u in participants}
-    diff = round(total - sum(shares.values()), 2)
-    # Assign rounding difference to the person who paid
-    shares[paid_by] += diff
-    return shares
+exact    = [Fraction(total_cents) * w / sum(weights) for w in weights]
+floors   = [floor(x) for x in exact]
+leftover = total_cents - sum(floors)            # always < len(weights)
+for i in sorted(range(n), key=lambda i: (-(exact[i] - floors[i]), i))[:leftover]:
+    floors[i] += 1
 ```
-This guarantees `sum(shares) == total` always. The slight 1-cent difference goes to the payer — they're the one approving the expense.
+This guarantees `sum(shares) == total` and that nobody is more than one cent from their exact share. Pushing the whole difference onto one person (payer or first participant) looks simpler but can produce a negative share: $0.05 split 7 ways rounds every share up to 0.01 (0.07 total), and the −0.02 correction leaves one person owing −0.01. Store amounts as `NUMERIC(12,2)` (or `BIGINT` cents) so the database never reintroduces floats.
 
 ---
 
 ### Settlement Service (Python)
-- Balance calculation (O(G) where G = group expenses)
+- Balance reads: O(members) from the materialised `balances` rows
 - Debt simplification (greedy min-transactions, NP-hard optimal)
 - Payment request creation
 
 **🔴 Interview Question:** *"What algorithm do you use for debt simplification?"*
 
-**✅ Answer:** The minimum transaction problem is NP-hard (subset sum reduction). I use a **greedy heuristic**:
-1. Calculate net balances: `net[user] = paid - owed`
-2. Sort by net balance (ascending)
-3. Match biggest debtor with biggest creditor, settle as much as possible
-4. Repeat until all balances < 1 cent
+**✅ Answer:** The minimum is n − k, where n is the number of people with a non-zero balance and k is the largest number of disjoint zero-sum subgroups. Finding k is NP-hard, so:
+1. Net balances come from the materialised balance rows (see Data Model).
+2. **Greedy:** match the largest debtor with the largest creditor (two heaps), transfer the smaller amount, repeat. O(n log n), at most n − 1 transfers, but not optimal: `{-8, -7, -2, +9, +8}` takes 4 greedy transfers where 3 suffice.
+3. **Exact** for small groups: bitmask DP over subsets, O(2ⁿ · n). Most groups have well under 15 active members, so 2ⁿ · n stays in the hundreds of thousands of steps; cap n and fall back to greedy above the cap.
 
-This gives near-optimal (within 1 transaction of optimal) in O(n log n) time. Splitwise's research shows users prefer clarity over optimality — "Alice pays Bob directly" is preferred even if "Alice pays Bob, Bob pays Charlie" uses fewer transactions.
+Simplification can make someone pay a person they never shared an expense with, so offer it as an opt-in group setting.
 
 ---
 
@@ -116,11 +113,21 @@ CREATE TABLE group_members (
     group_id UUID, user_id UUID, role TEXT DEFAULT 'member'
 );
 CREATE TABLE expenses (
-    id UUID, group_id UUID, description TEXT, amount DECIMAL(12,2),
-    paid_by UUID, split_type TEXT, created_at TIMESTAMP
+    id UUID PRIMARY KEY, group_id UUID, description TEXT, amount DECIMAL(12,2),
+    currency CHAR(3), paid_by UUID, split_type TEXT,
+    request_id UUID UNIQUE,                 -- client idempotency key
+    deleted_at TIMESTAMP, version INT,      -- edits = soft delete + new row
+    created_at TIMESTAMP
 );
 CREATE TABLE expense_shares (
-    expense_id UUID, user_id UUID, share_amount DECIMAL(12,2)
+    expense_id UUID, user_id UUID, share_amount DECIMAL(12,2),
+    PRIMARY KEY (expense_id, user_id)
+);
+-- Derived, updated in the same transaction as the expense insert:
+-- UPDATE balances SET net = net + :delta WHERE group_id = ? AND user_id = ?
+CREATE TABLE balances (
+    group_id UUID, user_id UUID, currency CHAR(3), net DECIMAL(14,2),
+    PRIMARY KEY (group_id, user_id, currency)
 );
 CREATE TABLE settlements (
     id UUID, group_id UUID, from_user UUID, to_user UUID,
@@ -135,13 +142,30 @@ CREATE TABLE settlements (
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Currency | Store in base + original | Multi-currency support; show in user's preferred currency |
-| Balance calc | Read-time computation | Cached for 30 seconds; recalculated on any new expense |
-| Rounding | Assign to payer | Payer approves — fair in practice |
+| Balance calc | Materialised `balances` rows, updated in the expense transaction | O(participants) per write, O(1) per read; a nightly job recomputes from `expense_shares` and alerts on drift |
+| Rounding | Largest remainder in cents | Exact total, nobody more than 1 cent off, never negative |
+| Edits | Soft delete + new row | Audit trail; the balance delta is "reverse old, apply new" in one transaction |
 | Settlements | Peer-to-peer | Not a payment processor; generate requests to PayPal/UPI |
 
 ---
 
-## 6. COST (Monthly)
+## 6. CONSISTENCY, IDEMPOTENCY & FAILURE MODES
+
+| Concern | Choice |
+|---------|--------|
+| **Consistency** | Strong within a group: the expense insert, its share rows and the balance deltas commit in one Postgres transaction. Shard by `group_id` so that transaction never crosses shards. Notifications and cross-device sync are eventually consistent (outbox → queue). |
+| **Concurrent writes** | Inserts do not conflict. Balance updates use `net = net + :delta`, which row-locks briefly; no read-modify-write in the app. Optimistic `version` checks guard edits to the same expense. |
+| **Mobile retries** | Client generates `request_id` per create; `UNIQUE(request_id)` turns a retry into a no-op that returns the original expense. |
+| **Lost notifications** | Transactional outbox: the event row is written in the expense transaction, a relay publishes it; consumers are idempotent on event id. |
+| **Payment provider timeouts** | Settlement is `PENDING` until the provider confirms; retries reuse the same provider idempotency key; a reconciliation job closes the gap. |
+| **Balance drift (bug or bad migration)** | Balances are derived data. Recompute from `expense_shares` + `settlements` per group and compare; the ledger is the source of truth. |
+| **Non-group (friend-to-friend) expenses** | Model as an implicit two-person group so the same per-group transaction and sharding rule apply. |
+
+**Capacity (from the numbers in §1):** 50M expenses/month ≈ 20 writes/s average, perhaps 200/s at peak (weekend evenings, month-end rent). Each expense is ~1 KB with ~4 share rows, so ~50 GB/year including indexes. A single well-sized Postgres primary with read replicas handles this comfortably; sharding by `group_id` is a growth plan, not a day-one need.
+
+---
+
+## 7. COST (Monthly)
 
 | Component | Cost |
 |-----------|------|

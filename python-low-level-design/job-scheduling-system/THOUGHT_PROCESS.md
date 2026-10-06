@@ -1,6 +1,6 @@
 # 🧠 Job Scheduling System LLD — Thought Process Guide
 
-> **Goal:** Learn *how* to think when designing a concurrent job scheduling system.
+> **Goal:** Learn *how* to think when designing a concurrent job scheduler, and how to pace it in a live round.
 
 ---
 
@@ -8,265 +8,193 @@
 
 ![](job-scheduling-class-diagram.drawio)
 
+!!! note
+    The diagram predates the v3 code. Names differ (`AsyncJobExecutor` is now `JobExecutor`, `*Scheduler` strategies are now `*Strategy`, and there is no `UnsafeCounter`/`SafeCounter`). [CODE.md](CODE.md) has the current class table.
+
 ---
 
-## Phase 0: Requirements Gathering
+## ⏱️ How to Run This in a 45–60 Minute Interview
 
-**Functional:**
-- One-time, recurring, and priority-based job execution
-- Retry with exponential backoff
-- Job timeout and cancellation
-- DAG-based dependencies between jobs
+| Time | Phase | What you produce | What to say out loud |
+|------|-------|------------------|----------------------|
+| 0–7 min | **Clarify** | 5–6 bullet requirements, explicit non-goals | "In-process or distributed? I'll do in-process first and say where it changes for a fleet." |
+| 7–15 min | **Entities + interfaces** | `Job` (Command), `JobStatus` + transition table, `SchedulingStrategy.key()`, `JobScheduler.submit/cancel/start/stop` | "The scheduler owns all state on one event-loop thread, so I won't need locks. I'll make that the invariant." |
+| 15–35 min | **Core code** | Ready heap, workers, `_run_attempt` with timeout, `_finish` | "A worker pops and marks RUNNING with no `await` in between, so two workers can't take the same job." |
+| 35–45 min | **Failure + concurrency** | Retry with backoff (`_delayed` heap), cancellation, graceful `stop()`, `submit_threadsafe` | "Timeouts on threads don't kill the thread. I'll record the timeout, and the slot stays busy until the call returns." |
+| 45–60 min | **Extension** | Whatever they add: dependencies, recurring, aging, rate limits | Show that the change touches one place (a strategy, `_finish`, the ticker). |
 
-**Non-functional / Concurrency:**
-- Handle I/O-bound (email, HTTP) and CPU-bound (data processing) jobs
-- Maximum N concurrent executions
-- Graceful shutdown (cancel running jobs, drain queue)
-- Support multiple concurrency models (async, thread, process)
+Write the transition table and the `submit → ready → worker → finish` path first. Retries, dependencies and recurring jobs are all small additions to `_finish` and the two heaps. If you start with them, you won't finish the core.
+
+### Clarifying questions worth asking
+
+1. **One process or a fleet?** In-process changes everything about durability and double execution. Build in-process first, then discuss distribution.
+2. **What kinds of work?** I/O-bound, blocking libraries, CPU-heavy? This decides ASYNC / THREAD / PROCESS.
+3. **Ordering:** FIFO, priority, deadlines? Is starvation of low priority acceptable?
+4. **Failure semantics:** retries, which errors are retryable, timeouts per job?
+5. **Cancellation:** queued only, or running too? What happens to a running job on shutdown?
+6. **Recurring jobs:** interval or cron? What if a run is still going when the next one is due (overlap)? What about missed runs after downtime?
+7. **Dependencies:** "B after A"? What happens to B if A fails?
+8. **Delivery guarantee:** at-most-once or at-least-once? (In-process it's effectively at-most-once: a crash loses the queue.)
+
+---
+
+## Phase 0: Requirements
+
+**Functional (what the code implements):**
+- Submit one-shot and delayed jobs; recurring fixed-interval jobs
+- Ordering via a pluggable strategy: FIFO, priority, priority with aging, earliest-deadline-first
+- Per-job timeout; retries with capped exponential backoff + jitter; non-retryable errors
+- Cancel queued or running jobs
+- Dependencies: a job runs only after all its upstreams complete; upstream failure cancels it
+
+**Non-functional:**
+- At most N jobs in flight
+- I/O-bound, blocking and CPU-bound jobs side by side
+- Graceful shutdown; submissions from other threads
+- Bounded memory for history
+
+**Out of scope (say it):** persistence, multiple scheduler instances, cron syntax. Each gets a sentence in the extension discussion.
 
 ---
 
 ## Phase 1: Concurrency Model Decision
 
-**This is the KEY design decision — everything else flows from it.**
+**This is the key decision; the rest follows from it.**
 
-| Model | Pros | Cons |
-|-------|------|------|
-| **Threading** (`threading`) | Familiar, preemptive, good for blocking I/O | GIL for CPU, heavy (~8KB/thread), race conditions |
-| **Multiprocessing** (`multiprocessing`) | True parallelism, own GIL | Heavy (~50MB/proc), IPC overhead, slow startup |
-| **Async** (`asyncio`) | Lightweight (~100 bytes/task), no GIL issues, cooperative | Single-thread, need async libraries, no CPU parallelism |
-| **Hybrid** (All three) | Right tool for each job | Complexity, need to manage 3 executors |
+| Model | Use for | Cost |
+|-------|---------|------|
+| **asyncio** | The scheduler core + I/O jobs written with `await` | Single thread; one blocking call stalls everything |
+| **Threads** | Blocking I/O libraries (sync DB drivers, `requests`) | GIL: CPU-bound Python gets ~no speedup; threads can't be killed |
+| **Processes** | CPU-bound work | Pickling in/out, process start-up, more memory |
 
-**Decision: Hybrid.** Let each job declare its model via `ConcurrencyModel` enum. The executor dispatches to the right backend.
+**Decision:** asyncio for the scheduler itself; each job declares its execution model by which base class it extends (`AsyncJob`, `BlockingJob`, `CpuBoundJob`). `JobExecutor` routes it.
 
----
-
-## Phase 2: Async-First Architecture
-
-```python
-# Why asyncio for the scheduler core?
-# 1. The scheduler spends 99% of time WAITING (for jobs, for timeouts)
-# 2. asyncio uses ~100 bytes per task vs ~8KB per thread
-# 3. No GIL contention → no race conditions on scheduler state
-# 4. Cooperative multitasking → deterministic interleaving
-
-class JobScheduler:
-    async def start(self):
-        # Create_task is how we spawn concurrent work in asyncio
-        self._scheduler_task = asyncio.create_task(
-            self._scheduler_loop(), name="scheduler-loop"
-        )
-        self._workers = [
-            asyncio.create_task(self._worker_loop(i), name=f"worker-{i}")
-            for i in range(self._num_workers)
-        ]
-
-    async def stop(self):
-        # Event-driven shutdown via asyncio.Event
-        self._stop_event.set()  # Signal all coroutines
-        # Cancel remaining tasks
-        for w in self._workers:
-            w.cancel()
-```
+Why asyncio for the core: the scheduler mostly waits (for work, for backoff timers, for jobs). Thousands of coroutines are cheap. And with all state on one thread, there are no data races on scheduler state, as long as you never `await` in the middle of a check-then-act.
 
 ---
 
-## Phase 3: Producer-Consumer with asyncio.Queue
-
-**The problem:** Scheduler creates jobs faster than workers can execute them. We need a buffer.
-
-**The solution:** `asyncio.Queue` — an async-safe FIFO queue.
+## Phase 2: Entities and the State Machine
 
 ```python
-# Producer: scheduler loop
-await self._job_queue.put(job)   # Blocks if queue at maxsize
-
-# Consumer: worker coroutines
-job = await self._job_queue.get()  # Blocks if queue empty
-# ... execute ...
-self._job_queue.task_done()        # Signal completion to queue.join()
+_TRANSITIONS = {
+    PENDING:    {RUNNING, CANCELLED},
+    RUNNING:    {COMPLETED, FAILED, TIMED_OUT, CANCELLED, RETRY_WAIT},
+    RETRY_WAIT: {RUNNING, CANCELLED},
+}
 ```
 
-**Why asyncio.Queue over threading.Queue or list + lock:**
-- `asyncio.Queue.get()` blocks COOPERATIVELY (yields to event loop)
-- No busy-waiting or polling
-- Built-in maxsize for backpressure
-- `join()` / `task_done()` for completion tracking
+Every status change goes through `_transition()`, which validates the edge and notifies listeners. That gives you two things interviewers like: illegal states fail loudly, and observability (metrics, audit log, tests) hangs off one hook.
 
 ---
 
-## Phase 4: Triple-Dispatch Executor
+## Phase 3: The Ready Queue
 
-**The problem:** Different jobs need different execution models.
+**Problem:** pick the "best" runnable job quickly.
 
-**The solution:** `AsyncJobExecutor.execute()` dispatches based on `ConcurrencyModel`.
+**Solution:** a heap keyed by `strategy.key(job)`. Keys must be **time-invariant** so a heap stays valid.
 
 ```python
-async def execute(self, job: Job) -> bool:
-    async with self._semaphore:  # Limit concurrent jobs
-        if job.concurrency_model == ASYNC:
-            # Run directly on event loop (cooperative)
-            success = await asyncio.wait_for(
-                job.execute_async(), timeout=job.timeout_seconds
-            )
-        elif job.concurrency_model == THREAD:
-            # Offload to ThreadPoolExecutor (GIL-contended)
-            loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(
-                self._thread_pool, job.execute_sync
-            )
-        elif job.concurrency_model == PROCESS:
-            # Offload to ProcessPoolExecutor (true parallelism)
-            loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(
-                self._process_pool, job.execute_sync
-            )
+class PriorityStrategy(SchedulingStrategy):
+    def key(self, job):  return (-job.priority, job.seq)
+
+class AgingPriorityStrategy(SchedulingStrategy):
+    # effective(now) = p + r·(now − t0). Every job ages at the same rate,
+    # so ordering by p − r·t0 gives the same answer at every `now`.
+    def key(self, job):  return (-(job.priority - self._age_rate * job.submitted_at), job.seq)
 ```
 
-**Why not just use one model for everything?**
-- ALL async → CPU jobs block event loop → everything stalls
-- ALL thread → CPU jobs fight over GIL → no parallelism
-- ALL process → I/O jobs pay heavy IPC cost → wasteful
+`seq` (submit order) is the tie-breaker, so the heap never compares two `Job` objects.
+
+Delayed work (retry backoff, `submit(delay=...)`) sits in a second heap keyed by `run_at`, and is promoted to the ready heap when due. Jobs waiting on dependencies sit in `_blocked` until their last upstream completes.
 
 ---
 
-## Phase 5: Semaphore-based Concurrency Limiting
-
-**The problem:** Without limits, 1000 concurrent jobs will overwhelm resources.
-
-**The solution:** `asyncio.Semaphore(N)` — only N jobs run simultaneously.
+## Phase 4: Workers (Producer-Consumer)
 
 ```python
-class AsyncJobExecutor:
-    def __init__(self, max_concurrent=3):
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        # Semaphore acts as a resource counter
-        # - acquire() decrements (or blocks if 0)
-        # - release() increments (wakes up a waiter)
-
-    async def execute(self, job):
-        async with self._semaphore:
-            # Only max_concurrent jobs reach here
-            await self._run_job(job)
-        # Semaphore released automatically on exit
+async def _worker(self, worker_id):
+    while True:
+        job = None if self._stopping else self._take_next()   # pop + mark RUNNING, no await
+        if job is None:
+            if self._stopping:
+                return
+            self._work_available.clear()
+            try:
+                await asyncio.wait_for(self._work_available.wait(), self._next_wakeup_in())
+            except asyncio.TimeoutError:
+                pass
+            continue
+        await self._run_attempt(job)
 ```
 
-**Semaphore vs Queue for concurrency limiting:**
-- Queue: controls how many items are BUFFERED
-- Semaphore: controls how many items are ACTIVE
-- We use BOTH: Queue for buffering, Semaphore for active limits
+- **N workers = concurrency limit.** No separate semaphore needed.
+- `clear()` then `wait()` has no lost-wakeup race: nothing can call `set()` between the failed `_take_next()` and `clear()` because there is no `await` between them.
+- The wait timeout is "time until the next delayed job is due", so retries fire on time without polling.
 
 ---
 
-## Phase 6: Deadlock Prevention
-
-**The problem:** `asyncio.Lock` is NOT reentrant. If a task holds a lock and gets cancelled, the finally block that tries to acquire the same lock will deadlock.
-
-**The solution:** Snapshot-then-cancel pattern.
+## Phase 5: Running One Attempt
 
 ```python
-# ❌ WRONG - deadlocks on cancel
-async def cancel_all(self):
-    async with self._lock:          # Acquire lock
-        for task in self._tasks:    # Cancel triggers finally...
-            task.cancel()           # ...which tries to acquire lock → DEADLOCK
-
-# ✅ CORRECT - snapshot, then cancel outside lock
-async def cancel_all(self):
-    async with self._lock:
-        tasks = list(self._tasks)   # Snapshot under lock
-    for task in tasks:              # Cancel outside lock
-        if not task.done():
-            task.cancel()
+attempt = asyncio.create_task(self._executor.invoke(job))
+done, _ = await asyncio.wait({attempt}, timeout=job.timeout)
+if not done:
+    attempt.cancel()                     # timed out
 ```
 
-**General deadlock prevention rules:**
-1. Never acquire a lock inside a finally/callback that might be called while holding that lock
-2. Always snapshot data under a lock, then work outside the lock
-3. Document lock ordering if using multiple locks
+Why a separate task per attempt:
+- `cancel(job_id)` cancels the attempt, not the worker.
+- `asyncio.wait` never raises on timeout, so "timed out" means the scheduler's timeout, not a `TimeoutError` the job raised itself.
+
+Then classify: cancelled → `CANCELLED`; timeout or exception → retry if attempts remain, else `TIMED_OUT`/`FAILED`; else `COMPLETED`.
 
 ---
 
-## Phase 7: Race Condition Demo
-
-**The problem:** Interviewers want to see that you understand thread safety at the hardware level.
-
-**The solution:** `UnsafeCounter` vs `SafeCounter` — live demo.
+## Phase 6: Retries with Backoff
 
 ```python
-class UnsafeCounter:
-    def increment(self, amount):
-        for _ in range(amount):
-            temp = self.count      # 1. LOAD
-            # ⏳ THREAD SWITCH HERE
-            self.count = temp + 1  # 2. ADD + 3. STORE
-
-# With 2 threads × 100K iterations:
-# Expected: 200,000
-# Unsafe result: ~150,000–180,000 (lost updates)
-# Safe result: 200,000 (always correct)
+cap   = min(max_delay, base_delay * 2 ** (attempt - 1))   # 1, 2, 4, 8 ... capped
+delay = uniform(0, cap) if jitter else cap                # "full jitter"
 ```
 
-**Why this demonstrates CS knowledge:**
-- Shows understanding that `+=` is NOT atomic (3 CPU instructions)
-- Demonstrates context switch window vulnerability
-- Proves that locks provide mutual exclusion
+The failed job goes to `RETRY_WAIT` and into `_delayed` with `run_at = now + delay`. Raise `NonRetryableError` for errors that will never succeed (bad input), so you don't burn retries on them.
 
 ---
 
-## Phase 8: Graceful Shutdown
+## Phase 7: Cancellation and Shutdown
 
-**The problem:** Killing threads mid-execution leaves corrupted state.
-
-**The solution:** Three-phase shutdown with cooperative cancellation.
-
-```python
-async def stop(self):
-    # Phase 1: Signal → workers finish current job, stop accepting
-    self._stop_event.set()
-
-    # Phase 2: Cancel → CancelledError propagates, cleanup runs
-    await self._executor.cancel_all()
-
-    # Phase 3: Drain → workers exit their loops naturally
-    await asyncio.gather(*self._workers, return_exceptions=True)
-```
-
-**Why this matters:** Shows understanding that cancellation is a COOPERATIVE protocol, not a forceful kill.
+- **Queued job:** mark `CANCELLED` immediately. Its heap entry is skipped when popped (lazy deletion, O(1)).
+- **Running ASYNC job:** `attempt.cancel()` → `CancelledError` at its next `await`.
+- **Running THREAD/PROCESS job:** the scheduler stops waiting and records `CANCELLED`, but the call keeps running. Say this unprompted; it's the most common gap.
+- **`stop()`:** reject new submits, wake every worker, let each finish (or cancel) its current job, await the worker tasks, shut the pools down with `cancel_futures=True`. Queued jobs stay `PENDING`, which is where a durable store would hand them to the next instance.
 
 ---
 
-## Phase 9: Anti-Starvation with Aging
+## Phase 8: Extensions (the "now add X" part)
 
-**The problem:** Priority scheduling can starve low-priority jobs.
-
-**The solution:** Priority aging — boost priority proportional to wait time.
-
-```python
-def effective_priority(job):
-    wait_seconds = (now - job.created_at).total_seconds()
-    age_bonus = wait_seconds * 0.1  # +1 priority per 10 seconds waiting
-    return job.priority.value + age_bonus
-```
-
-**Guarantee:** Every job eventually runs (no infinite starvation) as long as `age_factor > 0`.
+| Extension | Where it lands |
+|-----------|----------------|
+| Dependencies | `submit(depends_on=...)` puts the job in `_blocked`; `_finish` releases dependents on success or cascades `CANCELLED` on failure. Requiring upstreams to exist first makes cycles impossible. |
+| Recurring | `_ticker` task + `RecurringSchedule`: fixed-rate (`next_run += interval`), coalesce missed fires, optional overlap guard. |
+| Aging | A new strategy; see Phase 3 for why it still fits a heap. |
+| Cross-thread producers | `submit_threadsafe` → `loop.call_soon_threadsafe(self.submit, ...)`. |
 
 ---
 
 ## Quick Checklist
 
-| Concept | Implemented? | Where |
-|---------|-------------|-------|
-| ✅ Async/await architecture | Yes | `JobScheduler`, `AsyncJobExecutor` |
-| ✅ GIL explanation | Yes | `ConcurrencyModel` docstrings, `AsyncJobExecutor.execute()` |
-| ✅ Race condition demo | Yes | `UnsafeCounter` vs `SafeCounter` |
-| ✅ Deadlock prevention | Yes | `cancel_all()` snapshot pattern |
-| ✅ Semaphore limiting | Yes | `AsyncJobExecutor._semaphore` |
-| ✅ Producer-Consumer | Yes | `_scheduler_loop` + `_worker_loop` + `asyncio.Queue` |
-| ✅ Cooperative cancellation | Yes | `CancelledError` handlers |
-| ✅ Exponential backoff | Yes | `exponential_backoff()` function |
-| ✅ Context managers | Yes | `TimingContext`, `_AsyncPendingLock` |
-| ✅ Anti-starvation aging | Yes | `WeightedFairScheduler` |
-| ✅ Command Pattern | Yes | `Job` ABC + concrete subclasses |
-| ✅ Strategy Pattern | Yes | `SchedulingStrategy` + 4 implementations |
-| ✅ Facade Pattern | Yes | `JobScheduler` |
+| Concept | Where |
+|---------|-------|
+| ✅ Command pattern | `Job` → `AsyncJob` / `BlockingJob` / `CpuBoundJob` |
+| ✅ Strategy pattern | `SchedulingStrategy.key()` + 4 implementations |
+| ✅ Explicit state machine | `_TRANSITIONS`, `_transition()` |
+| ✅ Observer | `add_listener()` |
+| ✅ Lock-free single-owner state | All mutation on the loop thread; `submit_threadsafe` for others |
+| ✅ O(log n) dispatch | `_ready` / `_delayed` heaps, lazy deletion |
+| ✅ Anti-starvation | `AgingPriorityStrategy` |
+| ✅ Retry + backoff + jitter | `RetryPolicy`, `_after_failure()` |
+| ✅ Timeout + cancellation | `_run_attempt()`, `cancel()` |
+| ✅ Dependencies (DAG) | `_blocked`, `_dependents`, `_finish()` |
+| ✅ Recurring, drift-free | `RecurringSchedule.advance()`, `_ticker()` |
+| ✅ Graceful shutdown | `stop(cancel_running=...)` |
+| ✅ Bounded memory | `history_limit` |

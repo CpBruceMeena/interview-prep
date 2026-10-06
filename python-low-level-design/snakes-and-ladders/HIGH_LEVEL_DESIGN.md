@@ -41,10 +41,11 @@ Mobile/Web Client (React/PWA)
               │  chat, queue)  │
               └───────┬───────┘
                       │
-              ┌───────▼───────┐
-              │  PostgreSQL   │
-              │(Users, games,│  │ leaderboards) │
-  └───────────────┘
+              ┌───────▼────────┐
+              │  PostgreSQL    │
+              │ (users, games, │
+              │  moves, ranks) │
+              └────────────────┘
 ```
 
 ### 🎬 Animated Sequence Diagram
@@ -71,7 +72,7 @@ Mobile/Web Client (React/PWA)
 
 **✅ Answer:**
 1. **Server-authoritative dice:** Dice rolls happen server-side, not client-side. Clients send "roll intention," server computes result.
-2. **Seeded PRNG:** Use a server-side seed that's cryptographically random. Players can't predict rolls.
+2. **Unpredictable RNG:** Use a CSPRNG server-side (`secrets` / `random.SystemRandom`). A seeded `random.Random` is fine for tests and replay but its state is recoverable from outputs, so don't use a plain PRNG where money or rankings are at stake. For provable fairness, commit to `hash(server_seed)` before the game and reveal the seed after.
 3. **Cheat detection:** Track roll statistics per player — deviation beyond 3σ triggers investigation.
 4. **Spectator verification:** All rolls logged and verifiable post-game.
 
@@ -120,8 +121,10 @@ CREATE TABLE players (
     finish_order INT, color TEXT
 );
 CREATE TABLE moves (
-    id BIGSERIAL, game_id UUID, player_id UUID,
-    dice_value INT, from_pos INT, to_pos INT, timestamp TIMESTAMP
+    game_id UUID, turn_no INT, player_id UUID,
+    faces SMALLINT[], from_pos INT, landed_pos INT, to_pos INT,
+    request_id UUID, created_at TIMESTAMP,
+    PRIMARY KEY (game_id, turn_no)      -- one move per turn; a duplicate insert fails
 );
 CREATE TABLE boards (
     id UUID, game_id UUID, cell INT, type TEXT, destination INT
@@ -132,15 +135,33 @@ CREATE TABLE boards (
 
 ## 5. SCALABILITY
 
-**Bottleneck:** Game Engine — per-game state management when 10K concurrent games
+**Capacity:** 10K concurrent games × 4 players, one move every ~3 s per game → **~3.3K moves/s** peak. Each move is a ~200-byte state write plus a fan-out to 4 sockets (~13K messages/s). Active state is ~1 KB/game → ~10 MB in Redis. This is small: the hard parts are correctness and reconnects, not throughput.
 
-**Solution:** Redis stores all active game states. Game engine pods stateless — each pod handles N games. Redis pub/sub broadcasts moves to all players in a game room.
+**Solution:** Redis stores all active game states. Game engine pods are stateless — any pod can process any move. Redis pub/sub broadcasts moves to all players in a game room.
 
-**Failure mode:** Redis failure → games in progress lost. Mitigation: Redis replication + periodic snapshots to PostgreSQL every 5 seconds.
+**Alternative worth naming:** route each `game_id` to one owner pod (consistent hashing) and keep the game in memory, single-threaded per game (actor model). No per-move Redis CAS, lower latency; the cost is rebalancing and recovery when a pod dies (rebuild from the move log).
 
 ---
 
-## 6. COST (Monthly)
+## 6. CONSISTENCY, IDEMPOTENCY & FAILURE MODES
+
+**Single writer per game via optimistic concurrency.** Game state in Redis carries a `version` (= turn number). A roll request is `{game_id, player_id, expected_turn, request_id}`. The engine runs a Lua script (atomic in Redis) that checks `status == IN_PROGRESS`, `current_player == player_id` and `version == expected_turn`, then writes the new state and `version+1`. Two racing requests: one wins, the other gets a conflict and the client refetches. This is the distributed version of the in-process lock in the LLD.
+
+**Idempotent rolls.** Clients retry on timeouts. Store `request_id -> TurnResult` with a short TTL (or check it against the last applied move); a retry returns the original result instead of rolling again. Without this, a retry after a lost response lets a player re-roll.
+
+**Pub/sub is fire-and-forget.** A client that is disconnected during a publish misses the event. Every event carries the `version`; a client that sees a gap (or reconnects) fetches the full state. The move log, not pub/sub, is the source of truth.
+
+| Failure | Effect | Mitigation |
+|---------|--------|------------|
+| Engine pod dies mid-request | Move may or may not be applied | Client retries with the same `request_id`; idempotency makes it safe |
+| Redis primary fails | Writes since last replication lost | Replica + AOF `everysec`; append each move to Postgres asynchronously (via a queue) so finished games and history survive |
+| Client disconnects | Their turn stalls the game | Turn timer: auto-roll after 30 s; forfeit after N missed turns |
+| Duplicate roll (double-click) | Two moves | Turn/version check rejects the second |
+| Stale client UI | Wrong board shown | Version gap → full resync |
+
+---
+
+## 7. COST (Monthly)
 
 | Component | Cost |
 |-----------|------|

@@ -31,17 +31,17 @@ class Vehicle(ABC):
 This follows **Liskov Substitution Principle** — any `Vehicle` subclass (Car, Truck, Motorcycle) is fully substitutable for the base class. The caller doesn't need to check instance types.
 
 **Step 3 — Spot Allocation (SRP + OCP):**
-The `SpotAllocationMapping` class is a separate concern from vehicle management:
+The `SpotAllocationMapping` class is a separate concern from vehicle management. It derives the allowed spot types from the vehicle's minimum spot and returns them **smallest first**, which is what makes allocation best-fit:
 
 ```python
-_mapping = {
-    VehicleType.MOTORCYCLE: {SpotType.MOTORCYCLE, SpotType.COMPACT, SpotType.LARGE},
-    VehicleType.CAR: {SpotType.COMPACT, SpotType.LARGE},
-    VehicleType.TRUCK: {SpotType.LARGE},
-}
+@staticmethod
+def get_allowed_spots(vehicle: Vehicle) -> Tuple[SpotType, ...]:
+    required = vehicle.get_required_spot_type().size
+    return tuple(sorted((t for t in SpotType if t.size >= required),
+                        key=lambda t: t.size))
 ```
 
-This follows **Open/Closed Principle** — adding a new vehicle type like `ElectricCar` means adding a new entry to the mapping dictionary, not modifying existing logic.
+Order matters. An earlier version returned a Python `set`, whose iteration order for enums is arbitrary, so a car could land in a LARGE spot while COMPACT spots were free and starve trucks. A new vehicle subclass needs no entry here; a new *rule* (EV-only spots) is a change to this one class.
 
 **Step 4 — Encapsulation:**
 Each `ParkingSpot` encapsulates its own state (available/occupied), and `ParkingFloor` composes spots. This gives us clean separation — spot-level operations don't leak into floor-level logic.
@@ -75,24 +75,23 @@ SRP: A `Vehicle` knows *what* it needs, but *how* spots map to vehicles is a sep
 **🔴 The Problem:**
 Two threads check `is_available` simultaneously, both see `True`, and both park vehicles — double-booking the same spot.
 
-**✅ Solution: Lock-based spot allocation**
+**✅ Solution: Lock-based spot allocation** (this is what `parking_lot.py` does)
 
 ```python
-import threading
-
-class ParkingLot:
-    def __init__(self):
-        self._lock = threading.Lock()
-    
-    def park_vehicle(self, vehicle: Vehicle) -> Optional[ParkingTicket]:
-        with self._lock:  # Critical section
-            spot = self.find_available_spot(vehicle)
-            if not spot:
-                return None
-            spot.park(vehicle)
-            ticket = self._ticket_manager.create_ticket(spot, vehicle)
-            return ticket
+def park_vehicle(self, vehicle: Vehicle) -> ParkingTicket:
+    with self._lock:  # check-then-act must be one critical section
+        if vehicle.license_plate in self._active_by_plate:
+            raise VehicleAlreadyParkedError(...)
+        spot = self._find_spot_locked(vehicle)
+        if spot is None:
+            raise ParkingFullError(...)
+        self._floor_by_number[spot.floor].occupy(spot, vehicle)
+        ticket = self._ticket_manager.create_ticket(spot, vehicle, self._clock())
+        self._active_by_plate[vehicle.license_plate] = ticket
+        return ticket
 ```
+
+Note the private `_find_spot_locked`: the public `find_available_spot` also takes the lock, and `threading.Lock` is not re-entrant, so calling the public method from inside the critical section would deadlock. Splitting "public, locks" from "private, assumes lock held" is the standard fix (an `RLock` also works but hides the layering).
 
 **💼 Production-Grade Solution (Distributed):**
 
@@ -100,13 +99,17 @@ In a real system with multiple entry/exit terminals, application-level locks don
 
 1. **Pessimistic locking (Database):**
    ```sql
-   BEGIN TRANSACTION;
-   SELECT * FROM parking_spots 
-   WHERE spot_id = ? AND status = 'AVAILABLE'
-   FOR UPDATE;
-   UPDATE parking_spots SET status = 'OCCUPIED' WHERE spot_id = ?;
+   BEGIN;
+   SELECT id FROM parking_spot
+   WHERE spot_type = 'COMPACT' AND status = 'AVAILABLE'
+   ORDER BY floor_id, spot_number
+   LIMIT 1
+   FOR UPDATE SKIP LOCKED;          -- concurrent gates get different rows
+   UPDATE parking_spot SET status = 'OCCUPIED' WHERE id = :picked;
+   INSERT INTO ticket (...) VALUES (...);
    COMMIT;
    ```
+   Plain `FOR UPDATE` without `SKIP LOCKED` makes every gate queue on the same "first free" row.
 
 2. **Optimistic locking (Application):**
    ```sql
@@ -116,12 +119,13 @@ In a real system with multiple entry/exit terminals, application-level locks don
    ```
    Check affected row count — if 0, another transaction beat you.
 
-3. **Redis distributed lock (Redlock algorithm):**
+3. **Redis lock (single instance):**
    ```python
-   # Acquire lock with TTL
-   lock_key = f"lock:spot:{spot_id}"
-   acquired = redis.setnx(lock_key, "locked", ttl=5000)  # 5 second TTL
+   token = uuid4().hex
+   acquired = redis.set(f"lock:spot:{spot_id}", token, nx=True, px=5000)
+   # release only if we still own it (Lua compare-and-delete), never a bare DEL
    ```
+   `SETNX` has no TTL argument; `SET key val NX PX ms` is the atomic form. A Redis lock is advisory and can expire mid-operation (GC pause), so the DB write still needs its own guard (`WHERE status = 'AVAILABLE'` or a fencing token). For a parking lot the DB alone is enough; Redis locking adds a failure mode without buying throughput you need.
 
 ### 🔍 Trade-off Analysis
 
@@ -130,7 +134,7 @@ In a real system with multiple entry/exit terminals, application-level locks don
 | Threading.Lock | Simple, fast | Single process only | Single-server app |
 | DB Pessimistic | Accurate, durable | Lower throughput, deadlock risk | High contention |
 | DB Optimistic | Higher throughput | Retry overhead on conflict | Low contention |
-| Redis Lock | Distributed, fast | Complexity, TTL management | Multi-server deployment |
+| Redis Lock | Distributed, fast | Lock can expire mid-write; still need a DB guard | Rarely; only when the protected resource isn't in a DB |
 
 ---
 
@@ -145,8 +149,8 @@ In a real system with multiple entry/exit terminals, application-level locks don
 class FeeCalculator(ABC):
     """Interface Segregation: minimal, focused interface"""
     @abstractmethod
-    def calculate_fee(self, duration_hours: float, spot_type: SpotType) -> float:
-        pass
+    def calculate_fee(self, duration: timedelta, spot_type: SpotType) -> Decimal:
+        ...
 
 class HourlyFeeCalculator(FeeCalculator): ...
 class DailyFeeCalculator(FeeCalculator): ...
@@ -172,7 +176,7 @@ class ParkingLot:
 
 ### 💡 Real-world Production Considerations
 
-1. **Fee rounding:** Always round UP, not nearest. $0.005 rounding per transaction across 10M transactions is $50,000 lost.
+1. **Money type and rounding:** Use `Decimal` (DB: `NUMERIC(10,2)`), never float. Billing *units* round up (2 h 10 m is 3 started hours, `math.ceil(duration / timedelta(hours=1))`); the final currency amount is quantized once, at the end, with an explicit rounding mode.
 2. **Grace periods:** Many lots give 15-min grace. Model this as a `FreePeriodDecorator(FeeCalculator)`.
 3. **Lost tickets:** Flat fee (e.g., $50) — different concern, handled by a different calculator.
 4. **Currency/regional differences:** Some cities have tax on parking — compose with `TaxDecorator(FeeCalculator)`.
@@ -209,27 +213,31 @@ CREATE TABLE parking_spot (
     spot_type VARCHAR(20) NOT NULL,  -- MOTORCYCLE, COMPACT, LARGE
     status VARCHAR(20) DEFAULT 'AVAILABLE',
     version INT DEFAULT 1,  -- For optimistic locking
-    UNIQUE(floor_id, spot_number),
-    INDEX idx_status (status),
-    INDEX idx_floor_type (floor_id, spot_type, status)
+    UNIQUE(floor_id, spot_number)
 );
+CREATE INDEX idx_spot_type_status ON parking_spot(spot_type, status, floor_id);
 
 CREATE TABLE ticket (
     id BIGINT PRIMARY KEY,
     spot_id BIGINT REFERENCES parking_spot(id),
     vehicle_license VARCHAR(20) NOT NULL,
     vehicle_type VARCHAR(20) NOT NULL,
-    entry_time TIMESTAMP NOT NULL,
-    exit_time TIMESTAMP,
-    fee DECIMAL(10,2),
-    status VARCHAR(20) DEFAULT 'ACTIVE',
-    INDEX idx_status_entry (status, entry_time)
+    entry_time TIMESTAMPTZ NOT NULL,
+    exit_time TIMESTAMPTZ,
+    fee NUMERIC(10,2),
+    status VARCHAR(20) DEFAULT 'ACTIVE'
 );
+-- The DB enforces the invariants the in-memory lock enforces:
+CREATE UNIQUE INDEX one_active_ticket_per_spot  ON ticket(spot_id)         WHERE status = 'ACTIVE';
+CREATE UNIQUE INDEX one_active_ticket_per_plate ON ticket(vehicle_license) WHERE status = 'ACTIVE';
 ```
 
+The two partial unique indexes are the staff-level detail: even if application locking has a bug, the database refuses a double-booked spot or a plate parked twice.
+
 **Performance considerations for 10K+ spots:**
-- **Index strategy:** Composite index on `(spot_type, status)` for availability queries
-- **Partitioning:** Partition `ticket` table by month for query performance
+- **Size check first:** 10K spots is a tiny table that fits in memory. Even 1,000 entries/hour is well under 1 write/second. Don't reach for sharding or caches to solve load; reach for them only for multi-lot aggregation or availability fan-out to apps.
+- **Index strategy:** Composite index on `(spot_type, status, floor_id)` for availability queries
+- **Partitioning:** `ticket` grows forever (≈ 10K spots × a few turns/day ≈ 10M+ rows/year); partition by month so old partitions can be archived
 - **Caching:** Cache available spot counts in Redis, invalidate on ticket creation
 - **Read replicas:** Route availability queries to replicas, writes to primary
 
@@ -261,8 +269,8 @@ CREATE TABLE ticket (
 
 **Key decisions:**
 - **Database per city** — data locality, independent failure domains
-- **Global Redis cache** for cross-city availability queries (TTL: 30 seconds)
-- **Eventual consistency** for cross-city bookings — if City A wants to book in City B, use async messaging
+- **Lot is the consistency boundary.** A spot is only ever claimed in its own lot's DB, so there is no cross-region transaction. Availability shown to apps is a cached, eventually consistent view (a few seconds stale is fine; the gate is the final check).
+- **Cross-city bookings** go to the owning region (route by lot id), not via a global write path
 - **CQRS pattern** — separate read/write paths to scale availability queries independently
 
 ---
@@ -272,7 +280,7 @@ CREATE TABLE ticket (
 
 | Edge Case | Solution |
 |-----------|----------|
-| **Lost ticket** | Charge max daily rate × 24h, need ID verification to exit |
+| **Lost ticket** | Look up the active session by plate (ANPR or manual), charge fee-so-far + flat penalty (`unpark_lost_ticket`), require ID |
 | **Overstay after payment** | Pay-by-plate cameras, automatic fee recalc on exit |
 | **System crash mid-parking** | Transaction log replay, barrier manually override-able |
 | **Invalid license plate** | Accept any format, validate only on exit payment |
@@ -283,15 +291,15 @@ CREATE TABLE ticket (
 
 ## Question 7: Design Patterns Inventory
 
-| Pattern | Where | Why |
-|---------|-------|-----|
-| **Singleton** | ParkingLot | Single entry point for lot operations |
-| **Factory** | VehicleFactory | Centralizes vehicle creation |
-| **Strategy** | FeeCalculator | Interchangeable pricing algorithms |
-| **Observer** | DisplayBoard | Real-time updates when spot status changes |
-| **State** | Ticket | ACTIVE → PAID → LOST lifecycle |
-| **Facade** | ParkingLot | Unified interface over subsystems |
-| **Decorator** | FeeCalculator wrappers | Add seasonal surcharge without modifying core |
+| Pattern | Where | Status in code |
+|---------|-------|----------------|
+| **Strategy** | `FeeCalculator` | Implemented (`HourlyFeeCalculator`, `DailyFeeCalculator`) |
+| **Factory** | `VehicleFactory` | Implemented |
+| **Facade** | `ParkingLot` | Implemented; also owns the lock |
+| **Decorator** | `FeeCalculator` wrappers (grace period, tax) | Natural extension, not implemented |
+| **Observer** | Display boards, analytics | Only worth it with several subscribers; the code's `DisplayBoard` pulls |
+
+**Don't claim Singleton.** A singleton `ParkingLot` makes every test share one lot and blocks running two lots in one process. If someone asks, say "one instance, wired at startup", which is dependency injection, not a singleton. Likewise ticket status is an enum with a guard, not the State pattern.
 
 ---
 
@@ -319,6 +327,49 @@ CREATE TABLE ticket (
 **🔹 Dependency Inversion —** *"Does ParkingLot depend on concrete FeeCalculator?"*
 - No — constructor accepts `FeeCalculator` interface
 - Can swap Hourly→Daily→Weekend without changing ParkingLot
+
+---
+
+## Question 9: The Follow-ups Interviewers Actually Push On
+
+**"Now add EV charging spots."**
+Add `SpotType.EV`, an `ElectricCar` subclass, and a rule in `SpotAllocationMapping`: EVs try EV spots first and fall back to normal ones; non-EVs never take EV spots. Allocation, locking and tickets don't change. Bonus: charge for electricity as a separate fee line, not inside the parking strategy.
+
+**"Two gates call park at the same time and both get the same spot. Fix it."**
+The race is between *choosing* and *claiming*. Wrap find + occupy + ticket in one lock (single process) or make the claim conditional in the DB (`UPDATE parking_spot SET status='OCCUPIED' WHERE id=? AND status='AVAILABLE'`, check rowcount = 1). Locking `ParkingSpot.park()` alone does not help.
+
+**"The same exit ticket is scanned twice (retry, double-tap)."**
+`unpark_vehicle` takes the lock and `ParkingTicket.close()` rejects a non-ACTIVE ticket, so the second call raises `InvalidTicketError` and nobody is charged twice. In a service, make exit idempotent instead: the client sends an idempotency key and a retry returns the *original* receipt rather than an error.
+
+**"Payment fails after you've computed the fee."**
+Don't free the spot or close the ticket until payment succeeds: compute fee → authorize → on success mark PAID and release. On failure the ticket stays ACTIVE and the barrier stays closed. Split `close()` into `quote()` and `settle()` if this is in scope.
+
+**"Add reservations."**
+A reservation holds a spot for a time window. In memory: remove the spot from the floor's free index while reserved and re-add on expiry/cancel. In the DB: a GiST exclusion constraint on `(spot_id, tstzrange)` prevents overlaps. Decide whether a reservation guarantees a specific spot or just capacity of a type; capacity is easier to honour and much more efficient.
+
+**"How do you test this?"**
+Inject the clock (`ManualClock`) so "2 h 10 m → 3 hours" is an exact assertion with no sleeping. Unit-test best-fit order, full lot, duplicate plate, double unpark, lost ticket, rounding boundaries (exactly 1 h vs 1 h + 1 s). For concurrency, release 100 threads through a `threading.Barrier` against 55 spots and assert exactly 55 tickets, 55 distinct spots, 45 `ParkingFullError`.
+
+**"Performance: the lot has 50,000 spots."**
+Scanning all spots per entry is O(N). Keep a free index per (floor, spot type) so a pick is O(floors × types); with a min-heap per type you also get "lowest spot number first" in O(log n).
+
+---
+
+## ⚠️ Common Mistakes
+
+- Using a `set` for allowed spot types, then iterating it: allocation order becomes arbitrary and cars eat truck spots.
+- Locking only inside `ParkingSpot.park()`, leaving the find/claim race open.
+- Calling a locking public method from inside the lock with a non-reentrant `Lock` (deadlock).
+- `float` money and `datetime.now()` hard-coded inside the ticket, which makes fees untestable without `sleep()`.
+- Returning `None` and printing on failure, so callers can't distinguish "lot full" from "bad ticket".
+- No guard against a ticket being closed twice, or a plate parking twice.
+- Declaring `ParkingLot` a Singleton and listing patterns the code doesn't use.
+- Jumping to Redis/Kafka/microservices for a workload of under one write per second.
+
+## 🎚️ Senior vs Staff Signal
+
+- **Senior:** clean entities and interfaces, working best-fit allocation, a correct critical section, Decimal money, exceptions, a few targeted tests, and a fee strategy that extends cleanly.
+- **Staff:** all of the above, plus: sizes the problem first and says the load is tiny, picks the DB as the source of truth and pushes invariants into it (partial unique indexes, conditional updates), designs idempotent entry/exit for flaky gate hardware, separates fee quote from settlement for payment failures, and explains which patterns they deliberately *didn't* use.
 
 ---
 

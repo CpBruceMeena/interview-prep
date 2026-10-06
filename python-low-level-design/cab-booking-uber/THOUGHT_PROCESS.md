@@ -10,107 +10,118 @@
 
 ---
 
-## Phase 0: Requirements Gathering
+## ⏱️ How to Run This in a 45–60 min Interview
 
-How are riders matched to drivers? (Nearest, GeoRadius?) What cab types? Pricing model (base + per km)? Surge pricing? Location tracking?
+| Time | Step | What you do | What to say out loud |
+|------|------|-------------|----------------------|
+| 0–7 | **Clarify** | Pin scope with the questions below. Write the agreed list in a comment. | "I'll treat matching, the trip lifecycle and pricing as core; GPS ingestion and surge as stretch." |
+| 7–15 | **Entities & interfaces** | Enums, `Location`, `Driver`, `Trip`, `PricingStrategy`, `DriverMatchingStrategy`, the service facade. Draw the trip state machine. | "Driver status and trip status are separate state machines that move together. The trip owns the driver's status while it's active." |
+| 15–35 | **Core code** | `request_ride` (search → rank → claim → price → create trip), `Trip` transitions table, `StandardPricing` + `SurgePricing`. A linear scan for "nearby" is fine first. | "I'm writing the linear scan first and hiding it behind `GeoIndex.search` so I can swap in geohash without touching matching." |
+| 35–45 | **Concurrency** | `Driver.try_claim()` as a CAS; trip lock around transitions; one active trip per rider. | "The search result is stale by definition. The claim is the only authority, and losing a claim means try the next driver, not fail." |
+| 45–55 | **Extension** | Whatever they add: decline/timeout, surge, cancellation fee, pool, ETA ranking. | "This fits in `rank()` / a new transition / the decorator chain. Here's the one place that changes." |
+| 55–60 | **Wrap up** | Tests you'd write; how it maps to a service. | "In production the CAS becomes a conditional UPDATE or Redis `SET NX`, and the index is Redis GEO fed by Kafka." |
+
+### Clarifying questions worth asking
+
+1. **Matching rule:** nearest by straight line, by ETA, or by rating? Fixed radius or expanding? *(Drives the strategy interface.)*
+2. **Offer model:** does the driver accept/decline, with a timeout, or is assignment automatic? *(Adds `REQUESTED` vs `ACCEPTED`.)*
+3. **Cancellation:** who can cancel, until when, and is there a fee after the driver arrives? *(Transition table.)*
+4. **Pricing:** upfront fare locked at request, or metered at the end? Surge per zone? *(Fare stored on trip vs computed at completion.)*
+5. **Concurrency scope:** many riders requesting at once in the same area? *(Yes, always. Say you'll make the claim atomic.)*
+6. **Can a rider have more than one active trip?** *(Usually no; enforce it.)*
+7. **Scale for the follow-up:** drivers per city and GPS frequency. *(100K drivers / 3 s ≈ 33K writes/s, which is why the index is in memory.)*
+
+---
+
+## Phase 0: Requirements
+
+Rider requests a cab of a type from A to B. The system finds a nearby available driver of that type, offers
+the trip, and on acceptance the trip runs `ACCEPTED → DRIVER_ARRIVED → STARTED → COMPLETED`. Fare is quoted
+up front (base + per km + per minute, times zone surge). Drivers stream GPS. A driver is never on two trips.
 
 ## Phase 1: Identify the Nouns
 
-> *"Riders request cabs. Nearby drivers are matched. Fare is calculated based on distance and duration."*
-
 | Noun | Decision | Why |
 |------|----------|-----|
-| Rider | Regular Class | Identity, minimal behavior |
-| Driver | Regular Class | Status, location, rating, cab type |
-| Location | Regular Class | Value object with Haversine distance |
-| GeoIndex | Regular Class | Simulates Redis GEO for spatial search |
-| Trip | Regular Class | State machine: REQUESTED → COMPLETED |
-| PricingStrategy | ABC | Strategy for fare calculation |
-| DriverMatchingStrategy | ABC | Strategy for finding drivers |
-| Zone / ZoneManager | Regular | Surge pricing zones |
-| KafkaBroker / KafkaTopic | Regular | Event simulation |
-| CabBookingService | Facade | Main entry point |
-| CabStatus / TripStatus / CabType / PaymentMethod | Enum | System vocabularies |
+| Rider | Class | Identity, minimal behaviour |
+| Driver | Class with a lock | Status is contended state; changes via compare-and-set |
+| Location | Frozen dataclass | Value object with haversine `distance_to` |
+| GeoIndex | Class | "Who is near this point?" behind one method (`search`) |
+| Trip | Dataclass with a lock | State machine; owns its driver's status while active |
+| PricingStrategy | ABC | Base fare; surge decorates it |
+| DriverMatchingStrategy | ABC | Ranking policy, pure function of candidates |
+| Zone / ZoneManager | Classes | Surge per area |
+| KafkaBroker | Class | Event pipeline simulation (stretch) |
+| CabBookingService | Facade | Orchestrates matching, pricing, lifecycle |
 
 ## Phase 2: Enums First
 
 ```python
-class CabStatus(Enum):  AVAILABLE, BOOKED, ON_TRIP, OFFLINE, MAINTENANCE
-class TripStatus(Enum): REQUESTED, ACCEPTED, STARTED, COMPLETED, CANCELLED
+class CabStatus(Enum):  AVAILABLE, BOOKED, ON_TRIP, OFFLINE
+class TripStatus(Enum): REQUESTED, ACCEPTED, DRIVER_ARRIVED, STARTED, COMPLETED, CANCELLED
 class CabType(Enum):    MINI, SEDAN, SUV, PREMIUM, AUTO
-class PaymentMethod(Enum): CASH, CARD, WALLET, UPI
 ```
 
-## Phase 3: dataclass vs `__init__`
+Don't add enums you won't use (a `PaymentMethod` with no payment flow is noise in an interview).
 
-- **`Location`**: Regular — has behavior (`distance_to` with Haversine formula, `to_dict`)
-- **`Rider`**: Regular — identity class
-- **`Driver`**: Regular — complex state (status, rating, location updates)
-- **`Trip`**: Regular — lifecycle management (start, complete, cancel)
-- **`GeoIndex`**: Regular — geohash encoding + spatial search
-- **`KafkaMessage`/`KafkaTopic`**: Regular — event simulation
-
-## Phase 4: Assigning Responsibilities
+## Phase 3: Assigning Responsibilities
 
 | Action | Owner | Why |
 |--------|-------|-----|
-| Calculate distance | `Location.distance_to()` | Location is a value object with behavior |
-| Update driver location | `GeoIndex.update_location()` | GeoIndex manages spatial indices |
-| Search nearby drivers | `GeoIndex.geo_radius_search()` | Simulates Redis GEORADIUS |
-| Calculate fare | `PricingStrategy.calculate_fare()` | Strategy pattern |
-| Find best driver | `DriverMatchingStrategy.find_driver()` | Strategy pattern |
-| Start/complete trip | `Trip.start()`/`Trip.complete()` | Trip owns its lifecycle |
-| Request ride | `CabBookingService.request_ride()` | Orchestrates matching + pricing + trip |
+| Distance | `Location.distance_to()` | Pure value-object behaviour |
+| Who is nearby | `GeoIndex.search()` | Spatial structure hidden behind one call |
+| Order candidates | `DriverMatchingStrategy.rank()` | Policy, no side effects |
+| Reserve a driver | `Driver.try_claim()` | The driver guards its own status |
+| Fare | `PricingStrategy.calculate_fare()` | Strategy; surge is a decorator |
+| Status transitions | `Trip.accept/arrive/start/complete/cancel` | Trip owns its lifecycle and validates against a table |
+| Orchestration | `CabBookingService.request_ride()` | Search → rank → claim → price → create |
 
-## Phase 5: Location Value Object
+## Phase 4: The Concurrency Story (say this unprompted)
+
+The classic bug is check-then-act: `if driver.is_available(): driver.status = BOOKED`. Two requests both see
+AVAILABLE and both book. The fix is one atomic step:
 
 ```python
-class Location:
-    def __init__(self, lat: float, lng: float):
-        self._lat = lat
-        self._lng = lng
-    
-    def distance_to(self, other: 'Location') -> float:
-        """Haversine formula for km distance"""
-        # Pure calculation, no side effects
-    
-    def to_dict(self) -> dict:
-        return {"lat": self._lat, "lng": self._lng}
+def try_claim(self) -> bool:
+    with self._lock:
+        if self._status is not CabStatus.AVAILABLE:
+            return False
+        self._status = CabStatus.BOOKED
+        return True
 ```
 
-**Value objects** are immutable-ish, have behavior, and are compared by value.
+and a matcher that treats a failed claim as "next candidate". Then lock the trip for every transition, so
+cancel-vs-start can't both win. Lock order trip → driver, never the reverse.
 
-## Phase 6: Two Strategy Patterns
+## Phase 5: Two Strategy Patterns
 
-**Pricing:**
 ```python
 class PricingStrategy(ABC):
-    def calculate_fare(self, distance_km, duration_min) -> float
+    def calculate_fare(self, distance_km, duration_min) -> Decimal
 
-class StandardPricing(PricingStrategy):  # Base + per km + per min
-class SurgePricing(PricingStrategy):     # Multiplier on base
-```
+class StandardPricing(PricingStrategy)      # rate card per cab type
+class SurgePricing(PricingStrategy)         # decorator: wraps any strategy, multiplies
 
-**Driver Matching:**
-```python
 class DriverMatchingStrategy(ABC):
-    def find_driver(self, pickup, cab_type, drivers, geo_index)
+    def rank(self, pickup, candidates: list[(Driver, km)]) -> list[Driver]
 
-class NearestDriverMatching(DriverMatchingStrategy):  # Closest first
-class GeoRadiusDriverMatching(DriverMatchingStrategy):  # Progressive expansion
+class NearestDriverMatching(...)            # distance asc
+class HighestRatedDriverMatching(...)       # rating desc within radius, distance tiebreak
 ```
 
-## Phase 7: GeoIndex (Simulated Redis GEO)
+Radius expansion (2 → 5 → 10 km) lives in the service, not in each strategy, so every strategy gets it.
 
-The GeoIndex uses geohash encoding for O(log N) spatial search:
-```
-In production: Redis GEOADD + GEORADIUS
-Simulated: geohash prefix matching → distance filter → sort
-```
+## Phase 6: GeoIndex
 
-## Phase 8: Quick Checklist
+Start with a linear scan (O(N)), then say: "Redis GEO stores members in a sorted set keyed by a 52-bit
+geohash. A radius query scans the centre cell and its 8 neighbours at a precision where a cell is at least
+the radius wide, then filters by exact distance." Forgetting the neighbours is the common bug: a driver 50 m
+away across a cell edge gets missed.
 
-✅ **Value Object:** Location encapsulates coordinates + distance calculation
-✅ **Strategy:** Both pricing and driver matching are swappable
-✅ **SRP:** Rider, Driver, Trip, GeoIndex each own their data
-✅ **OCP:** New cab type → add enum + rate, no pricing class changes
+## Phase 7: Quick Checklist
+
+✅ **Atomic claim:** no driver on two trips, losers fall through to the next candidate
+✅ **State machine:** transitions in a table, illegal ones raise
+✅ **Money:** `Decimal`, quoted at request
+✅ **Strategy + Decorator:** matching and pricing swappable; surge composes
+✅ **OCP:** new cab type = enum value + rate card

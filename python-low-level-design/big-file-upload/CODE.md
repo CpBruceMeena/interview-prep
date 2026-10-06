@@ -1,8 +1,9 @@
 # Big File Upload — Implementation
 
-> Full Python implementation of the Big File Upload system following SOLID principles,
-> TUS protocol, and production-grade patterns with chunked uploads, checksum verification,
-> pluggable storage backends, and multi-level rate limiting.
+> Full Python implementation of the Big File Upload system: a resumable, parallel,
+> chunked upload protocol with per-chunk and whole-file SHA-256 verification,
+> pluggable storage backends, atomic per-user rate limits, garbage collection,
+> and a client that retries and resumes. Python 3.10+, stdlib only.
 
 ---
 
@@ -10,1007 +11,1001 @@
 
 | Component | Role | Pattern |
 |-----------|------|---------|
-| `UploadState` | Enum of upload lifecycle states | Enum |
-| `UploadSession` | Represents a single upload attempt | Data class |
-| `ChunkInfo` | Metadata for a single chunk | Data class |
-| `UploadRepository` | DB access for uploads/chunks | Repository |
-| `ChunkStorageBackend(ABC)` | Interface for chunk storage | Abstract Base |
-| `S3ChunkStorage` | S3/MinIO chunk storage | Strategy |
-| `LocalChunkStorage` | Local filesystem (dev/testing) | Strategy |
-| `ChecksumVerifier` | SHA-256 verification | Utility |
-| `UploadScheduler` | Controls concurrency + retry | Scheduler |
-| `RateLimiter` | Multi-level rate limiting | Utility |
-| `UploadService` | Core upload orchestration | Facade |
-| `UploadStateMachine` | Validates state transitions | State Machine |
-| `BackgroundGC` | Garbage collection for abandoned uploads | Background Task |
+| `UploadPolicy` | Chunk sizing (S3 part limits), size cap, TTL, per-user limits | Value object |
+| `UploadState` + `_TRANSITIONS` | Upload lifecycle; illegal edges raise `InvalidStateError` | State machine |
+| `UploadSession`, `ChunkInfo`, `ChunkReceipt` | Upload metadata, contiguous offset, missing chunks | Data classes |
+| `ChunkStorage` (ABC) | `put_chunk`, `get_chunk`, `compose`, `delete_prefix` | **Strategy** |
+| `InMemoryChunkStorage` | Tests and demo | Strategy |
+| `LocalChunkStorage` | Filesystem; atomic writes, I/O off the event loop, path containment | Strategy |
+| `UploadRepository` | Session lookup (stand-in for PostgreSQL) | Repository |
+| `TokenBucket`, `UploadLimiter` | Concurrent uploads, daily quota, bandwidth | — |
+| `UploadService` | `initiate`, `upload_chunk`, `get_offset`, `missing_chunks`, `complete`, `cancel`, `record_scan_result`, `collect_garbage` | **Facade** + **Observer** (`on_completed`) |
+| `UploadClient` | Splits the file, bounded parallelism, retry with jitter, resume | Client |
+| `FlakyNetwork` | Demo/test double that drops requests and "crashes" the client | Test double |
 
 ---
 
-## 🧠 Design Patterns
+## 🔄 Lifecycle
 
-| Pattern | Where | Why |
-|---------|-------|-----|
-| **Strategy** | `ChunkStorageBackend` | Swap S3 ↔ Local for testing |
-| **Repository** | `UploadRepository` | Abstracts DB access behind interface |
-| **Facade** | `UploadService` | Single entry point for upload operations |
-| **State Machine** | `UploadState` + validation | Ensures valid lifecycle transitions |
-| **Scheduler** | `UploadScheduler` | Controls parallel execution + retries |
-| **Factory** | RateLimiter creation | Pluggable rate limiting strategies |
-| **Observer** | Upload completion callbacks | Async processing pipeline hooks |
-
----
-
-## 📊 Class Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        UploadService (Facade)                          │
-│                                                                         │
-│  ┌────────────────┐  ┌────────────────┐  ┌──────────────────────────┐  │
-│  │ initiate()     │  │ upload_chunk() │  │ complete()              │  │
-│  │ cancel()       │  │ get_status()   │  │ get_progress()          │  │
-│  └───────┬────────┘  └───────┬────────┘  └────────────┬─────────────┘  │
-│          │                   │                         │                │
-└──────────┼───────────────────┼─────────────────────────┼────────────────┘
-           │                   │                         │
-           ▼                   ▼                         ▼
-┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────────┐
-│ UploadRepository │ │ ChunkStorage     │ │ ChecksumVerifier        │
-│ (PostgreSQL)     │ │ Backend          │ │ (SHA-256)               │
-└──────────────────┘ │ (Strategy)       │ └──────────────────────────┘
-                     └────────┬─────────┘
-                              │
-                    ┌─────────┴─────────┐
-                    ▼                   ▼
-            ┌──────────────┐   ┌──────────────┐
-            │ S3Chunk      │   │LocalChunk    │
-            │ Storage      │   │Storage       │
-            └──────────────┘   └──────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> INITIATED: initiate()
+    INITIATED --> IN_PROGRESS: first chunk
+    INITIATED --> ASSEMBLING: complete() on a 0-byte file
+    IN_PROGRESS --> ASSEMBLING: complete(), all chunks present
+    ASSEMBLING --> COMPLETED: chunks re-verified, whole-file sha256 matches
+    ASSEMBLING --> IN_PROGRESS: corrupted chunk dropped / storage error
+    ASSEMBLING --> FAILED: whole-file sha256 mismatch
+    COMPLETED --> READY: scan clean
+    COMPLETED --> QUARANTINED: scan flagged
+    QUARANTINED --> READY: false positive released
+    INITIATED --> CANCELLED
+    IN_PROGRESS --> CANCELLED
+    INITIATED --> EXPIRED: GC, no activity for TTL
+    IN_PROGRESS --> EXPIRED: GC
 ```
 
 ---
+
+## 🧠 Key Design Decisions
+
+| Decision | Why |
+|----------|-----|
+| **Chunk-indexed protocol** (chunk *i* = bytes `[i·size, (i+1)·size)`) | Allows parallel, out-of-order upload, like S3 multipart. The server validates the exact size of each chunk, so a chunk can't overlap or overrun its neighbours. |
+| **Two resume answers** | `missing_chunks()` for a parallel client (send exactly these). `get_offset()` is the **contiguous** prefix for a sequential/TUS-style client. The old code returned "sum of received bytes", which skips a gap: chunks {0, 2} → offset 10 MB, so chunk 1 would never be sent. |
+| **Chunk size from the file size** | `max(preferred, 5 MiB, ceil(size / 10,000))`. S3 allows 10,000 parts, so 100 GiB needs ≥ 10.24 MiB parts. A fixed 5 MiB fails above ~48.8 GiB. |
+| **Idempotent chunk PUT, with a conflict check** | Same index + same SHA-256 → `duplicate=True`, nothing written. Same index + different bytes → `ChunkConflictError`, never a silent overwrite. |
+| **Three-phase `upload_chunk`** | Validate and reserve the index under the per-upload lock → write to storage **without** the lock → record under the lock. Chunks of one upload write in parallel. The `inflight` set stops two requests writing the same chunk, and stops `complete`/`cancel` racing a write. |
+| **`ASSEMBLING` state** | `complete()` flips to it under the lock, then verifies and composes without the lock. Chunk writes, `cancel` and a second `complete` are refused meanwhile. Any storage error flips back to `IN_PROGRESS`, so the upload is never stranded. |
+| **Verify at rest before composing** | Each stored chunk is re-hashed and the whole-file SHA-256 is computed in one ordered pass. A corrupted chunk is dropped (`ChunkCorruptedError` names it) and the client re-sends only that chunk. A whole-file mismatch with every chunk intact means the client sent the wrong file → `FAILED`. |
+| **Atomic limits** | `UploadLimiter.start_upload` checks the concurrency slot and the quota, then applies both, with no `await` in between. The old version incremented the slot before the quota check and leaked it on rejection. Quota is refunded on cancel/expiry/failure; release is idempotent. |
+| **Bandwidth per chunk, not per file** | A token bucket charged with each chunk's bytes, returning `retry_after`. Charging the declared file size against a 60 s window (old code) rejected every file over 3 GB permanently. |
+| **Sliding expiry, GC owns cleanup** | Each chunk extends `expires_at`. The request path only refuses expired uploads; `collect_garbage()` transitions to `EXPIRED`, deletes chunks and releases the slot, so cleanup can't be skipped. |
+| **Storage keys never contain the filename** | `tmp/{upload_id}/{index}`, `files/{upload_id}`. The filename is metadata (validated anyway), so path traversal can't reach storage. `LocalChunkStorage` also checks that every resolved path stays under its root. |
+| **Hooks after commit** | `on_completed` hooks (virus scan) run after `COMPLETED` is recorded; a hook failure is logged, not propagated. In production this is a transactional outbox → Kafka. |
+
+---
+
+## 🔧 Where to Extend
+
+| New requirement | Change |
+|-----------------|--------|
+| S3 backend | `put_chunk` → `UploadPart` (record the ETag / `x-amz-checksum-sha256`), `compose` → `CompleteMultipartUpload`, `delete_prefix` → `AbortMultipartUpload`. Let S3 verify per-part checksums so `complete()` doesn't re-read 100 GB. |
+| Direct-to-S3 (pre-signed URLs) | `initiate` returns one pre-signed `UploadPart` URL per missing part; the client reports ETags + checksums; `complete` calls `ListParts` to verify instead of trusting the client. |
+| Whole-file checksum without a sequential pass | Use a composite checksum (hash of the per-part hashes, as S3 does for multipart), which the client and server can both compute in parallel. |
+| Content-defined dedup | Hash each chunk; skip upload if `(sha256)` already exists (a CAS store). Needs per-user scoping or proof of possession, or the hash leaks file existence. |
+| Multi-instance service | Replace the per-upload `asyncio.Lock` with a status-guarded row update (`UPDATE … WHERE status = 'in_progress'`) and a unique `(upload_id, index)` constraint; move `UploadLimiter` to Redis (one Lua script per check-and-apply). |
+
+---
+
 ## 📦 Full Source Code
 
+<!-- source: big_file_upload.py -->
 ```python
 """
 Big File Upload System — Low-Level Design
-============================================
-Design Principles: SOLID, TUS Protocol, Strategy Pattern, State Machine
+=========================================
 
-Supports:
-  - Chunked uploads (TUS protocol: HEAD/PATCH/POST)
-  - Resumability via byte offset tracking
-  - Parallel chunk uploads with configurable concurrency
-  - Checksum verification (SHA-256 per chunk and per file)
-  - Pluggable storage backends (S3, Local)
-  - Multi-level rate limiting (concurrent, throughput, daily quota)
-  - Upload state lifecycle management
-  - Garbage collection for abandoned uploads
-  - Async post-processing pipeline hooks
+Server side (UploadService) of a resumable, parallel, chunked upload protocol,
+plus a client (UploadClient) that splits a file, uploads chunks with bounded
+concurrency and retries, and resumes after a crash.
+
+The protocol is chunk-indexed, like S3 multipart upload (and TUS's
+concatenation extension): chunk i covers bytes [i*chunk_size, (i+1)*chunk_size).
+Chunks may arrive in any order and in parallel. A client resumes either by
+asking which chunks are missing (parallel clients) or by asking for the
+contiguous offset (TUS HEAD semantics, for a sequential client).
+
+Guarantees the code enforces:
+  * Every chunk has the exact expected size and a SHA-256 the server verifies.
+  * Re-sending a chunk with the same bytes is a no-op (idempotent retry);
+    different bytes for a stored chunk is a conflict, never a silent overwrite.
+  * The same chunk can't be written by two requests at once, and an upload
+    can't be completed or cancelled while a chunk write is in flight.
+  * complete() re-verifies every stored chunk, computes the whole-file SHA-256
+    while assembling, and checks it against the client's. A corrupted chunk is
+    dropped and the upload goes back to IN_PROGRESS so the client re-sends just
+    that chunk.
+  * Rate limits are atomic: a rejected upload never leaks a concurrency slot or
+    charges quota. Bandwidth is limited per chunk with a token bucket.
+  * Expired uploads are garbage-collected; expiry slides with activity.
+
+Concurrency model: asyncio, one event loop. Per-upload asyncio.Lock guards
+state changes; it is NOT held during storage I/O, so chunks of one upload
+still write in parallel.
+
+Run:   python3 big_file_upload.py
+Test:  python3 -m unittest test_big_file_upload
 """
+
+from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
+import math
 import os
+import random
 import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional, Callable
+from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("upload-service")
 
+KIB = 1024
+MIB = 1024 * KIB
+GIB = 1024 * MIB
 
-# ═══════════════════════════════════════════════════════════════
-#  DOMAIN MODELS
-# ═══════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════
+#  ERRORS (each maps to an HTTP status in the API layer)
+# ════════════════════════════════════════════════════════════════════════
+
+class UploadError(Exception):
+    """Base class."""
+
+
+class UploadNotFoundError(UploadError):           # 404
+    pass
+
+
+class InvalidRequestError(UploadError):           # 400 / 413
+    pass
+
+
+class InvalidStateError(UploadError):             # 409
+    pass
+
+
+class ChecksumMismatchError(UploadError):         # 460 in TUS, 400 otherwise
+    pass
+
+
+class ChunkConflictError(UploadError):            # 409: different bytes for a stored chunk
+    pass
+
+
+class ChunkInProgressError(UploadError):          # 409: retry later
+    pass
+
+
+class IncompleteUploadError(UploadError):         # 409 on complete()
+    def __init__(self, missing: List[int]) -> None:
+        super().__init__(f"{len(missing)} chunks missing, first: {missing[:5]}")
+        self.missing = missing
+
+
+class ChunkCorruptedError(UploadError):           # 409 on complete(): re-send these chunks
+    def __init__(self, chunks: List[int]) -> None:
+        super().__init__(f"stored chunks failed verification: {chunks}")
+        self.chunks = chunks
+
+
+class RateLimitedError(UploadError):              # 429 with Retry-After
+    def __init__(self, message: str, retry_after: float = 1.0) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class UploadExpiredError(UploadError):            # 410
+    pass
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  POLICY + STATE MACHINE
+# ════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class UploadPolicy:
+    min_chunk_size: int = 5 * MIB           # S3 multipart minimum (except the last part)
+    default_chunk_size: int = 8 * MIB
+    max_parts: int = 10_000                 # S3 multipart maximum
+    max_file_size: int = 100 * GIB
+    session_ttl: float = 7 * 86_400         # sliding: extended on every chunk
+    max_concurrent_uploads: int = 5         # per user
+    daily_quota_bytes: int = 200 * GIB      # per user
+    bandwidth_bytes_per_sec: float = 50 * MIB   # per user, token bucket refill
+    bandwidth_burst_bytes: float = 100 * MIB    # bucket size; must hold the largest chunk
+
+    def chunk_size_for(self, file_size: int, preferred: Optional[int] = None) -> int:
+        """
+        At least min_chunk_size, and big enough that the file fits in max_parts.
+        100 GiB / 10,000 parts needs >= 10.24 MiB chunks: a fixed 5 MiB would
+        need 20,480 parts and S3 would reject the upload.
+        """
+        size = max(preferred or self.default_chunk_size, self.min_chunk_size,
+                   math.ceil(file_size / self.max_parts))
+        if size > self.bandwidth_burst_bytes:
+            raise InvalidRequestError("chunk size exceeds the bandwidth burst; no chunk could ever be accepted")
+        return size
+
 
 class UploadState(str, Enum):
-    """Upload lifecycle states matching TUS protocol semantics."""
-    INITIATED = "initiated"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    PROCESSING = "processing"
-    READY = "ready"
-    QUARANTINED = "quarantined"
-    FAILED = "failed"
+    INITIATED = "initiated"        # session created, no chunk yet
+    IN_PROGRESS = "in_progress"    # receiving chunks
+    ASSEMBLING = "assembling"      # complete() is verifying + composing; chunk writes refused
+    COMPLETED = "completed"        # assembled and verified; awaiting virus scan
+    READY = "ready"                # scan clean: downloadable
+    QUARANTINED = "quarantined"    # scan flagged it
+    FAILED = "failed"              # whole-file checksum mismatch
+    CANCELLED = "cancelled"
     EXPIRED = "expired"
 
-    def can_transition_to(self, target: "UploadState") -> bool:
-        """Validate state transitions."""
-        transitions = {
-            UploadState.INITIATED: {UploadState.IN_PROGRESS, UploadState.FAILED, UploadState.EXPIRED},
-            UploadState.IN_PROGRESS: {UploadState.COMPLETED, UploadState.FAILED, UploadState.EXPIRED},
-            UploadState.COMPLETED: {UploadState.PROCESSING, UploadState.FAILED},
-            UploadState.PROCESSING: {UploadState.READY, UploadState.QUARANTINED, UploadState.FAILED},
-            UploadState.READY: set(),
-            UploadState.QUARANTINED: {UploadState.READY},  # False positive reviewed
-            UploadState.FAILED: {UploadState.INITIATED},  # Retry
-            UploadState.EXPIRED: set(),
-        }
-        return target in transitions.get(self, set())
+    @property
+    def accepts_chunks(self) -> bool:
+        return self in (UploadState.INITIATED, UploadState.IN_PROGRESS)
+
+    @property
+    def holds_slot(self) -> bool:
+        """Counts against the user's concurrent-upload limit."""
+        return self in (UploadState.INITIATED, UploadState.IN_PROGRESS, UploadState.ASSEMBLING)
 
 
-@dataclass
+_TRANSITIONS: Dict[UploadState, Set[UploadState]] = {
+    UploadState.INITIATED: {UploadState.IN_PROGRESS, UploadState.ASSEMBLING,   # 0-byte file
+                            UploadState.CANCELLED, UploadState.EXPIRED},
+    UploadState.IN_PROGRESS: {UploadState.ASSEMBLING, UploadState.CANCELLED, UploadState.EXPIRED},
+    UploadState.ASSEMBLING: {UploadState.COMPLETED, UploadState.IN_PROGRESS,    # corrupt chunk dropped
+                             UploadState.FAILED},
+    UploadState.COMPLETED: {UploadState.READY, UploadState.QUARANTINED},
+    UploadState.QUARANTINED: {UploadState.READY},                                # false positive released
+}
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  DOMAIN MODEL
+# ════════════════════════════════════════════════════════════════════════
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True)
 class ChunkInfo:
-    """Metadata for a single uploaded chunk."""
-    chunk_number: int
-    offset_start: int
-    offset_end: int
+    index: int
+    offset: int
     size: int
-    checksum: str            # SHA-256 of chunk data
-    storage_path: str        # blob/{upload_id}/chunk_{n}
-    received_at: float = 0.0
+    sha256: str
+    storage_key: str
+    received_at: float
+
+
+@dataclass(frozen=True)
+class ChunkReceipt:
+    index: int
+    duplicate: bool
+    received_bytes: int        # progress
+    contiguous_offset: int     # TUS Upload-Offset
 
 
 @dataclass
 class UploadSession:
-    """Tracks a single file upload from initiation through completion."""
-    id: str
+    upload_id: str
     user_id: str
     filename: str
     file_size: int
     mime_type: str
-    checksum_client: str               # SHA-256 of entire file (from client)
-    chunk_size: int = 5 * 1024 * 1024  # 5MB default
-    total_chunks: int = 0
+    chunk_size: int
+    expected_sha256: Optional[str]
+    created_at: float
+    expires_at: float
     status: UploadState = UploadState.INITIATED
-    storage_bucket: str = "uploads"
-    storage_prefix: str = ""           # temp-chunks/{id}/
-    storage_upload_id: str = ""        # S3 multipart upload ID
-    chunks: dict[int, ChunkInfo] = field(default_factory=dict)
-    created_at: float = 0.0
-    updated_at: float = 0.0
-    expires_at: float = 0.0            # 7 days from last activity
+    chunks: Dict[int, ChunkInfo] = field(default_factory=dict)
+    inflight: Set[int] = field(default_factory=set)       # chunk writes in progress
+    final_key: Optional[str] = None
+    final_sha256: Optional[str] = None
+    error: Optional[str] = None
 
-    def __post_init__(self):
-        now = time.time()
-        self.created_at = now
-        self.updated_at = now
-        self.expires_at = now + 7 * 86400  # 7 days
-        self.total_chunks = (self.file_size + self.chunk_size - 1) // self.chunk_size
-        self.storage_prefix = f"temp-chunks/{self.id}/"
+    @property
+    def total_chunks(self) -> int:
+        return math.ceil(self.file_size / self.chunk_size)
+
+    @property
+    def temp_prefix(self) -> str:
+        return f"tmp/{self.upload_id}/"
+
+    def chunk_bounds(self, index: int) -> Tuple[int, int]:
+        start = index * self.chunk_size
+        return start, min(start + self.chunk_size, self.file_size)
 
     @property
     def received_bytes(self) -> int:
-        """Total bytes received across all chunks (for progress)."""
         return sum(c.size for c in self.chunks.values())
 
     @property
+    def contiguous_offset(self) -> int:
+        """
+        Bytes received with no gap from the start. With out-of-order chunks
+        this is NOT received_bytes: chunks {0, 2} received means offset is the
+        end of chunk 0, because chunk 1 is still missing.
+        """
+        i = 0
+        while i in self.chunks:
+            i += 1
+        return min(i * self.chunk_size, self.file_size)
+
+    def missing_chunks(self) -> List[int]:
+        return [i for i in range(self.total_chunks) if i not in self.chunks]
+
     def progress_percent(self) -> float:
-        """Upload progress as percentage (0-100)."""
-        if self.file_size == 0:
-            return 100.0
-        return min(100.0, (self.received_bytes / self.file_size) * 100)
-
-    @property
-    def is_expired(self) -> bool:
-        return time.time() > self.expires_at
+        return 100.0 if self.file_size == 0 else 100.0 * self.received_bytes / self.file_size
 
 
-# ═══════════════════════════════════════════════════════════════
-#  STRATEGY: STORAGE BACKEND
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+#  STORAGE — Strategy
+# ════════════════════════════════════════════════════════════════════════
 
-class ChunkStorageBackend(ABC):
-    """Strategy interface for chunk storage. Supports S3, local FS, etc."""
+class ChunkStorage(ABC):
+    """
+    Object-store-shaped interface. On S3: put_chunk = UploadPart (or PutObject
+    to a temp key), compose = CompleteMultipartUpload, delete_prefix = list +
+    DeleteObjects (plus AbortMultipartUpload).
+    """
 
     @abstractmethod
-    async def store_chunk(self, upload_id: str, chunk_number: int,
-                          data: bytes, path: str) -> None:
-        """Store a single chunk. Must be idempotent (overwrite OK)."""
-        pass
+    async def put_chunk(self, key: str, data: bytes) -> None:
+        """Write (or overwrite) one object. Must be atomic: readers never see half a chunk."""
 
     @abstractmethod
-    async def retrieve_chunk(self, path: str) -> bytes:
-        """Retrieve a stored chunk by path."""
-        pass
+    async def get_chunk(self, key: str) -> bytes:
+        ...
+
+    @abstractmethod
+    async def compose(self, dest_key: str, part_keys: List[str]) -> None:
+        """Concatenate parts, in order, into dest_key."""
 
     @abstractmethod
     async def delete_prefix(self, prefix: str) -> None:
-        """Delete all objects under the given prefix."""
-        pass
+        ...
 
     @abstractmethod
-    async def assemble_file(self, upload_id: str, chunks: dict[int, ChunkInfo],
-                            destination_path: str) -> str:
-        """Assemble all chunks into the final file.
-        Returns the final storage key of the assembled file."""
-        pass
+    async def read_object(self, key: str) -> bytes:
+        """Whole final object. For demos/tests only; never do this for a 100 GB file."""
 
 
-class S3ChunkStorage(ChunkStorageBackend):
-    """AWS S3 (or MinIO) chunk storage backend."""
+class InMemoryChunkStorage(ChunkStorage):
+    def __init__(self) -> None:
+        self.objects: Dict[str, bytes] = {}
 
-    def __init__(self, bucket: str = "uploads"):
-        self.bucket = bucket
-        # In production: initialize boto3 S3 client here
-        logger.info(f"S3ChunkStorage initialized for bucket: {bucket}")
+    async def put_chunk(self, key: str, data: bytes) -> None:
+        await asyncio.sleep(0)                      # a real store would yield here
+        self.objects[key] = bytes(data)
 
-    async def store_chunk(self, upload_id: str, chunk_number: int,
-                          data: bytes, path: str) -> None:
-        """Store chunk to S3. Idempotent — retries overwrite same key."""
-        logger.info(f"S3: Stored chunk {chunk_number} for upload {upload_id} "
-                    f"({len(data)} bytes)")
-        # In production:
-        # await self.s3.put_object(Bucket=self.bucket, Key=path, Body=data)
+    async def get_chunk(self, key: str) -> bytes:
+        return self.objects[key]
 
-    async def retrieve_chunk(self, path: str) -> bytes:
-        """Retrieve chunk from S3."""
-        logger.info(f"S3: Retrieved {path}")
-        # In production:
-        # response = await self.s3.get_object(Bucket=self.bucket, Key=path)
-        # return await response["Body"].read()
-        return b""
+    async def compose(self, dest_key: str, part_keys: List[str]) -> None:
+        self.objects[dest_key] = b"".join(self.objects[k] for k in part_keys)
 
     async def delete_prefix(self, prefix: str) -> None:
-        """Delete all objects under prefix."""
-        logger.info(f"S3: Deleted prefix {prefix}")
-        # In production: list objects then batch delete
+        for key in [k for k in self.objects if k.startswith(prefix)]:
+            del self.objects[key]
 
-    async def assemble_file(self, upload_id: str,
-                            chunks: dict[int, ChunkInfo],
-                            destination_path: str) -> str:
-        """Assemble chunks into final file using S3 multipart upload."""
-        logger.info(f"S3: Assembling {len(chunks)} chunks for upload {upload_id}")
-        # In production: initiate S3 multipart upload, upload parts in order,
-        # then complete.
-        return destination_path
+    async def read_object(self, key: str) -> bytes:
+        return self.objects[key]
 
 
-class LocalChunkStorage(ChunkStorageBackend):
-    """Local filesystem storage backend — useful for development/testing."""
+class LocalChunkStorage(ChunkStorage):
+    """
+    Filesystem backend. Blocking file I/O runs in a worker thread
+    (asyncio.to_thread) so it doesn't stall the event loop. Writes go to a
+    temp file and are renamed into place, so a crash never leaves half a chunk
+    under the real name. Keys are built from server-generated ids, never from
+    the user's filename, so path traversal can't reach this layer.
+    """
 
-    def __init__(self, base_path: str = "/tmp/upload-chunks"):
-        self.base_path = base_path
-        os.makedirs(base_path, exist_ok=True)
-        logger.info(f"LocalChunkStorage initialized at: {base_path}")
+    def __init__(self, root: str) -> None:
+        self._root = os.path.realpath(root)
+        os.makedirs(self._root, exist_ok=True)
 
-    async def store_chunk(self, upload_id: str, chunk_number: int,
-                          data: bytes, path: str) -> None:
-        """Write chunk to local filesystem."""
-        full_path = os.path.join(self.base_path, path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "wb") as f:
+    def _path(self, key: str) -> str:
+        path = os.path.realpath(os.path.join(self._root, key))
+        if not path.startswith(self._root + os.sep):
+            raise InvalidRequestError(f"key escapes storage root: {key!r}")
+        return path
+
+    async def put_chunk(self, key: str, data: bytes) -> None:
+        await asyncio.to_thread(self._atomic_write, self._path(key), data)
+
+    @staticmethod
+    def _atomic_write(path: str, data: bytes) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as f:
             f.write(data)
-        logger.info(f"Local: Stored chunk {chunk_number} for upload {upload_id}")
+        os.replace(tmp, path)                      # atomic on POSIX
 
-    async def retrieve_chunk(self, path: str) -> bytes:
-        """Read chunk from local filesystem."""
-        full_path = os.path.join(self.base_path, path)
-        with open(full_path, "rb") as f:
+    async def get_chunk(self, key: str) -> bytes:
+        return await asyncio.to_thread(self._read, self._path(key))
+
+    @staticmethod
+    def _read(path: str) -> bytes:
+        with open(path, "rb") as f:
             return f.read()
 
+    async def compose(self, dest_key: str, part_keys: List[str]) -> None:
+        await asyncio.to_thread(self._concat, self._path(dest_key), [self._path(k) for k in part_keys])
+
+    @staticmethod
+    def _concat(dest: str, parts: List[str]) -> None:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = f"{dest}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as out:
+            for part in parts:
+                with open(part, "rb") as f:
+                    while block := f.read(MIB):     # stream: memory stays O(1 MiB)
+                        out.write(block)
+        os.replace(tmp, dest)
+
     async def delete_prefix(self, prefix: str) -> None:
-        """Recursively delete a prefix directory."""
-        full_path = os.path.join(self.base_path, prefix)
-        if os.path.exists(full_path):
-            import shutil
-            shutil.rmtree(full_path)
-            logger.info(f"Local: Deleted prefix {prefix}")
+        import shutil
+        path = self._path(prefix.rstrip("/"))
+        await asyncio.to_thread(shutil.rmtree, path, True)
 
-    async def assemble_file(self, upload_id: str,
-                            chunks: dict[int, ChunkInfo],
-                            destination_path: str) -> str:
-        """Assemble chunks into final file by concatenating in order."""
-        full_path = os.path.join(self.base_path, destination_path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-
-        with open(full_path, "wb") as outfile:
-            for chunk_num in sorted(chunks.keys()):
-                chunk = chunks[chunk_num]
-                chunk_data = await self.retrieve_chunk(chunk.storage_path)
-                outfile.write(chunk_data)
-
-        logger.info(f"Local: Assembled {len(chunks)} chunks into {full_path}")
-        return destination_path
+    async def read_object(self, key: str) -> bytes:
+        return await self.get_chunk(key)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  REPOSITORY: DATABASE ACCESS
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+#  REPOSITORY (in-memory stand-in for PostgreSQL)
+# ════════════════════════════════════════════════════════════════════════
 
 class UploadRepository:
-    """Repository pattern for upload metadata persistence.
-    Abstracts PostgreSQL (or in-memory for testing)."""
+    """
+    In production each mutation is a row update guarded by the current status
+    (UPDATE ... WHERE id = $1 AND status = $2), which gives the same
+    compare-and-set the per-upload lock gives here.
+    """
 
-    def __init__(self):
-        # In production: use asyncpg/psycopg3 connection pool
-        self._uploads: dict[str, UploadSession] = {}
-        self._lock = asyncio.Lock()
+    def __init__(self) -> None:
+        self._sessions: Dict[str, UploadSession] = {}
 
-    async def create(self, session: UploadSession) -> None:
-        async with self._lock:
-            self._uploads[session.id] = session
-            logger.info(f"Created upload session: {session.id}")
+    def add(self, session: UploadSession) -> None:
+        self._sessions[session.upload_id] = session
 
-    async def get(self, upload_id: str) -> Optional[UploadSession]:
-        async with self._lock:
-            return self._uploads.get(upload_id)
+    def get(self, upload_id: str) -> UploadSession:
+        try:
+            return self._sessions[upload_id]
+        except KeyError:
+            raise UploadNotFoundError(upload_id) from None
 
-    async def update_status(self, upload_id: str,
-                            new_status: UploadState) -> bool:
-        async with self._lock:
-            session = self._uploads.get(upload_id)
-            if not session:
-                return False
-            if not session.status.can_transition_to(new_status):
-                raise ValueError(
-                    f"Invalid state transition: {session.status} → {new_status}"
-                )
-            session.status = new_status
-            session.updated_at = time.time()
-            logger.info(f"Upload {upload_id}: {session.status} → {new_status}")
-            return True
-
-    async def add_chunk(self, upload_id: str, chunk: ChunkInfo) -> None:
-        async with self._lock:
-            session = self._uploads.get(upload_id)
-            if not session:
-                raise KeyError(f"Upload session not found: {upload_id}")
-            session.chunks[chunk.chunk_number] = chunk
-            session.updated_at = time.time()
-            # Extend expiry on activity
-            session.expires_at = time.time() + 7 * 86400
-            if session.status == UploadState.INITIATED:
-                session.status = UploadState.IN_PROGRESS
-
-    async def get_stale_uploads(self, max_age_hours: int = 168
-                                ) -> list[UploadSession]:
-        """Get uploads that haven't been updated in N hours."""
-        async with self._lock:
-            cutoff = time.time() - max_age_hours * 3600
-            return [
-                s for s in self._uploads.values()
-                if s.updated_at < cutoff
-                and s.status in (UploadState.INITIATED, UploadState.IN_PROGRESS)
-            ]
-
-    async def delete(self, upload_id: str) -> None:
-        async with self._lock:
-            self._uploads.pop(upload_id, None)
-
-    async def delete_upload_data(self, upload_id: str) -> None:
-        """Remove upload session and its chunks from the repository."""
-        async with self._lock:
-            session = self._uploads.pop(upload_id, None)
-            if session:
-                logger.info(f"Deleted upload data for {upload_id}")
+    def expired(self, now: float) -> List[UploadSession]:
+        return [s for s in self._sessions.values()
+                if s.status.accepts_chunks and s.expires_at <= now]
 
 
-# ═══════════════════════════════════════════════════════════════
-#  CHECKSUM VERIFICATION
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+#  RATE LIMITING
+# ════════════════════════════════════════════════════════════════════════
 
-class ChecksumVerifier:
-    """Verifies data integrity using SHA-256 at chunk and file levels."""
+class TokenBucket:
+    def __init__(self, rate: float, capacity: float, now: float) -> None:
+        self.rate, self.capacity = rate, capacity
+        self.tokens, self.updated = capacity, now
 
-    @staticmethod
-    def compute(data: bytes) -> str:
-        """Compute SHA-256 checksum of data."""
-        return hashlib.sha256(data).hexdigest()
-
-    @staticmethod
-    def verify(data: bytes, expected: str) -> bool:
-        """Verify data against expected checksum."""
-        return ChecksumVerifier.compute(data) == expected
-
-    @staticmethod
-    async def verify_chunks(chunks: dict[int, ChunkInfo],
-                            storage: ChunkStorageBackend) -> bool:
-        """Verify all chunks haven't been corrupted in storage."""
-        for chunk_num, chunk_info in sorted(chunks.items()):
-            data = await storage.retrieve_chunk(chunk_info.storage_path)
-            if not ChecksumVerifier.verify(data, chunk_info.checksum):
-                logger.error(f"Chunk {chunk_num} checksum mismatch!")
-                return False
-        return True
+    def try_take(self, amount: float, now: float) -> float:
+        """Take `amount` tokens. Returns 0 on success, else seconds until it would fit."""
+        self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+        self.updated = now
+        if amount <= self.tokens:
+            self.tokens -= amount
+            return 0.0
+        return (amount - self.tokens) / self.rate
 
 
-# ═══════════════════════════════════════════════════════════════
-#  UPLOAD SCHEDULER (CONCURRENCY + RETRY)
-# ═══════════════════════════════════════════════════════════════
+class UploadLimiter:
+    """
+    Per-user limits, all checked and applied in one step with no await in
+    between, so a rejected request changes nothing (the old version incremented
+    the concurrency counter even when the quota check then failed, leaking a
+    slot forever).
 
-@dataclass
-class RetryConfig:
-    """Configuration for upload retry behavior."""
-    max_retries: int = 3
-    base_delay: float = 1.0  # seconds
-    max_delay: float = 30.0
-    backoff_factor: float = 2.0  # exponential
+      * concurrent uploads — a set of upload ids, so release is idempotent
+      * daily quota — bytes reserved at initiate, refunded on cancel/expiry
+      * bandwidth — token bucket charged per chunk (not per declared file size:
+        charging 5 GB up front against a 50 MB/s x 60 s window would reject
+        every file over 3 GB forever)
 
+    In a fleet these live in Redis, each check-and-apply as one Lua script.
+    """
 
-class UploadScheduler:
-    """Manages concurrent chunk uploads with retry logic.
-    Controls parallelism and ensures chunks are uploaded reliably."""
+    def __init__(self, policy: UploadPolicy, clock: Callable[[], float]) -> None:
+        self._policy = policy
+        self._clock = clock
+        self._active: Dict[str, Set[str]] = {}
+        self._quota_used: Dict[Tuple[str, str], int] = {}
+        self._buckets: Dict[str, TokenBucket] = {}
 
-    def __init__(self, max_concurrent: int = 6, retry_config: Optional[RetryConfig] = None):
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._retry = retry_config or RetryConfig()
+    def _day(self) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
 
-    async def execute(self, chunk_number: int, upload_fn: Callable,
-                      *args, **kwargs) -> bool:
-        """
-        Execute a chunk upload with retry and concurrency control.
-        Returns True if the upload succeeded, False after exhausting retries.
-        """
-        async with self._semaphore:
-            last_error = None
-            for attempt in range(1, self._retry.max_retries + 1):
-                try:
-                    return await upload_fn(*args, **kwargs)
-                except Exception as e:
-                    last_error = e
-                    if attempt < self._retry.max_retries:
-                        delay = min(
-                            self._retry.base_delay * (self._retry.backoff_factor ** (attempt - 1)),
-                            self._retry.max_delay
-                        )
-                        logger.warning(
-                            f"Chunk {chunk_number} attempt {attempt}/{self._retry.max_retries} "
-                            f"failed: {e}. Retrying in {delay:.1f}s..."
-                        )
-                        await asyncio.sleep(delay)
-                    else:
-                        logger.error(
-                            f"Chunk {chunk_number} failed after "
-                            f"{self._retry.max_retries} attempts: {last_error}"
-                        )
+    def start_upload(self, user_id: str, upload_id: str, size: int) -> None:
+        active = self._active.setdefault(user_id, set())
+        if len(active) >= self._policy.max_concurrent_uploads:
+            raise RateLimitedError(f"{len(active)} uploads already in progress", retry_after=30)
+        key = (user_id, self._day())
+        if self._quota_used.get(key, 0) + size > self._policy.daily_quota_bytes:
+            raise RateLimitedError("daily upload quota exceeded", retry_after=3600)
+        active.add(upload_id)
+        self._quota_used[key] = self._quota_used.get(key, 0) + size
 
-            return False
+    def finish_upload(self, user_id: str, upload_id: str, refund: int = 0) -> None:
+        active = self._active.get(user_id)
+        if active is None or upload_id not in active:
+            return                                   # already released: idempotent
+        active.discard(upload_id)
+        if refund:
+            key = (user_id, self._day())
+            self._quota_used[key] = max(0, self._quota_used.get(key, 0) - refund)
 
-    async def execute_parallel(self, tasks: list[tuple[int, Callable, tuple, dict]]
-                               ) -> dict[int, bool]:
-        """
-        Execute multiple chunk uploads in parallel.
-        tasks: list of (chunk_number, upload_fn, args, kwargs)
-        Returns: {chunk_number: success_bool}
-        """
-        coros = [
-            self.execute(num, fn, *args, **kwargs)
-            for num, fn, args, kwargs in tasks
-        ]
-        results = await asyncio.gather(*coros)
-        return {tasks[i][0]: results[i] for i in range(len(tasks))}
+    def take_bandwidth(self, user_id: str, nbytes: int) -> None:
+        now = self._clock()
+        bucket = self._buckets.get(user_id)
+        if bucket is None:
+            bucket = self._buckets[user_id] = TokenBucket(
+                self._policy.bandwidth_bytes_per_sec, self._policy.bandwidth_burst_bytes, now)
+        wait = bucket.try_take(nbytes, now)
+        if wait:
+            raise RateLimitedError("bandwidth limit", retry_after=wait)
+
+    def active_uploads(self, user_id: str) -> int:
+        return len(self._active.get(user_id, ()))
 
 
-# ═══════════════════════════════════════════════════════════════
-#  RATE LIMITER
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+#  UPLOAD SERVICE — Facade
+# ════════════════════════════════════════════════════════════════════════
 
-class RateLimiter:
-    """Multi-level rate limiting for uploads.
-    In production, use Redis for distributed counting."""
+CompletionHook = Callable[[UploadSession], Awaitable[None]]
 
-    def __init__(self):
-        self._concurrent: dict[str, int] = {}
-        self._throughput: dict[str, list[tuple[float, int]]] = {}
-        self._daily: dict[str, int] = {}
-        self._lock = asyncio.Lock()
-
-    async def check_concurrent(self, user_id: str, max_concurrent: int = 5) -> bool:
-        """Check and increment concurrent upload count for user."""
-        async with self._lock:
-            current = self._concurrent.get(user_id, 0)
-            if current >= max_concurrent:
-                logger.warning(f"Rate limit: user {user_id} exceeded concurrent limit")
-                return False
-            self._concurrent[user_id] = current + 1
-            return True
-
-    async def release_concurrent(self, user_id: str) -> None:
-        """Decrement concurrent upload count."""
-        async with self._lock:
-            current = self._concurrent.get(user_id, 0)
-            if current > 0:
-                self._concurrent[user_id] = current - 1
-
-    async def check_throughput(self, user_id: str, file_size: int,
-                               max_mbps: float = 50.0) -> bool:
-        """Check upload throughput limit over a sliding 60s window."""
-        async with self._lock:
-            now = time.time()
-            if user_id not in self._throughput:
-                self._throughput[user_id] = []
-
-            # Prune entries older than 60s
-            window_start = now - 60
-            self._throughput[user_id] = [
-                (ts, sz) for ts, sz in self._throughput[user_id]
-                if ts > window_start
-            ]
-
-            # Calculate current throughput
-            total_bytes = sum(sz for _, sz in self._throughput[user_id])
-            mb_per_s = total_bytes / 60 / 1024 / 1024
-
-            if mb_per_s + (file_size / 60 / 1024 / 1024) > max_mbps:
-                logger.warning(f"Rate limit: user {user_id} throughput {mb_per_s:.1f} MB/s "
-                               f"(limit: {max_mbps} MB/s)")
-                return False
-
-            self._throughput[user_id].append((now, file_size))
-            return True
-
-    async def check_daily_quota(self, user_id: str, file_size: int,
-                                max_daily_gb: float = 100.0) -> bool:
-        """Check daily storage quota."""
-        async with self._lock:
-            today = time.strftime("%Y-%m-%d")
-            key = f"{user_id}:{today}"
-            current = self._daily.get(key, 0)
-
-            new_total_gb = (current + file_size) / (1024 ** 3)
-            if new_total_gb > max_daily_gb:
-                logger.warning(f"Rate limit: user {user_id} daily quota exceeded")
-                return False
-
-            self._daily[key] = current + file_size
-            return True
-
-    async def check_all(self, user_id: str, file_size: int) -> bool:
-        """Check all rate limits."""
-        checks = await asyncio.gather(
-            self.check_concurrent(user_id),
-            self.check_throughput(user_id, file_size),
-            self.check_daily_quota(user_id, file_size),
-        )
-        return all(checks)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  CORE UPLOAD SERVICE (FACADE)
-# ═══════════════════════════════════════════════════════════════
 
 class UploadService:
-    """
-    Core upload service — Facade for the upload system.
-    
-    Coordinates:
-      - Session management (initiate, track, complete)
-      - Chunk storage (delegated to ChunkStorageBackend)
-      - Checksum verification
-      - Rate limiting
-      - Concurrent upload scheduling
-      - State machine transitions
-      - Post-completion hooks (virus scan, transcode)
-    """
-
-    def __init__(
-        self,
-        repository: UploadRepository,
-        storage: ChunkStorageBackend,
-        scheduler: Optional[UploadScheduler] = None,
-        rate_limiter: Optional[RateLimiter] = None,
-    ):
-        self._repo = repository
+    def __init__(self, storage: ChunkStorage, *,
+                 repository: Optional[UploadRepository] = None,
+                 policy: UploadPolicy = UploadPolicy(),
+                 clock: Callable[[], float] = time.time,
+                 id_factory: Callable[[], str] = lambda: uuid.uuid4().hex) -> None:
         self._storage = storage
-        self._scheduler = scheduler or UploadScheduler()
-        self._rate_limiter = rate_limiter or RateLimiter()
-        self._on_complete_hooks: list[Callable] = []
+        self._repo = repository or UploadRepository()
+        self._policy = policy
+        self._clock = clock
+        self._new_id = id_factory
+        self._limiter = UploadLimiter(policy, clock)
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._hooks: List[CompletionHook] = []
 
-    def register_complete_hook(self, hook: Callable) -> None:
-        """Register a callback for when upload completes.
-        Used for async processing pipeline (virus scan, transcode)."""
-        self._on_complete_hooks.append(hook)
+    @property
+    def limiter(self) -> UploadLimiter:
+        return self._limiter
 
-    async def initiate(self, user_id: str, filename: str,
-                       file_size: int, mime_type: str,
-                       checksum: str = "",
-                       chunk_size: int = 5 * 1024 * 1024) -> UploadSession:
-        """
-        Step 1: Initiate a new upload session.
-        
-        Returns session with upload_id, chunk_size, and total_chunks.
-        Client uses this to know how to split the file.
-        """
-        # Rate limiting
-        allowed = await self._rate_limiter.check_all(user_id, file_size)
-        if not allowed:
-            raise PermissionError("Rate limit exceeded. Please try again later.")
+    def on_completed(self, hook: CompletionHook) -> None:
+        """Observer: called after an upload is assembled and verified (e.g. enqueue a virus scan)."""
+        self._hooks.append(hook)
 
-        # Validate file size
-        max_size = 100 * 1024**3  # 100 GB
-        if file_size > max_size:
-            raise ValueError(f"File too large (max: {max_size / 1024**3:.0f} GB)")
-
-        # Validate filename (no path traversal)
-        if ".." in filename or "/" in filename:
-            raise ValueError("Invalid filename")
-
-        # Create session
-        session = UploadSession(
-            id=str(uuid.uuid4()),
-            user_id=user_id,
-            filename=filename,
-            file_size=file_size,
-            mime_type=mime_type,
-            checksum_client=checksum,
-            chunk_size=chunk_size,
-        )
-
-        await self._repo.create(session)
-        logger.info(f"Upload initiated: {session.id} — {filename} ({file_size} bytes, "
-                    f"{session.total_chunks} chunks)")
-
+    # ── POST /uploads ─────────────────────────────────────────────────
+    async def initiate(self, user_id: str, filename: str, file_size: int, mime_type: str, *,
+                       sha256: Optional[str] = None,
+                       preferred_chunk_size: Optional[int] = None) -> UploadSession:
+        self._validate_filename(filename)
+        if not 0 <= file_size <= self._policy.max_file_size:
+            raise InvalidRequestError(f"file_size must be 0..{self._policy.max_file_size}")
+        if sha256 is not None and len(sha256) != 64:
+            raise InvalidRequestError("sha256 must be 64 hex characters")
+        chunk_size = self._policy.chunk_size_for(file_size, preferred_chunk_size)
+        upload_id = self._new_id()
+        self._limiter.start_upload(user_id, upload_id, file_size)      # atomic; raises on reject
+        now = self._clock()
+        session = UploadSession(upload_id, user_id, filename, file_size, mime_type, chunk_size,
+                                sha256, created_at=now, expires_at=now + self._policy.session_ttl)
+        self._repo.add(session)
+        self._locks[upload_id] = asyncio.Lock()
+        logger.info("initiated %s: %s, %d bytes, %d chunks of %d",
+                    upload_id, filename, file_size, session.total_chunks, chunk_size)
         return session
 
-    async def upload_chunk(self, upload_id: str, chunk_number: int,
-                           offset: int, data: bytes,
-                           checksum: str = "") -> dict:
-        """
-        Step 2: Upload a single chunk (TUS PATCH semantics).
-        
-        TUS protocol:
-          - Client sends data starting at given offset
-          - Chunk is stored independently (supports out-of-order)
-          - Returns the new offset (offset_end) for resume
-        
-        Idempotent: re-uploading the same chunk returns same result
-        without re-storing.
-        """
-        session = await self._repo.get(upload_id)
-        if not session:
-            raise KeyError(f"Upload not found: {upload_id}")
+    @staticmethod
+    def _validate_filename(name: str) -> None:
+        if not name or len(name) > 255 or name in (".", "..") \
+                or any(c in name for c in "/\\\x00") or name.startswith("."):
+            raise InvalidRequestError(f"invalid filename: {name!r}")
 
-        if session.status not in (UploadState.INITIATED, UploadState.IN_PROGRESS):
-            raise ValueError(f"Upload is in state {session.status}, "
-                             f"cannot accept chunks")
+    # ── PUT /uploads/{id}/chunks/{index} ──────────────────────────────
+    async def upload_chunk(self, upload_id: str, index: int, data: bytes, sha256: str) -> ChunkReceipt:
+        session = self._repo.get(upload_id)
+        lock = self._locks[upload_id]
 
-        # Check if chunk already received (idempotency)
-        if chunk_number in session.chunks:
-            existing = session.chunks[chunk_number]
-            logger.info(f"Duplicate chunk {chunk_number} for upload {upload_id}")
-            return {
-                "chunk_number": chunk_number,
-                "offset": existing.offset_end,
-                "checksum": existing.checksum,
-                "duplicate": True,
-            }
+        # Phase 1 (under lock): validate and reserve the index.
+        async with lock:
+            self._check_accepting(session)
+            if not 0 <= index < session.total_chunks:
+                raise InvalidRequestError(f"chunk index {index} out of range 0..{session.total_chunks - 1}")
+            start, end = session.chunk_bounds(index)
+            if len(data) != end - start:
+                raise InvalidRequestError(f"chunk {index} must be {end - start} bytes, got {len(data)}")
+            if sha256_hex(data) != sha256:
+                raise ChecksumMismatchError(f"chunk {index}: body does not match its sha256")
+            existing = session.chunks.get(index)
+            if existing is not None:
+                if existing.sha256 != sha256:
+                    raise ChunkConflictError(f"chunk {index} already stored with different content")
+                return self._receipt(session, index, duplicate=True)    # idempotent retry
+            if index in session.inflight:
+                raise ChunkInProgressError(f"chunk {index} is being written by another request")
+            self._limiter.take_bandwidth(session.user_id, len(data))
+            session.inflight.add(index)
 
-        # Verify checksum if provided
-        if checksum and not ChecksumVerifier.verify(data, checksum):
-            raise ValueError(f"Chunk {chunk_number} checksum mismatch")
+        # Phase 2 (no lock): the slow part. Other chunks of this upload proceed in parallel.
+        key = f"{session.temp_prefix}{index:05d}"
+        try:
+            await self._storage.put_chunk(key, data)
+        except BaseException:
+            async with lock:
+                session.inflight.discard(index)
+            raise
 
-        # Compute checksum
-        actual_checksum = ChecksumVerifier.compute(data) if not checksum else checksum
+        # Phase 3 (under lock): record it, unless the upload was cancelled/expired meanwhile.
+        async with lock:
+            session.inflight.discard(index)
+            if not session.status.accepts_chunks:
+                raise InvalidStateError(f"upload became {session.status.value} during the write")
+            now = self._clock()
+            session.chunks[index] = ChunkInfo(index, start, len(data), sha256, key, now)
+            session.expires_at = now + self._policy.session_ttl          # sliding expiry
+            if session.status is UploadState.INITIATED:
+                self._transition(session, UploadState.IN_PROGRESS)
+            return self._receipt(session, index, duplicate=False)
 
-        # Store chunk
-        storage_path = f"{session.storage_prefix}chunk_{chunk_number}"
-        await self._storage.store_chunk(upload_id, chunk_number, data, storage_path)
+    @staticmethod
+    def _receipt(session: UploadSession, index: int, duplicate: bool) -> ChunkReceipt:
+        return ChunkReceipt(index, duplicate, session.received_bytes, session.contiguous_offset)
 
-        # Record chunk metadata
-        chunk = ChunkInfo(
-            chunk_number=chunk_number,
-            offset_start=offset,
-            offset_end=offset + len(data),
-            size=len(data),
-            checksum=actual_checksum,
-            storage_path=storage_path,
-            received_at=time.time(),
-        )
-        await self._repo.add_chunk(upload_id, chunk)
+    def _check_accepting(self, session: UploadSession) -> None:
+        # The request path only refuses; collect_garbage() owns the EXPIRED
+        # transition and the storage cleanup, so neither can be skipped.
+        if session.status is UploadState.EXPIRED or \
+                (session.status.accepts_chunks and session.expires_at <= self._clock()):
+            raise UploadExpiredError(session.upload_id)
+        if not session.status.accepts_chunks:
+            raise InvalidStateError(f"upload is {session.status.value}")
 
-        logger.info(f"Chunk {chunk_number}/{session.total_chunks} received "
-                    f"for upload {upload_id} — progress: {session.progress_percent:.1f}%")
-
-        return {
-            "chunk_number": chunk_number,
-            "offset": chunk.offset_end,
-            "checksum": actual_checksum,
-            "duplicate": False,
-        }
-
+    # ── HEAD /uploads/{id}  and  GET /uploads/{id} ────────────────────
     async def get_offset(self, upload_id: str) -> int:
-        """
-        TUS HEAD: Get the byte offset for resuming.
-        
-        Returns the next byte the client should send.
-        """
-        session = await self._repo.get(upload_id)
-        if not session:
-            raise KeyError(f"Upload not found: {upload_id}")
+        """TUS-style resume point for a sequential client: the contiguous prefix."""
+        return self._repo.get(upload_id).contiguous_offset
 
-        return session.received_bytes
+    async def missing_chunks(self, upload_id: str) -> List[int]:
+        """Resume point for a parallel client: exactly the chunks still needed."""
+        return self._repo.get(upload_id).missing_chunks()
 
-    async def complete(self, upload_id: str,
-                       checksum: str = "") -> dict:
-        """
-        Step 3: Finalize upload after all chunks are received.
-        
-        Verifies:
-          1. All chunks are present (no gaps)
-          2. Final file checksum matches client-provided checksum
-        Then:
-          3. Assembles all chunks into final file
-          4. Transitions state to COMPLETED
-          5. Fires async processing hooks
-        """
-        session = await self._repo.get(upload_id)
-        if not session:
-            raise KeyError(f"Upload not found: {upload_id}")
+    async def get_status(self, upload_id: str) -> Dict[str, object]:
+        s = self._repo.get(upload_id)
+        return {"upload_id": s.upload_id, "status": s.status.value, "filename": s.filename,
+                "size": s.file_size, "chunk_size": s.chunk_size,
+                "chunks_received": len(s.chunks), "chunks_total": s.total_chunks,
+                "progress_percent": round(s.progress_percent(), 1),
+                "contiguous_offset": s.contiguous_offset, "error": s.error}
 
-        if session.status != UploadState.IN_PROGRESS:
-            raise ValueError(f"Upload is in state {session.status}, "
-                             f"expected IN_PROGRESS")
+    # ── POST /uploads/{id}/complete ───────────────────────────────────
+    async def complete(self, upload_id: str) -> UploadSession:
+        session = self._repo.get(upload_id)
+        lock = self._locks[upload_id]
+        async with lock:
+            if session.status in (UploadState.COMPLETED, UploadState.READY, UploadState.QUARANTINED):
+                return session                       # idempotent: the client retried complete
+            self._check_accepting(session)
+            if session.inflight:
+                raise ChunkInProgressError(f"chunks still being written: {sorted(session.inflight)}")
+            missing = session.missing_chunks()
+            if missing:
+                raise IncompleteUploadError(missing)
+            self._transition(session, UploadState.ASSEMBLING)   # blocks chunk writes + 2nd complete
 
-        # Verify all chunks are received
-        expected_chunks = set(range(session.total_chunks))
-        received_chunks = set(session.chunks.keys())
-        missing = expected_chunks - received_chunks
+        # Verify + compose without the lock: ASSEMBLING already keeps chunk
+        # writes, cancel and a second complete() out.
+        try:
+            ordered = [session.chunks[i] for i in range(session.total_chunks)]
+            whole = hashlib.sha256()
+            corrupted = []
+            for chunk in ordered:
+                data = await self._storage.get_chunk(chunk.storage_key)
+                if sha256_hex(data) != chunk.sha256:
+                    corrupted.append(chunk.index)
+                whole.update(data)
+            digest = whole.hexdigest()
 
-        if missing:
-            raise ValueError(f"Missing {len(missing)} chunks: {sorted(missing)}")
+            if corrupted:
+                # Bytes changed at rest. Forget those chunks; the client re-sends them.
+                async with lock:
+                    for i in corrupted:
+                        del session.chunks[i]
+                    self._transition(session, UploadState.IN_PROGRESS)
+                raise ChunkCorruptedError(corrupted)
 
-        # Verify all chunk checksums against stored data
-        chunks_valid = await ChecksumVerifier.verify_chunks(
-            session.chunks, self._storage
-        )
-        if not chunks_valid:
-            raise ValueError("Chunk checksum verification failed — corruption detected")
+            if session.expected_sha256 and digest != session.expected_sha256:
+                # Every chunk matched its own hash, so the client sent the wrong
+                # file (or the wrong hash). Not recoverable by re-sending chunks.
+                async with lock:
+                    session.error = "whole-file sha256 mismatch"
+                    self._transition(session, UploadState.FAILED)
+                    self._limiter.finish_upload(session.user_id, upload_id, refund=session.file_size)
+                await self._storage.delete_prefix(session.temp_prefix)
+                raise ChecksumMismatchError(f"file sha256 {digest} != expected {session.expected_sha256}")
 
-        # Assemble final file
-        destination = f"permanent/{session.user_id}/{session.id}_{session.filename}"
-        await self._storage.assemble_file(
-            upload_id, session.chunks, destination
-        )
+            final_key = f"files/{upload_id}"
+            await self._storage.compose(final_key, [c.storage_key for c in ordered])
+        except (ChunkCorruptedError, ChecksumMismatchError):
+            raise
+        except BaseException:
+            # Storage error (or cancellation) mid-assembly: chunks are intact,
+            # so go back to IN_PROGRESS and let the client retry complete().
+            async with lock:
+                if session.status is UploadState.ASSEMBLING:
+                    self._transition(session, UploadState.IN_PROGRESS)
+            raise
 
-        # Update status
-        await self._repo.update_status(upload_id, UploadState.COMPLETED)
+        async with lock:
+            session.final_key, session.final_sha256 = final_key, digest
+            self._transition(session, UploadState.COMPLETED)
+            self._limiter.finish_upload(session.user_id, upload_id)
+        await self._storage.delete_prefix(session.temp_prefix)     # best effort; GC/lifecycle as backstop
 
-        # Release rate limiter
-        await self._rate_limiter.release_concurrent(session.user_id)
-
-        # Fire async processing hooks
-        for hook in self._on_complete_hooks:
+        # Hooks run after the state is committed. In production this is an
+        # outbox row written in the same transaction, relayed to Kafka.
+        for hook in self._hooks:
             try:
                 await hook(session)
-            except Exception as e:
-                logger.error(f"Complete hook failed for {upload_id}: {e}")
+            except Exception:
+                logger.exception("completion hook failed for %s", upload_id)
+        return session
 
-        logger.info(f"Upload completed: {upload_id} — {session.filename} "
-                    f"({session.file_size} bytes, {session.total_chunks} chunks)")
+    # ── DELETE /uploads/{id} ──────────────────────────────────────────
+    async def cancel(self, upload_id: str) -> bool:
+        session = self._repo.get(upload_id)
+        async with self._locks[upload_id]:
+            if not session.status.accepts_chunks:
+                return False
+            if session.inflight:
+                raise ChunkInProgressError("chunk writes in flight; retry the cancel")
+            self._transition(session, UploadState.CANCELLED)
+            self._limiter.finish_upload(session.user_id, upload_id, refund=session.file_size)
+        await self._storage.delete_prefix(session.temp_prefix)     # state already final; no lock needed
+        return True
 
-        return {
-            "status": "completed",
-            "upload_id": upload_id,
-            "file_id": f"f_{session.id[:8]}",
-            "filename": session.filename,
-            "size": session.file_size,
-            "chunks": session.total_chunks,
-        }
+    # ── virus-scan callback ───────────────────────────────────────────
+    async def record_scan_result(self, upload_id: str, clean: bool) -> None:
+        session = self._repo.get(upload_id)
+        async with self._locks[upload_id]:
+            self._transition(session, UploadState.READY if clean else UploadState.QUARANTINED)
 
-    async def cancel(self, upload_id: str) -> None:
-        """Cancel an in-progress upload and clean up chunks."""
-        session = await self._repo.get(upload_id)
-        if not session:
-            raise KeyError(f"Upload not found: {upload_id}")
+    # ── garbage collection ────────────────────────────────────────────
+    async def collect_garbage(self) -> List[str]:
+        """Expire uploads with no activity for session_ttl. Run periodically."""
+        expired = []
+        for session in self._repo.expired(self._clock()):
+            async with self._locks[session.upload_id]:
+                if session.status.accepts_chunks and not session.inflight \
+                        and session.expires_at <= self._clock():
+                    self._expire(session)
+                    expired.append(session.upload_id)
+            if session.upload_id in expired:
+                await self._storage.delete_prefix(session.temp_prefix)
+        return expired
 
-        # Clean up storage
-        await self._storage.delete_prefix(session.storage_prefix)
-
-        # Update status
-        await self._repo.update_status(upload_id, UploadState.FAILED)
-
-        # Release rate limiter
-        await self._rate_limiter.release_concurrent(session.user_id)
-
-        logger.info(f"Upload cancelled: {upload_id}")
-
-    async def get_status(self, upload_id: str) -> dict:
-        """Get upload status, progress, and metadata."""
-        session = await self._repo.get(upload_id)
-        if not session:
-            raise KeyError(f"Upload not found: {upload_id}")
-
-        return {
-            "upload_id": session.id,
-            "filename": session.filename,
-            "size": session.file_size,
-            "status": session.status.value,
-            "progress_percent": session.progress_percent,
-            "received_bytes": session.received_bytes,
-            "total_bytes": session.file_size,
-            "chunks_received": len(session.chunks),
-            "chunks_total": session.total_chunks,
-            "created_at": session.created_at,
-            "updated_at": session.updated_at,
-        }
-
-
-# ═══════════════════════════════════════════════════════════════
-#  BACKGROUND GARBAGE COLLECTION
-# ═══════════════════════════════════════════════════════════════
-
-class BackgroundGC:
-    """Periodic garbage collection for abandoned/expired uploads."""
-
-    def __init__(self, repository: UploadRepository,
-                 storage: ChunkStorageBackend,
-                 rate_limiter: RateLimiter,
-                 interval_hours: int = 1):
-        self._repo = repository
-        self._storage = storage
-        self._rate_limiter = rate_limiter
-        self._interval = interval_hours * 3600
-        self._running = False
-
-    async def start(self):
-        """Start the GC loop."""
-        self._running = True
-        while self._running:
-            await asyncio.sleep(self._interval)
-            try:
-                await self._run_cycle()
-            except Exception as e:
-                logger.error(f"GC cycle failed: {e}")
-
-    async def stop(self):
-        """Stop the GC loop."""
-        self._running = False
-
-    async def _run_cycle(self):
-        """Single GC cycle — clean abandoned and expired uploads."""
-        logger.info("GC cycle starting...")
-
-        # Clean abandoned uploads (no activity in 7 days)
-        stale = await self._repo.get_stale_uploads(max_age_hours=168)
-        for session in stale:
-            await self._storage.delete_prefix(session.storage_prefix)
-            await self._repo.update_status(session.id, UploadState.EXPIRED)
-            await self._rate_limiter.release_concurrent(session.user_id)
-            await self._repo.delete_upload_data(session.id)
-            logger.info(f"GC: Expired abandoned upload {session.id}")
-
-        logger.info(f"GC cycle complete — cleaned {len(stale)} abandoned uploads")
-
-
-# ═══════════════════════════════════════════════════════════════
-#  ASYNC PROCESSING PIPELINE (EXAMPLE HOOKS)
-# ═══════════════════════════════════════════════════════════════
-
-class ProcessingPipeline:
-    """Async processing pipeline hooks for post-upload processing."""
+    def _expire(self, session: UploadSession) -> None:
+        self._transition(session, UploadState.EXPIRED)
+        self._limiter.finish_upload(session.user_id, session.upload_id, refund=session.file_size)
 
     @staticmethod
-    async def virus_scan(session: UploadSession):
-        """Hook: Queue file for virus scanning."""
-        logger.info(f"Pipeline: Queued {session.id} for virus scanning")
-        # In production: publish to Kafka/RabbitMQ
-        await asyncio.sleep(0.1)  # Simulate
-
-    @staticmethod
-    async def transcode_video(session: UploadSession):
-        """Hook: Queue video for transcoding (if applicable)."""
-        video_mimes = {"video/mp4", "video/quicktime", "video/x-msvideo",
-                       "video/webm", "video/mkv"}
-        if session.mime_type in video_mimes:
-            logger.info(f"Pipeline: Queued {session.id} for video transcoding")
-            await asyncio.sleep(0.1)  # Simulate
-
-    @staticmethod
-    async def notify_user(session: UploadSession):
-        """Hook: Send notification to user."""
-        logger.info(f"Pipeline: Notified user {session.user_id} about {session.filename}")
-        await asyncio.sleep(0.1)  # Simulate
+    def _transition(session: UploadSession, new: UploadState) -> None:
+        if new not in _TRANSITIONS.get(session.status, set()):
+            raise InvalidStateError(f"{session.upload_id}: {session.status.value} -> {new.value}")
+        logger.info("upload %s: %s -> %s", session.upload_id, session.status.value, new.value)
+        session.status = new
 
 
-# ═══════════════════════════════════════════════════════════════
-#  DEMO
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+#  CLIENT — chunking, bounded parallelism, retries, resume
+# ════════════════════════════════════════════════════════════════════════
 
-async def run_demo():
-    """Demonstrate the Big File Upload system end-to-end."""
-    print("=" * 60)
-    print("  BIG FILE UPLOAD SYSTEM — DEMO")
-    print("=" * 60)
+class TransientNetworkError(Exception):
+    """A dropped connection or timeout: the client should retry."""
 
-    # ── Setup ──
-    repo = UploadRepository()
-    storage = LocalChunkStorage(base_path="/tmp/upload-demo")
-    scheduler = UploadScheduler(max_concurrent=4)
-    rate_limiter = RateLimiter()
-    service = UploadService(repo, storage, scheduler, rate_limiter)
 
-    # Register processing hooks
-    service.register_complete_hook(ProcessingPipeline.virus_scan)
-    service.register_complete_hook(ProcessingPipeline.transcode_video)
-    service.register_complete_hook(ProcessingPipeline.notify_user)
+class ClientCrashed(Exception):
+    """Demo/test only: the client process died mid-upload. Not retryable."""
 
-    print("\n📤 1. Initiate Upload")
-    print("-" * 40)
-    session = await service.initiate(
-        user_id="user_123",
-        filename="demo_video.mp4",
-        file_size=50 * 1024 * 1024,  # 50MB
-        mime_type="video/mp4",
-        checksum="",
-        chunk_size=5 * 1024 * 1024,  # 5MB chunks
-    )
-    print(f"   Upload ID: {session.id}")
-    print(f"   Total Chunks: {session.total_chunks}")
-    print(f"   Chunk Size: {session.chunk_size / 1024 / 1024:.0f}MB")
 
-    print("\n📦 2. Upload Chunks (parallel)")
-    print("-" * 40)
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_attempts: int = 5
+    base_delay: float = 0.5
+    max_delay: float = 30.0
 
-    # Simulate uploading chunks in parallel
-    fake_data = b"A" * (5 * 1024 * 1024)  # 5MB of data
+    def delay(self, attempt: int, rng: random.Random) -> float:
+        return rng.uniform(0, min(self.max_delay, self.base_delay * 2 ** (attempt - 1)))   # full jitter
 
-    tasks = []
-    for chunk_num in range(session.total_chunks):
-        offset = chunk_num * session.chunk_size
-        # Last chunk may be smaller
-        if chunk_num == session.total_chunks - 1:
-            last_size = session.file_size - offset
-            data = fake_data[:last_size]
+
+_RETRYABLE = (TransientNetworkError, RateLimitedError, ChunkInProgressError)
+
+
+class UploadClient:
+    """
+    `api` is anything with the UploadService methods: the service itself in
+    tests, an HTTP client in real life. Uploads at most `concurrency` chunks at
+    a time. A chunk that keeps failing raises, but the upload stays resumable:
+    call upload() again with the same upload_id and only missing chunks are sent.
+    """
+
+    def __init__(self, api, user_id: str, *, concurrency: int = 4,
+                 retry: RetryPolicy = RetryPolicy(), rng: Optional[random.Random] = None) -> None:
+        self._api = api
+        self._user_id = user_id
+        self._concurrency = concurrency
+        self._retry = retry
+        self._rng = rng or random.Random()
+        self.chunks_sent = 0                       # successful chunk PUTs by this client
+        self.last_upload_id: Optional[str] = None  # persist this to resume after a crash
+
+    async def upload(self, data: bytes, filename: str, mime_type: str = "application/octet-stream", *,
+                     upload_id: Optional[str] = None, chunk_size: Optional[int] = None) -> UploadSession:
+        if upload_id is None:
+            session = await self._api.initiate(self._user_id, filename, len(data), mime_type,
+                                               sha256=sha256_hex(data), preferred_chunk_size=chunk_size)
+            self.last_upload_id = upload_id = session.upload_id
+            todo = list(range(session.total_chunks))
+            size = session.chunk_size
         else:
-            data = fake_data
+            self.last_upload_id = upload_id
+            status = await self._api.get_status(upload_id)
+            todo = await self._api.missing_chunks(upload_id)     # resume: ask, don't assume
+            size = int(status["chunk_size"])
 
-        tasks.append((
-            chunk_num,
-            service.upload_chunk,
-            (session.id, chunk_num, offset, data),
-            {"checksum": ChecksumVerifier.compute(data)},
-        ))
+        for _ in range(3):                         # re-send rounds for corrupted chunks
+            await self._send_all(upload_id, data, size, todo)
+            try:
+                return await self._api.complete(upload_id)
+            except ChunkCorruptedError as exc:
+                todo = exc.chunks
+        raise UploadError("chunks kept failing verification")
 
-    results = await scheduler.execute_parallel(tasks)
-    success_count = sum(1 for v in results.values() if v)
-    fail_count = sum(1 for v in results.values() if not v)
+    async def _send_all(self, upload_id: str, data: bytes, size: int, indices: List[int]) -> None:
+        sem = asyncio.Semaphore(self._concurrency)
 
-    print(f"   ✅ {success_count} chunks uploaded successfully")
-    if fail_count > 0:
-        print(f"   ❌ {fail_count} chunks failed")
+        async def one(i: int) -> None:
+            async with sem:
+                await self._send_with_retry(upload_id, i, data[i * size:(i + 1) * size])
 
-    # Simulate a resume scenario (HEAD request)
-    print("\n🔄 3. Resume Check (HEAD / get_offset)")
-    print("-" * 40)
-    offset = await service.get_offset(session.id)
-    print(f"   Current offset: {offset} / {session.file_size}")
-    print(f"   Progress: {session.progress_percent:.1f}%")
+        results = await asyncio.gather(*(one(i) for i in indices), return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            raise errors[0]
 
-    print("\n✅ 4. Complete Upload")
-    print("-" * 40)
-    result = await service.complete(session.id)
-    print(f"   Status: {result['status']}")
-    print(f"   File ID: {result['file_id']}")
-
-    print("\n📊 5. Upload Status")
-    print("-" * 40)
-    status = await service.get_status(session.id)
-    print(f"   Status: {status['status']}")
-    print(f"   Progress: {status['progress_percent']:.1f}%")
-    print(f"   Chunks: {status['chunks_received']}/{status['chunks_total']}")
-
-    print("\n" + "=" * 60)
-    print("  DEMO COMPLETE")
-    print("=" * 60)
+    async def _send_with_retry(self, upload_id: str, index: int, chunk: bytes) -> None:
+        digest = sha256_hex(chunk)
+        for attempt in range(1, self._retry.max_attempts + 1):
+            try:
+                await self._api.upload_chunk(upload_id, index, chunk, digest)
+                self.chunks_sent += 1
+                return
+            except _RETRYABLE as exc:
+                if attempt == self._retry.max_attempts:
+                    raise
+                wait = self._retry.delay(attempt, self._rng)
+                if isinstance(exc, RateLimitedError):
+                    wait = max(wait, exc.retry_after)   # honour Retry-After
+                await asyncio.sleep(wait)
 
 
-def demo():
-    """Entry point for running the demo."""
-    asyncio.run(run_demo())
+# ════════════════════════════════════════════════════════════════════════
+#  DEMO
+# ════════════════════════════════════════════════════════════════════════
+
+class FlakyNetwork:
+    """Wraps the service; drops chosen chunk requests, and can 'crash' the client."""
+
+    def __init__(self, service: UploadService, drop: Dict[int, int], crash_after: Optional[int] = None) -> None:
+        self._service = service
+        self._drop = dict(drop)                    # chunk index -> how many times to drop it
+        self._crash_after = crash_after
+        self.delivered = 0
+
+    def __getattr__(self, name):
+        return getattr(self._service, name)
+
+    async def upload_chunk(self, upload_id, index, data, sha256):
+        if self._crash_after is not None and self.delivered >= self._crash_after:
+            raise ClientCrashed("client process killed")
+        if self._drop.get(index, 0) > 0:
+            self._drop[index] -= 1
+            raise TransientNetworkError(f"connection reset on chunk {index}")
+        receipt = await self._service.upload_chunk(upload_id, index, data, sha256)
+        self.delivered += 1
+        return receipt
+
+
+async def _demo() -> None:
+    policy = UploadPolicy(min_chunk_size=64 * KIB, default_chunk_size=64 * KIB,
+                          max_file_size=10 * MIB, bandwidth_burst_bytes=1 * MIB)
+    data = random.Random(42).randbytes(1_000_000)        # ~16 chunks of 64 KiB
+    scanned: List[str] = []
+
+    # In-memory storage + zero retry delay keep the demo output deterministic;
+    # the tests exercise LocalChunkStorage against real files.
+    storage = InMemoryChunkStorage()
+    service = UploadService(storage, policy=policy)
+
+    async def virus_scan(session: UploadSession) -> None:
+        scanned.append(session.upload_id)
+        await service.record_scan_result(session.upload_id, clean=True)
+
+    service.on_completed(virus_scan)
+    print("=" * 64)
+    print("  BIG FILE UPLOAD DEMO  (1,000,000 bytes, 64 KiB chunks)")
+    print("=" * 64)
+
+    # 1. Flaky network (chunk 3 dropped twice, chunk 7 once); the client process dies once
+    #    9 chunks are acknowledged. Requests already in flight still land on the server.
+    net = FlakyNetwork(service, drop={3: 2, 7: 1}, crash_after=9)
+    client = UploadClient(net, "alice", concurrency=4,
+                          retry=RetryPolicy(base_delay=0), rng=random.Random(1))
+    try:
+        await client.upload(data, "dataset.bin")
+    except ClientCrashed:
+        pass
+    upload_id = client.last_upload_id          # a real client persists this (e.g. localStorage)
+    status = await service.get_status(upload_id)
+    missing = await service.missing_chunks(upload_id)
+    print(f"1. client crashed: {status['chunks_received']}/{status['chunks_total']} chunks stored, "
+          f"status={status['status']}, {len(missing)} missing")
+
+    # 2. A new client process resumes: it asks the server what's missing.
+    resumed = UploadClient(service, "alice", concurrency=4, rng=random.Random(2))
+    session = await resumed.upload(data, "dataset.bin", upload_id=upload_id)
+    print(f"2. resumed: sent only {resumed.chunks_sent} chunks, status={session.status.value}")
+
+    stored = await storage.read_object(session.final_key)
+    print(f"3. stored file intact: {stored == data}, sha256 verified: {session.final_sha256 == sha256_hex(data)}")
+    print(f"4. virus-scan hook ran: {scanned == [session.upload_id]}, "
+          f"active uploads for alice: {service.limiter.active_uploads('alice')}")
+
+    # 3. Idempotent retry and a conflicting re-send.
+    s2 = await service.initiate("alice", "small.txt", 10, "text/plain")
+    r1 = await service.upload_chunk(s2.upload_id, 0, b"0123456789", sha256_hex(b"0123456789"))
+    r2 = await service.upload_chunk(s2.upload_id, 0, b"0123456789", sha256_hex(b"0123456789"))
+    try:
+        await service.upload_chunk(s2.upload_id, 0, b"XXXXXXXXXX", sha256_hex(b"XXXXXXXXXX"))
+    except ChunkConflictError:
+        conflict = "rejected"
+    print(f"5. same chunk twice: duplicate={r2.duplicate} (first={r1.duplicate}); "
+          f"different bytes for it: {conflict}")
+
+    # 4. Policy: a 100 GiB file needs chunks above the 5 MiB S3 minimum.
+    big = UploadPolicy().chunk_size_for(100 * GIB, preferred=5 * MIB)
+    print(f"6. chunk size for 100 GiB: {big / MIB:.2f} MiB "
+          f"({math.ceil(100 * GIB / big)} parts <= 10,000)")
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.WARNING)
+    asyncio.run(_demo())
 
 
 if __name__ == "__main__":
-    demo()
-
+    main()
 ```
+<!-- /source -->
+
 ---
 
 ## ▶️ How to Run
 
 ```bash
 cd python-low-level-design/big-file-upload
-python big_file_upload.py
+python3 big_file_upload.py                     # demo
+python3 -m unittest test_big_file_upload       # 23 tests, < 1 s
 ```
 
-Or run the demo specifically:
-
-```bash
-python -c "from big_file_upload import demo; demo()"
-```
+The demo uploads a 1 MB file in 64 KiB chunks over a flaky network, "crashes" the client part-way, resumes with a new client that sends only the missing chunks, verifies the stored bytes and SHA-256, then shows idempotent re-sends and the S3-driven chunk size for a 100 GiB file.

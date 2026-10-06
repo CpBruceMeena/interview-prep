@@ -2,7 +2,7 @@
 
 > **Database:** PostgreSQL 16  
 > **Purpose:** Core banking, ATM network, card management, transactions, cash inventory, fraud detection  
-> **Tables:** 10 tables + 2 partitioned tables
+> **Tables:** 11 tables + 2 partitioned tables
 
 ---
 
@@ -71,8 +71,7 @@ CREATE TABLE customers (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_customers_email ON customers(email);
-CREATE INDEX idx_customers_phone ON customers(phone);
+-- email and phone are already indexed by their UNIQUE constraints.
 
 -- -----------------------------------------------------------
 -- 2. ACCOUNTS
@@ -87,6 +86,7 @@ CREATE TABLE accounts (
     balance DECIMAL(18,2) NOT NULL DEFAULT 0.00,
     available_balance DECIMAL(18,2) NOT NULL DEFAULT 0.00,  -- Balance minus holds
     credit_limit DECIMAL(18,2) DEFAULT 0.00,                -- For credit accounts
+    overdraft_limit DECIMAL(18,2) DEFAULT 0.00,             -- For checking accounts
     interest_rate DECIMAL(5,4) DEFAULT 0.0000,              -- Annual interest rate
     status VARCHAR(20) DEFAULT 'ACTIVE'
         CHECK (status IN ('ACTIVE', 'FROZEN', 'CLOSED', 'DORMANT', 'SUSPENDED')),
@@ -94,14 +94,14 @@ CREATE TABLE accounts (
     daily_transaction_limit INT DEFAULT 10,
     opened_at TIMESTAMPTZ DEFAULT NOW(),
     closed_at TIMESTAMPTZ,
-    version INT DEFAULT 1,                                   -- Optimistic locking
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT positive_balance CHECK (balance >= 0 OR account_type IN ('CREDIT', 'LOAN'))
+    -- Last line of defence; the application's conditional UPDATE should never hit it.
+    CONSTRAINT within_limits CHECK (
+        account_type = 'LOAN' OR balance >= -(overdraft_limit + credit_limit))
 );
 
 CREATE INDEX idx_accounts_customer ON accounts(customer_id);
-CREATE INDEX idx_accounts_number ON accounts(account_number);
 CREATE INDEX idx_accounts_status ON accounts(status) WHERE status = 'ACTIVE';
 
 -- -----------------------------------------------------------
@@ -111,16 +111,18 @@ CREATE TABLE cards (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     customer_id UUID NOT NULL REFERENCES customers(id),
     account_id UUID NOT NULL REFERENCES accounts(id),
-    card_number VARCHAR(19) UNIQUE NOT NULL,        -- Masked: ****-****-****-1234
+    pan_token VARCHAR(64) UNIQUE NOT NULL,          -- Token from the card vault; never the raw PAN
+    pan_last4 CHAR(4) NOT NULL,                     -- For display only (masked numbers are not unique)
     card_holder_name VARCHAR(255) NOT NULL,
     card_type VARCHAR(20) NOT NULL
         CHECK (card_type IN ('DEBIT', 'CREDIT', 'ATM', 'PREPAID')),
     network VARCHAR(20) NOT NULL                     -- 'VISA', 'MASTERCARD', 'RUPAY', 'AMEX'
         CHECK (network IN ('VISA', 'MASTERCARD', 'RUPAY', 'AMEX')),
-    pin_hash VARCHAR(255) NOT NULL,                  -- Bcrypt hash of PIN
+    pin_offset VARCHAR(16) NOT NULL,                 -- IBM 3624 offset / PVV; verified inside the HSM.
+                                                     -- A hash of a 4-digit PIN is brute-forceable.
     pin_attempts INT DEFAULT 0,
     pin_blocked BOOLEAN DEFAULT false,
-    cvv_hash VARCHAR(255) NOT NULL,
+    -- No CVV column: the issuer's HSM derives the CVV from the PAN and keys.
     expiry_date DATE NOT NULL,
     issued_date DATE NOT NULL DEFAULT CURRENT_DATE,
     status VARCHAR(20) DEFAULT 'ACTIVE'
@@ -129,7 +131,6 @@ CREATE TABLE cards (
     daily_transaction_limit INT DEFAULT 5,
     is_contactless BOOLEAN DEFAULT true,
     is_international_enabled BOOLEAN DEFAULT false,
-    version INT DEFAULT 1,                          -- Optimistic locking
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -165,14 +166,18 @@ CREATE TABLE atm_machines (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_atm_status ON atm_machines(status) WHERE status IN ('ACTIVE', 'ONLINE');
+CREATE INDEX idx_atm_status ON atm_machines(status) WHERE status = 'ACTIVE';
 CREATE INDEX idx_atm_location ON atm_machines(latitude, longitude);
 
 -- -----------------------------------------------------------
 -- 5. TRANSACTIONS (Core Ledger - Immutable, Partitioned by month)
 -- -----------------------------------------------------------
+-- On a partitioned table every PRIMARY KEY / UNIQUE constraint must include the
+-- partition key, and foreign keys can only target such a key. Hence the composite
+-- primary key, no UNIQUE on reference/idempotency columns here (see the
+-- idempotency_keys table below), and no FKs pointing at transactions(id).
 CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     account_id UUID NOT NULL REFERENCES accounts(id),
     card_id UUID REFERENCES cards(id),               -- NULL if digital/ATM cardless
     transaction_type VARCHAR(30) NOT NULL
@@ -189,16 +194,26 @@ CREATE TABLE transactions (
     balance_after DECIMAL(18,2) NOT NULL,
     description TEXT,
     atm_id UUID REFERENCES atm_machines(id),         -- NULL if not ATM transaction
-    reference_number VARCHAR(64) UNIQUE,              -- External reference
-    idempotency_key VARCHAR(64) UNIQUE,               -- Idempotent processing
+    reference_number VARCHAR(64),                     -- External reference (e.g. STAN + ATM id)
+    idempotency_key VARCHAR(64) NOT NULL,             -- Uniqueness enforced in idempotency_keys
     status VARCHAR(20) DEFAULT 'COMPLETED'
         CHECK (status IN ('PENDING', 'AUTHORIZED', 'COMPLETED', 'FAILED', 'REVERSED', 'DECLINED')),
     failure_reason TEXT,
-    reversal_of UUID REFERENCES transactions(id),     -- Link to reversed transaction
-    reversal_by UUID REFERENCES transactions(id),     -- Link to reversal transaction
+    reversal_of UUID,                                 -- Reversed transaction (no FK: partitioned target)
     metadata JSONB DEFAULT '{}',                      -- Flexible: ATM location, POS terminal, IP, etc.
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
+
+-- Global uniqueness for retries lives in a small non-partitioned table, inserted in
+-- the same database transaction as the ledger row and the balance update.
+CREATE TABLE idempotency_keys (
+    idempotency_key VARCHAR(64) PRIMARY KEY,
+    request_hash BYTEA NOT NULL,                      -- reject reuse with different parameters
+    transaction_id UUID NOT NULL,
+    response JSONB NOT NULL,                          -- returned verbatim on retry
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()     -- purge after the retry window (e.g. 7 days)
+);
 
 -- Monthly partitions for transactions
 CREATE TABLE transactions_202401 PARTITION OF transactions
@@ -211,7 +226,6 @@ CREATE INDEX idx_tx_created ON transactions(created_at DESC);
 CREATE INDEX idx_tx_type ON transactions(transaction_type);
 CREATE INDEX idx_tx_card ON transactions(card_id) WHERE card_id IS NOT NULL;
 CREATE INDEX idx_tx_atm ON transactions(atm_id) WHERE atm_id IS NOT NULL;
-CREATE INDEX idx_tx_idempotency ON transactions(idempotency_key);
 CREATE INDEX idx_tx_status ON transactions(status) WHERE status = 'PENDING';
 
 -- -----------------------------------------------------------
@@ -273,7 +287,7 @@ CREATE TABLE employees (
 -- -----------------------------------------------------------
 CREATE TABLE fraud_alerts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    transaction_id UUID REFERENCES transactions(id),
+    transaction_id UUID,                             -- no FK: transactions is partitioned
     card_id UUID REFERENCES cards(id),
     customer_id UUID REFERENCES customers(id),
     alert_type VARCHAR(50) NOT NULL
@@ -375,7 +389,7 @@ CREATE INDEX idx_scheduled_next ON scheduled_payments(next_execution)
 -- 1. Get a customer's complete financial profile
 SELECT c.full_name, c.email, c.kyc_status,
        a.account_number, a.account_type, a.balance, a.available_balance,
-       crd.card_number, crd.card_type, crd.status AS card_status
+       crd.pan_last4, crd.card_type, crd.status AS card_status
 FROM customers c
 JOIN accounts a ON a.customer_id = c.id
 LEFT JOIN cards crd ON crd.account_id = a.id AND crd.status = 'ACTIVE'
@@ -430,12 +444,11 @@ ORDER BY month DESC;
 ```ascii
 # Redis is used for: rate limiting, session state, hot account cache
 
-session:{session_id}                       → HASH (atm_session_id, card_number, authenticated, account_ids)
+session:{session_id}                       → HASH (atm_session_id, card_id, authenticated, account_ids)
 rate_limit:atm:{atm_id}:minute             → STRING (counter, reset every minute)
 rate_limit:customer:{customer_id}:hour     → STRING (counter, reset every hour)
 rate_limit:account:{account_id}:day        → STRING (daily withdrawal total)
-balance:{account_id}                       → STRING (cached balance, TTL 5s)
-card:{card_id}:pin_attempts                → STRING (failed PIN attempts, TTL 24h)
+balance:{account_id}                       → STRING (display-only balance, TTL 5s; never used to authorize)
 atm:{atm_id}:cash                         → HASH (denomination → count, refreshed every transaction)
 fraud:velocity:{card_id}:10m              → SET (transaction IDs in last 10 min)
 ```
@@ -450,14 +463,15 @@ fraud:velocity:{card_id}:10m              → SET (transaction IDs in last 10 mi
 | 2 | `accounts` | `customer_id → customers` | `cards(account_id)`, `transactions(account_id)`, `daily_limits(account_id)`, `scheduled_payments(account_id)` | customer, number, active(partial) |
 | 3 | `cards` | `customer_id → customers`, `account_id → accounts` | `transactions(card_id)`, `fraud_alerts(card_id)`, `atm_sessions(card_id)` | customer, account, status, expiry |
 | 4 | `atm_machines` | — | `transactions(atm_id)`, `atm_cash_inventory(atm_id)`, `atm_sessions(atm_id)` | status, location |
-| 5 | `transactions` | `account_id → accounts`, `card_id → cards`, `atm_id → atm_machines` | `fraud_alerts(transaction_id)` | account, created DESC, card, atm, idempotency |
+| 5 | `transactions` | `account_id → accounts`, `card_id → cards`, `atm_id → atm_machines` | `fraud_alerts(transaction_id)` (logical, no FK) | PK (id, created_at), account, created DESC, card, atm |
 | 6 | `atm_cash_inventory` | `atm_id → atm_machines` | — | (atm, denomination) UNIQUE, low-cash(filter) |
 | 7 | `atm_sessions` | `atm_id → atm_machines`, `card_id → cards`, `customer_id → customers` | — | atm, customer, start DESC |
 | 8 | `employees` | — | `fraud_alerts(reviewed_by)` | — |
-| 9 | `fraud_alerts` | `transaction_id → transactions`, `card_id → cards`, `customer_id → customers`, `reviewed_by → employees` | — | transaction, open(filter), severity |
+| 9 | `fraud_alerts` | `transaction_id` (logical ref to partitioned `transactions`), `card_id → cards`, `customer_id → customers`, `reviewed_by → employees` | — | transaction, open(filter), severity |
 | 10 | `daily_limits` | `account_id → accounts` | — | (account, date) UNIQUE |
 | 11 | `audit_log` | polymorphic | — | (entity, id), created DESC |
 | 12 | `scheduled_payments` | `account_id → accounts` | — | account, next_execution(filter) |
+| 13 | `idempotency_keys` | — (holds `transaction_id`) | — | PK idempotency_key |
 
 ---
 
@@ -465,9 +479,10 @@ fraud:velocity:{card_id}:10m              → SET (transaction IDs in last 10 mi
 
 | Concern | Solution |
 |---------|----------|
-| **Balance accuracy** | Optimistic locking via `version` column. Read version, compute, write only if version unchanged. On conflict, retry. |
-| **No double-withdrawal** | `idempotency_key` UNIQUE constraint prevents duplicate transaction processing. |
-| **No double-dispense** | Two-phase protocol: `PENDING` → dispense → `COMPLETED`. If dispense fails after 30s timeout, auto-reversal. |
-| **Hot account contention** | Redis cache + database. Write-through: update Redis → async write to DB. Read from Redis for balance checks. |
-| **ATM session atomicity** | Each session state tracked in both Redis (fast) and PostgreSQL (durable). On failover, replay from DB. |
-| **Geographic distribution** | Active-Active with CDC (Debezium + Kafka) for cross-region replication. Local reads, global consistency for balances. |
+| **Balance accuracy** | Conditional update: `UPDATE accounts SET balance = balance - :amt WHERE id = ? AND balance - :amt >= -(overdraft_limit + credit_limit)`. Zero rows = decline. No read-modify-write in the application, so no lost updates and no optimistic-retry storms on hot accounts. |
+| **No double-withdrawal** | Insert into `idempotency_keys` in the same transaction as the ledger row and balance update. A retry conflicts on the key and gets the stored response. |
+| **No double-dispense / no unpaid debit** | Withdrawal is `PENDING` until the ATM confirms; a failed dispense sends a reversal that the ATM stores and forwards until acknowledged. Ambiguous outcomes go to reconciliation rather than being guessed. |
+| **Hot account contention** | Keep the row lock short (one conditional `UPDATE`); never put a cache in the write path. Redis may serve display balances only. |
+| **PIN attempts** | Durable `cards.pin_attempts`, updated atomically (`SET pin_attempts = pin_attempts + 1 ... RETURNING`). Not a Redis key with a TTL, which would silently reset the count. |
+| **ATM session state** | Lives on the ATM and in `atm_sessions` for audit. Money state lives only in the ledger. |
+| **Geographic distribution** | Each account has one home region that owns its writes (single writer). Other regions forward writes there and may serve stale reads for display. Async active-active replication of balances would allow the same funds to be spent in two regions. |

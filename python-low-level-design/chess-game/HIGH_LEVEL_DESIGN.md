@@ -10,7 +10,7 @@
 
 **Purpose:** Online chess platform supporting real-time multiplayer, AI opponents, game analysis, and tournament management.
 
-**Scale:** 1M monthly active users, 10K concurrent games, 50K games/day.
+**Scale:** launch at ~10K concurrent games / 50K games per day; design target below (100K concurrent, 500K games/day). The numbers in the rest of this doc use the design target.
 
 **Users:** Players (casual/competitive), Spectators, Tournament organizers
 
@@ -29,7 +29,9 @@
 - **500K games/day**
 - **1M+ WebSocket connections** (players + spectators)
 - **50K matchmaking requests/minute**
-- **200K game moves/minute** (peak)
+- **200K game moves/minute** (peak) ≈ **3.3K moves/second**
+
+**Back-of-envelope:** 100K games × one move every ~30 s ≈ 3.3K moves/s, consistent with the line above. Each move is ~100 bytes on the wire and one row in the move log. 500K games/day × ~80 plies ≈ 40M move rows/day ≈ 460 rows/s average. None of this is large for PostgreSQL; the hard parts are **fan-out to ~1M sockets, clock accuracy, and never losing or double-applying a move**.
 
 ---
 
@@ -197,11 +199,11 @@ CREATE TABLE moves (
 | Aspect | Bitboard (uint64) | 2D Array |
 |--------|------------------|----------|
 | Speed | ✅ 50M+ positions/s | ❌ ~500K positions/s |
-| Memory | ✅ 768 bits total | ❌ 64+ bytes |
+| Memory | ~96 bytes (12 × 64-bit) | ~64 bytes (one byte per square) — memory is not the reason to choose either |
 | Complexity | ❌ Harder to debug | ✅ Simple |
 | Move generation | ✅ Bitwise ops | ❌ Loops |
 
-**Decision:** Bitboard for core engine, array wrapper for human-readable debugging.
+**Decision:** For a game server that validates *one* move per request, the array board is fast enough (well under a millisecond per legal-move check) and far easier to get right. Bitboards matter for the AI/analysis tier, which searches millions of positions; use a proven engine (Stockfish) there rather than writing one.
 
 ---
 
@@ -286,7 +288,7 @@ At 100K concurrent games and 1M users, the architecture must be fundamentally di
 Key design decisions:
 1. **Game engine is in Go**, not Python — Go's goroutines make it trivial to manage 2000+ concurrent games per pod (each with its own timer, WebSocket connection, and game state). Python would require complex async patterns for similar throughput.
 2. **One goroutine per game** — not per player. Both player WebSocket connections feed into the same game goroutine via channels. This eliminates all locking within a game.
-3. **Stateless at pod level** — game state is in Redis. If a pod crashes, another pod picks up the game by loading state from Redis.
+3. **Single writer per game, enforced by a lease** — a pod owns a game while it holds a lease (e.g. `SET game:{id}:owner pod-7 NX PX 10000`, renewed every few seconds) and every write carries a fencing token (the lease epoch). If a pod crashes, another pod takes the lease, rebuilds the game from the durable move log, and resumes. Without fencing, a paused-but-alive old owner could write after the new owner took over (split brain).
 4. **Bitboard engine compiled as native Go** — no CGo, no Python overhead. Pure Go bit manipulation for move generation.
 ```
 
@@ -318,29 +320,33 @@ func (g *Game) Run() {
     for {
         select {
         case move := <-g.MoveChan:
-            // Validate move using bitboard engine
+            // Reject duplicates / stale submissions: the client echoes the ply it saw
+            if move.ExpectedPly != len(g.MoveHistory) {
+                g.StateChan <- GameState{Error: "Stale move", Player: move.Player}
+                continue
+            }
             if !g.Board.IsLegalMove(move.Player, move.From, move.To) {
                 g.StateChan <- GameState{Error: "Illegal move", Player: move.Player}
                 continue
             }
-            // Apply move
-            g.Board.ApplyMove(move.From, move.To)
+            // Persist BEFORE acknowledging: INSERT ... (game_id, move_number) is the PK,
+            // so a second writer for the same ply fails instead of forking the game.
+            if err := g.Store.AppendMove(g.ID, len(g.MoveHistory)+1, move, g.LeaseEpoch); err != nil {
+                g.StateChan <- GameState{Error: "Retry", Player: move.Player}
+                continue
+            }
+            g.Board.ApplyMove(move.From, move.To, move.Promotion)
             g.MoveHistory = append(g.MoveHistory, move.ToMove())
             g.SwitchTurn()
-            
-            // Check game end conditions
-            if g.Board.IsCheckmate() {
-                g.EndGame(CHECKMATE)
+
+            if g.Board.IsCheckmate() || g.Board.IsStalemate() || g.Board.IsAutomaticDraw() {
+                g.EndGame()   // persists the result, then publishes game_over
                 return
             }
-            
             // Publish new state to Redis PubSub (-> other player + spectators)
             g.PublishState()
-            
-            // Async flush to PostgreSQL every 10 moves
-            if len(g.MoveHistory)%10 == 0 {
-                go g.FlushToPostgres()
-            }
+            // Note: never hand g.MoveHistory to another goroutine (e.g. `go flush(g.MoveHistory)`)
+            // while this loop keeps appending to it: that is a data race. Copy it, or don't.
             
         case playerID := <-g.DisconnectChan:
             g.HandleDisconnect(playerID)
@@ -362,8 +368,8 @@ func (g *Game) Run() {
 
 | Tier | Technology | Purpose | Recovery |
 |------|-----------|---------|----------|
-| **L1 - Hot** | Redis (in-memory) | Active game state, FEN, timers, last 50 moves | Primary for active games |
-| **L2 - Warm** | PostgreSQL (game_sessions + game_moves) | Full move history, completed games | Rebuild L1 from last checkpoint + moves |
+| **L1 - Hot** | Redis (in-memory) | Active game state, FEN, timers, last 50 moves | Cache; rebuilt from L2 on loss |
+| **L2 - Warm** | PostgreSQL (game_sessions + game_moves) | Source of truth: every move, written before ack | Replay the move log |
 | **L3 - Cold** | S3 / Object Store | PGN exports, archived games (older than 6 months) | Bulk restore |
 
 **State serialization format:**
@@ -391,10 +397,10 @@ func (g *Game) Run() {
 }
 ```
 
-**Checkpoint strategy:**
-- **Redis holds canonical state** for active games
-- Every **10 moves**, flush state to PostgreSQL (`game_sessions.final_fen`, `game_moves` rows)
-- If Redis node fails: load `game_sessions` by `game_id`, reconstruct state from last checkpoint + replay remaining moves from `game_moves`
+**Persistence strategy:**
+- **The move log in PostgreSQL is the source of truth.** Each accepted move is one `INSERT` into `game_moves` with PK `(game_id, move_number)` *before* the move is acknowledged. At ~3.3K moves/s peak this is comfortably within one primary (or a few hash-partitioned tables).
+- **Redis is a hot cache** of the derived state (FEN, clocks) for fast reconnects and spectators. Losing it loses nothing: replay the move log.
+- Batching every 10 moves (a common suggestion) means a pod or Redis failure can silently delete up to 10 moves of a ranked game. Unacceptable for a game whose result changes ratings; per-move writes are cheap enough that batching isn't worth it.
 - **Zombie game cleanup**: TTL on Redis keys (max 24h per game). Games exceeding max time (e.g., unlimited time control → 7 days) auto-draw.
 
 ### 5.4 WebSocket Architecture for 1M+ Connections
@@ -428,7 +434,7 @@ Client D ──WebSocket──→  │   - Connection mux    │  │  game:{id}
 
 1. **WebSocket Gateway is separate from Game Engine** — a thin proxy that maintains 1M+ connections. Each gateway pod can handle ~100K connections (Go's goroutines are lightweight: ~5KB per connection).
 
-2. **Sticky routing via game_id hash:** `hash(game_id) % num_pods` — ensures both players' messages for the same game reach the same engine pod. This eliminates cross-pod communication for game state.
+2. **Routing to the owning pod:** a game→pod lookup (the lease key above, cached at the gateway) or consistent hashing on `game_id`. Plain `hash(game_id) % num_pods` reshuffles almost every game when a pod is added or removed, which is exactly when you can least afford mass migration.
 
 3. **Redis PubSub for broadcasting:** When engine pod processes a move, it publishes the new state to Redis PubSub channel `game:{id}:state`. The gateway pod (which subscribed to this channel via Redis) pushes the update to both players' WebSocket connections.
 
@@ -445,7 +451,8 @@ Client D ──WebSocket──→  │   - Connection mux    │  │  game:{id}
   "payload": {
     "from": "e2",
     "to": "e4",
-    "promotion": null
+    "promotion": null,
+    "expected_ply": 0
   },
   "timestamp": 1704067200000
 }
@@ -509,7 +516,7 @@ Client D ──WebSocket──→  │   - Connection mux    │  │  game:{id}
    │  - Update chess clocks
    │  - Check for check/checkmate/stalemate
    │  - Publish new state to Redis
-   │  - Async: write to PG (every 10 moves)
+   │  - Append move to PG move log (before ack)
    │
 4. Redis PubSub fan-out
    │  - All gateway pods subscribed to this game's channel
@@ -524,18 +531,18 @@ Client D ──WebSocket──→  │   - Connection mux    │  │  game:{id}
 
 **Throughput calculations:**
 
-| Component | Per-game cost | 100K games cost | Capacity |
-|-----------|--------------|----------------|----------|
-| Move validation (bitboard) | 50μs | 5s total CPU/s | 20 cores |
-| Redis state update | 1ms | 100 ops/s per shard | 15 shards → <7 ops/s each |
-| PG write (every 10 moves) | 5ms | 50 writes/s | ~10K writes/s capacity |
-| WebSocket push (state) | 0.1ms | 10K pushes/s | ~1M pushes/s per gateway |
+| Component | Cost per move | At 3.3K moves/s | Notes |
+|-----------|--------------|-----------------|-------|
+| Move validation (array board, Python) | ~0.5 ms CPU | ~1.7 cores | Bitboards would cut this ~100×; not needed |
+| PG move-log insert | ~1–3 ms latency | 3.3K inserts/s | One well-provisioned primary; hash-partition `game_moves` for vacuum/index size, not for throughput |
+| Redis state update + PUBLISH | <1 ms | ~6.6K ops/s | A single Redis node handles ~100K ops/s; shard for memory/fan-out, not ops |
+| WebSocket pushes | ~10 recipients per move (2 players + ~8 spectators) | ~33K pushes/s | Spread across gateway pods; popular games need a separate fan-out path |
 
 **Bottleneck management:**
 
-1. **Redis write amplification:** Each game produces ~1 write/s to Redis. At 100K games, that's 100K writes/s. **Solution:** Redis Cluster with 15+ shards (each handling ~7K writes/s easily).
+1. **Clock sync traffic, not moves, dominates Redis/WebSocket load.** `clock_sync` every 500 ms × 100K games × 10 recipients = 2M messages/s. Send clock state only with moves (clients count down locally from the server timestamp) and resync every few seconds, not every 500 ms.
 
-2. **PG write batch:** Instead of writing every move, batch writes. Buffer moves in a goroutine-local slice, flush every 5 seconds or 50 moves, whichever comes first. Use PostgreSQL `COPY` for bulk inserts.
+2. **Hot games:** a top-board tournament game with 50K spectators. Don't fan out from the engine pod: publish once to a dedicated channel and let a CDN-style relay tier (or SSE with caching) handle viewers, who tolerate a second of delay.
 
 3. **WebSocket broadcast storm:** When 100K games all produce moves simultaneously, gateways could get overwhelmed. **Solution:** Rate-limit state broadcasts per-game (max 10/s). If a game produces moves faster (premoves in bullet chess), batch the last known state.
 
@@ -598,13 +605,13 @@ Client D ──WebSocket──→  │   - Connection mux    │  │  game:{id}
 **Availability:** 99.99% (ranked) / 99.9% (casual)
 
 **Game State Recovery:**
-1. Redis persistence (AOF every 1s + RDB every 5min)
-2. PostgreSQL checkpoint every 10 moves per game
-3. If Redis fails completely → reconstruct from PostgreSQL last checkpoint + replay remaining moves from `game_moves` table
+1. Every move is in PostgreSQL before it is acknowledged (see 5.3)
+2. Redis persistence (AOF every 1s + RDB every 5min) only shortens warm-up; it is not relied on for correctness
+3. If Redis fails completely → replay `game_moves` for each active game (≈80 rows per game; seconds for the whole fleet)
 
 **Disaster Recovery:**
 - Cross-region replica of PostgreSQL (Aurora Global Database)
-- Active games lost on full region failover → players reconnect, game resumes from last PG checkpoint. Max 10 moves of lost progress.
+- On full region failover, active games resume from the replicated move log. Aurora Global replicates asynchronously (typically under a second of lag), so a region loss can drop the last move or two; the client re-submits with its `expected_ply` and the server either accepts or returns the authoritative state. Clocks are paused for the failover window.
 - Redis replication across AZs within region
 
 **Graceful degradation:**
@@ -616,11 +623,23 @@ Client D ──WebSocket──→  │   - Connection mux    │  │  game:{id}
 | Full game service down | Active games paused. Rating changes deferred. All games resume when service is back. |
 
 **Scaling:**
-- Game engine pods: Horizontal based on active game count (auto-scale at 15K games/pod, target 2K games/goroutine)
+- Game engine pods: Horizontal based on active game count (target ~2K games per pod, one goroutine per game; scale out at ~80% of that)
 - WebSocket gateway pods: Scale based on connection count (target 100K connections/pod)
 - AI computation: GPU instances with auto-scaling queue. Analysis jobs queued via Kafka, processed as capacity allows.
 - Redis cluster: Add shards as memory usage crosses 70%
 - PostgreSQL: Read replicas for leaderboard queries, analytics offloading
+
+---
+
+### Idempotency & ordering (summary)
+
+| Risk | Guard |
+|------|-------|
+| Client retries a move after a timeout | Client sends `expected_ply`; server returns the current state if the ply already advanced |
+| Two pods both think they own a game | Lease + fencing epoch stored with each move write; the store rejects lower epochs |
+| Same ply written twice | `PRIMARY KEY (game_id, move_number)` on `game_moves` |
+| Rating applied twice when the game-over event is redelivered | `UNIQUE (user_id, game_id, rating_type)` on rating history; consumer is idempotent |
+| Flag-fall timer races a last-second move | Both go through the game's single writer; whichever is processed first wins |
 
 ---
 

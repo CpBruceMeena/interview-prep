@@ -22,6 +22,8 @@
 7. [Phase 6: Polymorphism & Inheritance](#phase-6-polymorphism-inheritance)
 8. [Phase 7: Design Patterns — When & Why](#phase-7-design-patterns-when-why)
 9. [Phase 8: Review & Refine Checklist](#phase-8-review-refine-checklist)
+10. [Phase 9: Concurrency — The Part Most Candidates Skip](#phase-9-concurrency-the-part-most-candidates-skip)
+11. [How to Run This in a 45–60 min Interview](#how-to-run-this-in-a-4560-min-interview)
 
 ---
 
@@ -37,6 +39,10 @@
 | Is it first-come-first-served or reservation-based? | Affects spot allocation logic | First-come-first-served |
 | Do we need a display board? | Adds Observer-like behavior | Yes, show availability |
 | Can a vehicle park in any spot? | Creates allocation rules | Motorcycles can use any spot |
+| Best fit or nearest spot? | Decides the allocation loop order | Best fit: keep LARGE spots for trucks |
+| Multiple entry gates at once? | Puts concurrency in scope | Yes: allocation must be race-free |
+| What happens with a lost ticket? | Needs a lookup by plate | Fee so far + flat penalty |
+| In-memory only, or persisted? | Decides how far to take the DB discussion | In-memory for the code, discuss DB after |
 
 **💡 Interview Tip:** Always clarify scope before writing code. It shows you think about the problem before diving into the solution. Say: *"Let me clarify a few things before I start — what vehicle types, how many floors, what pricing model?"*
 
@@ -177,14 +183,10 @@ class ParkingSpot:
 
 ```
 Does the class only hold data?
-├── YES → Can I use @dataclass?
-│   ├── YES → @dataclass (auto __init__, __eq__, __repr__)
-│   └── NO  → Simple __init__ (rare)
-└── NO  → Does it have behavior?
-    ├── YES → Regular class with __init__ + methods
-    └── YES → Is it an interface/contract?
-        ├── YES → ABC (abstract base class)
-        └── YES → Use ABC + @abstractmethod
+├── YES → @dataclass (auto __init__, __eq__, __repr__)
+└── NO  → Is it a contract with several implementations?
+    ├── YES → ABC + @abstractmethod
+    └── NO  → Regular class with __init__ + methods
 ```
 
 ### Applied to Parking Lot
@@ -193,6 +195,7 @@ Does the class only hold data?
 # DATACLASS candidates (passive data):
 # - RateInfo (just holds spot type + rates)
 # - PaymentInfo (holds payment details, no behavior)
+# (Money fields are Decimal, never float.)
 
 # REGULAR CLASS candidates (has behavior + state):
 # - ParkingSpot (park(), vacate()) ← STATE CHANGES
@@ -219,11 +222,11 @@ From the requirements, extract every action:
 |--------|-------------|------|
 | Park a vehicle in a spot | `ParkingSpot.park()` | Spot owns its state |
 | Vacate a spot | `ParkingSpot.vacate()` | Spot owns its state |
-| Find an available spot | `ParkingLot.find_available_spot()` | Lot knows all floors & spots |
+| Find an available spot | `ParkingLot.find_available_spot()` | Lot knows all floors and owns the lock |
 | Create a ticket | `TicketManager.create_ticket()` | TicketManager owns ticket lifecycle |
 | Calculate fee | `FeeCalculator.calculate_fee()` | FeeCalculator owns pricing logic |
 | Close a ticket | `ParkingTicket.close()` | Ticket owns its lifecycle |
-| Show available spots | `DisplayBoard.display()` | DisplayBoard owns output formatting |
+| Show available spots | `DisplayBoard.render()` | DisplayBoard owns output formatting |
 | Determine allowed spots for a vehicle | `SpotAllocationMapping.get_allowed_spots()` | Mapping owns allocation rules |
 
 ### Step 2: Apply the "Why" Test
@@ -234,17 +237,19 @@ For each method you're about to write, ask: **"Why does this method belong in th
 Method: park_vehicle(vehicle)
 Class: ParkingLot
 Q: Why does ParkingLot own this?
-A: Because ParkingLot orchestrates the full flow: 
-   1. Find a spot (uses floors/spots)
-   2. Park in the spot (delegates to ParkingSpot.park())
+A: Because ParkingLot orchestrates the full flow:
+   1. Find a spot (asks each floor's free index)
+   2. Occupy it (ParkingFloor.occupy() -> ParkingSpot.park())
    3. Create a ticket (delegates to TicketManager)
-   It's the Facade — the single entry point.
+   It's the Facade — the single entry point — and therefore
+   the natural owner of the lock that makes 1-3 atomic.
 
-Method: close(fee_calculator)
+Method: close(exit_time, fee_calculator, ...)
 Class: ParkingTicket
 Q: Why does ParkingTicket own this?
 A: Because closing a ticket means:
-   1. Recording exit time (ticket's own data)
+   0. Refusing if it is not ACTIVE (ticket's own state machine)
+   1. Recording exit time (passed in from the lot's clock)
    2. Calculating duration (ticket's own data)
    3. Computing fee (delegates to FeeCalculator)
    4. Updating status (ticket's own state)
@@ -408,10 +413,14 @@ Problem: "I need a unified interface for the parking lot operations"
    → Facade Pattern ✅ (ParkingLot class)
 
 Problem: "I need to notify the display board when spots change"
-   → Observer Pattern ✅ (DisplayBoard listens to spot changes)
+   → Observer only if there are several subscribers (boards, analytics,
+     mobile app). With one board, DisplayBoard.render() pulling counts is
+     simpler — that is what the code does.
 
 Problem: "I need to enforce a lifecycle for tickets"
-   → State Pattern ✅ (ACTIVE → PAID → LOST)
+   → An enum + a guard in ParkingTicket.close() (ACTIVE → PAID | LOST).
+     The full State pattern earns its keep only when behaviour differs a
+     lot per state; two transitions do not justify it.
 ```
 
 ### When NOT to Use a Pattern
@@ -495,11 +504,44 @@ Imagine adding a new feature and see how many classes need to change:
 |--------------|-----------------|
 | New enum value | `VehicleType.EV` → add to enum |
 | New subclass | `ElectricCar(Vehicle)` → new class |
-| New mapping | `SpotAllocationMapping._mapping` → one new entry |
-| New spot type (optional) | `SpotType.EV` → add to enum |
-| New rate (optional) | `HourlyFeeCalculator._rates` → one new entry |
+| New spot type | `SpotType.EV` + its `size` entry |
+| Allocation rule | `SpotAllocationMapping.get_allowed_spots()` → EVs try EV spots first; non-EVs skip EV spots |
+| New rate | `HourlyFeeCalculator._rates` → one new entry |
 
-**Result:** 5 small changes, **zero existing code modified**. That's the Open/Closed Principle working.
+**Result:** a handful of additive changes concentrated in the enums, one new class and the one class that owns allocation rules. `ParkingLot`, `ParkingFloor`, `ParkingTicket` and the fee strategies' logic are untouched. Be honest that enums and the mapping *are* edited: OCP in practice means "changes land in the places designed for them", not literally zero edits.
+
+---
+
+## Phase 9: Concurrency — The Part Most Candidates Skip
+
+Multiple entry gates mean `park_vehicle` runs concurrently. The naive flow is a **check-then-act race**:
+
+```
+Gate A: find_available_spot() -> B01      Gate B: find_available_spot() -> B01
+Gate A: B01.park(car1)                     Gate B: B01.park(car2)   # boom, or silent overwrite
+```
+
+**Fix:** make *find → occupy → issue ticket* one critical section. In the code, `ParkingLot` holds a single `threading.Lock`, and `park_vehicle`, `unpark_vehicle` and `unpark_lost_ticket` each take it once. Say out loud:
+
+- *"Locking `ParkingSpot.park()` alone isn't enough: the race is between choosing the spot and claiming it."*
+- *"One lock is fine here: the critical section is a few dict operations. I'd only stripe locks per floor or spot type if profiling showed contention, and then I'd have to lock in a fixed order to avoid deadlock."*
+- *"Unpark takes the same lock so two exits racing on one ticket can't both charge."*
+- *"Across processes this lock is useless; the DB becomes the arbiter (`FOR UPDATE SKIP LOCKED` or a conditional `UPDATE ... WHERE status='AVAILABLE'`)."*
+
+---
+
+## How to Run This in a 45–60 min Interview
+
+| Time | Step | What you do | What you say out loud |
+|------|------|-------------|-----------------------|
+| 0–5 | **Clarify** | Ask the Phase 0 questions; write the agreed scope as 4–6 bullets | *"I'll assume three vehicle sizes, multi-floor, hourly pricing, multiple gates. Reservations and payments are out of scope unless you want them."* |
+| 5–12 | **Entities & interfaces** | Enums, `Vehicle` ABC, `ParkingSpot`, `ParkingFloor`, `ParkingTicket`, `FeeCalculator` ABC, `ParkingLot` facade. Write signatures only. | *"Pricing changes most often, so it's a strategy. Allocation rules are their own class because the business will change them."* |
+| 12–35 | **Core code** | `park_vehicle`, `unpark_vehicle`, best-fit search, fee calc with `Decimal` and round-up, exceptions for full/duplicate/invalid ticket | *"I'm keeping a free-spot index per floor so I'm not scanning every spot on every entry."* |
+| 35–45 | **Concurrency** | Add the lock around find+occupy+ticket and around unpark; mention duplicate-plate check | *"The race is check-then-act; here is the critical section."* |
+| 45–55 | **Extension** | Whatever they ask: EV spots, lost ticket, reservations, grace period. Show where it plugs in. | *"This lands in `SpotAllocationMapping` / a `FeeCalculator` decorator; nothing else changes."* |
+| 55–60 | **Test & wrap-up** | Name the tests you'd write: best-fit order, full lot, double unpark, fee rounding with a fake clock, N-thread contention | *"I injected the clock so fee tests don't sleep."* |
+
+**If you're running behind:** skip `VehicleFactory` and `DisplayBoard` entirely. They're the least interesting classes. Never skip the lock.
 
 ---
 

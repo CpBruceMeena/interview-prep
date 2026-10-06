@@ -1,355 +1,187 @@
 # Car Rental Platform - Interview Questions & Answers
 
-> **Target Level:** Senior/Staff Engineer (10+ years)  
-> **Evaluation Focus:** Fleet availability management, hourly booking, capacity planning, search architecture, concurrency
+> **Target Level:** Senior / Staff Engineer  
+> **Evaluation Focus:** Availability modelling, overlap checks, double-booking prevention under concurrency, reservation lifecycle, search at scale
 
 ---
 
-## Question 1: Core Design — Availability-Driven
-**Interviewer:** *"Design a car rental platform where we own the fleet. The core challenge is accurately showing which cars are free for booking — by the hour or by the day — and showing availability for the next week."*
+## Question 1: Core Design — "When is a car free?"
+**Interviewer:** *"Design a car rental platform where we own the fleet. Users book by the hour or the day, and we show availability for the next week."*
 
-### 🎯 Staff-Level Answer
+### 🎯 Answer
 
-**Core Domain Model:**
+**Domain model:**
 ```
-Vehicle ──→ AvailabilityCalendar ──→ TimeBlock[] (hourly slots)
-    │                                      │
-    │                              1-week lookahead
-    │                                      │
-    └── Reservations ─────→ Booked Slots (exclusion constraint)
-```
-
-**Availability Calendar (Hourly Granularity):**
-```python
-class AvailabilityCalendar:
-    """
-    Tracks availability at hourly granularity.
-    Each day = 24 slots. Booking occupies contiguous slots.
-    """
-    
-    def is_available(self, vehicle_id, pickup, dropoff) -> bool:
-        # Check ALL hourly slots between pickup and dropoff
-        for slot in self._get_slots(pickup, dropoff):
-            if slot in self._booked_slots[vehicle_id]:
-                return False
-        return True
-    
-    def get_weekly_availability(self, vehicle_id, start_date):
-        # Return 7-day calendar: available hours per day
-        return {
-            'days': [
-                {'date': ..., 'available_hours': [9,10,11,14,15], ...}
-                for day in range(7)
-            ]
-        }
+Vehicle (type, rates, location, physical status)
+   └── VehicleSchedule: sorted, non-overlapping [start, end) blocks
+           ├── RESERVATION block (+ turnaround buffer, + hold expiry while unpaid)
+           └── MAINTENANCE block
+Reservation (customer, vehicle, pickup, dropoff, quote, status) ── owns one RESERVATION block
 ```
 
-**Database Guarantee:**
-```sql
-ALTER TABLE reservations ADD CONSTRAINT no_overlapping_booking
-EXCLUDE USING gist (
-    vehicle_id WITH =,
-    tstzrange(pickup_datetime, return_datetime) WITH &&
-);
-```
+**Decisions:**
+1. **Exact half-open intervals are the source of truth.** Hourly slots and the 7×24 grid are *derived* views. Rounding stored bookings to slots either misses real overlaps (round down) or wastes inventory (round up).
+2. **Overlap test:** `[a, b)` and `[c, d)` overlap iff `a < d and c < b`. With sorted non-overlapping blocks it's one bisect, O(log n).
+3. **Reserve = atomic check-and-insert** per vehicle (`try_block` under the vehicle's lock; in Postgres an exclusion constraint).
+4. **State machine:** `PENDING (hold, TTL) → CONFIRMED → IN_PROGRESS → COMPLETED`, plus `CANCELLED`, `EXPIRED`.
+5. **`VehicleStatus` is physical only** (on the lot / rented). A car booked for Friday is still on the lot today.
 
-**Search Response:**
+**Weekly view response** (projection of the intervals):
 ```json
-{
-  "vehicle": {"make": "Toyota", "model": "Fortuner", "hourly_rate": 12, "daily_rate": 80},
-  "estimated_cost": 72.0,
-  "weekly_availability": {
-    "days": [
-      {"date": "Mon", "available_hours": [9,10,11,14,15,16], "total_available": 6},
-      {"date": "Tue", "available_hours": [8,9,10,11,12,13,14,15], "total_available": 8}
-    ]
-  }
-}
+{"vehicle_id": "V1", "week_start": "2025-01-13",
+ "days": [{"date": "2025-01-14", "day_name": "Tue",
+           "available_hours": [0,1,2,3,4,5,6,7,8,9,13,14,15,16,17,18,19,20,21,22,23],
+           "total_available": 21, "is_fully_booked": false}]}
 ```
 
 ---
 
 ## Question 2: Preventing Double-Booking (Deep Dive)
-**Interviewer:** *"How do you ensure a vehicle isn't double-booked when two users try to book overlapping times concurrently?"*
+**Interviewer:** *"Two users book overlapping times on the same car at the same moment. What stops both succeeding?"*
 
-### 🎯 Staff-Level Answer
+### 🎯 Answer
 
-**Four-layer defense:**
+**The bug to name first:** `SELECT` overlapping rows → 0 → `INSERT`. Both transactions see 0 and both insert. Under Postgres `REPEATABLE READ` (snapshot isolation) this is classic write skew; neither row conflicts with the other at the row level.
 
-| Layer | Mechanism | Guarantee |
-|-------|-----------|-----------|
-| 1. Application | Optimistic check: `SELECT overlapping reservations COUNT = 0` | Catches 99.9% of conflicts |
-| 2. Database | **Exclusion constraint** `tstzrange && tstzrange` | Hard DB guarantee, atomic |
-| 3. Idempotency | `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` | Prevents duplicates from retry |
-| 4. Isolation | `SERIALIZABLE` transaction isolation | Prevents phantom reads |
+**Fixes, best first:**
 
-**Race condition walkthrough:**
+| Option | How | Notes |
+|--------|-----|-------|
+| **Exclusion constraint** | `EXCLUDE USING gist (vehicle_id WITH =, block_range WITH &&) WHERE (active)` | The INSERT itself fails (`23P01 exclusion_violation`). Works at READ COMMITTED. Needs `btree_gist` for the `=` on a UUID |
+| **Lock the parent row** | `SELECT ... FROM vehicles WHERE id = ? FOR UPDATE`, then check overlaps, then insert | Portable (MySQL too). Serialises bookings *per car*, which is fine: contention is per car |
+| **SERIALIZABLE** | Postgres SSI detects the read/write dependency and aborts one transaction at commit | Correct, but you must retry on `40001`, and it's easy to break by reading through a different path |
+| **Slot rows + unique key** | One row per (vehicle, hour) with a UNIQUE constraint; insert all slots in one txn | Works anywhere, but forces hourly rounding and N inserts per booking |
 
-```
-Time    User A                           User B
-│       BEGIN;                           BEGIN;
-│       SELECT overlapping_reservations  SELECT overlapping_reservations
-│       → 0 (no conflict)                → 0 (no conflict)
-│       INSERT reservation (pending)     
-│       COMMIT;                          
-│                                        INSERT reservation → CONSTRAINT VIOLATION!
-│                                        ROLLBACK;
-│                                        → "Vehicle no longer available"
-▼
-```
+**Two details people miss:**
+- The constraint must be **partial**: `WHERE (active)` or `WHERE (status IN ('PENDING','CONFIRMED','IN_PROGRESS'))`. Without it a *cancelled* reservation blocks its slot forever.
+- Reservations and maintenance must be in **the same constrained table** (e.g. `vehicle_blocks`). Two tables with two separate exclusion constraints don't stop a booking overlapping a maintenance window.
 
-**Why SERIALIZABLE?** 
-At `REPEATABLE READ`, both `SELECT` queries would see the same snapshot — no rows. Both INSERTs would attempt to write. Without the exclusion constraint, this would succeed (phantom). With `SERIALIZABLE`, the second transaction gets a serialization failure on commit, forcing a retry.
-
-**Exclusion constraint** is the hard guarantee — it catches the conflict at row-write time regardless of isolation level.
+The LLD mirrors the constraint: `AvailabilityCalendar.try_block()` does check-and-insert under the vehicle's lock. Search results are explicitly a hint.
 
 ---
 
-## Question 3: Hourly Booking Granularity
-**Interviewer:** *"Why hourly granularity instead of daily? What are the trade-offs?"*
+## Question 3: "Now add a hold while the customer pays."
+
+### 🎯 Answer
+
+Insert the block immediately in `PENDING` with `hold_expires_at = now + 10 min`. The car is invisible to others while they pay.
+
+- **Confirm** only if the hold is still live; otherwise `EXPIRED` and "please search again". Don't let a late confirm succeed just because nobody else happened to grab the slot, or behaviour depends on timing.
+- **Expiry without cron dependence:** in memory, expired holds are purged lazily on the next read/write of that car's schedule (`purge_expired`), and `expire_holds()` sweeps statuses.
+- **In Postgres** a constraint predicate can't reference `now()` (must be immutable). So: a sweeper sets `active = false` on lapsed holds every few seconds, and on an exclusion violation the booking path checks whether the blocker is a lapsed hold, expires it with a conditional UPDATE (`... WHERE id=? AND status='PENDING' AND hold_expires_at < now()`), and retries once.
+- **Payment idempotency:** the payment call carries the reservation id as the idempotency key; a retried confirm never double-charges.
+
+---
+
+## Question 4: "Add a turnaround buffer between rentals."
+
+### 🎯 Answer
+
+Each reservation blocks `[pickup, dropoff + turnaround)`. Put it in the calendar, not the UI, so search, booking and "next free" all agree. In Postgres store the computed `block_end` column (written by the app) and constrain on `tstzrange(pickup, block_end)`. You can't use `return_datetime + interval '30 min'` inside the constraint because `timestamptz + interval` is only STABLE, not IMMUTABLE.
+
+---
+
+## Question 5: Hourly vs Daily Granularity and Pricing
+**Interviewer:** *"Why hourly? How do you price?"*
 
 ### 🎯 Answer
 
 | Aspect | Hourly | Daily |
 |--------|--------|-------|
-| **Utilization** | Higher — gaps between bookings can be filled | Lower — whole day locked even if used for 2 hours |
-| **Revenue** | Higher — charge for actual usage | Lower — flat daily rate |
-| **Complexity** | Higher — need to track 168 slots/vehicle/week | Lower — 7 slots/vehicle/week |
-| **Availability Matrix** | 21 bytes/vehicle/week (24 bits × 7 days) | 7 bytes/vehicle/week |
-| **Search latency** | O(N) where N = hours in range | O(1) |
-| **User flexibility** | Rent for 3 hours for a meeting | Must rent for full day |
+| Utilisation | Higher: gaps can be sold | Lower: a 2 h rental burns a day |
+| Grid per car per week | 168 cells (21 bytes as a bitmap) | 7 cells |
+| Operations | More handovers, more cleaning | Fewer |
 
-**Decision:** Hourly with daily maximum cap. If hourly cost exceeds daily rate, charge daily rate instead. This gives best of both worlds:
+Pricing as implemented:
 ```python
-def calculate_cost(vehicle, hours, days):
-    hourly = vehicle.hourly_rate * hours
-    daily = vehicle.daily_rate * max(1, days)
-    return min(hourly, daily)  
-    # Wait, that loses revenue. Actually:
-    return max(hourly, daily)  # Always charge at least the daily rate
-    # Better:
-    return max(vehicle.hourly_rate * hours, vehicle.daily_rate * max(1, days))
+billable = max(1, ceil((dropoff - pickup) / 1h))           # every started hour
+hourly   = full_days * daily_rate + min(rest_hours * hourly_rate, daily_rate)   # cap per 24 h
+daily    = ceil(billable / 24) * daily_rate
+discount = WeeklyDiscountPricing(base)                      # -10% at 7 d, a further -15% at 30 d
 ```
+The cap is a `min`, not a `max`. `max(hourly × h, daily)` would charge a full day for a two-hour rental.
 
-**Staff-level nuance:** 
-- **Minimum rental period:** 1 hour. Shorter than that → logistics overhead exceeds revenue.
-- **Maximum rental period:** 30 days. Longer → monthly subscription model instead.
-- **Round-up policy:** Any started hour is charged as full hour. $0.005 rounding × 100K bookings = $500/month.
-- **Grace period:** 15-minute grace on return (no extra charge). After that, full hour charged.
+Store the **quote** on the reservation (prices change). On return: charge the quote, or re-price on actual hours if later than the grace period (15 min). Money is `Decimal` / `NUMERIC(10,2)`, never float.
 
 ---
 
-## Question 4: Search & Display Architecture
-**Interviewer:** *"How would you show 7-day availability data to users efficiently? Design the search and display system."*
-
-### 🎯 Staff-Level Answer
-
-**Data storage strategy:**
-
-```ascii
-                        ┌──────────────────────┐
-                        │  PostgreSQL            │
-                        │  reservations table    │
-                        │  (source of truth)     │
-                        └────┬─────────────────┘
-                             │
-                  ┌──────────┴──────────┐
-                  │                     │
-          ┌───────▼──────┐    ┌────────▼───────┐
-          │ ETL Job       │    │ Write-through  │
-          │ (every 15 min)│    │ (on booking)   │
-          └───────┬──────┘    └────────┬───────┘
-                  │                     │
-                  └──────────┬──────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  Redis Cache     │
-                    │  availability    │
-                    │  bitmaps         │
-                    │  (7-day, 24-bit) │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  API Service     │
-                    │  (Go, ~1ms)      │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  Frontend        │
-                    │  (React, grid)   │
-                    └─────────────────┘
-```
-
-**Availability bitmap encoding:**
-```python
-# Each vehicle has a 7-day × 24-hour bitmap (168 bits)
-# Encoding: 21 bytes per vehicle
-# 1 = available, 0 = booked/maintenance
-
-def encode_weekly(vehicle_id, start_date) -> bytes:
-    bitmap = 0
-    for day_offset in range(7):
-        for hour in range(24):
-            if is_slot_available(vehicle_id, start_date + day_offset, hour):
-                bit_position = day_offset * 24 + hour
-                bitmap |= (1 << bit_position)
-    return bitmap.to_bytes(21, 'big')  # 168 bits = 21 bytes
-
-def check_availability(bitmap: bytes, pickup_hour, dropoff_hour, day_offset) -> bool:
-    mask = 0
-    for hour in range(pickup_hour, dropoff_hour):
-        bit_position = day_offset * 24 + hour
-        mask |= (1 << bit_position)
-    return (int.from_bytes(bitmap, 'big') & mask) == mask
-```
-
-**API design:**
-```python
-# Lightweight: just returns bitmap + vehicle metadata
-GET /api/fleet/availability?start_date=2024-01-15&location=Bangalore
-
-Response:
-{
-  "start_date": "2024-01-15",
-  "vehicles": [
-    {
-      "id": "V1",
-      "make": "Toyota",
-      "model": "Fortuner",
-      "type": "SUV",
-      "hourly_rate": 12.0,
-      "daily_rate": 80.0,
-      "location": "Bangalore Airport",
-      "weekly_bitmap": "base64encoded_21bytes...",  # 168 bits
-      "total_available_hours_week": 45
-    }
-  ]
-}
-```
-
-**Frontend rendering:**
-- Parse bitmap → generate 7×24 grid
-- Color-code: green (available), red (booked), gray (outside branch hours)
-- Click an hour → auto-fill pickup time
-- Drag across multiple hours → auto-fill return time
-- Weekly view: show "available hours per day" summary per vehicle
-
----
-
-## Question 5: Fleet Management & Maintenance
-**Interviewer:** *"How do you handle maintenance scheduling so it doesn't conflict with bookings?"*
+## Question 6: Search & Display at Scale
+**Interviewer:** *"How do you serve the 7-day availability grid fast?"*
 
 ### 🎯 Answer
 
-**Maintenance is just another kind of "booking":**
-```sql
--- Maintenance also blocks availability
-CREATE TABLE maintenance_schedule (
-    vehicle_id UUID REFERENCES vehicles(id),
-    scheduled_start TIMESTAMPTZ NOT NULL,
-    scheduled_end TIMESTAMPTZ NOT NULL,
-    type VARCHAR(50),  -- OIL_CHANGE, SERVICE, REPAIR
-    
-    -- Same exclusion constraint as reservations
-    CONSTRAINT no_overlapping_maintenance 
-        EXCLUDE USING gist (
-            vehicle_id WITH =,
-            tstzrange(scheduled_start, scheduled_end) WITH &&
-        )
-);
-```
+- **Write path stays simple and correct** (constraint on `vehicle_blocks`).
+- **Read model:** a per-vehicle 168-bit bitmap per week (bit `day*24 + hour` = 1 if that full hour is free), stored in Redis (`fleet:weekly_bitmap:{vehicle_id}`). Rebuild it from the vehicle's blocks on every block insert/delete (via outbox/CDC event), plus a periodic full rebuild to heal drift.
+- **Query:** "free 10:00–14:00 Tuesday" on the grid is `(bitmap & mask) == mask`. That's a *pre-filter*; partial hours (10:30 starts) and the final decision always go back to the source of truth.
+- **Size:** 1K cars × 21 bytes ≈ 21 KB. Even 100K cars is ~2 MB. This is not a scale problem; the point is latency and keeping the DB off the browse path.
+- **Staleness:** a user can see a car that was just taken. Acceptable, because booking re-checks atomically and returns `next_free`/alternatives.
 
-**Availability query combines both:**
-```sql
-SELECT v.id, v.make, v.model
-FROM vehicles v
-WHERE v.status = 'AVAILABLE'
-  AND NOT EXISTS (
-    SELECT 1 FROM reservations r
-    WHERE r.vehicle_id = v.id
-      AND r.status IN ('CONFIRMED', 'IN_PROGRESS')
-      AND tstzrange(r.pickup_datetime, r.return_datetime) && 
-          tstzrange('2024-01-15 10:00', '2024-01-15 14:00')
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM maintenance_schedule m
-    WHERE m.vehicle_id = v.id
-      AND m.status IN ('SCHEDULED', 'IN_PROGRESS')
-      AND tstzrange(m.scheduled_start, m.scheduled_end) && 
-          tstzrange('2024-01-15 10:00', '2024-01-15 14:00')
-  );
-```
-
-**Predictive maintenance:** Schedule based on mileage (every 5,000km), not calendar. A lightly-used car needs less frequent service.
-
----
-
-## Question 6: Staff-Level — Fleet Utilization Optimization
-**Interviewer:** *"How would you optimize fleet utilization using the availability data?"*
-
-### 🎯 Answer
-
-**Metrics to track:**
 ```python
-utilization = booked_hours / total_available_hours
-turnover = total_bookings / fleet_size
-revenue_per_vehicle = total_revenue / vehicle_count
-idle_time = hours_available_but_not_booked
-```
-
-**Optimization strategies:**
-
-| Strategy | Implementation | Impact |
-|----------|---------------|--------|
-| **Dynamic pricing** | Lower hourly rate for low-demand hours (10AM-2PM weekdays) | +15% utilization |
-| **Last-minute discounts** | 20% off for bookings starting within 2 hours | +10% same-day bookings |
-| **Vehicle redistribution** | Move underutilized vehicles to high-demand locations | +20% utilization in saturated areas |
-| **Maintenance scheduling** | Schedule maintenance during low-demand periods | Minimizes revenue loss |
-| **Fleet sizing** | Add vehicles to locations with >80% utilization consistently | Prevents lost revenue |
-
-**Utilization dashboard query:**
-```sql
-SELECT v.location,
-       v.vehicle_type,
-       COUNT(DISTINCT v.id) AS fleet_size,
-       AVG(r.booked_hours / 24.0 * 100) AS avg_utilization_pct
-FROM vehicles v
-LEFT JOIN (
-    SELECT vehicle_id, 
-           SUM(EXTRACT(EPOCH FROM (return_datetime - pickup_datetime))/3600) AS booked_hours
-    FROM reservations
-    WHERE status IN ('CONFIRMED', 'IN_PROGRESS')
-      AND pickup_datetime >= CURRENT_DATE
-      AND pickup_datetime < CURRENT_DATE + 7
-    GROUP BY vehicle_id
-) r ON r.vehicle_id = v.id
-GROUP BY v.location, v.vehicle_type
-ORDER BY avg_utilization_pct DESC;
+def free_for(bitmap: int, day: int, start_hour: int, end_hour: int) -> bool:
+    mask = ((1 << (end_hour - start_hour)) - 1) << (day * 24 + start_hour)
+    return bitmap & mask == mask
 ```
 
 ---
 
-## Question 7: Edge Cases
+## Question 7: Maintenance Scheduling
 
-| Edge Case | Solution |
-|-----------|----------|
-| **User returns 3 hours late** | Grace period (15 min) → full extra hour charged → if > 2h late, charge full day |
-| **Vehicle breakdown during rental** | Swap to nearest available vehicle of same class; later, charge original booking only |
-| **No-show** | Charge 50% of booking amount; mark as NO_SHOW; release vehicle after 30 min |
-| **One-way rental** | Additional fee covers vehicle repositioning cost |
-| **Union in booking** | Pro-rate: one picks up, returns to different location, second picks up same vehicle |
-| **Cancellation within 24h** | Charge 100% (no refund). Cancellation > 24h → full refund. |
-| **Weather cancellation** | Full refund if government-issued weather advisory in effect |
+Maintenance is a block of another kind in the same schedule (and the same constrained table). It can't be placed over a booking, and bookings can't be placed over it. Mileage-based service (every N km) is scheduled into the *largest low-demand gap* before the threshold; if no gap exists, the ops tool shows which bookings to move to a same-class car.
 
 ---
 
-## Question 8: Design Patterns
+## Question 8: Failure Handling & Edge Cases
 
-| Pattern | Where | Why |
-|---------|-------|-----|
-| **Strategy** | Pricing (hourly/daily/discounted) | Interchangeable pricing algorithms |
-| **State** | Reservation lifecycle | PENDING → CONFIRMED → IN_PROGRESS → COMPLETED |
-| **Facade** | CarRentalService | Unified interface over fleet, search, calendar |
-| **Decorator** | WeeklyDiscountPricing | Compose discounts without modifying base pricing |
-| **Iterator** | AvailabilityCalendar | Iterate over hourly slots for availability check |
-| **Template Method** | Booking flow | Consistent create → validate → confirm → notify pipeline |
+| Scenario | Handling |
+|----------|----------|
+| Client retries `POST /reservations` after a timeout | `Idempotency-Key` header → `reservations.idempotency_key UNIQUE`; return the existing hold |
+| Payment succeeds, confirm call is lost | Payment webhook also confirms (idempotent on reservation id); hold TTL slightly longer than the payment timeout |
+| Hold lapses while the payment is in flight | Confirm fails → void the authorisation; never confirm on an expired hold |
+| Late return collides with the next booking | Detect at `dropoff + grace` ("car not back"), not at the next pickup; offer the next customer a same-class swap or upgrade, charge the late customer per policy |
+| Car breaks down mid-rental | Close the rental early, open a maintenance block, re-book affected future reservations onto same-class cars |
+| No-show | At `pickup + 30 min` CONFIRMED → NO_SHOW, release the block, apply the fee |
+| DST transition | Store UTC `timestamptz`; days in local time have 23 or 25 hours, so the grid must be built from local midnights, not "24 × hours" |
+
+---
+
+## Question 9: Testing Strategy
+
+- **Overlap edges:** touching intervals allowed; sub-hour overlaps caught on each side; containment both ways.
+- **Projection:** a 10:30 booking makes the 10:00 hour unavailable but not 12:00; bitmap bits match `free_hours`.
+- **Pricing:** cap at daily, multi-day remainder, discount thresholds, exact `Decimal`s.
+- **Lifecycle:** every illegal transition raises; hold expiry with an injected clock; confirmed bookings never expire.
+- **Concurrency:** 12 threads on mutually overlapping ranges → exactly 1 winner (repeat 20×); 12 threads on disjoint ranges → all 12 succeed (proves the lock isn't over-broad); confirm-vs-cancel → calendar agrees with the final status.
+- **Mutation check:** replace `try_block` with a racy check-then-insert and confirm the concurrency test fails (it does).
+
+---
+
+## Question 10: Design Patterns
+
+| Pattern | Where (in code) |
+|---------|-----------------|
+| **Strategy** | `RentalPricing` (`HourlyRentalPricing`, `DailyRentalPricing`) |
+| **Decorator** | `WeeklyDiscountPricing` wraps any strategy |
+| **State machine (table-driven)** | `_TRANSITIONS` + `Reservation.move_to()` |
+| **Facade** | `CarRentalService` |
+| **CQRS-lite** | Writes go through `try_block`; reads (`SearchService`, hourly grid) are projections |
+
+---
+
+## ⚠️ Common Mistakes
+
+1. SELECT-then-INSERT for availability, or "solving" it with a global lock across all cars.
+2. Storing bookings as rounded hour slots, so a 10:00–10:30 booking blocks nothing (or a 10:30 start blocks an hour it shouldn't).
+3. Closed intervals: rejecting a 12:00 pickup after an 11:00–12:00 rental.
+4. An exclusion constraint without a `WHERE` clause, so cancelled bookings block the car forever.
+5. Maintenance in a separate table with its own constraint, so bookings can overlap maintenance.
+6. A `RESERVED` vehicle status set at booking time for a rental next week.
+7. `max(hourly, daily)` instead of a daily cap; float money; recomputing the price at return from today's rates.
+8. Hold expiry that only works if a cron job runs; confirming a hold that has already lapsed.
+9. Using `datetime.now()` inside the domain, which makes expiry and "no past bookings" untestable.
+
+---
+
+## 🎚️ Senior vs Staff Signal
+
+- **Senior:** exact interval model with a correct overlap test, atomic check-and-insert, a state machine with holds, Decimal pricing with a daily cap, and tests including a concurrency test. Knows the Postgres exclusion constraint.
+- **Staff:** all of that, plus: makes the constraint partial and puts maintenance in the same table; explains why `now()` can't be in the constraint and designs hold expiry around it; separates the correctness path from the cached 7×24 read model and says staleness there is fine; handles late returns *before* they collide; thinks about DST, idempotency across payment callbacks, and which consistency each piece actually needs. Recognises that 1K–100K cars is not a data-volume problem, so doesn't shard Postgres prematurely.

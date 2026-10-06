@@ -79,8 +79,8 @@ Auth  Inven-Trans-Price Moni-
 
 **✅ Answer:**
 1. **Offline mode:** Machine queues transactions locally (SQLite file)
-2. **Payment:** Accept cash only when offline (card requires auth)
-3. **Sync on reconnect:** When connection restores, push queued transactions to cloud
+2. **Payment:** Cash always works offline. Card either goes cash-only, or uses EMV offline approval / store-and-forward under a small floor limit (e.g. $5) — the operator accepts a bounded fraud loss to keep selling
+3. **Sync on reconnect:** When connection restores, push queued transactions to cloud. Each carries a machine-generated id `(machine_id, local_seq)`, so a resend after a lost ack is deduplicated, not double-counted
 4. **Conflict resolution:** Cloud validates each transaction — if product row was restocked between offline queue and sync, adjust inventory accordingly
 5. **Machine state:** Reconcile physical inventory (count after restock) vs. cloud state
 
@@ -111,9 +111,9 @@ Auth  Inven-Trans-Price Moni-
 **🔴 Interview Question:** *"How do you handle partial payment or insufficient change?"*
 
 **✅ Answer:**
-1. **Insufficient change:** Machine displays "Exact change only" before starting. If user inserts more, offer refund or alternative product.
-2. **Partial payment:** Not possible — all-or-nothing per transaction. Cancel button triggers full refund.
-3. **Change optimization:** Greedy algorithm with available coins. If exact change impossible, offer "Donate remaining" or show message.
+1. **Insufficient change:** Light "Exact change only" when the coin float is low. Independently, before accepting a coin/note that overpays, run the change check; if change can't be made, reject that piece back to the customer. Never take the money and short-change.
+2. **Partial payment:** Inserted cash sits in escrow until the product drops. Cancel (or a jam, or the selection timing out) returns the exact pieces.
+3. **Change algorithm:** Bounded coin change (DP over available counts), not greedy: with a limited coin supply greedy fails even for USD (30c from one quarter + three dimes).
 
 ---
 
@@ -130,9 +130,11 @@ CREATE TABLE slots (
     reorder_level INT, expiry_date DATE
 );
 CREATE TABLE transactions (
-    id UUID, machine_id UUID, slot_id UUID,
-    amount DECIMAL, payment_method TEXT, status TEXT,
-    created_at TIMESTAMP
+    machine_id UUID, local_seq BIGINT,      -- generated on the machine
+    slot_id UUID, amount_cents BIGINT,      -- integer minor units, never float
+    payment_method TEXT, status TEXT,       -- AUTHORIZED / DISPENSED / CAPTURED / VOIDED / REFUNDED
+    gateway_auth_id TEXT, created_at TIMESTAMP,
+    PRIMARY KEY (machine_id, local_seq)     -- idempotent ingestion of retried uploads
 );
 ```
 
@@ -151,8 +153,24 @@ CREATE TABLE transactions (
 
 ## 6. SCALABILITY
 
-**Bottleneck:** 10K machines × 10 transactions/min peak = 1,667 TPS
+**Capacity:** 100K transactions/day ≈ 1.2 TPS average. A sale takes ~20–30 s at the machine, so even a busy machine does ~1–2/min; with a 10× peak factor the fleet is in the **tens of TPS**, plus telemetry (10K machines × 1 heartbeat/min ≈ 170 msg/s). The cloud side is not the hard part — the hard part is correctness at the edge (offline, power loss, payment reconciliation).
 
-**Solution:** Kafka for transaction ingestion, batch processing for inventory updates, Redis for real-time machine status
+**Solution:** MQTT → Kafka for transaction and telemetry ingestion (absorbs reconnect bursts when many machines come back online at once), consumers upsert by `(machine_id, local_seq)`, Redis for real-time machine status.
 
 **Availability:** 99.95% cloud, 99.9% per-machine (offline fallback)
+
+---
+
+## 7. FAILURE MODES & CONSISTENCY
+
+The machine is the source of truth for its own stock and cash; the cloud is eventually consistent with it.
+
+| Failure | What goes wrong | Handling |
+|---------|-----------------|----------|
+| Dispense jams / drop sensor sees nothing | Customer paid, got nothing | Cash: return escrow. Card: **void** the authorization (we capture only after the drop sensor fires) |
+| Power loss after authorize, before capture | Hold on the card, unknown whether product dropped | Write a journal entry (`AUTHORIZED`, then `DISPENSED`) to local flash before each step; on boot, capture `DISPENSED`, void `AUTHORIZED`. Uncaptured holds also expire at the issuer |
+| Power loss with cash in escrow | Customer's coins in limbo | Escrow is physical: on boot the escrow is returned. Log the event for audit |
+| Upload retried after lost ack (MQTT QoS 1 is at-least-once) | Duplicate transaction | Idempotent upsert on `(machine_id, local_seq)` |
+| Gateway timeout during authorize | Unknown whether the hold exists | Send an idempotency key with the auth request; on timeout, retry with the same key or query by it, then void if not proceeding |
+| Cloud price change while machine is offline | Machine sells at old price | Price lists are versioned; machine applies a new list only when idle; transactions record the price version used |
+| Stock drift (theft, mis-load) | Cloud stock wrong | Operator count at restock is authoritative and resets the slot count |

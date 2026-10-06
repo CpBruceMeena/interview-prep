@@ -1,7 +1,7 @@
 # Vending Machine - Interview Questions & Answers
 
 > **Target Level:** Senior/Staff Engineer (6+ years)  
-> **Evaluation Focus:** State machines, finite automata, payment systems, inventory
+> **Evaluation Focus:** State machines, money handling, failure paths, payment systems, concurrency
 
 ---
 
@@ -10,152 +10,165 @@
 
 ### 🎯 Expected Answer
 
-This is a textbook **State Pattern** problem. The vending machine has clearly defined states and transitions.
-
 **State Diagram:**
 ```
-    ┌─────────────────────────────────────────────┐
-    │                                             ▼
-  ┌──────┐  select  ┌──────────┐  sufficient  ┌──────────┐
-  │ Idle │─────────▶│ Waiting  │─────────────▶│  Ready   │
-  │      │          │ for $    │               │ to       │
-  │      │◀────────│          │◀──────────────│ Dispense │
-  └──────┘  cancel  └──────────┘   cancel      └────┬─────┘
-        ▲                                            │
-        └────────────────────────────────────────────┘
-                        dispense
+                 select(code)                 enough cash, change OK
+  ┌──────┐ ─────────────────────▶ ┌────────────────────┐ ──────────┐
+  │ IDLE │                         │  AWAITING_PAYMENT  │           │ dispense,
+  │      │ ◀───────────────────── │                    │ ◀─────────┘ commit
+  └──┬───┘   cancel / jam: refund  └────────────────────┘  (back to IDLE)
+     │  ▲                              card: authorize → dispense → capture
+     ▼  │ exit
+  ┌────────────────┐
+  │ OUT_OF_SERVICE │   entered from any state; refunds an open transaction
+  └────────────────┘
 ```
 
-**State Pattern Implementation:**
+**State Pattern with a rejecting base class:**
 ```python
-class VendingState(ABC):
-    def __init__(self, machine): self._machine = machine
-    
-    @abstractmethod
-    def select_product(self, product_id): pass
-    @abstractmethod
-    def insert_coin(self, coin): pass
-    @abstractmethod
-    def insert_note(self, note): pass
-    @abstractmethod
-    def dispense_product(self): pass
-    @abstractmethod
-    def cancel_transaction(self): pass
+class MachineState(ABC):
+    def __init__(self, machine): self.m = machine
+    def select(self, code):      raise InvalidStateError(...)
+    def insert(self, piece):     raise InvalidStateError(...)
+    def pay_by_card(self, tok):  raise InvalidStateError(...)
+    def cancel(self):            raise InvalidStateError(...)
 
-class IdleState(VendingState):
-    def select_product(self, product_id):
-        # Validate product exists and is in stock
-        # Transition to WaitingForMoneyState
-        self._machine._state = self._machine._waiting_for_money_state
-
-class WaitingForMoneyState(VendingState):
-    def insert_coin(self, coin):
-        self._machine._current_balance += coin.value
-        if self._machine._current_balance >= self._machine._selected_product.price:
-            self._machine._state = self._machine._ready_to_dispense_state
-
-class ReadyToDispenseState(VendingState):
-    def dispense_product(self):
-        self._machine._inventory.dispense(self._machine._selected_product.product_id)
-        self._machine._state = self._machine._idle_state
+class IdleState(MachineState):              # overrides select
+class AwaitingPaymentState(MachineState):   # overrides insert, pay_by_card, cancel
+class OutOfServiceState(MachineState):      # overrides nothing
 ```
 
-**Why State Pattern over if-else chains?** With `if state == IDLE: ... elif state == WAITING: ...`, adding a new state (e.g., MAINTENANCE) means modifying every method that checks state. With State Pattern, you add one class — OCP satisfied.
+Each state overrides only what it allows, so adding a state is one class and illegal actions fail loudly by default.
 
-### ✅ Edge Cases in State Transitions
+**Why State over if/else?** With `if state == IDLE ... elif ...` in every method, adding `OUT_OF_SERVICE` means editing every method. Honest caveat: with three states and four actions, a transition table is also fine — say so, then pick one.
 
-| Transition | Guard Condition |
-|------------|-----------------|
-| **Idle → Waiting** | Product must exist AND be in stock |
-| **Waiting → Ready** | `current_balance >= price` |
-| **Ready → Idle** | Product dispensed AND change returned |
-| **Any → Cancel** | Refund current balance, release selection |
-| **Maintenance** | Only with admin key, block all transactions |
+### ✅ Transition Guards
+
+| Transition | Guard |
+|------------|-------|
+| IDLE → AWAITING_PAYMENT | Slot exists and quantity > 0 |
+| AWAITING → vend | Balance ≥ price **and** change can be made from cash box + escrow |
+| AWAITING → IDLE (cancel / jam) | Return exact escrowed pieces; void card hold |
+| any → OUT_OF_SERVICE | Refund the open transaction first |
 
 ---
 
-## Question 2: Inventory Management
-**Interviewer:** *"Design the inventory system for a vending machine chain."*
+## Question 2: Money and Change
+**Interviewer:** *"How do you represent money, and how do you make change?"*
 
-### 🎯 Key Points
+**Integer cents.** Floats can't represent 0.10 exactly; comparisons and sums drift. Use integer minor units (or `Decimal`) everywhere; format only at the edge.
 
-- **Per-machine inventory**: `Dict[product_id, (Product, quantity)]`
-- **Real-time tracking**: WebSocket updates to central server on each dispense
-- **Restock alerts**: Triggered when `quantity <= reorder_level`
-- **Expiry management**: Products have `expiry_date`; auto-disable expired items
-- **Dynamic pricing**: Lower price for near-expiry items, higher for popular ones
+**Change-making with a limited supply:**
+```python
+def make_change(amount: int, available: Mapping[Denomination, int]) -> Optional[Counter]:
+    best = {0: Counter()}                         # reachable amount -> fewest coins
+    for d in coins_desc(available):
+        layer = dict(best)
+        for reached, used in best.items():
+            for k in range(1, available[d] + 1):
+                total = reached + k * d.cents
+                if total > amount: break
+                cand = used + Counter({d: k})
+                if total not in layer or size(cand) < size(layer[total]):
+                    layer[total] = cand
+        best = layer
+    return best.get(amount)                       # None -> can't make change
+```
 
-**Reducing waste:** Use FIFO (First In, First Out) ordering for restock — physically place newer items behind older ones.
+**Why not greedy?** Greedy is optimal for *canonical* systems like USD/EUR with **unlimited** coins. (Canonical doesn't mean "each coin divides the next" — 25 isn't a multiple of 10 — it means greedy happens to be optimal for every amount.) A machine's coin tubes are limited, and then greedy fails even for USD: 30c from one quarter and three dimes. Non-canonical systems (1, 3, 4) break greedy even with unlimited supply.
+
+**When change is impossible:** reject the piece that overpays before accepting it, keep the transaction open, and light "exact change only". Don't vend and then short-change.
 
 ---
 
 ## Question 3: Payment Integration
-**Interviewer:** *"How would you support multiple payment methods?"*
+**Interviewer:** *"Add card payments."*
 
-### 🎯 Answer
-
-**Strategy Pattern for Payments:**
 ```python
-class PaymentStrategy(ABC):
-    @abstractmethod
-    def process_payment(self, amount: float) -> bool: pass
-    @abstractmethod
-    def refund(self, amount: float) -> bool: pass
-
-class CashPayment(PaymentStrategy): ...
-class CardPayment(PaymentStrategy): ...
-class MobilePayment(PaymentStrategy): ...
+class PaymentGateway(ABC):
+    def authorize(self, token, amount_cents) -> str: ...   # hold, may decline
+    def capture(self, auth_id) -> None: ...
+    def void(self, auth_id) -> None: ...
 ```
 
-**Change-making algorithm (Greedy):**
-```python
-def make_change(amount: float, available: Dict[Coin, int]) -> Dict[Coin, int]:
-    change = {}
-    for coin in sorted(Coin, key=lambda c: c.value, reverse=True):
-        while amount >= coin.value and available.get(coin, 0) > 0:
-            change[coin] = change.get(coin, 0) + 1
-            available[coin] -= 1
-            amount = round(amount - coin.value, 2)
-    if amount > 0.01:  # Floating point tolerance
-        raise InsufficientChangeError("Can't make exact change")
-    return change
-```
+Flow: **authorize → dispense → capture**; void on jam. Charging first and refunding on failure means a real charge, a refund that takes days, and fees. Cash and card share the same states; they differ only in how the sale commits. Don't let a customer mix: once cash is in escrow, `pay_by_card` is rejected (or define split tender explicitly).
 
-**Note:** Greedy works for standard coin systems (USD, EUR, INR) because they are "canonical" — larger denominations are multiples of smaller ones. For non-canonical systems (e.g., 1, 3, 4), greedy fails and you need DP.
+Follow-ups:
+- *Gateway times out during authorize?* Send an idempotency key; on timeout, retry with the same key or query by it. Never authorize twice blind.
+- *Machine crashes between dispense and capture?* Journal `AUTHORIZED` and `DISPENSED` to local storage before each step; recover on boot (capture dispensed, void the rest). Uncaptured holds also expire at the issuer.
 
 ---
 
 ## Question 4: Concurrency & Thread Safety
-**Interviewer:** *"How would you handle two people using the same machine?"*
+**Interviewer:** *"Only one person can stand at the machine. Why do you need a lock?"*
 
-### 🎯 Real Scenario
+Because the keypad isn't the only caller:
 
-Modern vending machines have one active interface. But the question tests your understanding of:
+1. **Operator/telemetry thread:** restock, cash collection, maintenance mode run while a customer is mid-transaction.
+2. **Remote purchases** (app/QR): two buyers can race for the last unit.
 
-1. **Lock the state machine** during active transactions (`threading.Lock`)
-2. **Timeout**: If user doesn't insert money within 30 seconds, auto-cancel
-3. **Inventory consistency**: Decrement stock in a database transaction or with a lock
+One lock per machine, held for each public operation. The race to show:
 
----
+```python
+# Broken: check-then-act across two calls
+if vm.stock()["A1"] > 0:      # both buyers see 1
+    vm.purchase(...)          # both vend; stock goes to -1
+```
 
-## Question 5: Maintenance & Reporting
+`purchase_with_card` does select + pay under one `RLock` acquisition, so the stock check and the decrement are atomic. Test: 16 threads buy from a slot of 3 → exactly 3 succeed, 3 captures, no dangling holds.
 
-| Feature | Implementation |
-|---------|---------------|
-| **Sales analytics** | Per-product sales count, peak hours |
-| **Low stock alerts** | SMS/email when reorder level hit |
-| **Revenue tracking** | Daily/monthly totals by machine |
-| **Mechanical issues** | Error codes (coin jam, note jam, temp) |
-| **Remote dashboard** | Web UI with real-time machine status |
+**Lock held across a network call?** Yes, deliberately: the machine is a serial device and the call is ~1–2 s. The alternative is reserve → unlock → authorize → relock → commit, which needs a `RESERVED` state and expiry — worth it for a shared resource with many buyers (ticketing), not for one machine.
 
 ---
 
-## Question 6: Design Patterns
+## Question 5: Failure Handling
 
-| Pattern | Where | Why |
-|---------|-------|-----|
-| **State** | VendingStates | Clean state transitions |
-| **Strategy** | PaymentStrategy | Multiple payment methods |
-| **Observer** | Display updates | Real-time UI feedback |
-| **Facade** | VendingMachine | Unified API over subsystems |
-| **Factory** | Product creation | Config-driven inventory setup |
+| Failure | Correct behaviour |
+|---------|-------------------|
+| Motor jam / drop sensor sees nothing | Cash: return escrow. Card: void. Stock unchanged |
+| Can't make change | Reject the overpaying piece; transaction stays open |
+| Card declined | Stay in AWAITING_PAYMENT (or reset for app purchase) |
+| Customer walks away | Timeout → cancel → return escrow |
+| Maintenance mid-transaction | Refund, then go out of service |
+| Restock beyond capacity | Reject (`ValueError`), don't silently clamp |
+| Power loss | Escrow is physical — returned on boot; journal resolves card holds |
+
+---
+
+## Question 6: Testing Strategy
+
+- **Fake the ports:** `Jammed` dispenser, `FakeGateway` (records holds/captures/voids, declines tokens starting with `declined`).
+- **Pure-function tests for `make_change`:** greedy-breaking case, fewest coins, impossible, notes never paid out.
+- **Flow tests per path:** exact cash, overpay with change, change from escrow, rejected piece, cancel returns exact pieces, jam refunds, card capture/decline/void, maintenance refund.
+- **Accounting invariants:** cash box grows by exactly the price; stock decrements only on a confirmed drop.
+- **Concurrency:** many threads racing for the last units → no oversell, no dangling authorizations; restock racing with sales → `final = initial + restocked − sold` and never above capacity.
+
+---
+
+## Question 7: Inventory at Fleet Scale
+**Interviewer:** *"Design the inventory system for a vending machine chain."*
+
+- The **machine** is the source of truth for its slots; the cloud is eventually consistent via an append-only event stream (`SOLD`, `RESTOCKED`, `COUNTED`).
+- Restock alerts on `quantity <= reorder_level`; route planning from forecasted depletion (see HLD).
+- The operator's physical count at restock is authoritative and resets drift (theft, mis-loads).
+- Expiry per slot load (not per product), FIFO by loading newer items behind older.
+
+---
+
+## ❌ Common Mistakes
+
+- Money as `float`.
+- Greedy change with a limited coin supply; or vending first and discovering "insufficient change" afterwards.
+- `cancel()` that zeroes a balance instead of returning the inserted pieces.
+- Charging the card before dispensing.
+- Decrementing stock before the drop is confirmed.
+- States that silently `print` on illegal actions instead of raising — callers (and tests) can't tell anything went wrong.
+- Claiming "thread-safe" with a check (`is_available`) and an act (`dispense`) in separate unlocked calls.
+- `PaymentStrategy` classes that "process" a payment by printing and returning `True` — no failure path modelled at all.
+
+---
+
+## 🎚️ Senior vs Staff Signal
+
+- **Senior:** clean state machine with typed errors; integer money; correct change-making with limited supply; escrow; cancel/jam refund; a lock that covers check-and-act; tests with fakes.
+- **Staff:** drives the design from failure modes (jam, crash between dispense and capture, gateway timeout, lost acks) and the order of operations that keeps money safe; two-phase card payment with idempotency keys and a recovery journal; knows when *not* to add a reservation state; frames fleet inventory as machine-authoritative event streams with idempotent ingestion.
