@@ -2,7 +2,8 @@
 
 > **Category:** Language Fundamentals — Memory Model & Pointer Semantics  
 > **Target Level:** Staff/Principal Engineer (10+ years)  
-> **Why this matters at Staff level:** Memory bugs, escape analysis decisions, and pointer aliasing are the root causes of ~40% of production incidents in Go services. Understanding Go's memory model at the assembly level separates Staff engineers from Senior engineers.
+> **Why this matters at Staff level:** Aliasing bugs (shared slice backing arrays, captured pointers), the nil-interface trap, and allocation-heavy hot paths are among the most common Go production problems. Staff engineers can explain *where* a value lives, *who* can see it, and *what it costs the GC*.  \
+> **Current as of:** Go 1.27. Escape-analysis output below was produced with `go build -gcflags=-m` on Go 1.27.1; exact messages vary slightly by version.
 
 ---
 
@@ -36,18 +37,18 @@ fmt.Println(p)  // 0xc0000b2008 (some memory address)
 fmt.Println(*p) // 42
 ```
 
-**What actually happens at the assembly level (simplified):**
+**What happens at the machine level (simplified Go/Plan 9 amd64 assembly, when `x` and `p` live in the stack frame):**
 
 ```asm
 // x := 42
-MOVQ $42, (SP)       // Store 42 on stack at SP
+MOVQ $42, x-16(SP)    // store 42 into x's stack slot
 
 // p := &x
-LEAQ (SP), AX        // Load Effective Address of SP into AX
-MOVQ AX, (SP+8)      // Store address in p's memory location
+LEAQ x-16(SP), AX     // compute x's address (no memory read)
+MOVQ AX, p-8(SP)      // store that address into p
 ```
 
-`LEAQ` (Load Effective Address) is the CPU instruction — it computes the address without accessing memory. This is **zero-cost** for stack variables.
+`LEAQ` (Load Effective Address) computes an address without touching memory, so taking the address of a stack variable is essentially free. In optimized code `x` usually lives in a register and `&x` forces it into memory. If `&x` escapes, `x` moves to the heap instead (Section 3).
 
 ### `*` (Dereference Operator)
 
@@ -62,12 +63,14 @@ y := *p  // Reads the value at address p, copies it to y
 **Assembly:**
 
 ```asm
-// y := *p
-MOVQ (AX), BX        // Load value at address AX into BX
-MOVQ BX, (SP+16)     // Store in y
+// y := *p          (AX holds p)
+MOVQ (AX), BX         // load the int at address AX
+MOVQ BX, y-24(SP)     // store into y
 
 // *p = 100
-MOVQ $100, (AX)      // Store 100 at the address in AX
+MOVQ $100, (AX)       // store 100 at the address in AX
+// (If AX could be nil, the load/store faults and the runtime turns the
+//  SIGSEGV into a "nil pointer dereference" panic.)
 ```
 
 ### Declaration Syntax — T vs *T
@@ -86,15 +89,20 @@ b = &a         // Stores a's address in b's memory
 ### The `new()` Built-in
 
 ```go
-p := new(int)  // Allocates zero-value int on heap, returns *int
-*p = 42        // Sets the int to 42
+p := new(int)  // a new zero-valued int variable; p is *int
+*p = 42
 
-// Equivalent to:
+// Exactly equivalent to:
 var x int
-p := &x        // But x is stack-allocated (usually)
+q := &x
+
+// Go 1.26+: new accepts an expression and uses it as the initial value
+age := new(42)               // *int pointing at 42
+name := new(strings.ToUpper("go")) // *string → "GO"
+// Handy for optional pointer fields: Person{Age: new(yearsSince(born))}
 ```
 
-`new(T)` always **allocates and returns a pointer**. It does NOT initialize — all fields are zero-valued.
+`new(T)` creates a variable and returns its address. It says nothing about **where** the variable lives: `new(int)` and `&x` are both stack-allocated when they don't escape, and both move to the heap when they do. Escape analysis decides, not the syntax (verified: `new(int) does not escape` in `-m` output).
 
 ---
 
@@ -120,9 +128,9 @@ func (u User) Birthday() {
 ```
 
 **When to use value semantics:**
-- The type is small (< 4 machine words, ~32 bytes)
-- Immutable-like behavior (e.g., `time.Time`, `color.RGBA`)
-- The type is a primitive or simple scalar
+- The type is small, roughly up to a few machine words (a heuristic, not a rule)
+- It behaves like a value: `time.Time`, `netip.Addr`, `color.RGBA`, money amounts. Callers expect copies to be independent
+- You want callers to be unable to mutate shared state through it
 
 ### Pointer Semantics (References)
 
@@ -139,10 +147,10 @@ func (u *User) Print() {
 ```
 
 **When to use pointer semantics:**
-- The type is large (> 4 machine words)
 - You need to mutate the receiver
-- The type is a struct with `sync.Mutex` or similar (to avoid copying locks)
-- The type holds a reference type internally (slice, map, channel)
+- The type contains a `sync.Mutex`, `WaitGroup`, atomics, or a `noCopy` marker (copying them is a bug; `go vet` copylocks)
+- The type is large enough that copying shows up in profiles
+- The type has identity: a connection, a server, a cache. Two copies would be two different things
 
 ### The Mixing Rule — Consistency is Key
 
@@ -165,7 +173,7 @@ func (c *Config) GetTimeout() time.Duration { return c.Timeout }
 func (c *Config) SetTimeout(d time.Duration) { c.Timeout = d }
 ```
 
-**The Rule of Thumb:** If you're not sure, use pointer receivers. The only exception is very small, immutable types.
+**The Rule of Thumb (Go Code Review Comments):** be consistent per type, and if in doubt use pointer receivers. Mixing is legal and sometimes deliberate, but it makes the method sets of `T` and `*T` differ. Only `*Config` would satisfy an interface that needs `SetTimeout`, which surprises people.
 
 ### Factory Functions — Return Value or Pointer?
 
@@ -175,7 +183,8 @@ func NewUser(name string, age int) User {
     return User{Name: name, Age: age}
 }
 
-// Returns a pointer — caller gets a pointer to heap-allocated User
+// Returns a pointer: heap-allocated UNLESS the call is inlined and the
+// caller doesn't let it escape (then it can live on the caller's stack)
 func NewUserPtr(name string, age int) *User {
     return &User{Name: name, Age: age}
 }
@@ -197,51 +206,55 @@ func NewUserPtr(name string, age int) *User {
 
 ### The Stack
 
-- Each goroutine has its own stack (initially 2 KB, grows as needed)
-- Allocation = push frame pointer — **essentially free**
-- Deallocation = pop frame pointer — **essentially free**
-- Data is contiguous, cache-friendly
+- Each goroutine has its own stack. It starts at 2 KB (adaptive since Go 1.19) and grows by **copying** to a bigger block, which is why Go code never holds raw pointers into stacks across growth.
+- Allocation is free: the function's frame size is fixed at compile time, and entering the function adjusts SP once for all locals.
+- Deallocation is free: the frame disappears on return. The GC still *scans* live stack frames for pointers, but never frees anything there.
+- Hot in cache, and nothing to collect.
 
 ### The Heap
 
-- Managed by the garbage collector
-- Allocation = find free space in heap arena — **slower**
-- Deallocation = GC mark/sweep — **much slower**
-- Data can be scattered (pointer chasing, cache misses)
+- Managed by the GC. Allocation is fast: per-P `mcache`, size classes, bump-pointer-like for small objects, and Go 1.27 adds size-specialized allocation routines for objects under 80 bytes. But each allocation adds to the GC's work and to how often GC runs.
+- Freed only by the GC: mark (proportional to *live, pointer-containing* memory) plus sweep.
+- Objects can be scattered across memory, so following pointers costs cache misses.
+
+**Cost model to remember:** a heap allocation is cheap *at the moment it happens* (tens of ns). The real bill is paid later as GC CPU, roughly proportional to allocation rate × live heap / GOGC. Reducing allocations in hot paths is the most effective GC tuning there is.
 
 ### Escape Analysis — The Compiler's Decision
 
-The Go compiler decides whether a variable lives on the stack or the heap using **escape analysis**. If the compiler can prove a variable doesn't outlive its function, it stays on the stack.
+The compiler keeps a variable on the stack if it can **prove** the variable is not referenced after the function returns, and that its size is known and small enough. Otherwise the variable "escapes" to the heap. The analysis is static, works per function, and is conservative.
 
 ```go
 // ── Example 1: Stays on stack ────────────────────────────
 func sum() int {
-    x := 42       // Compiler: x doesn't escape
-    y := 58       // Compiler: y doesn't escape
-    return x + y
+    x := 42
+    y := 58
+    return x + y // no address taken: probably just registers
 }
 
-// ── Example 2: Escapes to heap ──────────────────────────
+// ── Example 2: Escapes: the address outlives the frame ──
 func newUser() *User {
-    u := User{Name: "Alice"}  // Compiler: u escapes!
-    return &u                 // Because we return its address
+    u := User{Name: "Alice"}
+    return &u // -m: "moved to heap: u" (unless newUser is inlined into a caller
+              //     that keeps the pointer local: then it stays on that stack)
 }
 
-// ── Example 3: Interface escape ─────────────────────────
+// ── Example 3: Interface conversion passed to fmt ────────
 func printAny(v any) {
-    fmt.Println(v)  // v escapes to heap (interface dynamic dispatch)
+    fmt.Println(v) // -m: "leaking param: v". fmt stores args in an []any it passes on
 }
 
 func demo() {
-    x := 42
-    printAny(x)  // x escapes to heap (boxed into interface)
+    x := 1000
+    printAny(x) // -m: "1000 escapes to heap": x is boxed into an interface.
+                // (Values 0–255, single bytes and constants are boxed without
+                //  allocating: the runtime points at static data.)
 }
 
 // ── Example 4: Closure escape ───────────────────────────
 func adder() func(int) int {
     sum := 0
-    return func(x int) int {  // sum escapes to heap
-        sum += x               // closure references sum
+    return func(x int) int { // -m: "func literal escapes to heap"
+        sum += x             // -m: "moved to heap: sum" (shared by the closure)
         return sum
     }
 }
@@ -250,53 +263,67 @@ func adder() func(int) int {
 ### Checking Escape Analysis
 
 ```bash
-# Tell the compiler to show escape analysis decisions
-go build -gcflags="-m" ./...
-go build -gcflags="-m -m" ./...  # More detail
+go build -gcflags='-m' ./...      # decisions for each allocation site
+go build -gcflags='-m=2' ./...    # with the reasoning chain ("flow: ... ")
 
-# Example output:
-# ./main.go:10:6: can inline sum
-# ./main.go:28:6: moved to heap: u
-# ./main.go:35:16: leaking param: v
+# Real output (Go 1.27.1) for the examples on this page:
+# ./main.go:10:16: leaking param: name
+# ./main.go:11:9: &Config{...} escapes to heap
+# ./main.go:21:2: moved to heap: sum
+# ./main.go:22:9: func literal escapes to heap
+# ./main.go:33:10: new(int) does not escape
+# ./main.go:35:11: make([]int, 10000) escapes to heap
+# ./main.go:36:11: make([]int, 1000) does not escape
 ```
+
+Confirm with a benchmark: `-benchmem` or `testing.AllocsPerRun` show actual allocations. Some "escapes to heap" boxing lines turn out not to allocate (static data for small values).
 
 ### Real-World Optimization
 
 ```go
-// 🔴 BAD: Returns pointer, forces heap allocation
 type Response struct {
-    Data []byte
-}
-func Process() *Response {
-    resp := &Response{Data: make([]byte, 1024)}
-    return resp
+    Status int
+    Data   []byte
 }
 
-// ✅ GOOD: Return value, let caller decide
-func Process() Response {
+// Version A: returns *Response. The Response header escapes (one allocation),
+// and so does the 1 KB buffer (a second allocation).
+func ProcessA() *Response {
+    return &Response{Data: make([]byte, 1024)}
+}
+
+// Version B: returns a value. The Response itself needs no allocation, but the
+// buffer still escapes, because it is reachable from the returned value.
+func ProcessB() Response {
     return Response{Data: make([]byte, 1024)}
 }
 
-// Or even better: pass buffer from caller
-func Process(buf []byte) *Response {
-    return &Response{Data: buf}
+// Version C: the CALLER owns the buffer and can reuse it across calls,
+// so the steady state has zero allocations.
+func ProcessC(dst *Response, buf []byte) {
+    dst.Data = buf[:0]
+    dst.Data = append(dst.Data, "payload"...)
 }
 ```
 
-**Key insight:** Returning a pointer doesn't always cause escape. If the compiler can inline the caller, it may allocate on the caller's stack instead.
+Measured with `testing.AllocsPerRun` (functions marked `//go:noinline`): A = 2 allocations, B = 1, C = 0. This is the same pattern the standard library uses: `strconv.AppendInt(dst, …)`, `fmt.Appendf`, `io.ReadFull(r, buf)`, `hash.Sum(b)`. Let the caller pass the destination and the callee won't allocate.
+
+**Key insight:** returning a pointer does not *always* mean a heap allocation. If the constructor is inlined (small functions are) and the caller doesn't let the pointer escape, the object lives on the caller's stack. In the test program above, `Process(NewConfig("a", 1))` reported `&Config{...} does not escape` at the call site after inlining.
 
 ### Escape Analysis Rules Summary
 
-| Condition | Escapes? | Reason |
+| Situation | Escapes? | Why |
 |-----------|----------|--------|
-| `return &x` | ✅ Yes | Value must outlive function |
-| `fmt.Printf("%p", &x)` | ✅ Yes | Address taken for parameter |
-| `x := 42; go func() { fmt.Println(x) }()` | ✅ Yes | Closure captures variable |
-| `s := make([]int, 1000)` | ✅ Yes | Large allocations always heap |
-| `s := make([]int, 10)` | ❌ No | Small slice fits on stack |
-| Interface method call with value | ✅ Yes | Dynamic dispatch boxes value |
-| `var x int; p := &x` (no return) | ❌ No | Address doesn't escape scope |
-| `json.Marshal(x)` | ✅ Yes | Reflection causes escape |
+| `return &x` (not inlined away) | ✅ Yes | Address outlives the frame |
+| Stored into a global, a heap object, or a channel | ✅ Yes | Reachable after return |
+| Captured by a closure that escapes (returned, `go func`) | ✅ Yes | Closure and captured variables move to the heap |
+| Converted to an interface and passed somewhere that retains it (`fmt.Println`, `json.Marshal`) | ✅ Usually | The analysis loses track behind interfaces and reflection |
+| `make([]int, 1000)` (8 KB, constant size, stays local) | ❌ No | Constant-size `make`/`new`/`&T{}` up to **64 KB** can be stack-allocated |
+| `make([]int, 10000)` (80 KB) | ✅ Yes | Larger than the 64 KB implicit-allocation limit (explicit `var` arrays: 128 KB) |
+| `make([]T, n)` with variable `n`, non-escaping | ⚠️ Depends | Go 1.25/1.26 stack-allocate small variable-size backing stores (a 32-byte stack buffer used when `n` is small) and fall back to the heap otherwise |
+| `var x int; p := &x`, `p` stays local | ❌ No | Address never leaves the frame |
+| Calling a method through an interface | ⚠️ Maybe | The *call* doesn't allocate. Arguments can escape because the compiler can't see the callee, unless it devirtualizes (PGO helps) |
+| Method values `f := x.M` used locally | ❌ No | The bound closure can live on the stack (`l.Log does not escape`) |
 
 ---
 
@@ -337,7 +364,7 @@ func main() {
 
 ### What About Slices, Maps, and Channels?
 
-These are **reference types** — they contain a pointer to underlying data:
+These are often called "reference types". The spec doesn't use the term, but the idea is right: the value you copy is a small descriptor that *contains* a pointer to shared underlying data.
 
 ```go
 func modifySlice(s []int) {
@@ -363,18 +390,24 @@ func main() {
     nums[0], nums[1], nums[2] = 1, 2, 3
     appendSlice(nums)
     fmt.Println(nums)  // [1 2 3] (not [1 2 3 4]!)
+    fmt.Println(nums[:4]) // [1 2 3 4]: the 4 WAS written into the shared array
 }
 ```
 
-**Go memory layout — the `reflect.SliceHeader`:**
+The subtle part: because `cap` was 10, `append` wrote `4` into the caller's backing array without changing the caller's `len`. A later `append` by the caller silently overwrites it. That is the source of the aliasing bugs in Question 7.
+
+**Slice layout** (what the runtime calls `slice`; 24 bytes on 64-bit):
 
 ```go
-type SliceHeader struct {
-    Data uintptr  // Pointer to the underlying array
-    Len  int      // Length
-    Cap  int      // Capacity
+type slice struct {
+    array unsafe.Pointer // first element of the backing array
+    len   int
+    cap   int
 }
-// Total: 24 bytes (on 64-bit)
+// Strings are the same minus cap: {ptr, len}, 16 bytes.
+// reflect.SliceHeader / StringHeader are DEPRECATED (Go 1.20+): their Data
+// field is a uintptr the GC doesn't track. Use unsafe.Slice, unsafe.SliceData,
+// unsafe.String and unsafe.StringData instead.
 ```
 
 ### The `map` Gotcha
@@ -393,7 +426,7 @@ func main() {
 }
 ```
 
-**Why?** A map variable is a pointer to the runtime's `hmap` struct. The pointer itself is copied, but both copies point to the same underlying hash map.
+**Why?** A map value is a single pointer to a runtime map header. Since Go 1.24 that is the Swiss-table `internal/runtime/maps.Map`; before, it was `hmap`. Copying the map variable copies the pointer, so both copies refer to the same table. The same holds for channels (`*hchan`). Two more map facts: a `nil` map can be read but **panics on write**, and `&m[k]` is illegal because entries move when the table grows.
 
 ---
 
@@ -409,7 +442,7 @@ p := &arr[0]
 q := p + 1  // invalid operation: p + 1 (type *int does not support +)
 ```
 
-**Why?** Memory safety. C/code with pointer arithmetic is the single largest source of security vulnerabilities (buffer overflows, use-after-free). Go's design philosophy prioritizes memory safety.
+**Why?** Memory safety. Unchecked pointer arithmetic is behind whole classes of C/C++ vulnerabilities (buffer overflows, out-of-bounds reads). Go puts bounds checks on slices and strings and gives you no way to forge a pointer without `unsafe`. That also lets the GC know exactly where every pointer is.
 
 ### How to Work Around (When You Absolutely Must)
 
@@ -418,16 +451,19 @@ import "unsafe"
 
 arr := [3]int{1, 2, 3}
 
-// Get pointer to first element
+// Go 1.17+: unsafe.Add does the arithmetic without a uintptr round-trip
 base := unsafe.Pointer(&arr[0])
+second := (*int)(unsafe.Add(base, unsafe.Sizeof(arr[0])))
+fmt.Println(*second) // 2
 
-// Move to second element (int is 8 bytes on 64-bit)
-second := (*int)(unsafe.Pointer(uintptr(base) + unsafe.Sizeof(arr[0])))
+// Older equivalent (legal ONLY as a single expression; see Section 8):
+// (*int)(unsafe.Pointer(uintptr(base) + unsafe.Sizeof(arr[0])))
 
-fmt.Println(*second)  // 2
+// Usually you want a slice view instead of arithmetic:
+s := unsafe.Slice(&arr[0], len(arr)) // []int over the same memory
 ```
 
-**⚠️ WARNING:** This is fragile, unsafe, and likely to break across Go versions or architectures. Only use in:
+**⚠️ WARNING:** The rules are documented in the `unsafe.Pointer` docs and `go vet` checks some misuse. But nothing stops you from walking past the end of the object, and the result is memory corruption, not a panic. Only use it for:
 - Interfacing with C code (cgo)
 - Extreme performance optimization (proven via profiling)
 - Implementing low-level data structures
@@ -484,15 +520,15 @@ func main() {
 **The memory layout:**
 
 ```go
-// iface{tab: &itab{inter: Animal, _type: *Dog}, data: nil}
-// a == nil compares iface == eface{nil, nil} — they don't match!
+// a = iface{tab: &itab{inter: Animal, _type: *Dog}, data: nil}
+// `a == nil` is true only if BOTH words are nil. tab is not, so it's false.
 ```
 
 **🔴 What happens when you call methods on this "nil" interface?**
 
 ```go
 a := NewAnimal()
-fmt.Println(a.Speak())  // Works! nil receiver is callable
+fmt.Println(a.Speak())  // "Woof!": the method never dereferences d, so a nil receiver is fine
 ```
 
 **Yes — Go allows calling methods on nil receivers!** This is intentional and useful:
@@ -532,10 +568,10 @@ func (n *Node) Sum() int {
 
 ### Why Alignment Matters
 
-CPU architectures read memory at word boundaries (8 bytes on 64-bit). Misaligned access can:
-- Double the memory read time (two reads instead of one)
-- Crash on some architectures (Sparc, ARM pre-v6)
-- Cause atomic operation panics on 32-bit platforms
+Each type has an alignment (`unsafe.Alignof`): its address must be a multiple of it. Go's compiler inserts padding so every field is naturally aligned, so you never get misaligned access in safe Go. Alignment matters to you for three reasons:
+- **Size:** padding wastes memory, which matters for structs stored by the million (cache entries, graph nodes)
+- **64-bit atomics on 32-bit platforms** (386, ARM, 32-bit MIPS): `int64` there is only 4-byte aligned, but 64-bit atomic instructions need 8-byte alignment, so misaligned atomic operations panic
+- **Cache lines / false sharing:** independent hot fields that share a 64-byte line slow each other down (pad them apart; see the sharded counter in the interview questions)
 
 ### Struct Padding
 
@@ -557,7 +593,7 @@ type GoodStruct struct {
 //   Layout: [B B B B B B B B|b b|_ _ _ _ _ _]
 ```
 
-**Rule:** Sort fields by size descending (largest first). This minimizes padding.
+**Rule:** order fields by **alignment**, largest first (8-byte: `int64`, `float64`, pointers, strings, slices, interfaces; then 4, 2, 1). That minimizes padding. The `fieldalignment` analyzer (`golang.org/x/tools/go/analysis/passes/fieldalignment`) finds and fixes such structs. Readability beats a few bytes for structs that aren't allocated in bulk. Also note: a zero-size field (`struct{}`) at the **end** of a struct gets padding, so the struct can't point past its own allocation.
 
 ### Using `unsafe.Sizeof`, `unsafe.Offsetof`, `unsafe.Alignof`
 
@@ -573,26 +609,24 @@ fmt.Println(unsafe.Sizeof(Point{}))    // 16
 fmt.Println(unsafe.Alignof(Point{}))   // 8
 fmt.Println(unsafe.Offsetof(Point{}.Y)) // 8
 
-// Atomic alignment requirement (critical!)
-type AtomicCounter struct {
-    // On 32-bit platforms, the first field must be 8-byte aligned
-    // for sync/atomic operations to work correctly
-    value int64  // Must be 8-byte aligned
-}
-
-// 🔴 BAD: On 32-bit platforms, value may NOT be 8-byte aligned
+// ── 64-bit atomics on 32-bit platforms ─────────────────────
 type BadCounter struct {
-    flag  bool  // 1 byte + 7 bytes padding
-    value int64 // 8 bytes — starts at offset 8, which IS 8-byte aligned
-    // Actually on 32-bit, struct base is 4-byte aligned
-    // so offset 8 from 4-byte base = 8... this is fine for 64-bit fields
-    // The real issue is on 32-bit where atomic.AddInt64 requires 8-byte alignment
-    // But a struct starts at 4-byte alignment on 32-bit
-    // So value at offset 8 from 4-byte = 12 → NOT 8-byte aligned → PANIC
+    flag  bool  // offset 0
+    value int64 // 64-bit: offset 8. 386/arm: offset 4, because int64 is only 4-byte aligned there
 }
-```
+// atomic.AddInt64(&c.value, 1) on 386/arm → panic: unaligned 64-bit atomic operation
+// (offsets checked with go/types.SizesFor("gc", "386"/"arm"): [0 4])
 
-**Critical production rule:** On 32-bit platforms, if you use `sync/atomic` on a `int64`/`uint64` field, it must be the **first field** in the struct to guarantee 8-byte alignment. Go's runtime guarantees the first field is 8-byte aligned even on 32-bit platforms.
+// ✅ Fix 1 (Go 1.19+, preferred): typed atomics are always 8-byte aligned
+type GoodCounter struct {
+    flag  bool
+    value atomic.Int64
+}
+
+// ✅ Fix 2 (legacy): put the int64 FIRST. sync/atomic guarantees that the first
+// word of an allocated struct, array or slice, and of a global variable, is
+// 64-bit aligned. (This does NOT hold for a struct embedded inside another one.)
+```
 
 ---
 
@@ -607,7 +641,7 @@ var p *int
 // 2. unsafe.Pointer — pointer to any type, like C's void*
 //   - Can convert any typed pointer to unsafe.Pointer
 //   - Can convert unsafe.Pointer to any typed pointer
-//   - Cannot do arithmetic (uintptr needed for that)
+//   - Arithmetic via unsafe.Add (Go 1.17+); GC-visible
 var up unsafe.Pointer = unsafe.Pointer(p)
 
 // 3. uintptr — an integer large enough to hold a pointer address
@@ -619,64 +653,44 @@ var addr uintptr = uintptr(up)
 ### The GC Trap with uintptr
 
 ```go
-// 🔴 DANGEROUS: uintptr doesn't keep object alive!
+// 🔴 INVALID: a uintptr kept in a variable is just a number
 func dangerous() {
     obj := &SomeLargeStruct{}
-    addr := uintptr(unsafe.Pointer(obj))  // GC doesn't know about this
-    
-    // GC could run here and collect obj!
-    // addr now points to garbage!
-    
-    p := (*SomeLargeStruct)(unsafe.Pointer(addr))  // Use-after-free!
+    addr := uintptr(unsafe.Pointer(obj)) // GC does not see this as a reference
+
+    // obj is no longer used, so the GC may free it here. And if obj lived on
+    // a goroutine stack, the stack may be MOVED when it grows: addr then points
+    // to the old copy.
+    p := (*SomeLargeStruct)(unsafe.Pointer(addr)) // possible use-after-free
+    _ = p
 }
 
-// ✅ SAFE: Keep the pointer alive
-func safe() {
-    obj := &SomeLargeStruct{}
-    p := unsafe.Pointer(obj)  // GC sees this as a pointer
-    // ... work with p ...
-    obj2 := (*SomeLargeStruct)(p)
-    _ = obj2
+// ✅ VALID: keep unsafe.Pointer (GC-visible) and do arithmetic in ONE expression
+func fieldPtr(obj *SomeLargeStruct, off uintptr) unsafe.Pointer {
+    return unsafe.Add(unsafe.Pointer(obj), off) // or unsafe.Pointer(uintptr(p) + off) in one expression
 }
 ```
 
-**Rule of thumb:** Never store a Go pointer in a `uintptr`. Only use `uintptr` for intermediate calculations, then immediately convert back to `unsafe.Pointer`.
+**The rules** (from the `unsafe.Pointer` docs): a `uintptr` → `unsafe.Pointer` conversion is valid only in the specific patterns listed there. The main ones are arithmetic inside a single expression, and the argument list of a `syscall.Syscall` call. Never store a Go pointer as a `uintptr` and convert it back later. `go vet` (the `unsafeptr` check) flags many violations, and `-gcflags=all=-d=checkptr` (enabled automatically by `-race` and `-msan`) checks some of them at runtime.
 
 ### Real-World Use: Zero-Copy String Conversion
 
 ```go
-// strings.Builder uses this internally
+// Go 1.20+: the supported way. No reflect headers, no struct-layout assumptions.
 func bytesToString(b []byte) string {
-    return *(*string)(unsafe.Pointer(&b))
+    return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
-// Equivalent to:
-// s := string(b)  // But this COPIES the data
-// bytesToString() does ZERO copy — same underlying memory!
-
-// 🔴 BUT: If b is modified, s sees the change!
-// This violates Go's string immutability guarantee!
-```
-
-**Production pattern — zero-copy JSON parsing:**
-
-```go
-// When you know the bytes are valid UTF-8 and won't be modified
-func UnsafeString(b []byte) string {
-    return *(*string)(unsafe.Pointer(&b))
-}
-
-// Matching zero-copy string to bytes (for reuse)
-func UnsafeBytes(s string) []byte {
-    sh := (*reflect.StringHeader)(unsafe.Pointer(&s))
-    bh := reflect.SliceHeader{
-        Data: sh.Data,
-        Len:  sh.Len,
-        Cap:  sh.Len,
-    }
-    return *(*[]byte)(unsafe.Pointer(&bh))
+func stringToBytes(s string) []byte {
+    return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 ```
+
+Both are zero-copy views over the same memory, and both are only safe under strict conditions:
+- `bytesToString`: **nobody may modify `b` afterwards**, or the "immutable" string changes under its users. Map keys, for example, would then be corrupted. `strings.Builder.String()` uses exactly this trick, safely, because the Builder never writes those bytes again.
+- `stringToBytes`: the result must be **read-only**. String data may live in read-only memory (literals), so writing to it can segfault, and other holders of the string would see the change anyway.
+- The old `*(*string)(unsafe.Pointer(&b))` cast and the `reflect.StringHeader`/`SliceHeader` versions rely on the header layout, and the header types are deprecated. Don't use them in new code.
+- Often you don't need either. The compiler already avoids the copy for `string(b)` in map lookups (`m[string(b)]`), comparisons, `switch string(b)`, and concatenations whose result is immediately consumed. Small non-escaping conversions also use a stack buffer. Profile before reaching for `unsafe`.
 
 ---
 
@@ -708,68 +722,76 @@ type FlatNode struct {
 ### GC Scanning Cost
 
 ```go
-// The GC scans:
-// 1. Global variables
-// 2. Goroutine stacks (every running goroutine's stack!)
-// 3. Heap objects (following pointers)
+// The GC marks from the roots (globals, every goroutine's stack) and then
+// scans every reachable heap object that CONTAINS pointers.
 //
-// Each pointer scanned takes ~5-20ns (depends on hardware)
-// 100M pointers = 0.5 - 2 seconds of scanning time
-//
-// Reducing pointer count by 50% ≈ doubles GC speed
+// What the cost depends on:
+//   • Mark work ≈ the live heap that contains pointers, plus stacks and globals.
+//   • Pointer-free objects ([]byte, []int64, structs of scalars) are allocated
+//     in "noscan" spans: the GC marks them live but NEVER looks inside them.
+//     A 1 GB []byte costs about the same to mark as a 1-byte one.
+//   • Hidden pointers count too: string, slice, map, chan, func, interface and
+//     time.Time (via its *Location) fields all contain pointers.
+//   • GC frequency ≈ allocation rate / (heap goal - live heap). Allocating less
+//     means fewer cycles, whatever each cycle costs.
 
-// ── Before: pointer-heavy ─────────────────────────────
+// ── Before: every entry has 3+ pointers to scan, and 3 extra objects ──
 type CacheEntry struct {
-    Key   string     // pointer (string header)
-    Value []byte     // pointer (slice header)
-    Tags  []string   // pointer (slice header)
+    Key   string   // pointer + len
+    Value []byte   // pointer + len + cap
+    Tags  []string // pointer to an array of more pointers
 }
 
-// ── After: pointer-light ──────────────────────────────
+// ── After: pointer-free entries in one big slice (one noscan allocation) ──
 type FlatCacheEntry struct {
-    KeyData   [32]byte  // inline array, no pointer
-    KeyLen    uint8
-    ValueData [256]byte // inline, no pointer
-    ValueLen  uint16
-    TagBitmap uint64    // bitset instead of slice
+    KeyOff, KeyLen uint32 // offsets into one shared []byte arena
+    ValOff, ValLen uint32
+    TagBitmap      uint64 // a bitset instead of []string
+}
+type FlatCache struct {
+    arena   []byte           // all keys and values, back to back (noscan)
+    entries []FlatCacheEntry // noscan
+    index   map[uint64]uint32 // hash → entry index; uint64/uint32 keys and values are pointer-free
 }
 ```
+
+This is the technique behind "GC-free" caches such as `bigcache` and `freecache`, and behind large in-memory indexes. The trade-offs: you manage space yourself (deletes leave holes, so you need compaction), lookups need hashing plus collision checks, and the code is harder to read. Use it for multi-GB heaps where profiles show GC mark time, not by default. Since Go 1.26 the **Green Tea** collector scans small objects span by span with better locality, which makes pointer-heavy heaps cheaper than before. It doesn't change the basic rule that pointer-free memory is the cheapest kind to have.
 
 ### Practical GC Optimization
 
 ```go
-// ✅ Pre-allocate slices with known capacity
-// 🔴 BAD: append causes repeated growth and GC churn
-func Build() []Item {
-    var items []Item
+// ✅ Pre-size slices and maps when the size is known
+func Build(data []int) []Item {
+    items := make([]Item, 0, len(data)) // one allocation instead of ~log2(n) growths + copies
     for _, v := range data {
         items = append(items, Item{Value: v})
     }
     return items
 }
+// m := make(map[string]int, n) also avoids repeated table growth.
 
-// ✅ GOOD: pre-allocate
-func Build() []Item {
-    items := make([]Item, 0, len(data))
-    for _, v := range data {
-        items = append(items, Item{Value: v})
-    }
-    return items
-}
-
-// ✅ Use sync.Pool for frequently allocated objects
-var bufferPool = sync.Pool{
-    New: func() any {
-        return new(bytes.Buffer)
-    },
-}
+// ✅ Reuse scratch buffers with sync.Pool (dropped across GCs: scratch only, never resources)
+var bufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 func Process() {
     buf := bufferPool.Get().(*bytes.Buffer)
-    defer bufferPool.Put(buf)
     buf.Reset()
-    // ... use buf ...
+    defer bufferPool.Put(buf)
+    // ... use buf; don't keep references to it after Put ...
 }
+
+// ✅ Avoid accidental retention: a small sub-slice pins the whole backing array
+func firstLine(file []byte) []byte {
+    i := bytes.IndexByte(file, '\n')
+    if i < 0 {
+        i = len(file)
+    }
+    return bytes.Clone(file[:i]) // copy, so the 100 MB file can be freed
+}
+
+// ✅ Weak references for canonicalizing caches (Go 1.24): entries vanish when unused
+// p := weak.Make(obj); later: if v := p.Value(); v != nil { ... }
+// unique.Make (Go 1.23) interns comparable values (e.g. repeated strings) for you.
 ```
 
 ---
@@ -778,29 +800,27 @@ func Process() {
 
 ### Pitfall 1: Loop Variable Capture (pre-Go 1.22)
 
+**Status in 2026:** fixed by the language. From Go 1.22, every iteration of every `for` loop (three-clause and `range`) has its own copy of the loop variables. The new semantics apply to packages whose module declares **`go 1.22` or later** in `go.mod`, whatever toolchain builds them.
+
 ```go
-// 🔴 BUG: All goroutines see the SAME address
+var prints []func()
 for i := 0; i < 3; i++ {
-    go func() {
-        fmt.Println(&i)  // All point to same address!
-    }()
+    prints = append(prints, func() { fmt.Print(i, " ") })
 }
+for _, p := range prints {
+    p()
+}
+// module `go 1.22`+ : 0 1 2
+// module `go 1.21`  : 3 3 3    (verified by building the same file under both go.mod versions)
 
-// ✅ FIX (pre-1.22): Create a new variable each iteration
+// The pre-1.22 fix, still seen in older code: shadow the variable
 for i := 0; i < 3; i++ {
-    i := i  // Shadow! Create new variable in this scope
-    go func() {
-        fmt.Println(&i)
-    }()
-}
-
-// ✅ Go 1.22+: Fixed! Each iteration gets a new variable
-for i := range 3 {
-    go func() {
-        fmt.Println(&i)  // Different address per iteration
-    }()
+    i := i // redundant in 1.22+ modules; `go fix` (1.26 modernizers) removes it
+    go func() { fmt.Println(i) }()
 }
 ```
+
+Interview tip: if a question claims "this prints 3 3 3" or "all goroutines see the last value", answer that this was true before Go 1.22 and in modules still on `go 1.21` or lower. For a modern module the closures see 0, 1, 2. Taking `&v` of a range variable likewise now gives a distinct address per iteration.
 
 ### Pitfall 2: Slice Append After Passing to Function
 
@@ -814,12 +834,15 @@ items := []int{1, 2, 3}
 addItem(items)
 fmt.Println(items)  // [1 2 3] — NOT updated!
 
-// ✅ FIX: Return the new slice or pass pointer
-func addItem(items *[]int) {
-    *items = append(*items, 4)
+// ✅ FIX (idiomatic): return the new slice, like append itself does
+func withItem(items []int) []int {
+    return append(items, 4)
 }
-addItem(&items)
-fmt.Println(items)  // [1 2 3 4]
+items = withItem(items)
+fmt.Println(items) // [1 2 3 4]
+
+// Also valid: pass *[]int when the function's job is to mutate the caller's slice
+func appendItem(items *[]int) { *items = append(*items, 4) }
 ```
 
 ### Pitfall 3: Range Copies Values (Not References)
@@ -850,71 +873,65 @@ for _, p := range people2 {
 
 ### Pitfall 4: Returning Local Pointer After Inlining
 
+This is a **non-issue**, a misconception carried over from C. Returning the address of a local is always safe in Go. The compiler either moves the variable to the heap or, after inlining, keeps it in the caller's frame when it can prove that is safe. You never get a dangling pointer.
+
 ```go
 func create() *int {
     x := 42
-    return &x  // x escapes to heap — fine
+    return &x // safe: "moved to heap: x" when create isn't inlined
 }
-
-// But what if compiler inlines create()?
 
 func caller() {
-    p := create()  // Inlined: &x is on caller's stack
-    fmt.Println(*p)  // Works because caller's stack is still alive
+    p := create()   // if inlined and p stays local, x can live in caller's frame
+    fmt.Println(*p) // either way: always 42, never garbage
 }
 ```
+
+The real cost question is only *heap vs stack*, which affects performance, never correctness.
 
 ### Pitfall 5: Method Value vs Method Expression
 
 ```go
-type Counter struct {
-    Value int
-}
+type Counter struct{ Value int }
 
 func (c *Counter) Inc() { c.Value++ }
 
-// Method value — binds receiver AT CALL TIME
+// Method VALUE: the receiver is evaluated and saved WHEN f IS CREATED
 c := &Counter{}
-f := c.Inc  // f is a function that will Inc c (or whatever c points to)
-c = &Counter{Value: 42}
-f()  // Increments which? The new c! (c was reassigned)
-fmt.Println(c.Value)  // 43
+f := c.Inc              // binds the pointer currently in c (the first Counter)
+c = &Counter{Value: 42} // reassigning c later doesn't affect f
+f()                     // increments the FIRST Counter
+fmt.Println(c.Value)    // 42 (verified)
 
-// Method expression — binds receiver AT CALL SITE? NO
-// Actually method expressions work differently:
-g := (*Counter).Inc  // g is a function taking (*Counter)
-c2 := &Counter{}
-g(c2)  // Must pass the receiver explicitly
+// Method EXPRESSION: no receiver bound; it becomes the first parameter
+g := (*Counter).Inc // func(*Counter)
+g(c)
+fmt.Println(c.Value) // 43
 ```
 
-**The real trap with method values:**
+**The real trap: `defer` with a value receiver.** `defer x.M()` evaluates the receiver when the `defer` statement runs. A *value* receiver is therefore copied at that point:
 
 ```go
-type Counter struct {
-    Value int
-    mu    sync.Mutex
-}
+type Stats struct{ N int }
 
-func (c *Counter) Process() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.Value++
-    
-    // ... some work ...
-    
-    // 🔴 BUG: Method value captures c BEFORE defer runs
-    defer c.Print  // Captures c's pointer value NOW
-}
+func (s Stats) Print()     { fmt.Println("value receiver sees N =", s.N) }
+func (s *Stats) PrintPtr() { fmt.Println("pointer receiver sees N =", s.N) }
 
-func (c *Counter) Print() {
-    fmt.Println(c.Value)
+func work() {
+    s := Stats{}
+    defer s.Print()    // copies s NOW (N = 0)
+    defer s.PrintPtr() // captures &s now; reads N when it runs
+    s.N = 10
 }
+// Output (deferred calls run LIFO):
+// pointer receiver sees N = 10
+// value receiver sees N = 0
 
-// ✅ FIX:
-defer func() {
-    c.Print()  // Evaluates c at defer time
-}()
+// ✅ To see the final state with a value receiver, defer a closure:
+// defer func() { s.Print() }()
 ```
+
+The same rule applies to deferred function **arguments**: `defer log.Println("took", time.Since(start))` evaluates `time.Since(start)` immediately, so it logs about 0 s. Wrap it in a closure.
 
 ---
 
@@ -942,18 +959,27 @@ func Process(config *Config) {
 <details>
 <summary>🎯 Answer</summary>
 
-- `NewConfig` returns `*Config` → `Config{...}` escapes to heap
-- `name string` parameter's underlying data escapes (stored in heap Config)
-- `config` parameter in `Process` doesn't escape — it's passed to `fmt.Println` which takes `any`, causing the pointer to escape via interface boxing
-- `config.Name` is a string → the pointer data within the Config struct is on heap (already escaped)
+Actual `go build -gcflags=-m` output (Go 1.27.1; line numbers are from the test file):
 
-**Key insight:** Even though `config` is a pointer to heap memory, passing it to `fmt.Println` which takes `any` causes the pointer value itself to be boxed, which is an additional allocation.
+```
+./main.go:10:16: leaking param: name               ← name's string data flows into the result
+./main.go:11:9:  &Config{...} escapes to heap      ← in NewConfig itself
+./main.go:14:14: leaking param content: config     ← what config POINTS TO reaches fmt…
+./main.go:15:20: config.Name escapes to heap       ← …because config.Name is boxed into an interface
+./main.go:15:13: ... argument does not escape      ← fmt.Println's []any slice stays on the stack
+```
+
+- `NewConfig`: `&Config{}` escapes **when compiled as a standalone function**. But `NewConfig` is tiny, so it gets inlined. At a call site like `Process(NewConfig("a", 1))`, the output says `&Config{...} does not escape`, and the `Config` lives on the caller's stack.
+- `name` "leaks" to the result: the string header is copied into the `Config`. The bytes of the string are not copied.
+- In `Process`, the **pointer** `config` doesn't escape ("leaking param **content**" means the pointee is reachable from somewhere that escapes). The allocation that can happen is `config.Name` being converted to `any` for `fmt.Println`: a 16-byte string header boxed on the heap.
+
+**Key insight:** "escapes" is decided per allocation site and per call path, after inlining. Read `-m` output with inlining in mind, and confirm with `-benchmem`.
 
 </details>
 
 ### Question 2: The Nil vs Non-Nil Interface
 
-**Problem:** This code panics. Why? Fix it.
+**Problem:** What does this print, and why? How do you prevent it?
 
 ```go
 type Handler interface {
@@ -986,10 +1012,22 @@ Prints `false`. `NewBetterHandler` returns an interface with type `*MyHandler` a
 
 `NewHandler()` returns an interface with type `nil` and value `nil` — that one IS nil.
 
-**Fix:** Either:
-1. Always return explicit nil from factory functions
-2. Wrap in a struct that checks nil: `if h == nil { return nil }`
-3. Use `reflect.ValueOf(h).IsNil()` (but this panics if h is non-pointer)
+**Prevention:**
+1. When a function's result type is an interface, return the **literal** `nil` on the "nothing" path. Never return a typed pointer variable that might be nil:
+   ```go
+   func NewHandler(cfg Config) Handler {
+       var h *MyHandler
+       if cfg.Enabled {
+           h = &MyHandler{}
+       }
+       if h == nil {
+           return nil // untyped nil → a nil interface
+       }
+       return h
+   }
+   ```
+2. Applies doubly to `error`: return `error`, never `*MyError`, from functions.
+3. Detecting it after the fact needs reflection (`v := reflect.ValueOf(h); v.Kind() == reflect.Pointer && v.IsNil()`). `IsNil` panics for kinds that can't be nil, such as structs, so check the kind first. Needing this is a design smell.
 
 </details>
 
@@ -1019,19 +1057,22 @@ func main() {
 <details>
 <summary>🎯 Answer</summary>
 
+Verified with `-gcflags=-m` (Go 1.27.1), with each variable passed to a non-inlined function that doesn't retain it:
+
 | Var | Location | Reason |
 |-----|----------|--------|
-| `a` | Stack | Small, doesn't escape |
-| `b` | Stack | Small, doesn't escape |
-| `c` | Heap | `new()` always allocates on heap |
-| `d` | Stack (≤32KB) | Small slice escapes if its size exceeds stack threshold (~32KB on most Go versions) |
-| `e` | Heap | Large allocation (>32KB) |
-| `f` | Stack | Fixed-size array, doesn't escape |
-| `g` | Stack | `g` itself is stack, `f` stays on stack (address doesn't escape) |
-| `h` | Stack | Small struct, doesn't escape |
-| `i` | Heap | Address taken and returned — must be heap unless compiler can inline |
-| `s` | Stack | String header on stack, data may be in read-only data section |
-| `t` | Stack | Byte value, small |
+| `a`, `b` | Stack (or just registers) | Scalars, no address taken |
+| `c := new(int)` | **Stack** | `new(int) does not escape`. `new` does not mean heap |
+| `d := make([]int, 10)` | Stack | Constant size (80 B), doesn't escape |
+| `e := make([]int, 10000)` | **Heap** | 80 KB is over the 64 KB limit for implicit stack allocations (`make`, `new`, `&T{}`) |
+| `f` `[100]int` | Stack | 800 B, explicit variable (limit 128 KB) |
+| `g := &f` | Stack | The pointer is a local. `f` stays on the stack because `g` doesn't escape |
+| `h` | Stack | Small struct value |
+| `i := &struct{x int}{42}` | **Stack** | `&struct {...}{...} does not escape`. Taking an address alone doesn't force the heap; escaping does |
+| `s := "hello"` | Header on stack; bytes in the binary's read-only data | String literals aren't allocated |
+| `t := s[0]` | Stack | A byte |
+
+If any of these were returned, stored in a global, sent on a channel, or captured by a goroutine, they would move to the heap.
 
 </details>
 
@@ -1096,17 +1137,19 @@ On 32-bit platforms, `sync/atomic` requires 8-byte alignment for `int64` fields.
 - `requests int64` at offset 4 (NOT 8-byte aligned!)
 - `errors int64` at offset 12 (NOT 8-byte aligned!)
 
-**Fix:** Put 8-byte atomic fields as the first struct fields:
+**Fix:** Put 8-byte atomic fields first. `sync/atomic` guarantees 64-bit alignment for the first word of an allocated struct and of a global variable. `stats` is a global, so this works:
 
 ```go
 type Stats struct {
-    requests  int64  // First field = guaranteed 8-byte aligned
-    errors    int64
-    active    bool
+    requests int64 // offset 0: aligned (first word of the global)
+    errors   int64 // offset 8: also aligned
+    active   bool
 }
 ```
 
-Or use `atomic.Int64` (Go 1.19+) which handles alignment internally.
+The guarantee does not cover a `Stats` *embedded* inside another struct at a non-aligned offset. That is one reason `atomic.Int64` is the better fix.
+
+Or, preferably, use `atomic.Int64` (Go 1.19+). It is guaranteed 8-byte aligned on every platform, and it makes non-atomic access impossible by construction.
 
 </details>
 
@@ -1137,16 +1180,20 @@ func AnalyzeStruct[T any]() {
     }
 }
 
-// Rule: Sort fields by alignment requirement descending
-// (int64/float64 → float64/int32 → int16 → bool/int8)
+// Rule: order fields by alignment, largest first:
+// 8 (int64, float64, pointers, string/slice/interface headers) → 4 (int32, float32)
+// → 2 (int16) → 1 (bool, int8, byte)
 type Optimized struct {
     A int64   // 8-byte align, offset 0
     B int32   // 4-byte align, offset 8
     C int16   // 2-byte align, offset 12
     D bool    // 1-byte align, offset 14
     // padding: 1 byte at offset 15 to make struct size multiple of 8
-    // Total: 16 bytes
+    // Total: 16 bytes (verified with unsafe.Sizeof)
 }
+// Reverse order (D, C, B, A) would be 1+1pad+2+4 = 8, then A at 8 → also 16;
+// a bad order like (D bool, A int64, C int16, B int32) is 24.
+// Tooling: fieldalignment -fix ./... (golang.org/x/tools) automates this.
 ```
 
 </details>
@@ -1227,13 +1274,20 @@ func main() {
 <details>
 <summary>🎯 Answer</summary>
 
-`f1 := l.Log` — creates a method value. Since `Log` has a value receiver, the compiler must copy `l` into the closure. This causes `l` to escape to heap (the closure captures it). The closure itself is also heap-allocated.
+`-gcflags=-m` (Go 1.27.1) on this code inside a test file (line numbers are from that file):
 
-`f2 := l.Error` — creates a method value with pointer receiver. This captures a pointer to `l`. Since `l` already escaped for `f1`, this doesn't cause additional allocation. If `f2` was the only binding, the compiler might still stack-allocate `l` if it could prove `l` doesn't escape through `f2`.
+```
+./main.go:27:7: l does not escape
+./main.go:65:9: l.Log does not escape
+./main.go:66:9: l.Error does not escape
+./main.go:27:66: l.prefix + ": " + msg escapes to heap
+```
 
-**Lesson:** Method values always escape at least one allocation (the closure). They should be avoided in hot paths.
+- `f1 := l.Log` creates a method value. Since `Log` has a value receiver, a **copy** of `l` is bound into a small closure. `f2 := l.Error` binds `&l`.
+- Neither closure escapes: `f1` and `f2` are only called locally. So both closures, and `l` itself, stay **on the stack**. No heap allocation comes from the method values.
+- The allocation that does happen is the **string concatenation** passed to `fmt.Println`: the result is boxed into `any`, so it escapes.
 
-**Alternative:** Use inline function calls instead of method values in performance-critical code.
+**When method values do allocate:** when the func value escapes. That happens if you store it in a struct field or global, pass it to something that retains it (`http.HandleFunc("/", s.handle)` stores it in the mux), return it, or start it with `go`. Then the closure, and for value receivers the receiver copy, goes to the heap. That's usually fine at setup time. Avoid creating method values per call inside hot loops when they escape.
 
 </details>
 
@@ -1243,13 +1297,15 @@ func main() {
 
 | Concept | Key Takeaway |
 |---------|-------------|
-| `&` | Creates pointer to memory location (LEAQ instruction) |
-| `*` | Dereferences pointer (reads/writes at address) |
-| Pass by value | Everything in Go is pass-by-value — including pointers |
-| Escape analysis | Compiler decides stack vs heap — use `-gcflags="-m"` to check |
-| Interface nil trap | `(*T)(nil)` != `nil` — interface has type info even when value is nil |
-| Memory alignment | Sort struct fields by size descending to minimize padding |
-| `unsafe.Pointer` vs `uintptr` | GC tracks `unsafe.Pointer` but NOT `uintptr` |
-| Range copies | `for _, v := range slice` copies — use index to mutate |
-| Slice sharing | Sub-slices share underlying array — use full slice expr to isolate |
-| GC pointers | Every pointer in a struct adds GC scanning work |
+| `&` | Address-of: on the stack it's an `LEAQ`; if the address escapes, the variable moves to the heap |
+| `*` | Dereference: a load/store through the address; nil → runtime panic |
+| `new(T)` / `new(expr)` | Creates a variable and returns its address; stack vs heap is still escape analysis' call. `new(expr)` since Go 1.26 |
+| Pass by value | Everything is copied, including pointers and slice/map/chan descriptors (which share underlying data) |
+| Escape analysis | Static, per allocation site, after inlining. Check `-gcflags=-m`, confirm with `-benchmem` |
+| Interface nil trap | An interface holding `(*T)(nil)` is not `nil`. Return a literal `nil` |
+| Memory alignment | Order fields by alignment; use `atomic.Int64` for 64-bit atomics on 32-bit targets |
+| `unsafe.Pointer` vs `uintptr` | GC tracks `unsafe.Pointer`, not `uintptr`. Use `unsafe.Add/Slice/String` |
+| Range copies | `for _, v := range s` copies elements. Index to mutate |
+| Slice sharing | Sub-slices and appends within capacity share the backing array. Use `s[:n:n]` or `slices.Clone` to isolate |
+| Loop variables | Per-iteration since Go 1.22 (module `go` version decides) |
+| GC pointers | Pointer-free memory is never scanned; fewer pointers and fewer allocations mean less GC work |
