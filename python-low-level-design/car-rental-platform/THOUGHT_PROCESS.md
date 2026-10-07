@@ -6,7 +6,180 @@
 
 ## 📊 Class Diagram
 
-![](car-rental-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class CarRentalService {
+        +HOLD_TTL: timedelta
+        +MIN_RENTAL: timedelta
+        +RETURN_GRACE: timedelta
+        +POINTS_PER_HOUR: int
+        +calendar: AvailabilityCalendar
+        +search: SearchService
+        -_vehicles: Dict~str, Vehicle~
+        -_customers: Dict~str, Customer~
+        -_reservations: Dict~str, Reservation~
+        +add_vehicle(vehicle: Vehicle) None
+        +register_customer(name: str, email: str, license_number: str) Customer
+        +get_reservation(reservation_id: str) Reservation
+        +create_reservation(customer_id: str, vehicle_id: str, pickup: datetime, dropoff: datetime, ...) Reservation
+        +confirm_reservation(reservation_id: str) Reservation
+        +cancel_reservation(reservation_id: str) Reservation
+        +expire_holds() List~str~
+        +schedule_maintenance(vehicle_id: str, start: datetime, end: datetime) str
+        +start_rental(reservation_id: str) Reservation
+        +complete_rental(reservation_id: str, returned_at: datetime) Decimal
+    }
+    class Vehicle {
+        <<dataclass>>
+        +vehicle_id: str
+        +vehicle_type: VehicleType
+        +make: str
+        +model: str
+        +license_plate: str
+        +fuel_type: FuelType
+        +hourly_rate: Decimal
+        +daily_rate: Decimal
+        +location: str
+        +status: VehicleStatus
+    }
+    class Customer {
+        <<dataclass>>
+        +customer_id: str
+        +name: str
+        +email: str
+        +license_number: str
+        +loyalty_points: int
+    }
+    class Reservation {
+        <<dataclass>>
+        +reservation_id: str
+        +customer: Customer
+        +vehicle: Vehicle
+        +pickup: datetime
+        +dropoff: datetime
+        +pricing: RentalPricing
+        +quoted_amount: Decimal
+        +hold_expires_at: datetime
+        +status: ReservationStatus
+        +final_amount: Optional~Decimal~
+        +returned_at: Optional~datetime~
+        +duration_hours: int
+        +move_to(target: ReservationStatus) None
+    }
+    class AvailabilityCalendar {
+        -_turnaround: timedelta
+        -_schedules: Dict~str, VehicleSchedule~
+        +add_vehicle(vehicle_id: str) None
+        +try_block(vehicle_id: str, start: datetime, end: datetime, kind: BlockKind, ref_id: str, expires_at: datetime) bool
+        +confirm_hold(vehicle_id: str, ref_id: str) bool
+        +release(vehicle_id: str, ref_id: str) None
+        +is_available(vehicle_id: str, pickup: datetime, dropoff: datetime) bool
+        +get_available_vehicles(vehicle_ids: List~str~, pickup: datetime, dropoff: datetime) List~str~
+        +next_free_window(vehicle_id: str, pickup: datetime, dropoff: datetime) datetime
+        +free_hours(vehicle_id: str, day: date) List~int~
+        +get_availability_summary(vehicle_id: str, day: date) dict
+        +get_weekly_availability(vehicle_id: str, start_date: date) dict
+        +weekly_bitmap(vehicle_id: str, start_date: date) int
+    }
+    class VehicleSchedule {
+        +lock: Lock
+        -_blocks: List~Block~
+        +purge_expired(now: datetime) None
+        +conflict(start: datetime, end: datetime) Optional~Block~
+        +insert(block: Block) None
+        +find(ref_id: str) Optional~Block~
+        +remove(ref_id: str) None
+        +blocks() List~Block~
+    }
+    class Block {
+        <<dataclass>>
+        +start: datetime
+        +end: datetime
+        +kind: BlockKind
+        +ref_id: str
+        +expires_at: Optional~datetime~
+        +live(now: datetime) bool
+    }
+    class SearchService {
+        -_calendar: AvailabilityCalendar
+        +search_available(pickup: datetime, dropoff: datetime, vehicle_type: VehicleType, location: str) List~Vehicle~
+        +search_by_date(day: date, vehicle_type: VehicleType) dict
+        +browse_weekly(start_date: date, vehicle_type: VehicleType, location: str) dict
+    }
+    class RentalPricing {
+        <<abstract>>
+        +calculate_cost(vehicle: Vehicle, hours: int) Decimal
+    }
+    class HourlyRentalPricing {
+        +calculate_cost(vehicle: Vehicle, hours: int) Decimal
+    }
+    class DailyRentalPricing {
+        +calculate_cost(vehicle: Vehicle, hours: int) Decimal
+    }
+    class WeeklyDiscountPricing {
+        -_base: RentalPricing
+        +calculate_cost(vehicle: Vehicle, hours: int) Decimal
+    }
+    class ReservationStatus {
+        <<enumeration>>
+        PENDING
+        CONFIRMED
+        IN_PROGRESS
+        COMPLETED
+        CANCELLED
+        EXPIRED
+    }
+    class VehicleStatus {
+        <<enumeration>>
+        AVAILABLE
+        RENTED
+    }
+    class BlockKind {
+        <<enumeration>>
+        RESERVATION
+        MAINTENANCE
+    }
+    class VehicleType {
+        <<enumeration>>
+        HATCHBACK
+        SEDAN
+        SUV
+        LUXURY
+        VAN
+    }
+    class FuelType {
+        <<enumeration>>
+        PETROL
+        DIESEL
+        ELECTRIC
+        HYBRID
+    }
+
+    RentalPricing <|-- HourlyRentalPricing
+    RentalPricing <|-- DailyRentalPricing
+    RentalPricing <|-- WeeklyDiscountPricing
+    WeeklyDiscountPricing o-- RentalPricing : wraps
+
+    CarRentalService *-- AvailabilityCalendar
+    CarRentalService *-- SearchService
+    CarRentalService o-- "*" Vehicle
+    CarRentalService o-- "*" Customer
+    CarRentalService *-- "*" Reservation
+    SearchService --> AvailabilityCalendar : reads
+    SearchService ..> Vehicle
+    AvailabilityCalendar *-- "*" VehicleSchedule : one per vehicle
+    VehicleSchedule *-- "*" Block : sorted, non-overlapping
+    Block --> BlockKind
+
+    Reservation --> "1" Customer
+    Reservation --> "1" Vehicle
+    Reservation --> RentalPricing : quoted with
+    Reservation --> ReservationStatus
+    Vehicle --> VehicleType
+    Vehicle --> FuelType
+    Vehicle --> VehicleStatus
+```
 
 ---
 

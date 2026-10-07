@@ -6,9 +6,127 @@
 
 ## 📊 Class Diagram
 
-![](splitwise-class-diagram.drawio)
+```mermaid
+classDiagram
+    class User {
+        <<dataclass>>
+        +user_id: str
+        +name: str
+        +email: str
+    }
+    class SplitType {
+        <<enumeration>>
+        EQUAL
+        EXACT
+        PERCENTAGE
+        SHARE
+    }
+    class SplitStrategy {
+        <<abstract>>
+        +calculate_shares(amount: Decimal, participant_ids: List~str~, values: Optional~List~)* Dict~str, Decimal~
+    }
+    class EqualSplit
+    class ExactSplit
+    class PercentageSplit
+    class ShareSplit
+    class SplitStrategyFactory {
+        -_strategies: Dict~SplitType, SplitStrategy~
+        +get(split_type: SplitType) SplitStrategy
+    }
+    class Expense {
+        <<dataclass>>
+        +expense_id: str
+        +description: str
+        +amount: Decimal
+        +paid_by: str
+        +split_type: SplitType
+        +shares: Mapping~str, Decimal~
+        +category: ExpenseCategory
+        +group_id: Optional~str~
+        +created_at: datetime
+    }
+    class Payment {
+        <<dataclass>>
+        +payment_id: str
+        +from_user: str
+        +to_user: str
+        +amount: Decimal
+        +group_id: Optional~str~
+        +created_at: datetime
+    }
+    class BalanceSheet {
+        -_net: Dict~str, Decimal~
+        +apply_expense(expense: Expense, sign: int) None
+        +apply_payment(payment: Payment) None
+        +balance_of(user_id: str) Decimal
+        +snapshot() Dict~str, Decimal~
+    }
+    class Group {
+        +group_id: str
+        +name: str
+        +ledger: BalanceSheet
+        -_member_ids: List~str~
+        +member_ids: List~str~
+        +is_member(user_id: str) bool
+        +add_member(user_id: str) None
+        +remove_member(user_id: str) None
+    }
+    class Transfer {
+        <<NamedTuple>>
+        +debtor: str
+        +creditor: str
+        +amount: Decimal
+    }
+    class SettlementStrategy {
+        <<abstract>>
+        +settle(balances: Mapping~str, Decimal~)* List~Transfer~
+    }
+    class GreedySettlement
+    class OptimalSettlement {
+        -_max_people: int
+        -_fallback: SettlementStrategy
+    }
+    class SplitwiseService {
+        -_lock: RLock
+        -_users: Dict~str, User~
+        -_groups: Dict~str, Group~
+        -_expenses: Dict~str, Expense~
+        -_payments: List~Payment~
+        -_personal: BalanceSheet
+        -_settlement: SettlementStrategy
+        +add_user(name: str, email: str) User
+        +create_group(name: str, member_ids: List~str~) Group
+        +add_member(group_id: str, user_id: str) None
+        +add_expense(description, amount, paid_by, participant_ids, split_type, values, group_id, category) Expense
+        +delete_expense(expense_id: str) None
+        +record_payment(from_user: str, to_user: str, amount, group_id) Payment
+        +get_balance(user_id: str) Decimal
+        +get_group_balances(group_id: str) Dict~str, Decimal~
+        +get_settlement_plan(group_id: str, strategy) List~Transfer~
+    }
 
-> The diagram predates the current code: it still shows `BalanceCalculator` and float amounts. The code uses `BalanceSheet`, `SettlementStrategy` and `Decimal`.
+    SplitStrategy <|-- EqualSplit
+    SplitStrategy <|-- ExactSplit
+    SplitStrategy <|-- PercentageSplit
+    SplitStrategy <|-- ShareSplit
+    SplitStrategyFactory "1" *-- "4" SplitStrategy : keyed by SplitType
+    SplitStrategyFactory ..> SplitType
+    Expense --> SplitType
+    SettlementStrategy <|-- GreedySettlement
+    SettlementStrategy <|-- OptimalSettlement
+    OptimalSettlement o-- SettlementStrategy : fallback
+    SettlementStrategy ..> Transfer : produces
+    Group *-- "1" BalanceSheet : ledger
+    BalanceSheet ..> Expense : applies
+    BalanceSheet ..> Payment : applies
+    SplitwiseService "1" *-- "*" User
+    SplitwiseService "1" *-- "*" Group
+    SplitwiseService "1" *-- "*" Expense
+    SplitwiseService "1" *-- "*" Payment
+    SplitwiseService *-- BalanceSheet : personal ledger
+    SplitwiseService o-- SettlementStrategy
+    SplitwiseService ..> SplitStrategyFactory : looks up split
+```
 
 ---
 

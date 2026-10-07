@@ -72,9 +72,95 @@
 
 ## 2.5 CLASS DIAGRAM
 
-![LRU Cache Class Diagram](lru-cache-class-diagram.svg)
+```mermaid
+classDiagram
+    class CacheStats {
+        <<dataclass>>
+        +hits: int
+        +misses: int
+        +evictions: int
+        +expirations: int
+        +hit_rate() float
+    }
+    class BaseCache {
+        <<abstract>>
+        -_capacity: int
+        -_default_ttl: Optional~float~
+        -_clock: Clock
+        -_map: Dict~K, _Node~
+        -_expiry_heap: List~tuple~
+        +capacity: int
+        +stats: CacheStats
+        +get(key: K, default: V) Optional~V~
+        +put(key: K, value: V, ttl: float) None
+        +delete(key: K) bool
+        +purge_expired() int
+        -_insert(node: _Node)* None
+        -_touch(node: _Node)* None
+        -_unlink(node: _Node)* None
+        -_victim()* _Node
+    }
+    class LRUCache {
+        -_order: _DList
+        +keys_mru_to_lru() List~K~
+    }
+    class LFUCache {
+        -_buckets: Dict~int, _DList~
+        -_min_freq: Optional~int~
+        +frequency(key: K) int
+    }
+    class _DList {
+        -_head: _Node
+        -_tail: _Node
+        +push_front(node: _Node) None
+        +remove(node: _Node) None
+        +back() Optional~_Node~
+    }
+    class _Node {
+        +key: K
+        +value: V
+        +expires_at: Optional~float~
+        +freq: int
+        +prev: _Node
+        +next: _Node
+    }
+    class ThreadSafeCache {
+        -_cache: BaseCache
+        -_lock: Lock
+        -_inflight: Dict~K, _Flight~
+        +get(key: K, default: V) Optional~V~
+        +put(key: K, value: V, ttl: float) None
+        +delete(key: K) bool
+        +purge_expired() int
+        +get_or_load(key: K, loader: Callable, ttl: float) V
+        +stats: CacheStats
+    }
+    class _Flight {
+        +done: Event
+        +value: V
+        +error: Optional~BaseException~
+    }
+    class StripedCache {
+        -_shards: List~ThreadSafeCache~
+        +get(key: K, default: V) Optional~V~
+        +put(key: K, value: V, ttl: float) None
+        +delete(key: K) bool
+        +get_or_load(key: K, loader: Callable, ttl: float) V
+        +stats: CacheStats
+    }
 
-> **📥 Download:** [LRU Cache Architecture Diagram (draw.io)](lru-cache-class-diagram.drawio) — Open in [draw.io](https://app.diagrams.net/) to edit.
+    BaseCache <|-- LRUCache
+    BaseCache <|-- LFUCache
+    BaseCache *-- CacheStats : stats
+    BaseCache "1" *-- "0..capacity" _Node : key to node map
+    LRUCache *-- "1" _DList : recency order
+    LFUCache *-- "*" _DList : one per frequency
+    _DList o-- "*" _Node : linked in order
+    ThreadSafeCache o-- "1" BaseCache : wraps under one lock
+    ThreadSafeCache *-- "*" _Flight : single-flight loads
+    StripedCache *-- "N" ThreadSafeCache : shards, hash of key mod N
+    StripedCache ..> BaseCache : factory builds each shard
+```
 
 ---
 

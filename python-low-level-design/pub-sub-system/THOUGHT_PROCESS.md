@@ -6,10 +6,108 @@
 
 ## 📊 Class Diagram
 
-![](pub-sub-class-diagram.drawio)
+```mermaid
+classDiagram
+    class MessagePriority {
+        <<enumeration>>
+        LOW
+        NORMAL
+        HIGH
+        CRITICAL
+    }
+    class Message {
+        <<dataclass>>
+        +topic: str
+        +payload: Any
+        +priority: MessagePriority
+        +headers: Mapping~str, str~
+        +message_id: str
+        +timestamp: float
+    }
+    class DeadLetterReason {
+        <<enumeration>>
+        RETRIES_EXHAUSTED
+        OVERFLOW
+    }
+    class DeadLetter {
+        <<dataclass>>
+        +subscription_id: str
+        +message: Message
+        +reason: DeadLetterReason
+        +error: str
+    }
+    class Subscriber {
+        <<abstract>>
+        +subscriber_id: str
+        +on_message(message: Message)* None
+    }
+    class CallbackSubscriber {
+        -_name: str
+        -_callback: Callable
+        +on_message(message: Message) None
+    }
+    class DedupingSubscriber {
+        -_inner: Subscriber
+        -_seen: OrderedDict~str, None~
+        -_capacity: int
+        +on_message(message: Message) None
+    }
+    class RetryPolicy {
+        <<dataclass>>
+        +max_attempts: int
+        +base_delay: float
+        +multiplier: float
+        +max_delay: float
+        +delay(attempt: int) float
+    }
+    class Subscription {
+        +topic: str
+        +subscriber: Subscriber
+        +subscription_id: str
+        +delivered: int
+        +dead_lettered: int
+        -_predicate: Optional~Predicate~
+        -_retry: RetryPolicy
+        -_max_queue: int
+        -_heap: List~tuple~
+        -_cond: Condition
+        +offer(message: Message) bool
+        +dispatch_one(block: bool, timeout: Optional~float~) bool
+        +wait_idle(timeout: Optional~float~) bool
+        +close() None
+        +pending: int
+    }
+    class MessageBroker {
+        -_topics: Dict~str, Dict~
+        -_lock: Lock
+        -_workers: Dict~str, Thread~
+        -_dlq: List~DeadLetter~
+        +create_topic(name: str) None
+        +delete_topic(name: str) None
+        +subscribe(topic: str, subscriber: Subscriber, predicate, retry) Subscription
+        +unsubscribe(topic: str, subscriber_id: str) None
+        +publish(topic: str, payload: Any, priority, headers) Message
+        +run_until_idle() int
+        +start() None
+        +wait_idle(timeout: float) bool
+        +close() None
+        +dead_letters() List~DeadLetter~
+    }
 
-!!! note "Diagram vs code"
-    The diagram shows the earlier design (a `MessageQueue` per topic, `Topic`, `DeliveryStrategy` with Direct/Async, `FilteringSubscriber`, `flush()`). The code now has a bounded queue per `Subscription`, a `RetryPolicy`, a dead-letter queue and `DedupingSubscriber`. Trust [the code](CODE.md) where they differ.
+    Subscriber <|-- CallbackSubscriber
+    Subscriber <|-- DedupingSubscriber
+    DedupingSubscriber o-- "1" Subscriber : decorates
+    MessageBroker "1" *-- "*" Subscription : per topic and subscriber
+    MessageBroker "1" *-- "*" DeadLetter : DLQ
+    MessageBroker ..> Message : publish creates
+    Subscription o-- "1" Subscriber
+    Subscription --> "1" RetryPolicy
+    Subscription o-- "0..max_queue" Message : bounded priority queue
+    Subscription ..> DeadLetter : emits
+    DeadLetter --> Message
+    DeadLetter --> DeadLetterReason
+    Message --> MessagePriority
+```
 
 ---
 

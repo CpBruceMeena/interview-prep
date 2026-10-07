@@ -6,9 +6,133 @@
 
 ## 📊 Class Diagram
 
-![](library-management-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class LibraryService {
+        +HOLD_DAYS: int
+        -_catalog: Catalog
+        -_fines: FineCalculator
+        -_clock: Callable
+        -_members: Dict~str, Member~
+        -_loans: Dict~str, Loan~
+        -_active: Dict~str, Loan~
+        -_waitlist: Dict~str, Deque~
+        -_holds: Dict~str, Hold~
+        +register_member(name: str, member_type: MemberType) Member
+        +member(member_id: str) Member
+        +available_copies(isbn: str) int
+        +borrow(member_id: str, isbn: str) Loan
+        +return_item(barcode: str) Loan
+        +renew(barcode: str) Loan
+        +report_lost(barcode: str, replacement_cost: Decimal) Loan
+        +reserve(member_id: str, isbn: str) int
+        +cancel_reservation(member_id: str, isbn: str) None
+        +hold_for(member_id: str, isbn: str) Optional~Hold~
+        +pay_fine(member_id: str, amount: Decimal) Decimal
+    }
+    class Catalog {
+        -_books: Dict~str, Book~
+        -_items: Dict~str, BookItem~
+        +add_book(book: Book) None
+        +add_item(item: BookItem) None
+        +book(isbn: str) Book
+        +item(barcode: str) BookItem
+        +items_for(isbn: str) List~BookItem~
+        +search(title: str, author: str, category: str) List~Book~
+    }
+    class Book {
+        <<dataclass>>
+        +isbn: str
+        +title: str
+        +author: str
+        +category: str
+        +year: int
+    }
+    class BookItem {
+        <<dataclass>>
+        +barcode: str
+        +isbn: str
+        +rack: str
+        +status: ItemStatus
+    }
+    class Loan {
+        <<dataclass>>
+        +loan_id: str
+        +barcode: str
+        +isbn: str
+        +member_id: str
+        +borrowed_on: date
+        +due_on: date
+        +renewals: int
+        +returned_on: Optional~date~
+        +fine: Decimal
+        +days_overdue(on: date) int
+    }
+    class Hold {
+        <<dataclass>>
+        +member_id: str
+        +barcode: str
+        +expires_on: date
+    }
+    class Member {
+        <<dataclass>>
+        +member_id: str
+        +name: str
+        +member_type: MemberType
+        +active_loans: Dict~str, Loan~
+        +fine_due: Decimal
+        +policy: MembershipPolicy
+    }
+    class MembershipPolicy {
+        <<dataclass>>
+        +max_books: int
+        +loan_days: int
+        +max_renewals: int
+    }
+    class ItemStatus {
+        <<enumeration>>
+        AVAILABLE
+        ON_LOAN
+        ON_HOLD
+        LOST
+    }
+    class MemberType {
+        <<enumeration>>
+        STUDENT
+        FACULTY
+        PUBLIC
+        PREMIUM
+    }
+    class FineCalculator {
+        <<abstract>>
+        +calculate_fine(days_overdue: int, member_type: MemberType) Decimal
+    }
+    class StandardFine {
+        +calculate_fine(days_overdue: int, member_type: MemberType) Decimal
+    }
+    class ProgressiveFine {
+        -_cap: Optional~Decimal~
+        +calculate_fine(days_overdue: int, member_type: MemberType) Decimal
+    }
 
-> The diagram predates the current code: it still shows `Book.available_copies`, `BookStatus` and float fines. The code derives availability from `BookItem.status` (`ItemStatus`), adds `Loan`, `Hold` and `MembershipPolicy`, and uses `Decimal`.
+    FineCalculator <|-- StandardFine
+    FineCalculator <|-- ProgressiveFine
+    LibraryService o-- Catalog
+    LibraryService --> FineCalculator : prices overdue
+    LibraryService *-- "*" Member
+    LibraryService *-- "*" Loan : history
+    LibraryService *-- "*" Hold : barcode to hold
+    Catalog *-- "*" Book : by ISBN
+    Catalog *-- "*" BookItem : by barcode
+    Book "1" <.. "*" BookItem : isbn
+    BookItem --> ItemStatus
+    Member o-- "*" Loan : active_loans
+    Member --> MemberType
+    Member ..> MembershipPolicy : POLICIES lookup
+    Loan ..> BookItem : barcode
+    Hold ..> BookItem : barcode
+```
 
 ---
 

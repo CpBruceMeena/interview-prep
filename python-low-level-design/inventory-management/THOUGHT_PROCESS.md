@@ -6,10 +6,187 @@
 
 ## 📊 Class Diagram
 
-![](inventory-management-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class InventoryService {
+        -_allocation: AllocationStrategy
+        -_reorder_policy: ReorderPolicy
+        -_products: Dict~str, Product~
+        -_warehouses: Dict~str, Warehouse~
+        -_items: Dict~Tuple, InventoryItem~
+        -_reservations: Dict~str, Reservation~
+        -_by_order: Dict~str, Reservation~
+        -_purchase_orders: Dict~str, PurchaseOrder~
+        -_ledger: List~Movement~
+        +add_product(product: Product) Product
+        +add_warehouse(warehouse: Warehouse) Warehouse
+        +receive_stock(sku: str, warehouse_id: str, qty: int, reference: str) InventoryItem
+        +adjust_stock(sku: str, warehouse_id: str, counted_on_hand: int, reason: str) int
+        +transfer_stock(sku: str, from_wh: str, to_wh: str, qty: int) None
+        +reserve(order_id: str, request: Mapping~str, int~) Reservation
+        +commit(reservation_id: str, reference: str) Reservation
+        +release(reservation_id: str) Reservation
+        +expire_reservations() List~Reservation~
+        +check_reorder() List~PurchaseOrder~
+        +receive_purchase_order(po_id: str) PurchaseOrder
+        +cancel_purchase_order(po_id: str) PurchaseOrder
+        +stock(sku: str, warehouse_id: str) Tuple
+        +available(sku: str) int
+        +inventory_value() Decimal
+        +movements(sku: str) List~Movement~
+    }
+    class Product {
+        <<dataclass>>
+        +sku: str
+        +name: str
+        +unit_price: Decimal
+        +reorder_level: int
+        +reorder_quantity: int
+    }
+    class Warehouse {
+        <<dataclass>>
+        +warehouse_id: str
+        +name: str
+        +priority: int
+    }
+    class InventoryItem {
+        +product: Product
+        +warehouse: Warehouse
+        +lock: Lock
+        +key: Tuple~str, str~
+        +on_hand: int
+        +reserved: int
+        +available: int
+        +receive(qty: int) None
+        +correct(delta: int) None
+        +reserve(qty: int) None
+        +release(qty: int) None
+        +ship_reserved(qty: int) None
+        +remove_available(qty: int) None
+    }
+    class Reservation {
+        <<dataclass>>
+        +reservation_id: str
+        +order_id: str
+        +lines: Tuple~ReservationLine~
+        +expires_at: float
+        +status: ReservationStatus
+        +lock: Lock
+        +requested() Dict~str, int~
+    }
+    class ReservationLine {
+        <<dataclass>>
+        +sku: str
+        +warehouse_id: str
+        +quantity: int
+    }
+    class PurchaseOrder {
+        <<dataclass>>
+        +po_id: str
+        +sku: str
+        +warehouse_id: str
+        +quantity: int
+        +status: POStatus
+    }
+    class Movement {
+        <<dataclass>>
+        +movement_id: int
+        +sku: str
+        +warehouse_id: str
+        +type: MovementType
+        +delta: int
+        +on_hand_after: int
+        +reference: str
+        +at: float
+    }
+    class StockView {
+        <<dataclass>>
+        +warehouse_id: str
+        +priority: int
+        +available: int
+    }
+    class ReorderContext {
+        <<dataclass>>
+        +product: Product
+        +warehouse_id: str
+        +position: int
+        +avg_daily_demand: float
+    }
+    class AllocationStrategy {
+        <<abstract>>
+        +allocate(qty: int, stock: Sequence~StockView~) Optional~List~
+    }
+    class GreedySplitAllocation {
+        +allocate(qty: int, stock: Sequence~StockView~) Optional~List~
+    }
+    class SingleWarehouseFirstAllocation {
+        -_fallback: GreedySplitAllocation
+        +allocate(qty: int, stock: Sequence~StockView~) Optional~List~
+    }
+    class ReorderPolicy {
+        <<abstract>>
+        +reorder_quantity(ctx: ReorderContext) int
+    }
+    class FixedReorderPolicy {
+        +reorder_quantity(ctx: ReorderContext) int
+    }
+    class DemandBasedReorderPolicy {
+        -_lead: int
+        -_safety: int
+        -_cover: int
+        +reorder_quantity(ctx: ReorderContext) int
+    }
+    class ReservationStatus {
+        <<enumeration>>
+        ACTIVE
+        COMMITTED
+        RELEASED
+        EXPIRED
+    }
+    class MovementType {
+        <<enumeration>>
+        RECEIVE
+        SHIP
+        TRANSFER_OUT
+        TRANSFER_IN
+        ADJUST
+    }
+    class POStatus {
+        <<enumeration>>
+        OPEN
+        RECEIVED
+        CANCELLED
+    }
 
-!!! note
-    The diagram predates the reservation redesign. Read it for the Product / Warehouse / InventoryItem / Strategy shape; the current classes are listed in Phase 1 below.
+    AllocationStrategy <|-- GreedySplitAllocation
+    AllocationStrategy <|-- SingleWarehouseFirstAllocation
+    SingleWarehouseFirstAllocation *-- GreedySplitAllocation : fallback
+    ReorderPolicy <|-- FixedReorderPolicy
+    ReorderPolicy <|-- DemandBasedReorderPolicy
+
+    InventoryService --> AllocationStrategy : which warehouse
+    InventoryService --> ReorderPolicy : when to reorder
+    InventoryService o-- "*" Product
+    InventoryService o-- "*" Warehouse
+    InventoryService *-- "*" InventoryItem : per sku and warehouse
+    InventoryService *-- "*" Reservation
+    InventoryService *-- "*" PurchaseOrder
+    InventoryService *-- "*" Movement : append-only ledger
+    InventoryService ..> StockView : builds
+    InventoryService ..> ReorderContext : builds
+
+    InventoryItem --> "1" Product
+    InventoryItem --> "1" Warehouse
+    Reservation *-- "1..*" ReservationLine
+    Reservation --> ReservationStatus
+    ReservationLine ..> InventoryItem : sku and warehouse_id
+    PurchaseOrder --> POStatus
+    Movement --> MovementType
+    AllocationStrategy ..> StockView
+    ReorderPolicy ..> ReorderContext
+    ReorderContext --> Product
+```
 
 ---
 

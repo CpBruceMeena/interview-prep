@@ -6,7 +6,141 @@
 
 ## 📊 Class Diagram
 
-![](vending-machine-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction TB
+    class VendingMachine {
+        -inventory: Inventory
+        -cash: CashBox
+        -dispenser: Dispenser
+        -gateway: PaymentGateway
+        -state: MachineState
+        -selected: Optional~Slot~
+        -escrow: Counter
+        -lock: RLock
+        +state: str
+        +balance_cents: int
+        +select(code: str) Product
+        +insert(piece: Denomination) Optional~Receipt~
+        +pay_by_card(token: str) Receipt
+        +cancel() Dict~Denomination, int~
+        +purchase_with_card(code: str, token: str) Receipt
+        +add_slot(code: str, product: Product, quantity: int, capacity: int) None
+        +restock(code: str, qty: int) int
+        +load_change(pieces: Mapping) None
+        +collect_cash(keep_float: Mapping) Dict~Denomination, int~
+        +enter_maintenance() Dict~Denomination, int~
+        +exit_maintenance() None
+        +stock() Dict~str, int~
+        +cash_total_cents() int
+    }
+    class MachineState {
+        <<abstract>>
+        +name: str
+        +m: VendingMachine
+        +select(code: str) Product
+        +insert(piece: Denomination) Optional~Receipt~
+        +pay_by_card(token: str) Receipt
+        +cancel() Dict~Denomination, int~
+    }
+    class IdleState {
+        +select(code: str) Product
+    }
+    class AwaitingPaymentState {
+        +insert(piece: Denomination) Optional~Receipt~
+        +pay_by_card(token: str) Receipt
+        +cancel() Dict~Denomination, int~
+    }
+    class OutOfServiceState
+    class Inventory {
+        -slots: Dict~str, Slot~
+        +add_slot(code: str, product: Product, quantity: int, capacity: int) None
+        +slot(code: str) Slot
+        +restock(code: str, qty: int) int
+        +snapshot() Dict~str, int~
+    }
+    class Slot {
+        <<dataclass>>
+        +code: str
+        +product: Product
+        +quantity: int
+        +capacity: int
+    }
+    class Product {
+        <<dataclass>>
+        +sku: str
+        +name: str
+        +price_cents: int
+    }
+    class CashBox {
+        -counts: Counter
+        +deposit(pieces: Mapping) None
+        +withdraw(pieces: Mapping) None
+        +counts() Dict~Denomination, int~
+        +total() int
+    }
+    class Dispenser {
+        <<abstract>>
+        +dispense(slot_code: str)* bool
+    }
+    class ReliableDispenser {
+        +dispense(slot_code: str) bool
+    }
+    class PaymentGateway {
+        <<abstract>>
+        +authorize(token: str, amount_cents: int)* str
+        +capture(auth_id: str)* None
+        +void(auth_id: str)* None
+    }
+    class FakeGateway {
+        +holds: Dict~str, int~
+        +captured: Dict~str, int~
+        +voided: Dict~str, int~
+    }
+    class Receipt {
+        <<dataclass>>
+        +slot_code: str
+        +product: Product
+        +method: PaymentMethod
+        +paid_cents: int
+        +change: Dict~Denomination, int~
+        +change_cents: int
+    }
+    class Denomination {
+        <<enumeration>>
+        NICKEL
+        DIME
+        QUARTER
+        DOLLAR_COIN
+        ONE_NOTE
+        FIVE_NOTE
+        +cents: int
+        +is_coin: bool
+    }
+    class PaymentMethod {
+        <<enumeration>>
+        CASH
+        CARD
+    }
+
+    VendingMachine "1" *-- "1" Inventory
+    VendingMachine "1" *-- "1" CashBox
+    VendingMachine "1" *-- "3" MachineState : idle, awaiting, out_of_service
+    VendingMachine o-- Dispenser : port
+    VendingMachine o-- PaymentGateway : port
+    VendingMachine ..> Receipt : returns
+    MachineState --> VendingMachine : m
+    MachineState <|-- IdleState
+    MachineState <|-- AwaitingPaymentState
+    MachineState <|-- OutOfServiceState
+    Inventory "1" *-- "*" Slot
+    Slot --> Product
+    Dispenser <|-- ReliableDispenser
+    PaymentGateway <|-- FakeGateway
+    Receipt --> Product
+    Receipt --> PaymentMethod
+    CashBox ..> Denomination : counts per piece
+```
 
 ---
 

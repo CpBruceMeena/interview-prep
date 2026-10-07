@@ -6,10 +6,141 @@
 
 ## 📊 Class Diagram
 
-![](notification-service-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class NotificationService {
+        +dead_letters: List~Delivery~
+        -_senders: Dict~Channel, ChannelSender~
+        -_users: Dict~str, UserPreferences~
+        -_ready: List~Tuple~
+        -_delayed: List~Tuple~
+        -_idempotency: OrderedDict
+        +upsert_user(prefs: UserPreferences) None
+        +submit(request: NotificationRequest) Notification
+        +process_next() Optional~Delivery~
+        +run_until_idle(max_steps: int) int
+        +get(notification_id: str) Notification
+        +next_wakeup() Optional~float~
+    }
+    class ChannelSender {
+        <<abstract>>
+        +send(delivery_id: str, address: str, body: str) str
+    }
+    class TemplateStore {
+        +register(template_id: str, channel: Channel, text: str) None
+        +render(template_id: str, channel: Channel, params: Mapping) str
+    }
+    class RateLimiter {
+        -_user_buckets: OrderedDict
+        -_channel_buckets: Dict~Channel, TokenBucket~
+        +acquire(user_id: str, channel: Channel, now: float) float
+    }
+    class TokenBucket {
+        +capacity: float
+        +rate: float
+        +tokens: float
+        +try_take(now: float) float
+        +peek_wait(now: float) float
+    }
+    class Limit {
+        <<dataclass>>
+        +capacity: int
+        +per_seconds: float
+        +rate: float
+    }
+    class RetryPolicy {
+        +max_attempts: int
+        +delay(attempt: int) float
+    }
+    class UserPreferences {
+        <<dataclass>>
+        +user_id: str
+        +contacts: Dict~Channel, str~
+        +opted_out_channels: FrozenSet~Channel~
+        +opted_out_categories: FrozenSet~Category~
+        +quiet_hours: Optional~QuietHours~
+    }
+    class QuietHours {
+        <<dataclass>>
+        +start: time
+        +end: time
+        +tz: tzinfo
+        +next_allowed(now: float) float
+    }
+    class NotificationRequest {
+        <<dataclass>>
+        +idempotency_key: str
+        +user_id: str
+        +template_id: str
+        +params: Mapping~str, str~
+        +channels: Tuple~Channel~
+        +priority: Priority
+        +category: Category
+        +send_at: Optional~float~
+    }
+    class Notification {
+        <<dataclass>>
+        +notification_id: str
+        +request: NotificationRequest
+        +deliveries: List~Delivery~
+    }
+    class Delivery {
+        <<dataclass>>
+        +delivery_id: str
+        +channel: Channel
+        +address: str
+        +body: str
+        +priority: Priority
+        +status: DeliveryStatus
+        +attempts: int
+        +ready_at: float
+        +last_error: Optional~str~
+    }
+    class Channel {
+        <<enumeration>>
+        EMAIL
+        SMS
+        PUSH
+    }
+    class Priority {
+        <<enumeration>>
+        CRITICAL
+        HIGH
+        NORMAL
+        LOW
+    }
+    class Category {
+        <<enumeration>>
+        TRANSACTIONAL
+        MARKETING
+    }
+    class DeliveryStatus {
+        <<enumeration>>
+        QUEUED
+        SENDING
+        SENT
+        FAILED
+        SUPPRESSED
+    }
 
-!!! note
-    The diagram shows the earlier asyncio version (orchestrator, per-channel workers, provider factory). The current classes are listed in Phase 1.
+    NotificationService o-- "1..*" ChannelSender : one per Channel
+    NotificationService o-- TemplateStore
+    NotificationService *-- RateLimiter
+    NotificationService *-- RetryPolicy
+    NotificationService o-- "0..*" UserPreferences
+    NotificationService *-- "0..*" Notification
+    NotificationService ..> NotificationRequest : submit
+    RateLimiter *-- "0..*" TokenBucket : per user+channel and per channel
+    RateLimiter --> Limit : configured by
+    UserPreferences *-- "0..1" QuietHours
+    Notification *-- NotificationRequest
+    Notification *-- "1..*" Delivery : one per channel
+    Delivery --> Channel
+    Delivery --> Priority
+    Delivery --> Category
+    Delivery --> DeliveryStatus
+```
 
 ---
 

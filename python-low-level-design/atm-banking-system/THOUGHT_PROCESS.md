@@ -6,9 +6,175 @@
 
 ## 📊 Class Diagram
 
-![](atm-banking-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class ATM {
+        +atm_id: str
+        +bank: Bank
+        +dispenser: CashDispenser
+        +state: str
+        +retained_cards: List~str~
+        -_state: ATMState
+        -_card: Optional~str~
+        -_account: Optional~str~
+        +insert_card(card_number: str) None
+        +enter_pin(pin: str) None
+        +select_account(account_number: str) None
+        +balance() Decimal
+        +withdraw(amount: int) Dict~int, int~
+        +deposit(amount: MoneyLike) Transaction
+        +eject_card() None
+        +take_offline() None
+        +restock(notes: Dict~int, int~) None
+    }
+    class ATMState {
+        <<abstract>>
+        +name: str
+        +atm: ATM
+        +insert_card(card_number: str) None
+        +enter_pin(pin: str) None
+        +select_account(account_number: str) None
+        +balance() Decimal
+        +withdraw(amount: int) Dict~int, int~
+        +deposit(amount: MoneyLike) Transaction
+        +eject_card() None
+    }
+    class IdleState {
+        +insert_card(card_number: str) None
+    }
+    class CardInsertedState {
+        +enter_pin(pin: str) None
+        +eject_card() None
+    }
+    class AuthenticatedState {
+        +select_account(account_number: str) None
+        +balance() Decimal
+        +withdraw(amount: int) Dict~int, int~
+        +deposit(amount: MoneyLike) Transaction
+        +eject_card() None
+    }
+    class OutOfServiceState
+    class CashDispenser {
+        -_notes: Dict~int, int~
+        +total: int
+        +notes() Dict~int, int~
+        +plan(amount: int) Dict~int, int~
+        +dispense(plan: Dict~int, int~) Dict~int, int~
+        +load(notes: Dict~int, int~) None
+    }
+    class Bank {
+        -_accounts: Dict~str, Account~
+        -_cards: Dict~str, Card~
+        -_transactions: Dict~str, Transaction~
+        -_requests: Dict~str, object~
+        -_withdrawn_today: Dict~Tuple, Decimal~
+        +open_account(customer_id: str, account_type: AccountType, initial_deposit: MoneyLike) Account
+        +issue_card(account_number: str, pin: str, daily_limit: MoneyLike) Card
+        +validate_card(card_number: str) Card
+        +verify_pin(card_number: str, pin: str) Card
+        +accounts_of(customer_id: str) List~Account~
+        +balance(account_number: str) Decimal
+        +available(account_number: str) Decimal
+        +statement(account_number: str, limit: int) List~Transaction~
+        +authorize_withdrawal(card_number: str, account_number: str, amount: MoneyLike, request_id: str) Transaction
+        +capture(tx_id: str) Transaction
+        +reverse(tx_id: str) Transaction
+        +deposit(account_number: str, amount: MoneyLike, request_id: str) Transaction
+        +transfer(from_number: str, to_number: str, amount: MoneyLike, request_id: str) Tuple~Transaction, Transaction~
+    }
+    class Account {
+        <<abstract>>
+        +account_number: str
+        +customer_id: str
+        +lock: Lock
+        +balance: Decimal
+        +held: Decimal
+        +account_type: AccountType
+        +withdrawable()* Decimal
+        -_hold(amount: Decimal) None
+        -_capture_hold(amount: Decimal) None
+        -_release_hold(amount: Decimal) None
+        -_debit(amount: Decimal) None
+        -_credit(amount: Decimal) None
+    }
+    class SavingsAccount {
+        +min_balance: Decimal
+        +withdrawable() Decimal
+    }
+    class CheckingAccount {
+        +overdraft_limit: Decimal
+        +withdrawable() Decimal
+    }
+    class CreditAccount {
+        +credit_limit: Decimal
+        +withdrawable() Decimal
+    }
+    class Card {
+        +MAX_PIN_ATTEMPTS: int
+        +card_number: str
+        +customer_id: str
+        +account_number: str
+        +expiry: date
+        +daily_limit: Decimal
+        +blocked: bool
+        -_pin_hash: bytes
+        +verify_pin(pin: str) None
+    }
+    class Transaction {
+        <<dataclass>>
+        +tx_id: str
+        +request_id: str
+        +account_number: str
+        +tx_type: TransactionType
+        +amount: Decimal
+        +status: TransactionStatus
+        +business_date: date
+        +card_number: Optional~str~
+        +counterparty: Optional~str~
+        +move_to(status: TransactionStatus) None
+    }
+    class AccountType {
+        <<enumeration>>
+        SAVINGS
+        CHECKING
+        CREDIT
+    }
+    class TransactionType {
+        <<enumeration>>
+        WITHDRAWAL
+        DEPOSIT
+        TRANSFER_OUT
+        TRANSFER_IN
+    }
+    class TransactionStatus {
+        <<enumeration>>
+        PENDING
+        COMPLETED
+        REVERSED
+    }
 
-> The diagram predates the current code. It still shows float balances, `BankingService`, `PinEnteredState`/`ReadyATMState` and a bank-owned `CashDispenser`. The code has `Bank`, `IdleState` → `CardInsertedState` → `AuthenticatedState` (+ `OutOfServiceState`), a dispenser owned by each `ATM`, and `Decimal` money.
+    ATMState <|-- IdleState
+    ATMState <|-- CardInsertedState
+    ATMState <|-- AuthenticatedState
+    ATMState <|-- OutOfServiceState
+    ATM *-- "4" ATMState : one instance per state
+    ATMState --> ATM : atm
+    ATM *-- "1" CashDispenser : owns
+    ATM --> Bank : calls
+
+    Account <|-- SavingsAccount
+    Account <|-- CheckingAccount
+    Account <|-- CreditAccount
+    Account ..> AccountType
+    Bank *-- "*" Account
+    Bank *-- "*" Card
+    Bank *-- "*" Transaction : ledger
+    Card ..> Account : default account_number
+    Transaction ..> Account : account_number
+    Transaction --> TransactionType
+    Transaction --> TransactionStatus
+```
 
 ---
 
