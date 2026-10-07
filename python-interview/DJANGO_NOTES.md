@@ -2425,6 +2425,8 @@ def mixed_prefetch():
 # Async: aprefetch_related_objects() (Django 5.0+).
 ```
 
+</details>
+
 ---
 
 ## 13. Async Django
