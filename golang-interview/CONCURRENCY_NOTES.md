@@ -1,7 +1,7 @@
 # 🦦 Go Concurrency & Multithreading — Practical Notes
 
 > **A hands-on guide to writing concurrent Go code: goroutines, channels, synchronization, and production patterns**
-> *From basics to staff-level depth*
+> *From basics to staff-level depth. Current as of Go 1.27 (August 2026); version-specific behaviour is tagged, e.g. (Go 1.25+). Code assumes a module with `go 1.22` or later in `go.mod` (per-iteration loop variables).*
 
 ---
 
@@ -26,68 +26,49 @@
 
 ### Definitions
 
+**Concurrency** is a property of program *structure*: independently executing tasks that may overlap in time. **Parallelism** is a property of *execution*: tasks literally running at the same instant on different cores. Rob Pike: "Concurrency is about dealing with lots of things at once. Parallelism is about doing lots of things at once." In Go you write concurrent code with goroutines. The runtime turns it into parallel execution on up to `GOMAXPROCS` cores.
+
 ```go
-// ── CONCURRENCY ──────────────────────────────────────────────
-// "Dealing with many things at once" — Rob Pike
-// Structure: composing independently executing tasks
-// Go's superpower: you structure your program as concurrent
-//   goroutines, and the runtime maps them to parallel execution.
-//
-// go func() { ... }()  // This is CONCURRENT design
-// The runtime decides if it runs in PARALLEL.
+// ── CONCURRENCY: the design ─────────────────────────────────
+go handle(conn) // many in-flight tasks, interleaved; works on one core too
 
-// ── PARALLELISM ──────────────────────────────────────────────
-// "Doing many things at once" — Rob Pike
-// Execution: actually running on multiple cores simultaneously
-// Requires: GOMAXPROCS > 1 (default = runtime.NumCPU())
-// Go handles this via GMP scheduler.
-//
-// runtime.GOMAXPROCS(4)  // Allow parallel execution on 4 cores
+// ── PARALLELISM: the execution ─────────────────────────────
+// At most GOMAXPROCS goroutines run Go code simultaneously.
+// Default (Go 1.25+): number of usable CPUs, lowered to the container's
+// cgroup CPU limit on Linux, and re-checked periodically.
+// Before 1.25 the default ignored container limits, a common cause of CPU throttling.
+fmt.Println(runtime.GOMAXPROCS(0)) // 0 = query without changing
 
-// ── MULTITHREADING ──────────────────────────────────────────
-// Go abstracts OS threads behind goroutines.
-// You don't manage threads — Go does.
-// M:N threading: M goroutines scheduled on N OS threads.
+// ── MULTITHREADING: the mechanism ───────────────────────────
+// M:N scheduling: many goroutines (G) multiplexed onto a few OS threads (M);
+// a thread needs a P (one per GOMAXPROCS) to run Go code.
 //
-// OS Thread (M)  ← Goroutine (G) ← Goroutine (G) ← ...
-//        ↓
-//   Processor (P) — one per GOMAXPROCS
+//   G G G G G   ← goroutines (cheap, millions possible)
+//   P P P P     ← GOMAXPROCS scheduling contexts, each with a run queue
+//   M M M M M   ← OS threads (extra ones exist while blocked in syscalls)
 ```
 
 ### Go's Approach
 
-| Concept | Traditional OS | Go |
+| Concept | OS thread | Goroutine |
 |---------|---------------|----|
-| Unit of execution | OS thread (MB stack) | Goroutine (2KB stack, growable) |
-| Creation cost | ~1MB memory, syscall | ~2KB, user-space |
-| Context switch | Kernel-mode (~1μs) | User-mode (~100ns) |
-| Communication | Shared memory + locks | Channels (prefer) + sync |
-| Scheduler | Kernel preemptive | Go runtime (cooperative + preemptive) |
+| Stack | Fixed, reserved up front (commonly 8 MB on Linux, 512 KB–1 MB elsewhere) | Starts at 2 KB, grows and shrinks by copying (max 1 GB on 64-bit) |
+| Creation | Syscall (`clone`), roughly 10 µs | User-space, well under 1 µs |
+| Context switch | Kernel, roughly 1–2 µs plus cache effects | User-space, roughly 100–200 ns |
+| Communication | Shared memory + locks | Channels and `sync` (both are idiomatic) |
+| Scheduler | Kernel, preemptive, priorities | Go runtime: work-stealing, async preemption every 10 ms, no priorities |
+
+The numbers are orders of magnitude and vary by hardware. The point is the ratio: you can afford a goroutine per connection, but not a thread per connection.
 
 ### When to Use What
 
-```go
-// ── DECISION TREE ───────────────────────────────────────────
-
-// 1. I/O-bound work (network, files, databases)
-//    → Goroutines + channels (async by design)
-//    go fetchURL(ctx, url)
-
-// 2. CPU-bound work (computation, data processing)
-//    → Goroutines + GOMAXPROCS
-//    runtime.GOMAXPROCS(runtime.NumCPU())
-//    for i := 0; i < runtime.NumCPU(); i++ {
-//        go worker(jobs)
-//    }
-
-// 3. Sequential logic with occasional blocking
-//    → Simple goroutines with select
-//    go periodicTask(ctx, interval)
-
-// 4. N-to-M communication (multiple producers, multiple consumers)
-//    → Channels (buffered)
-//    jobs := make(chan Job, 100)
-```
+| Workload | Approach |
+|---|---|
+| I/O-bound (network, DB) | A goroutine per request or connection is fine: blocked goroutines cost only memory. Bound fan-out to *downstream* services with a semaphore or `errgroup.SetLimit` |
+| CPU-bound | About `GOMAXPROCS` workers. More goroutines than cores adds scheduling overhead with no extra throughput |
+| Blocking syscalls / cgo / file I/O | Bound concurrency: each blocked call holds an OS thread (default max 10,000 threads) |
+| Producer/consumer with bursts | Buffered channel sized to the measured burst |
+| Shared state with simple updates | `sync.Mutex` or atomics, not a goroutine plus channel |
 
 ---
 
@@ -97,7 +78,7 @@
 
 ```go
 // ── Basic goroutine ─────────────────────────────────────────
-go fmt.Println("Hello from goroutine") // Simplest possible
+go fmt.Println("Hello from goroutine") // arguments are evaluated NOW, in the caller
 
 // ── Anonymous function ──────────────────────────────────────
 go func() {
@@ -105,120 +86,120 @@ go func() {
     fmt.Println("Result:", result)
 }()
 
-// ── Named function with arguments ───────────────────────────
-go processData(ctx, inputCh, outputCh)
-
-// ── Goroutine with wait ─────────────────────────────────────
+// ── Goroutines you wait for (Go 1.25+: WaitGroup.Go) ────────
 var wg sync.WaitGroup
-for i := 0; i < 10; i++ {
-    wg.Add(1)
-    go func(id int) {
-        defer wg.Done()
-        fmt.Printf("Worker %d starting\n", id)
+for i := range 10 {          // Go 1.22+: i is a new variable each iteration,
+    wg.Go(func() {           // so capturing it is safe (no `i := i`, no parameter)
+        fmt.Printf("Worker %d starting\n", i)
         time.Sleep(time.Second)
-    }(i)
+    })
 }
-wg.Wait() // Wait for ALL goroutines
+wg.Wait()
+
+// Pre-1.25 equivalent:
+//   wg.Add(1)                  // BEFORE the go statement
+//   go func() { defer wg.Done(); work(i) }()
 ```
+
+If you need the first error, cancellation of the others, or a concurrency limit, use `golang.org/x/sync/errgroup` (`g.Go`, `g.Wait`, `g.SetLimit(n)`), not a bare WaitGroup.
 
 ### Goroutine Lifecycle
 
 ```
-┌──────────┐     ┌────────────┐     ┌──────────┐     ┌───────────┐
-│ _Gidle   │────→│ _Grunnable │────→│ _Grunning │────→│ _Gdead    │
-└──────────┘     └────────────┘     └──────────┘     └───────────┘
-                       ↑                 │    ↘
-                       │                 │     ┌──────────┐
-                       │                 │     │_Gsyscall │
-                       │                 │     └──────────┘
-                       │                 │    ↗
-                       │                 │     ┌──────────┐
-                       │                 │     │_Gwaiting │
-                       │                 │     └──────────┘
-                       │                 │    ↗
-                       └─────────────────┘
+            go f()
+ _Gidle ──────────► _Grunnable ◄──────────────────────────┐
+                        │  scheduled on an M+P              │ woken (goready)
+                        ▼                                   │
+                    _Grunning ── blocks on chan/mutex/net ─► _Gwaiting
+                     │  │  │
+                     │  │  └── preempted / Gosched ───────► _Grunnable
+                     │  ▼
+                     │ _Gsyscall ── returns, gets a P ───► _Grunning
+                     │            ── no P free ───────────► _Grunnable
+                     ▼
+                  f returns ─► _Gdead (struct cached for reuse)
 ```
 
 ### Key Properties
 
 ```go
-// 1. Stack starts at ~2KB, grows as needed (up to 1GB on 64-bit)
-//    → You can have 100K+ goroutines without memory issues
+// 1. Stack starts at 2 KB (since Go 1.19 the initial size adapts to the
+//    average stack use seen so far) and grows by copying, up to 1 GB on 64-bit.
+//    → 100K goroutines ≈ a few hundred MB at most; fine for most servers.
 
-// 2. Goroutines are NOT garbage collected
-//    → You must ensure they complete or are cancelled
-//    → Leaked goroutines = memory leak that never goes away
+// 2. Goroutines are NOT garbage collected.
+//    A goroutine blocked forever keeps its stack AND everything reachable
+//    from it alive. It's a leak until the process exits.
 
-// 3. Goroutines share the same address space
-//    → Race conditions are possible (and dangerous)
-//    → Use channels or sync primitives to coordinate
+// 3. Goroutines share the address space.
+//    → Data races are possible; synchronize with channels, sync, or atomics.
 
-// 4. The go statement is a "fire and forget"
-//    → The caller doesn't wait
-//    → Use channels/WaitGroup to get results
+// 4. No handle, no return value, no ID, no way to kill one from outside.
+//    → Results come back via channels / shared memory; stopping is
+//      cooperative via context cancellation.
+
+// 5. An unrecovered panic in ANY goroutine crashes the whole process.
+//    → Recover at goroutine boundaries you own (worker loops, handlers).
 ```
 
 ### Goroutine Leaks — The #1 Mistake
 
 ```go
-// 🔴 LEAK: Goroutine blocks forever on channel send
-func leak() {
-    ch := make(chan int)  // Unbuffered
+// 🔴 LEAK: sender blocks forever when nobody receives
+func leak() int {
+    ch := make(chan int) // unbuffered
     go func() {
-        ch <- 42  // Blocks forever — no one reads!
+        ch <- compute() // blocks forever if the caller returns early
     }()
-    // Goroutine never exits
+    select {
+    case v := <-ch:
+        return v
+    case <-time.After(time.Second):
+        return -1 // caller gave up → sender is stuck for good
+    }
 }
 
-// ✅ FIX: Use context or buffered channel
-func noLeak(ctx context.Context) {
-    ch := make(chan int, 1)  // Buffered
-    go func() {
-        select {
-        case ch <- 42:
-        case <-ctx.Done():
-            return
-        }
-    }()
+// ✅ FIX: buffer of 1, so the send always completes even if nobody reads
+func noLeak() int {
+    ch := make(chan int, 1)
+    go func() { ch <- compute() }()
+    select {
+    case v := <-ch:
+        return v
+    case <-time.After(time.Second):
+        return -1 // goroutine finishes and is collected
+    }
 }
+// (Better still: pass a ctx into compute so the work itself stops.)
 
-// 🔴 LEAK: Reading from channel that never closes
+// 🔴 LEAK: ranging over a channel that is never closed
 func leakReader() {
     ch := make(chan int)
     go func() {
-        for v := range ch { // Never exits — ch never closed
+        for v := range ch { // waits forever after the last value
             fmt.Println(v)
         }
     }()
     ch <- 1
-    // ch is never closed, goroutine runs forever
 }
 
-// ✅ FIX: Close the channel when done, or use done channel
+// ✅ FIX: the sender closes when done (and/or the reader also selects on ctx.Done())
 func noLeakReader() {
     ch := make(chan int)
     done := make(chan struct{})
-    
     go func() {
-        defer fmt.Println("reader exited")
-        for {
-            select {
-            case v, ok := <-ch:
-                if !ok {
-                    return // Channel closed
-                }
-                fmt.Println(v)
-            case <-done:
-                return // Cancelled
-            }
+        defer close(done)
+        for v := range ch {
+            fmt.Println(v)
         }
     }()
-    
     ch <- 1
-    close(ch)
-    // Reader exits because range loop ends
+    close(ch) // range ends after draining
+    <-done    // optional: wait for the reader to finish
 }
 ```
+
+Finding leaks: the goroutine count over time (`runtime.NumGoroutine`, `/sched/goroutines:goroutines`), `pprof` `goroutine?debug=1` grouped by stack, `go.uber.org/goleak` in tests, and *(Go 1.27)* the **`goroutineleak` profile** (`/debug/pprof/goroutineleak`). That profile uses the GC to report goroutines blocked on channels or locks that no runnable goroutine can still reach.
 
 ---
 
@@ -235,6 +216,7 @@ func noLeakReader() {
 //     buf      unsafe.Pointer // Circular buffer
 //     elemsize uint16         // Element size
 //     closed   uint32         // 0 = open, 1 = closed
+//     timer    *timer         // Go 1.23+: set for time.Timer/Ticker channels
 //     elemtype *_type
 //     sendx    uint           // Send index in circular buffer
 //     recvx    uint           // Receive index in circular buffer
@@ -246,39 +228,41 @@ func noLeakReader() {
 // ── Creating channels ───────────────────────────────────────
 
 // Unbuffered: synchronous — send blocks until someone receives
-ch := make(chan int)
+unbuf := make(chan int)
 
 // Buffered: asynchronous — send blocks only when buffer is full
-ch := make(chan int, 100)
+buf := make(chan int, 100)
 
 // Directional channels (compile-time enforced):
 var sendOnly chan<- int  // Can only send
 var recvOnly <-chan int  // Can only receive
 
-// Convert bidirectional to directional:
+// Bidirectional converts implicitly to either direction:
 ch := make(chan int)
 var out chan<- int = ch  // OK
 var in <-chan int = ch   // OK
-// ch2 := make(chan<- int) // Can't convert back to bidirectional!
+// The reverse is a compile error: you can't turn `in` back into a chan int.
+// (make(chan<- int) compiles, but a send-only channel nobody can receive from is useless.)
 ```
 
 ### Channel Operations
 
 ```go
 // ── SEND ────────────────────────────────────────────────────
-ch <- value  // Blocks until:
-             // - Unbuffered: a receiver is ready
-             // - Buffered: buffer has space
-             // - Never on a nil channel (blocks forever)
-             // - Panics on a closed channel
+ch <- value  // Unbuffered: blocks until a receiver takes it
+             // Buffered:   blocks only while the buffer is full
+             // nil channel: blocks forever
+             // closed channel: PANICS
 
 // ── RECEIVE ─────────────────────────────────────────────────
-value := <-ch         // Blocks until data available
-value, ok := <-ch     // ok == false when channel is closed AND empty
+value := <-ch         // Blocks until data available (nil channel: forever)
+value, ok := <-ch     // ok == false only when the channel is closed AND drained
 
 // ── CLOSE ───────────────────────────────────────────────────
-close(ch)  // Panics if already closed
-// After close: receives succeed (draining), sends panic
+close(ch)  // Panics if already closed (or nil)
+// After close: buffered values are still delivered, then receives return
+// the zero value immediately with ok == false; sends panic.
+// len(ch) / cap(ch) report buffered count / capacity (racy snapshot, for metrics only).
 
 // ── NIL CHANNEL ─────────────────────────────────────────────
 var ch chan int  // nil
@@ -297,7 +281,7 @@ func unbuffered() {
     
     go func() {
         ch <- 42  // Will block until main goroutine receives
-        fmt.Println("Sent!") // Only runs AFTER receive
+        fmt.Println("Sent!") // runs only after the receiver has taken the value
     }()
     
     time.Sleep(time.Second) // Simulate work
@@ -336,7 +320,7 @@ func handler(requests <-chan Request) {
 
 // ── ZERO-SIZE CHANNEL (signaling only) ──────────────────────
 // Use: signal events (no data needed)
-done := make(chan struct{}) // struct{} is zero bytes
+var done = make(chan struct{}) // struct{} is zero bytes
 // close(done) signals — all receivers get zero value immediately
 ```
 
@@ -463,9 +447,12 @@ func sink(ctx context.Context, in <-chan int) {
 ### Closing Channels — Rules & Patterns
 
 ```go
-// ── RULE: The sender should close the channel ───────────────
-// Never close from the receiver side.
-// Closing a channel is a signal: "no more data"
+// ── RULE: The sender closes, never the receiver ─────────────
+// Closing means "no more values". Only the side that knows that (the sender)
+// can close safely; a receiver closing would make a still-running sender panic.
+// Many senders → a coordinator closes after ALL of them finish (wg.Wait(); close(ch)).
+// You don't HAVE to close: an unreachable channel is garbage-collected. Close
+// only when receivers need the "done" signal (range loops, broadcast).
 
 // ── PATTERN: Deferred close ─────────────────────────────────
 func producer(out chan<- int) {
@@ -488,122 +475,64 @@ func (s *SafeClose) Close() {
     })
 }
 
-// ── PATTERN: Nil channel to disable select cases ───────────
-func multiplex(ctx context.Context, in1, in2 <-chan int) <-chan int {
-    out := make(chan int)
-    go func() {
-        defer close(out)
-        
-        // Set both channels to their initial values
-        ch1, ch2 := in1, in2
-        var v1, v2 int
-        var ok1, ok2 bool
-        
-        for {
-            select {
-            case v1, ok1 = <-ch1:
-                // Got value from ch1
-                if !ok1 {
-                    ch1 = nil // Disable this case forever
-                    if ch2 == nil {
-                        return // Both channels done
-                    }
-                    continue
-                }
-            case v2, ok2 = <-ch2:
-                if !ok2 {
-                    ch2 = nil
-                    if ch1 == nil {
-                        return
-                    }
-                    continue
-                }
-            }
-            
-            // Send to output (but don't block)
-            select {
-            case out <- v1:
-            case out <- v2:
-            case <-ctx.Done():
-                return
-            }
-        }
-    }()
-    return out
-}
+// ── PATTERN: "close once" with many potential closers ───────
+// If several goroutines might close, that's usually a design smell: prefer ONE
+// owner, or signal with a context instead. The Once above is the fallback.
+// (Merging channels with the nil-channel trick is shown in Section 6.)
 ```
 
 ### Ring Buffer Channel (Bounded Queue)
 
+A buffered channel **already is** a bounded FIFO ring buffer, safe for many senders and receivers. When full, it blocks the sender (backpressure). Build your own only when you need *different* full-buffer behaviour. The common case is **drop-oldest**: telemetry, "latest N events", UI updates.
+
 ```go
-type RingChannel[T any] struct {
-    buf    []T
-    head   int
-    tail   int
-    count  int
-    cap    int
-    sendCh chan T
-    recvCh chan T
-    done   chan struct{}
-    mu     sync.Mutex
-    notFull  *sync.Cond
-    notEmpty *sync.Cond
+// Drop-oldest ring: Push never blocks; when full it overwrites the oldest item.
+type Ring[T any] struct {
+    mu      sync.Mutex
+    buf     []T
+    head, n int // index of oldest item, number of items
+    dropped int
 }
 
-func NewRingChannel[T any](capacity int) *RingChannel[T] {
-    rc := &RingChannel[T]{
-        buf:    make([]T, capacity),
-        cap:    capacity,
-        sendCh: make(chan T),
-        recvCh: make(chan T),
-        done:   make(chan struct{}),
+func NewRing[T any](capacity int) *Ring[T] { return &Ring[T]{buf: make([]T, capacity)} }
+
+func (r *Ring[T]) Push(v T) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    if r.n == len(r.buf) { // full: overwrite oldest, advance head
+        r.buf[r.head] = v
+        r.head = (r.head + 1) % len(r.buf)
+        r.dropped++
+        return
     }
-    rc.notFull = sync.NewCond(&rc.mu)
-    rc.notEmpty = sync.NewCond(&rc.mu)
-    go rc.run()
-    return rc
+    r.buf[(r.head+r.n)%len(r.buf)] = v
+    r.n++
 }
 
-func (rc *RingChannel[T]) run() {
-    for {
-        rc.mu.Lock()
-        for rc.count == 0 {
-            rc.notEmpty.Wait() // Block until not empty
-        }
-        
-        val := rc.buf[rc.head]
-        rc.head = (rc.head + 1) % rc.cap
-        rc.count--
-        
-        rc.notFull.Signal() // Wake up blocked senders
-        rc.mu.Unlock()
-        
-        select {
-        case rc.recvCh <- val:
-        case <-rc.done:
-            return
-        }
+func (r *Ring[T]) Pop() (T, bool) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    var zero T
+    if r.n == 0 {
+        return zero, false
     }
+    v := r.buf[r.head]
+    r.buf[r.head] = zero // don't keep a reference alive for the GC
+    r.head = (r.head + 1) % len(r.buf)
+    r.n--
+    return v, true
 }
 
-func (rc *RingChannel[T]) Send(val T) {
-    rc.mu.Lock()
-    for rc.count == rc.cap {
-        rc.notFull.Wait() // Block until not full
-    }
-    rc.buf[rc.tail] = val
-    rc.tail = (rc.tail + 1) % rc.cap
-    rc.count++
-    rc.notEmpty.Signal()
-    rc.mu.Unlock()
-}
+// Push 1..5 into NewRing[int](3), then Pop until empty → 3 4 5 (dropped = 2)
+```
 
-func (rc *RingChannel[T]) Receive() T {
-    return <-rc.recvCh
-}
+A "drop-newest" policy is even simpler with a plain channel:
 
-func (rc *RingChannel[T]) Close() {
-    close(rc.done)
+```go
+select {
+case ch <- v:
+default:
+    droppedTotal.Add(1) // buffer full: shed load instead of blocking
 }
 ```
 
@@ -712,7 +641,7 @@ func (w *Worker) Stop() {
 
 func (w *Worker) execute(job Job) Result {
     // ... process job
-    return Result{WorkerID: w.ID, JobID: job.ID, Output: "done"}
+    return Result{TaskID: job.ID, Output: fmt.Sprintf("done by worker %d", w.ID)}
 }
 
 // ── Dispatcher manages the pool ─────────────────────────────
@@ -742,7 +671,8 @@ func (d *Dispatcher) Start(ctx context.Context) {
     // Distribute jobs to workers
     go func() {
         for job := range d.jobQueue {
-            // Round-robin or use select across workers
+            // Static assignment by ID: simple, but one slow job blocks every
+            // later job routed to the same worker (head-of-line blocking).
             worker := d.workers[job.ID%d.maxWorkers]
             select {
             case worker.JobQueue <- job:
@@ -779,8 +709,8 @@ func NewService() *Service {
 }
 
 func (s *Service) loop() {
-    // Wait until ready
-    close(s.readyCh)
+    // ... initialization that must finish before requests are served ...
+    close(s.readyCh) // signal readiness to every WaitReady caller at once
     
     for {
         select {
@@ -792,8 +722,15 @@ func (s *Service) loop() {
     }
 }
 
-func (s *Service) Handle(req Request) {
-    s.requestCh <- req
+func (s *Service) Handle(ctx context.Context, req Request) error {
+    select {
+    case s.requestCh <- req:
+        return nil
+    case <-s.stopCh: // without this, callers block forever after Stop
+        return errors.New("service stopped")
+    case <-ctx.Done():
+        return ctx.Err()
+    }
 }
 
 func (s *Service) WaitReady() {
@@ -804,6 +741,8 @@ func (s *Service) Stop() {
     close(s.stopCh)
 }
 ```
+
+**Design note:** per-worker queues plus a dispatcher are rarely better than the simplest pool: N workers all ranging over **one shared** `jobs` channel. The runtime then hands each job to whichever worker is free, with no head-of-line blocking and no dispatcher goroutine (see [Worker Pool](#worker-pool)). Use per-worker queues only when a job *must* go to a particular worker, for example to keep per-key ordering. Shard by key then, not by round-robin.
 
 ### Immutable Structs Through Channels
 
@@ -875,6 +814,8 @@ func (c *Counter) run(state CounterState) {
             resp <- state.Value()
         }
     }
+    // Production version: add `case <-ctx.Done(): return` so the actor can be
+    // stopped; as written, this goroutine lives for the life of the process.
 }
 
 func (c *Counter) Increment() {
@@ -891,6 +832,8 @@ func (c *Counter) Value() int64 {
     return <-resp
 }
 ```
+
+Trade-off: the actor style removes locks from *your* code, but every operation goes through a channel, and every query is a round trip with a goroutine switch. On one Apple M5 machine with Go 1.27 and 10 goroutines contending, the costs per operation were: actor increment about 127 ns, actor `Value()` about 267 ns (plus one allocation for the reply channel), mutex increment about 77 ns, `atomic.Int64.Add` about 35 ns. Use an actor when the state is complex and the operations are coarse, or when you need ordering and serialization, not for a counter.
 
 ---
 
@@ -919,9 +862,17 @@ default:
 select {
 case v := <-ch:
     fmt.Println("Got:", v)
-case <-time.After(5 * time.Second):
-    fmt.Println("Timeout waiting for data")
+case <-time.After(5 * time.Second): // fine for a one-off wait; Go 1.23+ collects the
+    fmt.Println("Timeout waiting for data") // timer once unreferenced, even if it never fired
 }
+// Usually better: a ctx with a deadline, so the timeout propagates to callees too.
+
+// ── Rules worth knowing ─────────────────────────────────────
+// • If several cases are ready, one is chosen uniformly at random (no priority,
+//   no source order); this prevents starvation.
+// • All channel expressions and send values are evaluated ONCE, on entry,
+//   even for cases that aren't chosen.
+// • select {} blocks forever; a select with only nil channels and no default too.
 
 // ── Select with send and receive ────────────────────────────
 select {
@@ -1000,7 +951,8 @@ func prioritySelect(ctx context.Context, high, low <-chan int) <-chan int {
             default:
                 // No high priority — try low
                 select {
-                case v := <-high: // Check high again (can't starve low)
+                case v := <-high: // both ready → random pick, so this is
+                                  // best-effort priority, not strict
                     select {
                     case out <- v:
                     case <-ctx.Done():
@@ -1029,77 +981,66 @@ func prioritySelect(ctx context.Context, high, low <-chan int) <-chan int {
 ### sync.WaitGroup
 
 ```go
-// ── WaitGroup — wait for goroutines to complete ─────────────
+// ── WaitGroup: wait for a known set of goroutines ───────────
 func processBatch(items []Item) []Result {
+    results := make([]Result, len(items)) // each goroutine writes its own index: no lock needed
     var wg sync.WaitGroup
-    results := make([]Result, len(items))
-    
-    for i, item := range items {
-        wg.Add(1)
-        go func(idx int, it Item) {
-            defer wg.Done()
-            results[idx] = process(it)
-        }(i, item)
+    for i, it := range items {
+        wg.Go(func() { results[i] = process(it) }) // Go 1.25+; i and it are per-iteration (1.22+)
     }
-    
-    wg.Wait() // Blocks until all Done() calls
+    wg.Wait()
     return results
 }
 
-// ── Common mistake: Add after goroutine starts ──────────────
-// 🔴 BAD
-go func() {
-    wg.Add(1) // Race condition — main might reach wg.Wait() before this runs
-    defer wg.Done()
-    doWork()
-}()
-
-// ✅ GOOD
-wg.Add(1)
-go func() {
-    defer wg.Done()
-    doWork()
-}()
-
-// ── WaitGroup with error collection ─────────────────────────
-type ErrorGroup struct {
-    mu     sync.Mutex
-    errors []error
-}
-
-func (eg *ErrorGroup) Add(err error) {
-    if err != nil {
-        eg.mu.Lock()
-        eg.errors = append(eg.errors, err)
-        eg.mu.Unlock()
-    }
-}
-
-func (eg *ErrorGroup) Err() error {
-    eg.mu.Lock()
-    defer eg.mu.Unlock()
-    if len(eg.errors) == 0 {
-        return nil
-    }
-    return fmt.Errorf("%d errors: %v", len(eg.errors), eg.errors)
-}
-
-func parallelWork(items []string) error {
-    var wg sync.WaitGroup
-    var eg ErrorGroup
-    
-    for _, item := range items {
+// ── Pre-1.25 form and its classic bug ───────────────────────
+func bad(wg *sync.WaitGroup) {
+    // 🔴 Add inside the goroutine: Wait may run before Add and return early
+    go func() {
         wg.Add(1)
-        go func(s string) {
-            defer wg.Done()
-            if err := process(s); err != nil {
-                eg.Add(err)
+        defer wg.Done()
+        doWork()
+    }()
+}
+
+func good(wg *sync.WaitGroup) {
+    // ✅ Add before the go statement (or just use wg.Go)
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        doWork()
+    }()
+}
+// go vet's `waitgroup` analyzer (Go 1.25) reports the bad form.
+
+// ── Collecting errors ───────────────────────────────────────
+// All errors: a mutex-protected slice, then errors.Join (Go 1.20).
+func parallelWork(items []string) error {
+    var (
+        wg   sync.WaitGroup
+        mu   sync.Mutex
+        errs []error
+    )
+    for _, item := range items {
+        wg.Go(func() {
+            if err := processOne(item); err != nil {
+                mu.Lock()
+                errs = append(errs, fmt.Errorf("%s: %w", item, err))
+                mu.Unlock()
             }
-        }(item)
+        })
     }
-    
     wg.Wait()
-    return eg.Err()
+    return errors.Join(errs...) // nil if errs is empty; errors.Is/As see every entry
+}
+
+// First error + cancel the rest + limit concurrency: errgroup.
+func fetchAll(ctx context.Context, urls []string) error {
+    g, ctx := errgroup.WithContext(ctx) // golang.org/x/sync/errgroup
+    g.SetLimit(8)                       // at most 8 in flight
+    for _, u := range urls {
+        g.Go(func() error { return fetch(ctx, u) }) // ctx is cancelled on the first error
+    }
+    return g.Wait()
 }
 ```
 
@@ -1142,56 +1083,76 @@ func (c *SafeCache) Set(key string, value any) {
     c.data[key] = value
 }
 
+// RWMutex helps only when reads dominate AND hold the lock for a while.
+// Every RLock/RUnlock is an atomic op on a shared counter, so with tiny
+// critical sections on many cores a plain Mutex is often as fast or faster.
+// Benchmark before choosing. Neither lock is reentrant: RLock while holding
+// Lock (or Lock while holding RLock) on the same mutex deadlocks.
+
 // ── Deadlock example ────────────────────────────────────────
-// 🔴 BAD: Lock ordering inconsistency
+// 🔴 BAD: lock ordering depends on argument order
 type Account struct {
-    mu    sync.Mutex
-    balance float64
+    ID      int64
+    mu      sync.Mutex
+    balance int64 // cents: never use float64 for money
 }
 
-func Transfer(a, b *Account, amount float64) {
+func Transfer(a, b *Account, amount int64) {
     a.mu.Lock()
+    defer a.mu.Unlock()
     b.mu.Lock()
+    defer b.mu.Unlock()
     a.balance -= amount
     b.balance += amount
-    a.mu.Unlock()
-    b.mu.Unlock()
 }
-// If goroutine 1 calls Transfer(acctA, acctB, 100)
-// and goroutine 2 calls Transfer(acctB, acctA, 50)
-// → DEADLOCK! Each holds one lock, waiting for the other.
+// Goroutine 1: Transfer(x, y, 100) holds x, wants y
+// Goroutine 2: Transfer(y, x, 50)  holds y, wants x  → DEADLOCK
+// (The runtime only reports deadlock when EVERY goroutine is blocked;
+//  in a server the two just hang silently.)
 
-// ✅ GOOD: Consistent lock ordering (by memory address)
-func SafeTransfer(a, b *Account, amount float64) {
-    // Always lock the lower address first
-    aPtr := uintptr(unsafe.Pointer(a))
-    bPtr := uintptr(unsafe.Pointer(b))
-    
-    if aPtr < bPtr {
-        a.mu.Lock()
-        b.mu.Lock()
-    } else {
-        b.mu.Lock()
-        a.mu.Lock()
+// ✅ GOOD: a global lock order on a stable key
+func SafeTransfer(a, b *Account, amount int64) {
+    if a == b {
+        return // locking the same mutex twice would self-deadlock
     }
-    
+    first, second := a, b
+    if b.ID < a.ID {
+        first, second = b, a
+    }
+    first.mu.Lock()
+    defer first.mu.Unlock()
+    second.mu.Lock()
+    defer second.mu.Unlock()
     a.balance -= amount
     b.balance += amount
-    
-    if aPtr < bPtr {
-        b.mu.Unlock()
-        a.mu.Unlock()
-    } else {
-        a.mu.Unlock()
-        b.mu.Unlock()
-    }
 }
+// Order by a stable ID, not by pointer address: addresses are stable for heap
+// objects in today's runtime, but an ID is explicit and survives refactors.
 ```
+
+**Mutex internals worth knowing:** a fast path that is one CAS. Then brief spinning on multicore. Then the goroutine parks on a runtime semaphore. If a waiter has waited more than 1 ms, the mutex enters **starvation mode** and hands ownership directly to the oldest waiter (FIFO), trading throughput for bounded tail latency. Don't copy a struct containing a `Mutex` after first use. `go vet`'s `copylocks` check catches most cases, such as value receivers and passing by value.
 
 ### sync.Once
 
 ```go
-// ── sync.Once — run initialization exactly once ─────────────
+// ── Lazy init with an error: OnceValues (Go 1.21) ───────────
+var getDB = sync.OnceValues(func() (*sql.DB, error) {
+    db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+    if err != nil {
+        return nil, err
+    }
+    // sql.Open doesn't connect; Ping does. Note the error is cached FOREVER:
+    // a transient failure at startup is never retried.
+    return db, db.Ping()
+})
+
+func handler() {
+    db, err := getDB() // first caller runs the func; everyone else waits, then reuses the result
+    _ = db
+    _ = err
+}
+
+// ── Classic form ────────────────────────────────────────────
 type Singleton struct {
     once     sync.Once
     instance *ExpensiveDB
@@ -1199,110 +1160,81 @@ type Singleton struct {
 }
 
 func (s *Singleton) Get() (*ExpensiveDB, error) {
-    s.once.Do(func() {
-        s.instance, s.err = NewExpensiveDB()
-    })
+    s.once.Do(func() { s.instance, s.err = NewExpensiveDB() })
     return s.instance, s.err
 }
-
-// ── Lazy singleton with error ───────────────────────────────
-var (
-    connOnce sync.Once
-    conn     *sql.DB
-    connErr  error
-)
-
-func GetConnection() (*sql.DB, error) {
-    connOnce.Do(func() {
-        conn, connErr = sql.Open("postgres", os.Getenv("DATABASE_URL"))
-    })
-    return conn, connErr
-}
+// If f panics, Once considers it done (later calls do nothing); OnceFunc/OnceValue
+// re-panic with the same value on every call. Calling once.Do from inside f deadlocks.
+// If you need "retry until success", use a mutex + a done flag instead of Once.
 ```
 
 ### sync.Cond
 
 ```go
-// ── Condition Variable — signal/wait pattern ────────────────
+// ── Condition variable: wait until a predicate becomes true ─
 type Queue struct {
-    items []int
+    mu    sync.Mutex
     cond  *sync.Cond
+    items []int
 }
 
 func NewQueue() *Queue {
-    return &Queue{
-        cond: sync.NewCond(&sync.Mutex{}),
-    }
+    q := &Queue{}
+    q.cond = sync.NewCond(&q.mu)
+    return q
 }
 
 func (q *Queue) Enqueue(item int) {
-    q.cond.L.Lock()
+    q.mu.Lock()
     q.items = append(q.items, item)
-    q.cond.L.Unlock()
-    q.cond.Signal() // Wake one waiting goroutine
+    q.mu.Unlock()
+    q.cond.Signal() // wake one waiter (signalling after Unlock is allowed)
 }
 
 func (q *Queue) Dequeue() int {
-    q.cond.L.Lock()
-    defer q.cond.L.Unlock()
-    
-    for len(q.items) == 0 {
-        q.cond.Wait() // Release lock and sleep
+    q.mu.Lock()
+    defer q.mu.Unlock()
+    for len(q.items) == 0 { // ALWAYS a loop: wake-ups can be spurious or stolen
+        q.cond.Wait()       // atomically unlocks, sleeps, re-locks
     }
-    
     item := q.items[0]
     q.items = q.items[1:]
     return item
 }
 
-// ── Broadcast — wake all waiters ───────────────────────────
-// q.cond.Broadcast() // Used for "all hands" events like shutdown
+// Broadcast wakes all waiters (state changes that every waiter must re-check).
 ```
+
+`Cond` has two big limitations: `Wait` can't be combined with a timeout, `select`, or `ctx.Done()`, and missed signals are easy to cause. In most Go code, a channel (or a mutex plus a channel that is closed and replaced on each state change) is the better choice. `Cond` earns its place with many waiters and a rapidly changing predicate.
 
 ### sync.Pool
 
 ```go
-// ── Object Pool — reduce GC pressure ────────────────────────
+// ── Object pool: reuse short-lived scratch objects ──────────
 var bufferPool = sync.Pool{
-    New: func() any {
-        return new(bytes.Buffer)
-    },
+    New: func() any { return new(bytes.Buffer) },
 }
 
-func processRequest(data []byte) string {
+func render(data []byte) string {
     buf := bufferPool.Get().(*bytes.Buffer)
     buf.Reset()
-    defer bufferPool.Put(buf)
-    
-    buf.Write(data)
-    // ... processing
-    return buf.String()
-}
-
-// ── Pool for expensive structs ──────────────────────────────
-type LargeStruct struct {
-    Data [1024]byte
-    Meta map[string]any
-}
-
-var largePool = sync.Pool{
-    New: func() any {
-        return &LargeStruct{
-            Meta: make(map[string]any, 16),
+    defer func() {
+        if buf.Cap() <= 64<<10 { // don't let one huge request pin a huge buffer forever
+            bufferPool.Put(buf)
         }
-    },
-}
-
-func GetLarge() *LargeStruct {
-    return largePool.Get().(*LargeStruct)
-}
-
-func PutLarge(s *LargeStruct) {
-    // Reset before returning
-    clear(s.Meta) // Go 1.21+
-    largePool.Put(s)
+    }()
+    buf.Write(data)
+    // ... processing ...
+    return buf.String() // String() copies, so it's safe to reuse buf afterwards
 }
 ```
+
+How it behaves:
+- Per-P local caches make Get/Put nearly contention-free.
+- Pooled objects are **dropped across GC cycles**: a victim cache keeps them for one more cycle. So a pool is a cache of *garbage*, not a resource pool. Never pool connections or files.
+- Reset objects before reuse, and never use an object after `Put`: another goroutine may already own it.
+- Put pointers (`*bytes.Buffer`), not values. Putting a slice or struct value boxes it into `any`, which allocates and defeats the purpose (staticcheck SA6002).
+- Measure. For small objects the allocator is fast, and a pool adds complexity for little gain.
 
 ---
 
@@ -1333,33 +1265,40 @@ func isReady() bool {
     return ready.Load()
 }
 
-// ── Compare and swap (CAS) ─────────────────────────────────
-var value atomic.Int64
+// ── Compare and swap (CAS): read-modify-write for logic Add can't express ──
+var peak atomic.Int64
 
-func tryIncrement() bool {
+func recordPeak(v int64) {
     for {
-        old := value.Load()
-        if value.CompareAndSwap(old, old+1) {
-            return true
+        old := peak.Load()
+        if v <= old || peak.CompareAndSwap(old, v) {
+            return // not a new max, or we installed it
         }
-        // CAS failed — someone else changed it, retry
+        // CAS failed: another goroutine changed peak; reload and retry
     }
 }
+// (For plain increments use Add: one instruction, no retry loop.)
 
-// ── Atomic pointer — lock-free read cache ───────────────────
+// ── Atomic pointer: lock-free reads of an immutable snapshot ──
 type Config struct {
-    mu     sync.Mutex
-    config atomic.Pointer[ConfigData]
+    mu  sync.Mutex // serializes WRITERS only (read-modify-write updates)
+    cur atomic.Pointer[ConfigData]
 }
 
-func (c *Config) Get() ConfigData {
-    return *c.config.Load() // Lock-free read!
+func NewConfig(initial ConfigData) *Config {
+    c := &Config{}
+    c.cur.Store(&initial) // Load would return nil before the first Store
+    return c
 }
 
-func (c *Config) Update(data ConfigData) {
+func (c *Config) Get() *ConfigData { return c.cur.Load() } // treat as read-only!
+
+func (c *Config) Update(mutate func(*ConfigData)) {
     c.mu.Lock()
     defer c.mu.Unlock()
-    c.config.Store(&data) // Atomic pointer swap
+    next := *c.cur.Load() // copy (deep-copy any maps/slices you will modify)
+    mutate(&next)
+    c.cur.Store(&next) // readers see the old or the new snapshot, never a mix
 }
 ```
 
@@ -1377,13 +1316,13 @@ type node[T any] struct {
 }
 
 func (s *LockFreeStack[T]) Push(value T) {
-    new := &node[T]{value: value}
+    n := &node[T]{value: value}
     for {
-        new.next = s.top.Load()
-        if s.top.CompareAndSwap(new.next, new) {
-            return // Success!
+        n.next = s.top.Load()
+        if s.top.CompareAndSwap(n.next, n) {
+            return
         }
-        // CAS failed — retry with updated top
+        // CAS failed: top changed under us; retry
     }
 }
 
@@ -1397,18 +1336,23 @@ func (s *LockFreeStack[T]) Pop() (T, bool) {
         if s.top.CompareAndSwap(old, old.next) {
             return old.value, true
         }
-        // CAS failed — retry
+        // CAS failed: retry
     }
 }
 ```
 
+Why this is safe in Go but subtle in C: the classic **ABA problem** is that a node is popped, freed and *reused at the same address* while another thread's CAS still holds the old pointer. That can't happen here, because the GC never frees or reuses a node while any goroutine holds a reference to it. Two other caveats: lock-free is not automatically faster, since under contention every failed CAS is wasted work and cache-line traffic. And a mutex-protected slice is often quicker and easier to make correct. Benchmark before choosing.
+
 ### Memory Ordering
 
 ```go
-// ── Go uses sequentially consistent atomics ─────────────────
-// This means all goroutines see atomic operations in the same order.
-// On x86: MOV instruction (cheap)
-// On ARM: LDAR/STLR instructions (more expensive)
+// ── Go's atomics are sequentially consistent (memory model, Go 1.19) ──
+// All goroutines observe all atomic operations in one global order.
+// x86-64: loads are plain MOV (TSO already gives acquire); stores use XCHG
+//         (an implicit full fence), so atomic STORES are the expensive part.
+// ARM64:  LDAR / STLR; read-modify-write uses LSE atomics (LDADDAL, CASAL)
+//         when available.
+// There are no relaxed/acquire-only variants in Go, by design.
 
 // ── Happens-before with atomics ─────────────────────────────
 var data atomic.Pointer[LargeData]
@@ -1421,13 +1365,19 @@ func writer() {
 
 // Goroutine 2: reader
 func reader() {
-    d := data.Load() // Load happens AFTER the Store that set this value
-    fmt.Println(d.Value) // Guaranteed to see `d` fully initialized
+    d := data.Load()
+    if d == nil {
+        return // not published yet
+    }
+    fmt.Println(d.Value) // the Store is synchronized before this Load, so
+                         // everything computeExpensive wrote is visible
 }
 
 // ── This is the "publication" pattern ───────────────────────
-// atomic Store = "publish" (acts as release barrier)
-// atomic Load = "subscribe" (acts as acquire barrier)
+// atomic Store = publish (at least release semantics)
+// atomic Load  = subscribe (at least acquire semantics)
+// It also works with a plain atomic.Bool flag guarding ordinary writes, as
+// long as nothing writes those fields after the flag is set.
 ```
 
 ---
@@ -1450,15 +1400,16 @@ func reader() {
 //              │                   │
 //           value              withDeadline
 
-// ── Parent cancels → all children cancel ────────────────────
+// ── Parent cancels → all children cancel (never the reverse) ──
 func handle(ctx context.Context) error {
-    // Create child with timeout
+    // The child's deadline is min(parent deadline, now+5s).
     childCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-    defer cancel() // Must call to avoid leak!
-    
+    defer cancel() // releases the timer and unlinks the child from the parent
     return process(childCtx)
 }
 ```
+
+Useful additions (Go 1.20–1.21): `WithCancelCause` / `context.Cause(ctx)` to record *why* something was cancelled. `WithTimeoutCause`. `AfterFunc(ctx, f)` runs `f` once ctx is done, without you spawning a watcher goroutine. `WithoutCancel(ctx)` keeps values but drops cancellation, for work that must outlive the request.
 
 ### Propagation Patterns
 
@@ -1531,43 +1482,29 @@ func fanOutWithContext[T any](ctx context.Context, in <-chan T, workers int) []<
 
 ```go
 func main() {
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-    
-    // Handle SIGINT/SIGTERM
-    sigCh := make(chan os.Signal, 1)
-    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-    
-    go func() {
-        <-sigCh
-        fmt.Println("Shutting down...")
-        cancel() // Cancel ALL goroutines
-    }()
-    
-    // Start workers — they all receive cancellation
+    // ctx is cancelled on the first SIGINT/SIGTERM; stop() restores default
+    // handling, so a second Ctrl-C kills the process immediately.
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+
     results := make(chan Result)
     var wg sync.WaitGroup
-    
-    for i := 0; i < 10; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            worker(ctx, id, results)
-        }(i)
+    for id := range 10 {
+        wg.Go(func() { runWorker(ctx, id, results) }) // must return when ctx is done
     }
-    
-    // Wait for graceful shutdown
     go func() {
         wg.Wait()
-        close(results)
+        close(results) // only after every sender has exited
     }()
-    
-    // Process results until cancelled
-    for r := range results {
+
+    for r := range results { // ends once all workers have stopped
         fmt.Println(r)
     }
+    fmt.Println("shut down cleanly")
 }
 ```
+
+Put a time bound on the drain in real services: after cancellation, wait for `wg` with a deadline and exit anyway if it passes. In Kubernetes the kill (SIGKILL) arrives `terminationGracePeriodSeconds` after SIGTERM, 30 s by default.
 
 ---
 
@@ -1576,102 +1513,82 @@ func main() {
 ### Worker Pool
 
 ```go
-// ── Generalized worker pool ─────────────────────────────────
-func WorkerPool[T, U any](
-    ctx context.Context,
-    jobs []T,
-    workers int,
-    process func(context.Context, T) (U, error),
-) ([]U, error) {
-    if workers <= 0 {
-        workers = runtime.NumCPU()
-    }
-    if workers > len(jobs) {
-        workers = len(jobs)
-    }
-    
-    jobCh := make(chan T, len(jobs))
-    resultCh := make(chan struct {
-        idx int
-        val U
-        err error
-    }, len(jobs))
-    
-    // Send all jobs
-    for _, job := range jobs {
-        jobCh <- job
-    }
-    close(jobCh)
-    
-    // Start workers
+// ── Bounded concurrency, results in input order, fail fast ──
+func WorkerPool[T, U any](ctx context.Context, jobs []T, workers int,
+    process func(context.Context, T) (U, error)) ([]U, error) {
+    ctx, cancel := context.WithCancelCause(ctx)
+    defer cancel(nil)
+
+    results := make([]U, len(jobs)) // each index written by exactly one worker: no lock
+    idx := make(chan int)           // send INDEXES, so results keep input order
     var wg sync.WaitGroup
-    for i := 0; i < workers; i++ {
-        wg.Add(1)
+    for range max(1, min(workers, len(jobs))) {
+        wg.Go(func() {
+            for i := range idx {
+                v, err := process(ctx, jobs[i])
+                if err != nil {
+                    cancel(err) // first error wins; stops the feeder and other workers
+                    return
+                }
+                results[i] = v
+            }
+        })
+    }
+feed:
+    for i := range jobs {
+        select {
+        case idx <- i:
+        case <-ctx.Done():
+            break feed // error or caller cancellation: stop handing out work
+        }
+    }
+    close(idx)
+    wg.Wait()
+    if err := context.Cause(ctx); err != nil { // the worker's error, or the parent's ctx error
+        return nil, err
+    }
+    return results, nil
+}
+
+// results, err := WorkerPool(ctx, []int{1, 2, 3, 4, 5}, 3, square) → [1 4 9 16 25] <nil>
+// If any job fails: nil, <that job's error> (verified with go test -race)
+```
+
+The same thing with `errgroup`: `g, ctx := errgroup.WithContext(ctx)`, `g.SetLimit(workers)`, then `g.Go` per job writing to `results[i]`. It's shorter and well-tested, so prefer it in real code. Sizing: about `GOMAXPROCS` workers for CPU-bound jobs. For I/O-bound jobs, size by what the **downstream** can take (DB pool size, the partner API's rate limit), not by core count.
+
+### Pipeline Pattern
+
+```go
+// ── A stage is a function from an input channel to an output channel ──
+type Stage[T any] func(context.Context, <-chan T) <-chan T
+
+func Compose[T any](stages ...Stage[T]) Stage[T] {
+    return func(ctx context.Context, in <-chan T) <-chan T {
+        for _, s := range stages {
+            in = s(ctx, in) // each stage's output feeds the next
+        }
+        return in
+    }
+}
+
+// MapStage lifts a plain function into a cancellable stage.
+func MapStage[T any](f func(T) T) Stage[T] {
+    return func(ctx context.Context, in <-chan T) <-chan T {
+        out := make(chan T)
         go func() {
-            defer wg.Done()
-            for job := range jobCh {
-                val, err := process(ctx, job)
+            defer close(out)
+            for v := range in {
                 select {
-                case resultCh <- struct {
-                    idx int
-                    val U
-                    err error
-                }{val: val, err: err}:
+                case out <- f(v):
                 case <-ctx.Done():
                     return
                 }
             }
         }()
+        return out
     }
-    
-    // Wait for all workers
-    go func() {
-        wg.Wait()
-        close(resultCh)
-    }()
-    
-    // Collect results in order
-    results := make([]U, len(jobs))
-    for result := range resultCh {
-        if result.err != nil {
-            return nil, result.err
-        }
-        results[result.idx] = result.val
-    }
-    
-    return results, nil
 }
 
-// Usage:
-// results, err := WorkerPool(ctx, urls, 10, fetchURL)
-```
-
-### Pipeline Pattern
-
-```go
-// ── Stage-based pipeline ────────────────────────────────────
-type Pipeline[T, U any] struct {
-    stages []StageFunc
-}
-
-type StageFunc func(context.Context, <-chan T) <-chan U
-
-func NewPipeline[T, U any](stages ...StageFunc) *Pipeline[T, U] {
-    return &Pipeline[T, U]{stages: stages}
-}
-
-func (p *Pipeline[T, U]) Run(ctx context.Context, in <-chan T) <-chan U {
-    var out any = in
-    for _, stage := range p.stages {
-        // Type assertion — in practice use generics carefully
-        next := stage(ctx, out.(<-chan T))
-        out = next
-    }
-    return out.(<-chan U)
-}
-
-// ── Concrete pipeline example ───────────────────────────────
-// Stage 1: Generate numbers
 func genNumbers(ctx context.Context, nums ...int) <-chan int {
     out := make(chan int)
     go func() {
@@ -1687,44 +1604,13 @@ func genNumbers(ctx context.Context, nums ...int) <-chan int {
     return out
 }
 
-// Stage 2: Double
-func double(ctx context.Context, in <-chan int) <-chan int {
-    out := make(chan int)
-    go func() {
-        defer close(out)
-        for n := range in {
-            select {
-            case out <- n * 2:
-            case <-ctx.Done():
-                return
-            }
-        }
-    }()
-    return out
-}
-
-// Stage 3: Filter evens
-func filterEvens(ctx context.Context, in <-chan int) <-chan int {
-    out := make(chan int)
-    go func() {
-        defer close(out)
-        for n := range in {
-            if n%2 == 0 {
-                select {
-                case out <- n:
-                case <-ctx.Done():
-                    return
-                }
-            }
-        }
-    }()
-    return out
-}
-
 // Usage:
-// pipeline := NewPipeline(double, filterEvens)
-// results := pipeline.Run(ctx, genNumbers(ctx, 1,2,3,4,5))
+// p := Compose(MapStage(func(n int) int { return n * 2 }),
+//              MapStage(func(n int) int { return n + 1 }))
+// for v := range p(ctx, genNumbers(ctx, 1, 2, 3)) { fmt.Print(v, " ") } // 3 5 7
 ```
+
+Stages that change type (`int` → `string`) can't share one `Stage[T]` type in a slice. Compose them by plain function calls instead: `format(ctx, square(ctx, gen(ctx)))`. Pipeline costs: every hop is a channel operation plus a goroutine wake-up. For cheap per-item work, batch items (send `[]T`) or fuse stages, or the channel overhead dominates.
 
 ### Fan-Out / Fan-In
 
@@ -1785,6 +1671,7 @@ func processBatch(ctx context.Context, items []int, workers int) []int {
     pipelines := fanOut(source, workers)
     
     // Stage 3: Each worker doubles (could be any processing)
+    double := MapStage(func(n int) int { return n * 2 })
     processed := make([]<-chan int, workers)
     for i, p := range pipelines {
         processed[i] = double(ctx, p)
@@ -1793,7 +1680,7 @@ func processBatch(ctx context.Context, items []int, workers int) []int {
     // Stage 4: Fan in results
     merged := fanIn(ctx, processed...)
     
-    // Collect all results
+    // Collect all results (order is NOT preserved across workers)
     var results []int
     for v := range merged {
         results = append(results, v)
@@ -1802,138 +1689,129 @@ func processBatch(ctx context.Context, items []int, workers int) []int {
 }
 ```
 
+`fanOut` here gives each worker its own channel. That is only needed when stages differ per worker. For identical workers, let them all `range` over the same input channel, and the runtime load-balances for free.
+
 ### Tee (Split One Channel)
 
 ```go
-// ── Split one channel into two ──────────────────────────────
-func tee[T any](in <-chan T) (<-chan T, <-chan T) {
-    out1 := make(chan T)
-    out2 := make(chan T)
-    
+// ── Duplicate every value to two consumers ─────────────────
+func tee[T any](ctx context.Context, in <-chan T) (<-chan T, <-chan T) {
+    out1, out2 := make(chan T), make(chan T)
     go func() {
         defer close(out1)
         defer close(out2)
-        
         for val := range in {
-            // Must send to both — clone val for second send
-            v1, v2 := val, val
-            for i := 0; i < 2; i++ {
-                select {
-                case out1 <- v1:
-                    out1 = nil // Disable first case
-                case out2 <- v2:
-                    out2 = nil // Disable second case
-                }
-            }
-            // Re-enable both
-            out1 = make(chan T) // Wait, this creates new channels each iteration
-            // NO — this is wrong. Fix below:
-        }
-    }()
-    
-    return out1, out2
-}
-
-// ── Correct Tee implementation ──────────────────────────────
-func teeCorrect[T any](in <-chan T) (<-chan T, <-chan T) {
-    out1 := make(chan T)
-    out2 := make(chan T)
-    
-    go func() {
-        defer close(out1)
-        defer close(out2)
-        
-        for val := range in {
-            // Local variables shadow the channel variables
-            // so we can nil them out after each send
+            // Local copies of the channel variables, so each can be set to nil
+            // (disabled) after its send without touching the real channels.
             o1, o2 := out1, out2
-            for i := 0; i < 2; i++ {
+            for range 2 {
                 select {
                 case o1 <- val:
                     o1 = nil
                 case o2 <- val:
                     o2 = nil
+                case <-ctx.Done():
+                    return
                 }
             }
         }
     }()
-    
     return out1, out2
 }
 ```
 
+The two consumers run in **lockstep**: the slower one throttles the faster one. Decouple them with buffered outputs, or with a per-consumer queue if their speeds differ a lot. If the values are pointers or contain slices or maps, both consumers share the underlying data. Copy it, or treat it as read-only.
+
 ### Circuit Breaker
 
 ```go
-// ── Channel-based circuit breaker ────────────────────────────
-type CircuitBreaker struct {
-    mu            sync.Mutex
-    state         State
-    failures      int
-    threshold     int
-    resetTimeout  time.Duration
-    lastFailure   time.Time
-    halfOpenCh    chan struct{}
-}
+// ── Closed → Open after N CONSECUTIVE failures; after a cooldown, ONE probe
+//    request (Half-Open) decides between Closed and Open again ──
+var ErrOpen = errors.New("circuit open")
 
 type State int
 
 const (
-    StateClosed   State = iota // Normal operation
-    StateHalfOpen              // Testing if service recovered
-    StateOpen                  // Rejecting requests
+    Closed State = iota
+    Open
+    HalfOpen
 )
 
-func (cb *CircuitBreaker) Execute(fn func() error) error {
-    if !cb.allowRequest() {
-        return ErrCircuitOpen
+type Breaker struct {
+    mu            sync.Mutex
+    state         State
+    failures      int // consecutive failures while Closed
+    threshold     int
+    cooldown      time.Duration
+    openedAt      time.Time
+    probeInFlight bool
+    now           func() time.Time // injectable clock for tests
+}
+
+func NewBreaker(threshold int, cooldown time.Duration) *Breaker {
+    return &Breaker{threshold: threshold, cooldown: cooldown, now: time.Now}
+}
+
+func (b *Breaker) Do(fn func() error) error {
+    probe, err := b.admit()
+    if err != nil {
+        return err // fail fast: don't even try the dependency
     }
-    
-    err := fn()
-    cb.recordResult(err)
+    err = fn() // NOT under the lock
+    b.record(probe, err)
     return err
 }
 
-func (cb *CircuitBreaker) allowRequest() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    
-    switch cb.state {
-    case StateClosed:
-        return true
-    case StateOpen:
-        if time.Since(cb.lastFailure) > cb.resetTimeout {
-            cb.state = StateHalfOpen
-            return true
+func (b *Breaker) admit() (probe bool, err error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    switch b.state {
+    case Open:
+        if b.now().Sub(b.openedAt) < b.cooldown {
+            return false, ErrOpen
         }
-        return false
-    case StateHalfOpen:
-        return true
-    default:
-        return false
+        b.state = HalfOpen
+        fallthrough
+    case HalfOpen:
+        if b.probeInFlight { // exactly one trial request at a time
+            return false, ErrOpen
+        }
+        b.probeInFlight = true
+        return true, nil
     }
+    return false, nil // Closed
 }
 
-func (cb *CircuitBreaker) recordResult(err error) {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    
-    if err == nil {
-        if cb.state == StateHalfOpen {
-            cb.state = StateClosed
-            cb.failures = 0
+func (b *Breaker) record(probe bool, err error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    if probe {
+        b.probeInFlight = false
+        if err != nil {
+            b.state, b.openedAt = Open, b.now() // still broken: another cooldown
+        } else {
+            b.state, b.failures = Closed, 0
         }
         return
     }
-    
-    cb.failures++
-    cb.lastFailure = time.Now()
-    
-    if cb.failures >= cb.threshold {
-        cb.state = StateOpen
+    if err == nil {
+        b.failures = 0 // successes reset the streak
+        return
+    }
+    if b.failures++; b.failures >= b.threshold && b.state == Closed {
+        b.state, b.openedAt = Open, b.now()
     }
 }
+
+// threshold=2: Do(fail), Do(fail) → Open; Do(ok) → ErrOpen without calling ok.
+// After the cooldown, Do(ok) runs as the probe → Closed. (Verified with a fake clock.)
 ```
+
+Production points:
+- Count only failures that indicate the **dependency** is unhealthy: timeouts, 5xx, connection errors. Not 4xx or `context.Canceled`.
+- Many libraries use a failure *rate* over a sliding window with a minimum request count, rather than a consecutive streak. Good options: `sony/gobreaker` or a service mesh.
+- One breaker per dependency (or per host), not one global breaker.
+- Pair it with timeouts and retries that use backoff and jitter. The breaker stops retry storms from hammering a dependency that is already down.
 
 ### Rate Limiter (Token Bucket)
 
@@ -1991,6 +1869,8 @@ func (rl *RateLimiter) Close() {
 }
 ```
 
+This channel version is good for explaining the idea, but it has costs: a goroutine and a ticker per limiter, a granularity of one tick, and a divide-by-zero panic if `rate` is 0. In real code use `golang.org/x/time/rate`. It computes tokens lazily from timestamps, so it has no goroutine, and it offers `Allow()`, `Wait(ctx)` and `Reserve()`. Keep one limiter per client key (with eviction) for per-tenant limits. For limits across many instances you need shared state, such as Redis with a token bucket or GCRA in a Lua script.
+
 ---
 
 ## 11. Common Pitfalls & Debugging
@@ -1998,105 +1878,110 @@ func (rl *RateLimiter) Close() {
 ### Pitfall Checklist
 
 ```go
-// 🔴 1. Goroutine leaks (already covered above)
-//     → Always have a done/close path for every goroutine
+// 🔴 1. Goroutine leaks (see Section 2)
+//     → Every goroutine needs a guaranteed exit: closed input, ctx.Done(), or a buffered result slot.
 
-// 🔴 2. Closing a channel twice
-//     → Use sync.Once for channels that might be closed by multiple goroutines
+// 🔴 2. Closing a channel twice / closing from the receiver
+//     → One owner closes. sync.Once only as a last resort.
 
-// 🔴 3. Sending on a closed channel
-//     → Never send after close; use a done channel pattern
+// 🔴 3. Sending on a closed channel → panic
+//     → Senders must stop before close: wg.Wait() then close(ch).
 
-// 🔴 4. Forgetting to close channels
-//     → Causes receiver goroutines to leak (reading from never-closed channel)
+// 🔴 4. Never closing a channel that receivers range over
+//     → Receivers leak waiting for a close that never comes.
 
-// 🔴 5. Deadlock from lock ordering
-//     → Always acquire locks in the same order
+// 🔴 5. Inconsistent lock ordering → deadlock
+//     → Global order by a stable key; hold one lock at a time where possible.
 
-// 🔴 6. Calling wg.Add inside the goroutine
-//     → Call wg.Add BEFORE go func()
+// 🔴 6. wg.Add inside the goroutine
+//     → Use wg.Go (1.25) or Add before `go`. go vet's waitgroup check catches it.
 
-// 🔴 7. Mutex copy (mutexes must not be copied)
-//     → Pass mutexes by pointer, not by value
-//     type Safe struct { mu sync.Mutex } // OK
-//     func (s *Safe) Lock() { s.mu.Lock() } // OK (by pointer)
+// 🔴 7. Copying a struct that contains a Mutex / WaitGroup / atomic value
+//     → Use pointer receivers on such types; go vet's copylocks check flags copies.
+//     type Safe struct { mu sync.Mutex; n int }
+//     func (s *Safe) Inc() { s.mu.Lock(); s.n++; s.mu.Unlock() } // ✅ pointer receiver
 
-// 🔴 8. Forgetting to call context cancel
-//     → defer cancel() ALWAYS after creating a cancellable context
+// 🔴 8. Forgetting cancel() from WithCancel/WithTimeout
+//     → defer cancel() immediately; go vet's lostcancel check catches most cases.
 
-// 🔴 9. Data race on maps
-//     → Maps are NOT thread-safe. Use sync.Map or mutex.
+// 🔴 9. Concurrent map access
+//     → Built-in maps are not safe for concurrent writes. The runtime detects
+//       some cases and dies with "fatal error: concurrent map writes", which
+//       recover() can't catch. Use a mutex, sync.Map, or a sharded map.
 
-// 🔴 10. Using time.After in a loop (leaks!)
+// 🔴 10. Pre-1.22 loop-variable capture in goroutines
+//     → In modules with `go 1.22`+ in go.mod each iteration has its own variable;
+//       in older modules all goroutines may see the LAST value.
+
+// 🔴 11. Idle timeout inside a loop
 for {
     select {
     case v := <-ch:
         fmt.Println(v)
-    case <-time.After(time.Second): // New timer each iteration!
-        // → TIMER LEAK: timer not stopped until it fires
+    case <-time.After(time.Second): // allocates a new timer every iteration
+        fmt.Println("idle for 1s")
     }
 }
+// Since Go 1.23 this no longer LEAKS (unreferenced timers are collected
+// before they fire), but it still allocates a timer per message on hot loops.
 
-// ✅ FIX: Use time.NewTicker instead
-ticker := time.NewTicker(time.Second)
-defer ticker.Stop()
+// ✅ Reuse one timer and reset it after each message.
+idle := time.NewTimer(time.Second)
+defer idle.Stop()
 for {
     select {
     case v := <-ch:
         fmt.Println(v)
-    case <-ticker.C:
-        fmt.Println("timeout")
+        idle.Reset(time.Second) // Go 1.23+: Reset never leaves a stale value in idle.C
+    case <-idle.C:
+        fmt.Println("idle for 1s")
+        idle.Reset(time.Second)
     }
 }
+// Note: a Ticker is NOT a fix. It fires every second regardless of activity,
+// which is a different behaviour from "no message for 1s".
 ```
 
 ### Debugging Tools
 
 ```go
-// ── 1. Race Detector ─────────────────────────────────────────
-// go test -race ./...
-// go build -race .
-// go run -race main.go
-//
-// Catches: unsynchronized reads/writes to shared memory
-// Cost: 5-10x slower, ~10x memory
-// Never run in production!
+// ── 1. Race detector ─────────────────────────────────────────
+// go test -race ./...    go build -race    go run -race main.go
+// Finds unsynchronized access that actually happens during the run.
+// Cost (per Go docs): 5-10x memory, 2-20x execution time. Use in CI and
+// tests; at most a small race-enabled canary in production.
 
-// ── 2. Goroutine stack dump ─────────────────────────────────
-// Send SIGQUIT (Ctrl+\ on Linux) to get ALL goroutine stacks
+// ── 2. Goroutine dumps ───────────────────────────────────────
+// SIGQUIT (Ctrl+\) prints every goroutine's stack AND EXITS the process
+// (GOTRACEBACK=all/system controls detail). For a live, non-fatal dump:
+//   curl localhost:6060/debug/pprof/goroutine?debug=2   (net/http/pprof)
 // Or programmatically:
-func dumpGoroutines() {
-    buf := make([]byte, 1<<20)
-    n := runtime.Stack(buf, true) // true = all goroutines
-    fmt.Printf("=== GOROUTINE DUMP ===\n%s\n", buf[:n])
+func dumpGoroutines(w io.Writer) {
+    pprof.Lookup("goroutine").WriteTo(w, 2) // runtime/pprof; debug=1 groups identical stacks
 }
 
-// ── 3. GODEBUG environment variables ─────────────────────────
-// GODEBUG=gctrace=1    → GC trace
-// GODEBUG=schedtrace=1000 → Scheduler trace every 1000ms
-// GODEBUG=scheddetail=1   → Detailed scheduler trace
+// ── 3. GODEBUG ───────────────────────────────────────────────
+// GODEBUG=gctrace=1              one line per GC cycle
+// GODEBUG=schedtrace=1000        scheduler summary every 1000 ms
+// GODEBUG=schedtrace=1000,scheddetail=1   per-P/M/G detail
 
-// ── 4. pprof ─────────────────────────────────────────────────
-// import _ "net/http/pprof"
-// go run main.go
+// ── 4. pprof (import _ "net/http/pprof", serve on an ADMIN port) ──
 // go tool pprof http://localhost:6060/debug/pprof/goroutine
 // go tool pprof http://localhost:6060/debug/pprof/heap
-// go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+// go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30   (CPU)
+// go tool pprof http://localhost:6060/debug/pprof/block   (needs runtime.SetBlockProfileRate)
+// go tool pprof http://localhost:6060/debug/pprof/mutex   (needs runtime.SetMutexProfileFraction)
+// go tool pprof http://localhost:6060/debug/pprof/goroutineleak   (Go 1.27)
 
-// ── 5. Execution tracer ──────────────────────────────────────
-// import "runtime/trace"
-// f, _ := os.Create("trace.out")
-// trace.Start(f)
-// defer trace.Stop()
+// ── 5. Execution tracer: scheduling latency, GC, blocking ────
+// curl -o trace.out localhost:6060/debug/pprof/trace?seconds=5
 // go tool trace trace.out
+// Go 1.25: runtime/trace.FlightRecorder keeps the last few seconds in memory,
+// so you can snapshot a trace right AFTER something rare goes wrong.
 
-// ── 6. Channel debugging with reflect ────────────────────────
-func inspectChannel[T any](ch chan T) {
-    v := reflect.ValueOf(ch)
-    fmt.Printf("Channel type: %v\n", v.Type())
-    fmt.Printf("Buffer size: %v\n", v.Cap())
-    fmt.Printf("Current length: %v\n", v.Len())
-}
+// ── 6. Channel occupancy ─────────────────────────────────────
+// len(ch) and cap(ch) are built-ins; export len(ch)/cap(ch) as a gauge to
+// spot a backed-up stage. (No reflection needed.)
 ```
 
 ---
@@ -2116,7 +2001,7 @@ In Go: you design with concurrency (goroutines), the runtime and hardware provid
 <details>
 <summary><b>Q2: How do you create a goroutine? What is the minimum stack size?</b></summary>
 
-**Answer:** Use `go f()` or `go func() { ... }()`. A goroutine starts with ~2KB stack (varies by Go version) that grows and shrinks as needed. This is why you can have hundreds of thousands of goroutines — compared to OS threads that start with ~1MB stacks.
+**Answer:** Use `go f()` or `go func() { ... }()`. The arguments are evaluated in the calling goroutine, right away. A goroutine starts with a 2 KB stack. Since Go 1.19 the starting size adapts to the program's average stack use. The stack grows and shrinks by copying, up to 1 GB on 64-bit. That is why hundreds of thousands of goroutines are practical. An OS thread reserves a fixed stack, commonly 8 MB of virtual memory on Linux, and costs a kernel call to create.
 </details>
 
 <details>
@@ -2144,7 +2029,7 @@ In Go: you design with concurrency (goroutines), the runtime and hardware provid
 5. For long-running goroutines, always check `ctx.Done()` in the loop
 6. Use `defer` for cleanup actions that must run on goroutine exit
 
-Tools: `runtime.NumGoroutine()` to detect leaks, `pprof` goroutine profile to see which goroutines are stuck.
+Tools: `runtime.NumGoroutine()` trends, the `pprof` goroutine profile (which stacks are piling up), `go.uber.org/goleak` in tests, `testing/synctest` (a test fails if bubble goroutines are left blocked), and the `goroutineleak` profile *(Go 1.27)*, which reports goroutines blocked on primitives that nothing runnable can still reach.
 </details>
 
 <details>
@@ -2156,27 +2041,28 @@ Tools: `runtime.NumGoroutine()` to detect leaks, `pprof` goroutine profile to se
 <details>
 <summary><b>Q7: How does Go's scheduler decide which goroutine to run next?</b></summary>
 
-**Answer:** Go uses a GMP scheduler. When a goroutine blocks (channel op, syscall, mutex, or gets preempted after ~10ms), the scheduler runs:
-1. Check for GC work
-2. Try `runnext` (goroutine priority queue per P)
-3. Try local run queue (LRQ) per P
-4. Try global run queue (GRQ)
-5. Steal work from other P's LRQ (random victim, steal half)
-6. Spin, then idle
+**Answer:** Go uses the GMP scheduler. When a goroutine blocks, yields, exits, or is preempted after about 10 ms, the M runs `findRunnable` for its P:
+1. A GC mark worker, if the GC needs one on this P
+2. Every 61st scheduling round, the **global** queue first (so it can't starve)
+3. `runnext`: a **single slot** holding the goroutine this P most recently readied (e.g. the other end of a channel), for locality
+4. The P's local run queue (up to 256 Gs)
+5. The global run queue
+6. Non-blocking network poll (goroutines whose sockets are ready)
+7. Steal **half** of another P's local queue (Ps visited in random order)
+8. Otherwise release the P and park the thread (possibly blocking in netpoll)
 
-Work stealing ensures load balancing. The network poller (epoll/kqueue) handles I/O-bound goroutines without blocking OS threads.
+Work stealing balances load across Ps. Network I/O parks goroutines on the netpoller (epoll/kqueue/IOCP) without holding a thread. Blocking syscalls *do* hold a thread, and the P is handed to another thread so parallelism is kept.
 </details>
 
 <details>
 <summary><b>Q8: When would you use sync.Mutex vs channels in Go?</b></summary>
 
-**Answer:** Guidelines from Go's creators and production experience:
-- **Channels:** For passing ownership of data, coordinating goroutines, signaling events. When data flows from producer to consumer.
-- **Mutexes:** For protecting shared state, critical sections, updating cached data. When many goroutines access the same data.
+**Answer:**
+- **Channels** when you are *transferring ownership* of data (a job, a result), *coordinating* goroutines (pipelines, worker pools, done signals), or need `select` with timeouts and cancellation.
+- **Mutexes** when several goroutines *share state* that stays in place (a cache, a counter, a connection map) and critical sections are short. A mutex is faster and simpler for that. A goroutine plus channel guarding a map is usually over-engineering.
+- **Atomics** for single words: counters, flags, and pointer swaps of immutable snapshots.
 
-Practical rule: Use channels for orchestrating goroutine communication. Use mutexes for protecting data. Many production systems use both.
-
-Go proverb: "Don't communicate by sharing memory; share memory by communicating."
+Go proverb: "Don't communicate by sharing memory; share memory by communicating." The Go wiki's *MutexOrChannel* page also says: use whichever is most expressive or simplest, and don't be afraid to use a `sync.Mutex`.
 </details>
 
 ### Advanced
@@ -2184,35 +2070,34 @@ Go proverb: "Don't communicate by sharing memory; share memory by communicating.
 <details>
 <summary><b>Q9: Write a program that detects if a goroutine is stuck (blocked forever).</b></summary>
 
-**Answer:**
-```go
-func detectStuckGoroutine(timeout time.Duration) {
-    initial := runtime.NumGoroutine()
-    
-    time.Sleep(timeout)
-    
-    current := runtime.NumGoroutine()
-    if current > initial {
-        // Goroutines didn't complete — dump stacks
-        buf := make([]byte, 1<<20)
-        n := runtime.Stack(buf, true)
-        fmt.Printf("STUCK GOROUTINES (%d leaked):\n%s\n", 
-            current-initial, buf[:n])
-    }
-}
+**Answer:** "Blocked forever" can't be decided in general, so in practice you use one of three approaches:
 
-// Usage in tests:
-func TestNoGoroutineLeak(t *testing.T) {
-    initial := runtime.NumGoroutine()
-    defer func() {
-        if runtime.NumGoroutine() != initial {
-            t.Error("goroutine leak detected")
+1. **In tests:** assert that no goroutines remain after the test. `goleak` retries for a short while, so goroutines that are still exiting don't cause flakes:
+```go
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) } // go.uber.org/goleak
+```
+   Or run the code under `synctest.Test`. Goroutines in the bubble that are still blocked when the test function returns make the test fail with a deadlock report.
+
+2. **In production, Go 1.27+:** the `goroutineleak` profile (`/debug/pprof/goroutineleak` or `pprof.Lookup("goroutineleak")`). During a GC the runtime finds goroutines blocked on channels, mutexes or conds that no runnable goroutine can still reach. Those can provably never wake.
+
+3. **Heuristic watchdog (any version):** watch for goroutines stuck in the *same* blocking state for too long:
+```go
+// Snapshot all stacks; the header line includes the wait reason and duration,
+// e.g. "goroutine 42 [chan receive, 15 minutes]:".
+func longBlocked(min time.Duration) []string {
+    var buf bytes.Buffer
+    pprof.Lookup("goroutine").WriteTo(&buf, 2)
+    re := regexp.MustCompile(`(?m)^goroutine \d+ \[([^,\]]+), (\d+) minutes\]:`)
+    var out []string
+    for _, m := range re.FindAllStringSubmatch(buf.String(), -1) {
+        if mins, _ := strconv.Atoi(m[2]); time.Duration(mins)*time.Minute >= min {
+            out = append(out, m[0])
         }
-    }()
-    
-    // Run test
+    }
+    return out
 }
 ```
+The minutes value appears only once a goroutine has been blocked for at least a minute. Alert on a steadily growing count, not on single entries: long-lived idle goroutines, such as a server's accept loop, look "stuck" too.
 </details>
 
 <details>
@@ -2288,61 +2173,52 @@ func main() {
     wg.Wait()
 }
 ```
+
+What to say about this design:
+- It is a **sliding-window log**: exact, but memory is O(limit) timestamps per key. At 10K req/s per key that is a lot. A **sliding-window counter** (two fixed windows, weighted) or a **token bucket** / GCRA is O(1) per key.
+- One global mutex serializes every key, so it is not "scalable" yet. Shard the map by key hash (see Q15), or keep a `x/time/rate.Limiter` per key in a `sync.Map`.
+- The map grows forever. Evict idle keys (a TTL sweep, or an LRU bound) or one client can drive the process out of memory.
+- In-process limits are per instance. With N replicas the effective limit is N × rate, unless the state is shared (Redis) or the load balancer pins keys to instances.
 </details>
 
 <details>
 <summary><b>Q11: Explain the "happens-before" guarantees of different channel operations.</b></summary>
 
-**Answer:**
+**Answer** (Go memory model, revised 2022 / Go 1.19):
+1. **Send → receive:** a send is synchronized before the *completion* of the corresponding receive. The receiver sees everything the sender wrote before sending.
+2. **Unbuffered, the other direction:** a receive is synchronized before the *completion* of the corresponding send. When an unbuffered send returns, the sender knows the receiver has the value and sees everything the receiver did before receiving.
+3. **Buffered, capacity C:** the k-th receive is synchronized before the (k+C)-th send completes. This is what makes `make(chan struct{}, C)` a correct counting semaphore that limits concurrency to C.
+4. **Close:** `close(ch)` is synchronized before any receive that returns because the channel is closed. That is why `close(done)` works as a broadcast.
+5. **`sync.Mutex`:** for n < m, the n-th `Unlock` is synchronized before the m-th `Lock` returns.
+6. **`sync/atomic`:** if atomic B observes atomic A's effect, A is synchronized before B. All atomics are sequentially consistent.
 
-According to the Go Memory Model:
-1. **Unbuffered channel:** A send happens before the corresponding receive completes. Conversely, a receive happens before the send completes if the send was the one that synchronized (both are synchronized).
-
-2. **Buffered channel (capacity C):** The kth receive on a channel with capacity C happens before the (k+C)th send completes. This means:
-   - The first receive happens before the (1+C)th send
-   - This guarantees that the sender sees everything the earlier receiver did
-
-3. **Channel close:** A close happens before any receive that returns a zero value due to the channel being closed.
-
-4. **`sync.Mutex`:** The nth `Unlock()` happens before the (n+1)th `Lock()`.
-
-5. **`sync/atomic`:** All atomic operations are sequentially consistent — all goroutines see the same order of atomic operations.
-
-Practical implication: If goroutine A sends a value on a channel, and goroutine B receives that value, then B sees everything A did before the send (including writes to shared variables).
+Practical implication: if goroutine A writes a variable and then sends on a channel, and goroutine B receives that send and then reads the variable, B sees the write. No lock is needed. Without such an edge, even a "harmless" flag read is a data race.
 </details>
 
 <details>
-<summary><b>Q12: How do Go 1.14+ signal-based preemption work? What problem did it solve?</b></summary>
+<summary><b>Q12: How does Go 1.14+ signal-based preemption work? What problem did it solve?</b></summary>
 
-**Answer:** Before Go 1.14, Go used cooperative scheduling — goroutines only yielded at function calls. A tight loop like `for { sum++ }` would block the OS thread indefinitely (no function call = no preemption).
+**Answer:** Before Go 1.14, preemption was **cooperative**. The only check was in function prologues, piggybacking on the stack-growth check. A loop with no function calls, like `for { sum++ }`, could hold its P indefinitely. That delayed other goroutines, and above all it blocked the GC's stop-the-world, so the whole program could stall.
 
-Go 1.14+ added signal-based preemption. The `sysmon` thread sends a `SIGURG` signal to the M running a goroutine that has been executing for >10ms without preempting. The signal handler sets a flag, and at the next safe point (any function prologue), the goroutine checks the flag and yields. This ensures that tight loops can be preempted.
+Go 1.14 added **asynchronous preemption**:
+1. `sysmon` notices a goroutine that has been running for more than 10 ms. It sets the goroutine's preempt flag (for the cooperative path) and sends **`SIGURG`** to the thread running it. `SIGURG` was chosen because programs rarely use it, and it's ignored by default.
+2. The signal handler inspects the interrupted PC. If it is an **async safe point**, meaning the compiler's metadata says every register and stack slot can be described precisely for the GC, the handler changes the signal context so the thread "calls" `asyncPreempt` as soon as the handler returns.
+3. `asyncPreempt` saves **all** registers and enters the scheduler, so the goroutine is descheduled right there, mid-loop, with no function call in user code.
+4. If the PC isn't at a safe point (runtime code, some assembly, rare compiler-sensitive sequences), the runtime simply retries later.
 
-Key details:
-- Signal is `SIGURG` (unused by most programs) not `SIGALRM`
-- Preemption points are at async-safe locations (function entry, loop back edges)
-- The GC uses this mechanism to stop-the-world for mark termination
+The same mechanism lets the GC stop goroutines quickly for stack scanning and stop-the-world phases. `GODEBUG=asyncpreemptoff=1` disables it, which is mainly useful for debugging signal-related issues (e.g., `EINTR` from syscalls in cgo code).
 </details>
 
 <details>
 <summary><b>Q13: Design an actor-based system using goroutines and channels (no external framework).</b></summary>
 
-**Answer:**
+**Answer:** An actor is a goroutine that owns some state plus a mailbox (channel). Only that goroutine touches the state, so it needs no locks. Others interact by `Tell` (fire-and-forget) or `Ask` (request with a reply channel).
+
 ```go
-// ── Actor model in Go ───────────────────────────────────────
-type ActorID string
-
-type Actor struct {
-    id    ActorID
-    inbox chan Message
-    state map[string]any
-    handlers map[string]func(Message) error
-}
-
 type Message struct {
     Type    string
     Payload any
-    ReplyTo chan Response
+    reply   chan Response // set by Ask; nil for Tell
 }
 
 type Response struct {
@@ -2350,17 +2226,16 @@ type Response struct {
     Err  error
 }
 
-func NewActor(id ActorID) *Actor {
-    return &Actor{
-        id:       id,
-        inbox:    make(chan Message, 100),
-        state:    make(map[string]any),
-        handlers: make(map[string]func(Message) error),
-    }
+// Handler runs on the actor's goroutine, so it may touch actor state freely.
+type Handler func(msg Message) (any, error)
+
+type Actor struct {
+    inbox    chan Message
+    handlers map[string]Handler // fixed before Start; read-only afterwards
 }
 
-func (a *Actor) Handle(msgType string, handler func(Message) error) {
-    a.handlers[msgType] = handler
+func NewActor(mailbox int, handlers map[string]Handler) *Actor {
+    return &Actor{inbox: make(chan Message, mailbox), handlers: handlers}
 }
 
 func (a *Actor) Start(ctx context.Context) {
@@ -2368,19 +2243,15 @@ func (a *Actor) Start(ctx context.Context) {
         for {
             select {
             case msg := <-a.inbox:
-                handler, ok := a.handlers[msg.Type]
-                if !ok {
-                    if msg.ReplyTo != nil {
-                        msg.ReplyTo <- Response{Err: fmt.Errorf("unknown msg type: %s", msg.Type)}
-                    }
-                    continue
+                var resp Response
+                if h, ok := a.handlers[msg.Type]; ok {
+                    resp.Data, resp.Err = h(msg)
+                } else {
+                    resp.Err = fmt.Errorf("unknown message type %q", msg.Type)
                 }
-                
-                err := handler(msg)
-                if msg.ReplyTo != nil {
-                    msg.ReplyTo <- Response{Data: nil, Err: err}
+                if msg.reply != nil {
+                    msg.reply <- resp // buffered(1): never blocks the actor
                 }
-                
             case <-ctx.Done():
                 return
             }
@@ -2388,63 +2259,44 @@ func (a *Actor) Start(ctx context.Context) {
     }()
 }
 
-func (a *Actor) Tell(msg Message) {
-    a.inbox <- msg
-}
-
-func (a *Actor) Ask(msg Message) (any, error) {
-    msg.ReplyTo = make(chan Response, 1)
-    a.inbox <- msg
-    resp := <-msg.ReplyTo
-    return resp.Data, resp.Err
-}
-
-// ── Actor system ────────────────────────────────────────────
-type ActorSystem struct {
-    actors map[ActorID]*Actor
-    mu     sync.RWMutex
-}
-
-func NewActorSystem() *ActorSystem {
-    return &ActorSystem{
-        actors: make(map[ActorID]*Actor),
+// Tell blocks while the mailbox is full (backpressure) and gives up when ctx ends.
+func (a *Actor) Tell(ctx context.Context, msg Message) error {
+    select {
+    case a.inbox <- msg:
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
     }
 }
 
-func (as *ActorSystem) Spawn(id ActorID, fn func(*Actor)) *Actor {
-    actor := NewActor(id)
-    fn(actor)
-    as.mu.Lock()
-    as.actors[id] = actor
-    as.mu.Unlock()
-    return actor
-}
-
-func (as *ActorSystem) Send(from, to ActorID, msg Message) error {
-    as.mu.RLock()
-    actor, ok := as.actors[to]
-    as.mu.RUnlock()
-    if !ok {
-        return fmt.Errorf("actor %s not found", to)
+func (a *Actor) Ask(ctx context.Context, msg Message) (any, error) {
+    msg.reply = make(chan Response, 1) // buffered: a late reply after we give up doesn't block the actor
+    if err := a.Tell(ctx, msg); err != nil {
+        return nil, err
     }
-    actor.Tell(msg)
-    return nil
+    select {
+    case r := <-msg.reply:
+        return r.Data, r.Err
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    }
 }
 
-// Usage:
-// system := NewActorSystem()
-// counter := system.Spawn("counter", func(a *Actor) {
-//     a.state["count"] = 0
-//     a.Handle("increment", func(msg Message) error {
-//         a.state["count"] = a.state["count"].(int) + 1
-//         return nil
-//     })
-//     a.Handle("get", func(msg Message) error {
-//         msg.ReplyTo <- Response{Data: a.state["count"]}
-//         return nil
-//     })
-// })
+// A counter actor: state lives in the closure, owned by the actor goroutine.
+func NewCounterActor(ctx context.Context) *Actor {
+    count := 0
+    a := NewActor(64, map[string]Handler{
+        "inc": func(Message) (any, error) { count++; return nil, nil },
+        "get": func(Message) (any, error) { return count, nil },
+    })
+    a.Start(ctx)
+    return a
+}
+
+// 100 concurrent Tell(inc), then Ask(get) → 100 <nil>   (verified with -race)
 ```
+
+Design points: handlers must never block for long, because a slow handler stalls the whole mailbox. Push slow work to other goroutines and reply later. Mailbox size is a backpressure decision: an unbounded queue just moves the problem to memory. A registry (`map[ID]*Actor` behind an `RWMutex`) adds addressing. Supervision (restart on panic) means wrapping the loop in `recover`, which Go gives you no help with: that is where Erlang/OTP or Akka-style frameworks earn their keep.
 </details>
 
 <details>
@@ -2452,207 +2304,169 @@ func (as *ActorSystem) Send(from, to ActorID, msg Message) error {
 
 **Answer:**
 
-| Feature | CSP (Go) | Actor Model (Erlang/Akka) |
+| Feature | CSP (Hoare 1978) / Go channels | Actor model (Hewitt 1973; Erlang, Akka) |
 |---------|---------|--------------------------|
-| Communication | Via channels (anonymous) | Direct messages to named actors |
-| Channel/Capacity | Buffered or unbuffered | Mailbox (always bounded) |
-| Sender identity | Anonymous (channel doesn't know sender) | Actor knows sender via address |
-| Error handling | Propagate via error values | "Let it crash" + supervision |
-| State isolation | Shared memory + synchronization | Complete isolation (no shared state) |
-| Addressing | No identity — data goes to channel | Actors have addresses |
+| What you send to | A **channel**: anonymous, first-class, shareable by many senders and receivers | A specific **actor** by address (PID / ActorRef) |
+| Synchrony | Classic CSP is a synchronous rendezvous; Go adds buffered channels | Asynchronous send; the sender never waits for the receiver |
+| Mailbox | Channel capacity is fixed: 0 (rendezvous) or N | One mailbox per actor, **unbounded by default** in Erlang and Akka (bounded mailboxes are opt-in) |
+| Waiting on several sources | `select` over many channels | Selective receive / pattern matching on one mailbox |
+| Identity | Goroutines have no identity or handle | Actors are addressable; they can be monitored or linked |
+| Failure handling | Error values; a panic kills the whole process unless recovered | "Let it crash" + supervisor trees restart failed actors |
+| Distribution | In-process only | Location-transparent across nodes (Erlang, Akka Cluster) |
+| Shared memory | Allowed (mutexes, atomics) | None: isolated state is enforced (Erlang) or a convention (Akka) |
 
-Go is primarily CSP-inspired (via Hoare's CSP paper), borrowing channel-based communication. However, Go also has shared memory (mutexes, atomics), making it a hybrid. Pure actor systems like Erlang enforce complete isolation — actors never share state and only communicate via messages with actor addresses.
+Go took its channel ideas from CSP via Newsqueak, Alef and Limbo. Unlike pure CSP it makes channels first-class values and also allows shared memory with locks. In practice Go code is a hybrid: channels for coordination and ownership transfer, mutexes for shared state. You can build actors on top (Q13), but you don't get supervision or distribution for free.
 </details>
 
 <details>
 <summary><b>Q15: How would you implement a distributed rate limiter using consistent hashing and goroutines?</b></summary>
 
-**Answer:**
+**Answer:** Split it into the two separate problems.
+
+**1. Route each key to one owner node** with a consistent-hash ring. Each node owns the buckets for its keys, so no cross-node coordination is needed per request. Adding or removing a node remaps only about 1/N of the keys.
+
 ```go
-// ── Distributed rate limiter shard ──────────────────────────
-type Shard struct {
-    mu       sync.Mutex
-    counters map[string]*tokenBucket
-}
+type HashRing struct {
+    hashes []uint64          // sorted virtual-node positions
+    owner  map[uint64]string // vnode position → node
+    seed   maphash.Seed      // every process must use the SAME hash: in a real cluster use a
+}                            // fixed hash (xxhash, FNV), since maphash seeds are per-process
 
-type tokenBucket struct {
-    tokens    float64
-    maxTokens float64
-    rate      float64
-    lastRefill time.Time
-}
-
-func (s *Shard) Allow(key string, rate, burst float64) bool {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    
-    bucket, ok := s.counters[key]
-    if !ok {
-        bucket = &tokenBucket{
-            tokens:    burst,
-            maxTokens: burst,
-            rate:      rate,
-            lastRefill: time.Now(),
+func NewHashRing(nodes []string, vnodes int) *HashRing {
+    r := &HashRing{owner: map[uint64]string{}, seed: maphash.MakeSeed()}
+    for _, n := range nodes {
+        for v := range vnodes { // ~100+ vnodes per node evens out the load
+            h := maphash.String(r.seed, n+"#"+strconv.Itoa(v))
+            r.hashes = append(r.hashes, h)
+            r.owner[h] = n
         }
-        s.counters[key] = bucket
     }
-    
-    // Refill
-    now := time.Now()
-    elapsed := now.Sub(bucket.lastRefill).Seconds()
-    bucket.tokens = math.Min(bucket.maxTokens, bucket.tokens+elapsed*bucket.rate)
-    bucket.lastRefill = now
-    
-    if bucket.tokens < 1 {
-        return false
-    }
-    bucket.tokens--
-    return true
+    slices.Sort(r.hashes)
+    return r
 }
 
-// ── Sharded rate limiter ────────────────────────────────────
-type DistributedRateLimiter struct {
-    shards    []*Shard
-    replicas  int // Virtual nodes for consistent hashing
-}
-
-func NewDistributedRateLimiter(shardCount, replicas int) *DistributedRateLimiter {
-    limiter := &DistributedRateLimiter{
-        shards:   make([]*Shard, shardCount),
-        replicas: replicas,
+func (r *HashRing) Node(key string) string {
+    h := maphash.String(r.seed, key)
+    i, _ := slices.BinarySearch(r.hashes, h) // first vnode clockwise
+    if i == len(r.hashes) {
+        i = 0 // wrap around the ring
     }
-    for i := range limiter.shards {
-        limiter.shards[i] = &Shard{counters: make(map[string]*tokenBucket)}
-    }
-    return limiter
-}
-
-func (d *DistributedRateLimiter) getShard(key string) *Shard {
-    // Consistent hash using FNV
-    h := fnv.New64a()
-    h.Write([]byte(key))
-    hash := h.Sum64()
-    return d.shards[hash%uint64(len(d.shards))]
-}
-
-func (d *DistributedRateLimiter) Allow(key string, rate, burst float64) bool {
-    shard := d.getShard(key)
-    return shard.Allow(key, rate, burst)
+    return r.owner[r.hashes[i]]
 }
 ```
+
+**2. On the owner, keep buckets in a lock-striped map,** so different keys rarely contend:
+
+```go
+type shard struct {
+    mu      sync.Mutex
+    buckets map[string]*rate.Limiter // golang.org/x/time/rate token buckets
+}
+
+type LocalLimiter struct {
+    seed   maphash.Seed
+    shards [64]shard
+    rate   rate.Limit
+    burst  int
+}
+
+func (l *LocalLimiter) Allow(key string) bool {
+    s := &l.shards[maphash.String(l.seed, key)%64]
+    s.mu.Lock()
+    lim, ok := s.buckets[key] // (init each shard's map in the constructor)
+    if !ok {
+        lim = rate.NewLimiter(l.rate, l.burst)
+        s.buckets[key] = lim
+    }
+    s.mu.Unlock()
+    return lim.Allow() // rate.Limiter is itself goroutine-safe
+}
+// Plus a background sweep that deletes idle keys, or memory grows without bound.
+```
+
+Trade-offs to discuss:
+- **Hop cost:** a request that lands on a non-owner node must be forwarded, or the load balancer must route by key (header-based consistent hashing in Envoy, Nginx or a service mesh).
+- **Rebalancing:** when membership changes, moved keys start with fresh buckets, so there is a brief burst allowance. That is usually acceptable.
+- **Alternative: centralized state.** Redis with an atomic Lua script (token bucket or GCRA) keeps one source of truth, at the price of a network round trip per request. Combine it with a small local pre-check to save calls.
+- **Approximate but cheap:** each of N nodes enforces `limit/N` locally. No coordination, but inaccurate when traffic is skewed.
+
+(Hashing a key modulo a fixed shard count is fine **inside** one process. It is not consistent hashing, because changing N remaps almost every key.)
 </details>
 
 <details>
 <summary><b>Q16: How does the Go race detector work under the hood?</b></summary>
 
-**Answer:** The Go race detector uses ThreadSanitizer (TSan), a dynamic analysis tool. It:
-1. **Instrumentation:** At compile time, every memory access (read/write) is instrumented with a TSan callback. The compiler adds metadata tracking per-access.
-2. **Happens-before graph:** TSan maintains a vector clock for each goroutine and each synchronization event (lock acquire/release, channel send/receive, etc.).
-3. **Race detection:** When two goroutines access the same memory location without a happens-before relation, and at least one access is a write, TSan reports a data race.
-4. **False positives:** Zero false positives in theory (precise detection). However, it only detects races that occur during execution — so a race exists if you don't trigger it. Run with multiple workloads.
-5. **Performance cost:** 5-10x slower, 10x more memory. Never use in production.
-6. **Limitations:** Only works for actual runtime races, not compile-time races. Can't detect races in hand-written assembly or cgo code.
+**Answer:** `-race` links ThreadSanitizer (TSan, a C++ runtime from LLVM) into the binary:
+1. **Instrumentation:** the compiler inserts a call before every memory read and write (`racefuncenter`, `raceread`, `racewrite`), and the runtime reports synchronization events: channel operations, mutexes, WaitGroup, atomics, goroutine creation.
+2. **Vector clocks:** each goroutine has a vector clock. Sync operations merge clocks to record happens-before edges.
+3. **Shadow memory:** for every 8 bytes of application memory TSan keeps a few shadow cells: recent accesses with goroutine ID, clock and read/write flag. On each access it compares against the shadow cells. Two accesses with at least one write and no happens-before order produce a report with both stacks.
+4. **Precision:** no false positives (every report is a real race), but **false negatives** are common. It only sees interleavings that actually happen, and it remembers a limited history per word. Run real concurrent workloads, repeatedly.
+5. **Cost:** memory grows 5–10× and execution time 2–20× (Go docs). There is a limit of 8,128 simultaneously alive goroutines. Requires cgo support on most platforms.
+6. **Blind spots:** races inside C code reached through cgo, in hand-written assembly, and on memory accessed through `syscall` or mmap that isn't instrumented.
 </details>
 
 <details>
 <summary><b>Q17: Implement a lock-free, concurrent hash map using atomic operations.</b></summary>
 
-**Answer:**
+**Answer:** A simple correct design is a fixed array of buckets, each an `atomic.Pointer` to an **immutable** slice of entries. Readers load a bucket with no locks. Writers copy the bucket, modify the copy, and install it with **CAS**, retrying if another writer got there first.
+
 ```go
-type ConcurrentHashMap[K comparable, V any] struct {
-    buckets []atomic.Pointer[bucket[K, V]]
-    mask    uint64
-}
-
-type bucket[K comparable, V any] struct {
-    entries []entry[K, V]
-}
-
 type entry[K comparable, V any] struct {
-    key   K
-    value atomic.Value
+    key K
+    val V
+}
+type bucket[K comparable, V any] struct{ entries []entry[K, V] } // never mutated once published
+
+type COWMap[K comparable, V any] struct {
+    seed    maphash.Seed
+    buckets []atomic.Pointer[bucket[K, V]]
 }
 
-func NewConcurrentHashMap[K comparable, V any](size int) *ConcurrentHashMap[K, V] {
-    // Round to power of 2
-    n := 1
-    for n < size {
-        n <<= 1
-    }
-    
-    m := &ConcurrentHashMap[K, V]{
-        buckets: make([]atomic.Pointer[bucket[K, V]], n),
-        mask:    uint64(n - 1),
-    }
-    
-    for i := range m.buckets {
-        b := &bucket[K, V]{
-            entries: make([]entry[K, V], 8), // Initial per-bucket capacity
-        }
-        m.buckets[i].Store(b)
-    }
-    
-    return m
+func NewCOWMap[K comparable, V any](n int) *COWMap[K, V] {
+    return &COWMap[K, V]{seed: maphash.MakeSeed(), buckets: make([]atomic.Pointer[bucket[K, V]], n)}
 }
 
-func (m *ConcurrentHashMap[K, V]) hash(key K) uint64 {
-    h := fnv.New64a()
-    h.Write([]byte(fmt.Sprintf("%v", key)))
-    return h.Sum64()
+func (m *COWMap[K, V]) slot(k K) *atomic.Pointer[bucket[K, V]] {
+    // maphash.Comparable (Go 1.24) hashes any comparable key without fmt.Sprintf
+    return &m.buckets[maphash.Comparable(m.seed, k)%uint64(len(m.buckets))]
 }
 
-func (m *ConcurrentHashMap[K, V]) Load(key K) (V, bool) {
-    hash := m.hash(key)
-    idx := hash & m.mask
-    
-    b := m.buckets[idx].Load()
-    if b == nil {
-        var zero V
-        return zero, false
-    }
-    
-    for _, e := range b.entries {
-        if e.key == key {
-            val, ok := e.value.Load().(V)
-            if ok {
-                return val, true
+func (m *COWMap[K, V]) Load(k K) (V, bool) {
+    if b := m.slot(k).Load(); b != nil {
+        for _, e := range b.entries {
+            if e.key == k {
+                return e.val, true
             }
-            return val, false
         }
     }
-    
     var zero V
     return zero, false
 }
 
-func (m *ConcurrentHashMap[K, V]) Store(key K, value V) {
-    hash := m.hash(key)
-    idx := hash & m.mask
-    
-    // Load bucket
-    b := m.buckets[idx].Load()
-    
-    // Try to update existing
-    for i := range b.entries {
-        if b.entries[i].key == key {
-            b.entries[i].value.Store(value)
+func (m *COWMap[K, V]) Store(k K, v V) {
+    s := m.slot(k)
+    for {
+        old := s.Load()
+        var entries []entry[K, V]
+        if old != nil {
+            entries = slices.Clone(old.entries) // copy: readers may be iterating the old one
+        }
+        if i := slices.IndexFunc(entries, func(e entry[K, V]) bool { return e.key == k }); i >= 0 {
+            entries[i].val = v
+        } else {
+            entries = append(entries, entry[K, V]{k, v})
+        }
+        if s.CompareAndSwap(old, &bucket[K, V]{entries}) {
             return
         }
+        // Lost the race to another writer: retry on top of its bucket.
+        // A plain Store here would silently drop the other writer's key.
     }
-    
-    // Append new entry
-    newEntries := make([]entry[K, V], len(b.entries)+1)
-    copy(newEntries, b.entries)
-    newEntries[len(b.entries)] = entry[K, V]{
-        key:   key,
-        value: atomic.Value{},
-    }
-    newEntries[len(b.entries)].value.Store(value)
-    
-    newBucket := &bucket[K, V]{entries: newEntries}
-    m.buckets[idx].Store(newBucket)
 }
+// 100 concurrent Stores of distinct keys, then 100 Loads: all present (verified with -race).
 ```
+
+Limitations to state: no resizing (fixed bucket count, so a bad size means long buckets), O(bucket size) copying on every write, and readers can see a slightly old bucket, though never a torn one. For real use, the standard library's `sync.Map` (a concurrent hash-trie since Go 1.24) or a sharded `map` plus mutex is the right answer. A production lock-free map with resizing (split-ordered lists, Cliff Click's NonBlockingHashMap) is a research-grade data structure.
 </details>
 
 ---
@@ -2665,15 +2479,17 @@ func (m *ConcurrentHashMap[K, V]) Store(key K, value V) {
 | N-to-1 | Buffered channel | Decoupled producer/consumer |
 | N-to-M | Fan-in, Fan-out | Work distribution |
 | Broadcast | `close(ch)` | Signal all waiters |
-| Timeout | `time.After` + select | Deadline for single op |
+| Timeout | `context.WithTimeout` (or `time.After` + select) | Deadline for an operation and everything it calls |
 | Cancellation | `context.Context` + select | Graceful shutdown |
 | Mutual exclusion | `sync.Mutex` | Protect shared state |
 | Reader/Writer | `sync.RWMutex` | Read-heavy workloads |
-| Coordination | `sync.WaitGroup` | Wait for goroutines |
-| One-time init | `sync.Once` | Lazy initialization |
+| Coordination | `sync.WaitGroup` (`wg.Go`, 1.25) / `errgroup` | Wait for goroutines / first error + limit |
+| One-time init | `sync.Once` / `sync.OnceValue(s)` | Lazy initialization |
 | Lock-free | `sync/atomic` | High-performance counters |
 | Object reuse | `sync.Pool` | Reduce GC pressure |
-| Signal/wait | `sync.Cond` | Complex state-dependent logic |
+| Signal/wait | `sync.Cond` | Many waiters on a changing predicate (prefer channels) |
+| Concurrent map | `sync.Map` / sharded map+mutex | Read-mostly keys / write-heavy |
+| Limit concurrency | buffered chan as semaphore, `errgroup.SetLimit` | Protect downstreams |
 
 ---
 

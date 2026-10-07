@@ -1,7 +1,7 @@
 # ⚡ FastAPI — Staff-Level Notes & Interview Questions
 
 > **Deep-dive into FastAPI's internals, async patterns, Pydantic integration, dependency injection, and production deployment**
-> *Designed for Staff/Principal Engineer interviews (10+ years experience)*
+> *Current as of October 2026: FastAPI 0.14x, Pydantic 2.x, Starlette 1.x, Python 3.10+. Version-specific behaviour is marked.*
 
 ---
 
@@ -28,6 +28,9 @@
 ## 1. FastAPI Architecture & Philosophy
 
 ### What Makes FastAPI Different
+
+!!! tip "30-second answer"
+    FastAPI is a thin layer over **Starlette** (ASGI routing, requests/responses, middleware, websockets) and **Pydantic v2** (validation and serialisation in Rust via `pydantic-core`). It reads your type hints once at startup to build three things: a validator per endpoint, a dependency-injection graph, and the OpenAPI schema. It's "fast" because it's async and does validation in compiled code. Your own handler code and database usually dominate latency, and one blocking call inside an `async def` stalls the whole worker.
 
 ```python
 # FastAPI is built on three pillars:
@@ -58,14 +61,16 @@ async def create_item(item: Item):
 ### ASGI vs WSGI — The Key Difference
 
 ```python
-# ── WSGI (Django/Flask) ────────────────────────────────────
-# Synchronous, one request per worker
-# Cannot handle WebSocket natively
+# ── WSGI (Flask, classic Django) ───────────────────────────
+# app(environ, start_response) -> iterable of bytes. One request per
+# worker THREAD for its whole duration; no protocol for websockets.
 # Request → WSGI Server → WSGI Handler → View → Response
 
-# ── ASGI (FastAPI/Starlette) ───────────────────────────────
-# Asynchronous, supports long-lived connections
-# Native WebSocket, Server-Sent Events, HTTP/2
+# ── ASGI (FastAPI/Starlette, Django under ASGI) ────────────
+# async app(scope, receive, send). One event loop multiplexes many
+# connections; long-lived connections (WebSocket, SSE, streaming) are
+# first-class. HTTP/2 depends on the SERVER (Hypercorn/Granian yes,
+# Uvicorn is HTTP/1.1; usually the load balancer terminates HTTP/2 anyway).
 # Request → ASGI Server → ASGI App (scope, receive, send) → Response
 
 # The ASGI protocol:
@@ -99,13 +104,15 @@ from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 
 # Starlette provides:
-# - ASGI request/response handling
+# - ASGI request/response handling, routing
 # - WebSocket support
 # - Background tasks
 # - Middleware stack
 # - Static file serving
-# - Server-Sent Events
-# - Streaming responses
+# - Streaming responses (SSE is built on these)
+# - Lifespan (startup/shutdown). Starlette 1.0 (March 2026) removed the
+#   old on_startup/on_shutdown/on_event APIs; FastAPI keeps a deprecated
+#   @app.on_event shim, but new code uses lifespan.
 
 # FastAPI adds:
 # - OpenAPI/Swagger auto-generation
@@ -122,29 +129,29 @@ from starlette.staticfiles import StaticFiles
 ### Path Operation Decorators
 
 ```python
+from typing import Annotated
 from fastapi import FastAPI, Path, Query, Body
 
 app = FastAPI()
 
 # ── All HTTP methods ───────────────────────────────────────
-@app.get("/items/{item_id}")
-@app.post("/items/")
-@app.put("/items/{item_id}")
-@app.patch("/items/{item_id}")
-@app.delete("/items/{item_id}")
-@app.options("/items/{item_id}")
-@app.head("/items/{item_id}")
+# @app.get / .post / .put / .patch / .delete / .options / .head / .trace
+# and @app.api_route(path, methods=[...]) for several at once.
 
-# ── Path parameters with validation ────────────────────────
+# ── Path parameters with validation (Annotated style, recommended) ──
 @app.get("/items/{item_id}")
 async def read_item(
-    item_id: int = Path(..., ge=1, le=1000, description="The item ID"),
-    q: str | None = Query(None, max_length=50, pattern="^[a-zA-Z]+$"),
+    item_id: Annotated[int, Path(ge=1, le=1000, description="The item ID")],
+    q: Annotated[str | None, Query(max_length=50, pattern="^[a-zA-Z]+$")] = None,
 ):
     return {"item_id": item_id, "q": q}
+# Annotated keeps the real default as a normal Python default, so the
+# function is still callable outside FastAPI, and one alias like
+# ItemId = Annotated[int, Path(ge=1)] can be reused across endpoints.
+# The older form `item_id: int = Path(..., ge=1)` still works.
 
 # ── Route ordering matters! ────────────────────────────────
-# FastAPI matches routes in order of declaration.
+# Starlette matches routes in order of declaration; first match wins.
 # More specific routes must come before parameterized ones:
 
 @app.get("/users/me")           # Must come first
@@ -160,9 +167,9 @@ async def get_user(user_id: int):
 async def get_review(
     item_id: int,
     review_id: int,
-    include_details: bool = Query(False),
-    page: int = Query(1, ge=1),
-    size: int = Query(10, ge=1, le=100),
+    include_details: bool = False,                     # plain default = query param
+    page: Annotated[int, Query(ge=1)] = 1,
+    size: Annotated[int, Query(ge=1, le=100)] = 10,
 ):
     skip = (page - 1) * size
     # ...
@@ -188,7 +195,7 @@ async def list_items(db=Depends(get_db)):
 @router.post("/")
 async def create_item(item: Item, db=Depends(get_db)):
     # Router prefix means path is /items/
-    return await db.execute("INSERT INTO items ...", item.dict())
+    return await db.execute("INSERT INTO items ...", item.model_dump())  # .dict() is the deprecated v1 name
 
 # ── Include routers in main app ────────────────────────────
 app.include_router(router)
@@ -196,18 +203,17 @@ app.include_router(admin_router, prefix="/admin")
 app.include_router(api_router, prefix="/api/v1")
 
 # ── Nested routers ─────────────────────────────────────────
-# Routers can be nested for deep API structures
-# /api/v1/users/{user_id}/items/{item_id}
+# Prefixes concatenate: app prefix + user_router prefix + item_router prefix.
 user_router = APIRouter(prefix="/users")
-item_router = APIRouter(prefix="/items")
+item_router = APIRouter(prefix="/{user_id}/items")   # path params can live in prefixes
 
 @user_router.get("/{user_id}")
-async def get_user(user_id: int): ...
+async def get_user(user_id: int): ...                 # GET /api/v1/users/{user_id}
 
 @item_router.get("/{item_id}")
-async def get_item(item_id: int): ...
+async def get_item(user_id: int, item_id: int): ...   # GET /api/v1/users/{user_id}/items/{item_id}
 
-user_router.include_router(item_router)
+user_router.include_router(item_router)   # include children BEFORE including the parent in the app
 app.include_router(user_router, prefix="/api/v1")
 ```
 
@@ -217,77 +223,55 @@ app.include_router(user_router, prefix="/api/v1")
 
 ### Model Definition & Advanced Features
 
-```python
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
-from typing import Optional
-from datetime import datetime, date
-from decimal import Decimal
-from enum import Enum
-import re
+!!! tip "Pydantic v2 in one paragraph"
+    Validation and serialisation run in `pydantic-core` (Rust). The class definition is compiled once into a core schema, so `model_validate`/`model_dump` are typically several times to 10×+ faster than v1. The API renames to know: `.dict()`→`model_dump()`, `.json()`→`model_dump_json()`, `parse_obj`→`model_validate`, `class Config`→`model_config = ConfigDict(...)`, `orm_mode`→`from_attributes`, `@validator`→`@field_validator`, `@root_validator`→`@model_validator`, `__root__`→`RootModel`. FastAPI 0.126 dropped Pydantic v1 and 0.128 removed the temporary `pydantic.v1` compatibility (around the turn of 2026), so current FastAPI is v2-only. Pydantic v1 itself doesn't support Python 3.14.
 
-# ── Field validation ───────────────────────────────────────
+```python
+from datetime import datetime, UTC
+from decimal import Decimal
+from typing import Annotated, Literal
+from pydantic import (BaseModel, ConfigDict, Field, computed_field,
+                      field_validator, model_validator)
+
 class Item(BaseModel):
     model_config = ConfigDict(
-        frozen=True,           # Immutable (hashable)
-        from_attributes=True,  # ORM mode
-        populate_by_name=True, # Allow alias usage
-        extra="forbid",        # Reject unknown fields
-        json_schema_extra={
-            "example": {"name": "Foo", "price": 42.0}
-        }
+        frozen=True,            # immutable; hashable only if every field is hashable
+        from_attributes=True,   # validate from ORM objects (was orm_mode)
+        extra="forbid",         # reject unknown fields → 422 (default "ignore")
+        str_strip_whitespace=True,
+        json_schema_extra={"examples": [{"name": "Foo", "price": "42.00"}]},
     )
-    
-    name: str = Field(
-        ...,                    # Required field (ellipsis)
-        min_length=3,
-        max_length=50,
-        pattern=r"^[a-zA-Z0-9 ]+$",
-        description="Item name",
-    )
-    price: float = Field(
-        ..., ge=0.01, le=1000000.0,
-        description="Item price",
-    )
-    tax: float | None = Field(None, ge=0.0, le=1.0)
-    tags: list[str] = Field(default_factory=list, max_length=10)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    
-    # ── Field-level validators ─────────────────────────────
+
+    name: Annotated[str, Field(min_length=3, max_length=50, pattern=r"^[a-zA-Z0-9 ]+$")]
+    price: Annotated[Decimal, Field(gt=0, le=1_000_000, decimal_places=2)]   # money: Decimal, not float
+    tax_rate: Annotated[Decimal, Field(ge=0, le=1)] | None = None
+    tags: tuple[str, ...] = ()                     # tuple keeps a frozen model hashable
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))  # utcnow() is deprecated
+
     @field_validator("name")
     @classmethod
-    def name_must_be_proper(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("Name cannot be blank")
-        return v.strip()
-    
-    # ── Model-level validators (cross-field) ────────────────
-    @model_validator(mode="after")
-    def check_price_with_tax(self):
-        if self.tax is not None and self.tax > self.price * 0.5:
-            raise ValueError("Tax cannot exceed 50% of price")
-        return self
+    def not_reserved(cls, v: str) -> str:
+        if v.lower() in {"admin", "null"}:
+            raise ValueError("reserved name")       # ValueError → 422 with field location
+        return v
 
-# ── Computed fields ────────────────────────────────────────
-from pydantic import computed_field
+    @model_validator(mode="after")                  # cross-field, runs on the built model
+    def tax_needs_price(self):
+        if self.tax_rate is not None and self.price < 1:
+            raise ValueError("tax_rate not allowed below 1.00")
+        return self
 
 class Order(BaseModel):
     items: list[Item]
-    discount: float = Field(default=0.0, ge=0.0, le=1.0)
-    
-    @computed_field
-    @property
-    def subtotal(self) -> float:
-        return sum(item.price for item in self.items)
-    
-    @computed_field
-    @property
-    def total(self) -> float:
-        return self.subtotal * (1 - self.discount) * 1.1  # 10% tax
+    discount: Annotated[Decimal, Field(ge=0, le=1)] = Decimal("0")
 
-# ── Discriminated unions (polymorphic models) ──────────────
-from typing import Annotated, Literal
-from pydantic import Discriminator
+    @computed_field                                 # included in model_dump() and the schema
+    @property
+    def total(self) -> Decimal:
+        subtotal = sum((i.price for i in self.items), Decimal("0"))
+        return (subtotal * (1 - self.discount)).quantize(Decimal("0.01"))
 
+# ── Discriminated unions: O(1) dispatch on a tag field ─────
 class Cat(BaseModel):
     pet_type: Literal["cat"]
     meows: int
@@ -296,265 +280,184 @@ class Dog(BaseModel):
     pet_type: Literal["dog"]
     barks: int
 
-def get_pet_discriminator(v: dict) -> str:
-    if isinstance(v, dict):
-        return v.get("pet_type")
-    return getattr(v, "pet_type")
-
-Pet = Annotated[Cat | Dog, Discriminator(get_pet_discriminator)]
+Pet = Annotated[Cat | Dog, Field(discriminator="pet_type")]
 
 class Zoo(BaseModel):
     pets: list[Pet]
 
-# Usage:
-# zoo = Zoo(pets=[{"pet_type": "cat", "meows": 3}, {"pet_type": "dog", "barks": 2}])
+Zoo(pets=[{"pet_type": "cat", "meows": 3}, {"pet_type": "dog", "barks": 2}])
+# Without a discriminator Pydantic tries each member ("smart" mode) and
+# reports errors for all of them. A callable Discriminator(fn) also
+# works, but then every member must be tagged: Annotated[Cat, Tag("cat")].
+
+# ── Strict vs lax ──────────────────────────────────────────
+# Lax (default): "42" → 42 for int fields, "true" → True for bool.
+# Strict: ConfigDict(strict=True) or Annotated[int, Strict()] rejects
+# type mismatches. Useful for internal contracts where "42" means a bug.
 ```
 
 ### Serialization & Deserialization
 
 ```python
-# ── Custom JSON encoding ───────────────────────────────────
-from pydantic import field_serializer
-from datetime import datetime
-import json
+from datetime import datetime, UTC
+from pydantic import BaseModel, RootModel, computed_field, field_serializer
 
 class Event(BaseModel):
     name: str
-    timestamp: datetime
-    
+    timestamp: datetime          # aware datetimes already serialise as ISO 8601 with offset
+
     @field_serializer("timestamp")
-    def serialize_timestamp(self, dt: datetime) -> str:
-        return dt.isoformat() + "Z"
+    def as_utc_z(self, dt: datetime) -> str:
+        # Normalise to UTC and use "Z"; appending "Z" to dt.isoformat() on an
+        # aware datetime would produce an invalid "+00:00Z"
+        return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
-# ── Custom root type ───────────────────────────────────────
-class ErrorResponse(BaseModel):
-    """Wraps a dict as the root of the response"""
-    root: dict[str, str]
-    
-    def __getitem__(self, key):
-        return self.root[key]
+# ── Root models (v1's __root__) ────────────────────────────
+class Tags(RootModel[list[str]]):
+    pass
 
-# ── Generics with Pydantic ─────────────────────────────────
-from typing import Generic, TypeVar
-from pydantic import BaseModel
+Tags(["a", "b"]).model_dump()          # ['a', 'b']
 
-T = TypeVar("T")
-
-class PaginatedResponse(BaseModel, Generic[T]):
+# ── Generic models ─────────────────────────────────────────
+class Page[T](BaseModel):              # PEP 695 syntax (3.12+); Generic[T] also works
     items: list[T]
     total: int
     page: int
     size: int
-    pages: int
-    
-    @model_validator(mode="after")
-    def compute_pages(self):
-        self.pages = (self.total + self.size - 1) // self.size
-        return self
 
-# Usage:
-# @app.get("/items/", response_model=PaginatedResponse[Item])
+    @computed_field
+    @property
+    def pages(self) -> int:
+        return (self.total + self.size - 1) // self.size
+
+# @app.get("/items/", response_model=Page[Item])
+# Page[Item] is a distinct model with its own OpenAPI schema ("Page_Item_").
+
+# ── Performance tips ───────────────────────────────────────
+# - Validate JSON directly: Model.model_validate_json(raw_bytes) skips the
+#   intermediate dict and is the fastest path.
+# - For non-model types, build a TypeAdapter(list[Item]) ONCE at import time;
+#   creating one per request rebuilds the schema.
+# - model_construct() skips validation for trusted data (e.g. from your own DB).
 ```
 
 ---
 
 ## 4. Dependency Injection System
 
+!!! tip "30-second answer"
+    A dependency is any callable whose parameters FastAPI can resolve: request data, or other dependencies. At startup FastAPI builds a graph per endpoint. Per request it resolves the graph, **caches each dependency's result for that request** (unless `use_cache=False`), runs sync dependencies in the thread pool, and treats `yield` dependencies as context managers. A `yield` dependency's teardown runs **after the response is sent** by default; pass `Depends(scope="function")` (0.12x+) to close it before the response goes out. Overrides via `app.dependency_overrides` make the same graph testable.
+
 ### Core Concepts
 
 ```python
-# FastAPI's DI system is one of its most powerful features.
-# Dependencies are callables that can have their own dependencies.
-
-from fastapi import Depends, FastAPI, HTTPException, status
 from typing import Annotated
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 app = FastAPI()
 
-# ── Simple dependency (function) ───────────────────────────
+# ── yield dependency: setup, hand over, teardown ───────────
 async def get_db():
-    """Yields a database session — handles cleanup via try/finally"""
-    db = DatabaseSession()
-    try:
-        yield db
-    finally:
-        db.close()
+    async with async_session() as session:   # closes the session on exit
+        yield session
 
-# ── Dependency with parameters ─────────────────────────────
+# ── Dependency with its own parameters (query params here) ─
 def pagination(
-    page: int = Query(1, ge=1),
-    size: int = Query(20, ge=1, le=100),
+    page: Annotated[int, Query(ge=1)] = 1,
+    size: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> tuple[int, int]:
-    skip = (page - 1) * size
-    return skip, size
+    return (page - 1) * size, size
 
-# ── Using dependencies ─────────────────────────────────────
+# ── Reusable Annotated aliases: the idiomatic style ───────
+DB = Annotated[AsyncSession, Depends(get_db)]
+Page = Annotated[tuple[int, int], Depends(pagination)]
+
 @app.get("/items/")
-async def list_items(
-    db: Annotated[DatabaseSession, Depends(get_db)],
-    pagination: Annotated[tuple[int, int], Depends(pagination)],
-):
-    skip, limit = pagination
-    return await db.fetch_all("SELECT * FROM items LIMIT $1 OFFSET $2", limit, skip)
+async def list_items(db: DB, page: Page):
+    offset, limit = page
+    result = await db.execute(select(ItemRow).offset(offset).limit(limit))
+    return result.scalars().all()
 ```
 
 ### Advanced DI Patterns
 
 ```python
-# ── Class-based dependencies ───────────────────────────────
-class AuthDependency:
-    """Class-based dependency with state"""
-    
-    def __init__(self, required_role: str = "user"):
-        self.required_role = required_role
-    
-    async def __call__(self, request: Request):
-        token = request.headers.get("Authorization")
-        if not token:
-            raise HTTPException(status_code=401)
-        
-        user = await verify_token(token)
-        if user.role != self.required_role:
-            raise HTTPException(status_code=403)
-        
+from fastapi import Request, Security
+from fastapi.security import OAuth2PasswordBearer
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# ── Class instance as a parameterised dependency ───────────
+class RequireRole:
+    def __init__(self, role: str):          # configured once, at import time
+        self.role = role
+
+    async def __call__(self, user: Annotated[User, Depends(get_current_user)]) -> User:
+        if self.role not in user.roles:      # called per request
+            raise HTTPException(status.HTTP_403_FORBIDDEN)
         return user
 
-require_admin = AuthDependency(required_role="admin")
-
 @app.get("/admin/")
-async def admin_endpoint(user: Annotated[User, Depends(require_admin)]):
+async def admin_endpoint(user: Annotated[User, Depends(RequireRole("admin"))]):
     return {"admin": user.email}
 
-# ── Dependency with internal dependencies ─────────────────
-class Pagination:
-    """Dependency class that itself depends on other dependencies"""
-    
-    def __init__(self, page: int = 1, size: int = 20):
-        self.page = page
-        self.size = size
-        self.skip = (page - 1) * size
-    
-    @classmethod
-    async def from_query(
-        cls,
-        page: int = Query(1, ge=1),
-        size: int = Query(20, ge=1, le=100),
-    ):
-        return cls(page=page, size=size)
-
-@app.get("/items/")
-async def list_items(p: Annotated[Pagination, Depends(Pagination.from_query)]):
-    return {"skip": p.skip, "limit": p.size}
-
-# ── Sub-dependencies (dependency graph) ────────────────────
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    """Top-level auth dependency"""
-    payload = decode_jwt(token)
-    user = await db.get_user(payload["sub"])
-    if not user:
-        raise HTTPException(status_code=401)
+# ── Sub-dependencies (a chain) ─────────────────────────────
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: DB) -> User:
+    payload = decode_jwt(token)                 # raises 401 on failure
+    user = await db.get(User, int(payload["sub"]))
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED)
     return user
 
-async def get_current_active_user(
-    current_user: Annotated[User, Depends(get_current_user)],
-) -> User:
-    """Sub-dependency that depends on get_current_user"""
-    if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user
+async def get_active_user(user: Annotated[User, Depends(get_current_user)]) -> User:
+    if not user.is_active:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Inactive user")
+    return user
 
-async def get_current_active_superuser(
-    current_user: Annotated[User, Depends(get_current_active_user)],
-) -> User:
-    """Another layer of dependency"""
-    if not current_user.is_superuser:
-        raise HTTPException(status_code=403, detail="Not enough permissions")
-    return current_user
+CurrentUser = Annotated[User, Depends(get_active_user)]
 
 @app.get("/users/me")
-async def read_own_items(
-    current_user: Annotated[User, Depends(get_current_active_user)],
-):
-    return {"user": current_user}
+async def read_me(user: CurrentUser):
+    return user
 
-# ── Dependencies with yield (context managers) ─────────────
-async def get_db_session():
-    """Provides a DB session with automatic cleanup"""
-    session = SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
-
-async def transactional(
-    db: Annotated[Session, Depends(get_db_session)],
-):
-    """Wraps operations in a transaction"""
+# ── Transactions: commit in the endpoint/service, not after yield ─
+# With the default scope="request", code after `yield` runs AFTER the
+# response is sent. A dependency that commits there can return 200 to
+# the client and then fail to commit. Either commit explicitly before
+# returning, or declare the dependency with scope="function".
+async def transactional(db: DB):
     try:
         yield db
-        db.commit()
+        await db.commit()               # runs before the response with scope="function"
     except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+        await db.rollback()
+        raise                           # always re-raise from a yield dependency
 
-@app.post("/items/")
-async def create_item(
-    item: Item,
-    db: Annotated[Session, Depends(transactional)],
-):
-    db.add(item)
-    return item  # Auto-committed by the transaction dependency
+Tx = Annotated[AsyncSession, Depends(transactional, scope="function")]
 
-# ── Global dependencies (apply to all routes) ──────────────
+@app.post("/items/", status_code=201)
+async def create_item(payload: ItemIn, db: Tx) -> ItemOut:
+    row = ItemRow(**payload.model_dump())   # ORM row, not the Pydantic model
+    db.add(row)
+    await db.flush()                        # get the PK before commit
+    return ItemOut.model_validate(row)      # committed before the response is sent
+
+# ── App- and router-level dependencies (run, value discarded) ─
 app = FastAPI(dependencies=[Depends(verify_api_key)])
-
-# Or per-router:
 router = APIRouter(dependencies=[Depends(rate_limiter)])
-
-# ── Cached dependencies (singleton per request) ────────────
-# FastAPI caches dependencies by default within the same request!
-async def get_db():
-    """Called once per request — result is cached"""
-    return Database()
-
-async def get_repo(db: Annotated[Database, Depends(get_db)]):
-    """Uses the same db instance — no second call"""
-    return Repository(db)
-
-# Both depends(get_db) in get_repo and depends(get_repo) in the
-# view will share the SAME db instance for the same request.
 ```
 
 ### DI Lifecycle & Caching
 
-```python
-# ── How FastAPI caches dependencies ────────────────────────
-# FastAPI uses a DAG (Directed Acyclic Graph) for dependencies.
-# Within the same request, each dependency is called only once,
-# and its result is cached and reused.
-
-# This means:
-# - Multiple routes can share the same dependency without redundant calls
-# - Dependencies can be called at different levels (router, app, path)
-# - The cache is per-request, not global
-
-# ── Use Depends() vs Depends for singleton vs callable ────
-# Depends(some_function)  → Calls some_function each time
-# Depends(SomeClass())    → Uses the SAME instance always
-# Depends(SomeClass)      → Calls SomeClass() each time (new instance)
-
-# ── Async vs Sync dependencies ─────────────────────────────
-# FastAPI can mix sync and async dependencies:
-def sync_dep():
-    return "sync"
-
-async def async_dep():
-    return "async"
-
-# FastAPI runs sync deps in a thread pool to avoid blocking
-```
+| Behaviour | Detail |
+|---|---|
+| Per-request cache | The same dependency used in several places in one request is called **once**; all users get the same value. Opt out with `Depends(dep, use_cache=False)` |
+| Not a singleton | Nothing is cached *across* requests. For process-wide objects (engine, HTTP client, settings), create them in **lifespan** and read them from `request.app.state`, or use `@lru_cache` on a getter |
+| Sync dependencies | Run in the thread pool, like sync endpoints. A trivial sync dependency still costs a thread hop, so make cheap ones `async def` |
+| `yield` teardown | Default `scope="request"`: after the response is sent. `scope="function"`: right after the endpoint returns, before the response. Exceptions raised in the endpoint are re-thrown at the `yield`; **re-raise** them if you catch them, or they vanish into a 500 with no log |
+| `Depends(SomeClass)` | Calls `SomeClass(...)` per request, resolving its `__init__` params as dependencies |
+| `Depends(instance)` | Calls `instance.__call__(...)` per request; the instance itself is shared |
+| Overrides | `app.dependency_overrides[real] = fake` swaps any node in the graph, sub-dependencies included |
 
 ---
 
@@ -564,7 +467,7 @@ async def async_dep():
 
 ```python
 import asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 app = FastAPI()
 
@@ -580,35 +483,33 @@ async def async_endpoint():
     await asyncio.sleep(0.1)
     return {"message": "async"}
 
-# ── When to use async ──────────────────────────────────────
-# USE async for:
-#   - Database queries (async ORM like SQLAlchemy 2.0 async)
-#   - API calls (httpx.AsyncClient)
-#   - File I/O (aiofiles)
-#   - Long-running operations with asyncio.sleep
-#   - WebSockets
-
-# USE sync for:
-#   - CPU-bound operations (better to use thread pool)
-#   - Simple CRUD with sync libraries
-#   - Legacy code
+# ── The rule ───────────────────────────────────────────────
+# async def → only if EVERYTHING it awaits is non-blocking (asyncpg,
+#             SQLAlchemy async, httpx.AsyncClient, redis.asyncio).
+# def       → if it calls ANY blocking library (requests, psycopg2,
+#             boto3, sync SQLAlchemy). FastAPI runs it in a worker thread.
+# Getting this wrong in the async direction is the #1 FastAPI outage:
+# one requests.get() inside async def freezes every request on that worker.
 
 # ── The thread pool ────────────────────────────────────────
-# FastAPI runs sync path operations in a thread pool.
-# You can also submit work explicitly:
+# Sync endpoints and sync dependencies run via anyio.to_thread.run_sync
+# (Starlette's run_in_threadpool). The default limiter allows 40
+# concurrent threads per process; once they're busy, further sync
+# requests queue even though the event loop is idle. Raise it at startup
+# if you're sure the downstream (e.g. DB pool) can take it:
+#   anyio.to_thread.current_default_thread_limiter().total_tokens = 100
 
-from concurrent.futures import ThreadPoolExecutor
+# ── CPU-bound work ─────────────────────────────────────────
+# Threads don't help pure-Python CPU work (GIL). Use a process pool
+# created in lifespan, or better, a task queue so the API stays responsive.
+from concurrent.futures import ProcessPoolExecutor
 import asyncio
 
-executor = ThreadPoolExecutor(max_workers=10)
-
 @app.post("/process")
-async def process_data(data: dict):
-    # Run CPU-bound work in thread pool
+async def process_data(data: dict, request: Request):
+    pool: ProcessPoolExecutor = request.app.state.cpu_pool    # created in lifespan
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        executor, cpu_intensive_task, data
-    )
+    result = await loop.run_in_executor(pool, cpu_intensive_task, data)
     return {"result": result}
 ```
 
@@ -621,8 +522,10 @@ import asyncio
 
 @app.get("/dashboard")
 async def get_dashboard():
-    """Fetch multiple sources concurrently"""
-    async with httpx.AsyncClient() as client:
+    """Fetch multiple sources concurrently.
+    In production, create ONE AsyncClient in lifespan and reuse it:
+    a client per request throws away connection pooling and TLS sessions."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as client:
         # Create tasks
         user_task = client.get("https://api.example.com/user")
         orders_task = client.get("https://api.example.com/orders")
@@ -695,26 +598,34 @@ async def right():
     await asyncio.sleep(5)
     return {"message": "after 5 seconds"}
 
-# ── Pitfall 2: Shared mutable state ────────────────────────
-shared_list: list = []  # 🔴 Not thread-safe!
+# ── Pitfall 2: In-process state ────────────────────────────
+counter = {"n": 0}
 
-@app.post("/add")
-async def add_item(item: str):
-    shared_list.append(item)  # Race condition!
-    return {"items": shared_list}
+@app.post("/hit")
+async def hit():
+    counter["n"] += 1          # No await in between: atomic on the event loop
+    return counter             # BUT each worker process has its own copy,
+                               # and it's lost on restart. Use Redis/DB.
 
-# ✅ Fix: Use asyncio.Lock or database
-lock = asyncio.Lock()
-
-@app.post("/add-safe")
-async def add_item_safe(item: str):
-    async with lock:
-        shared_list.append(item)
-        return {"items": shared_list.copy()}
+# Where races DO appear in async code: read, then await, then write.
+@app.post("/withdraw")
+async def withdraw(amount: int):
+    balance = await get_balance()          # other requests run during awaits...
+    await set_balance(balance - amount)    # ...so this is a lost update.
+    # Fix in the data store (UPDATE ... SET balance = balance - $1 WHERE
+    # balance >= $1), not with an asyncio.Lock, which only covers one process.
+    # Sync (def) endpoints run in threads, so there module state needs a
+    # threading.Lock as well.
 
 # ── Pitfall 3: Database connections ────────────────────────
-# Don't create connections per-request without pooling
-# Use connection pools (SQLAlchemy, asyncpg, aioredis)
+# Create engines/pools ONCE (lifespan), never per request. Pool size is
+# per process: workers × pool_size must fit under the DB's max_connections.
+
+# ── Pitfall 4: Fire-and-forget tasks ───────────────────────
+# asyncio.create_task(coro()) without keeping a reference can be
+# garbage-collected mid-flight, and its exceptions are never seen. Keep
+# references (a set + add_done_callback(discard)), use BackgroundTasks,
+# or a task queue.
 ```
 
 ---
@@ -722,6 +633,10 @@ async def add_item_safe(item: str):
 ## 6. Middleware & Lifecycle Events
 
 ### Custom Middleware
+
+!!! warning "Order and `BaseHTTPMiddleware`"
+    - `app.add_middleware()` **wraps** the current stack, so the **last one added is the outermost** (first to see the request). Put CORS outermost, so error responses also get CORS headers, and put cheap rejections (trusted host, rate limit) near the outside.
+    - `BaseHTTPMiddleware` (the `dispatch(request, call_next)` style) is convenient but costs extra per request and buffers the plumbing between layers. For hot paths, or anything that touches streaming responses, write **pure ASGI middleware** (below). Starlette's own docs recommend that for performance-sensitive middleware.
 
 ```python
 from fastapi import FastAPI, Request
@@ -754,28 +669,44 @@ class TimingMiddleware(BaseHTTPMiddleware):
 # ── Request ID middleware ─────────────────────────────────
 import uuid
 
-class RequestIDMiddleware(BaseHTTPMiddleware):
-    """Adds a unique request ID to each request"""
-    
-    async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-        request.state.request_id = request_id
-        
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        
-        return response
+class RequestIDMiddleware:
+    """Pure ASGI middleware: no BaseHTTPMiddleware overhead, works with
+    streaming responses, sets a contextvar for logging."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = dict(scope["headers"])
+        incoming = headers.get(b"x-request-id", b"").decode()
+        # Only trust a well-formed ID from your own edge; otherwise mint one
+        request_id = incoming if 8 <= len(incoming) <= 64 else uuid.uuid4().hex
+        scope.setdefault("state", {})["request_id"] = request_id   # request.state.request_id
+        token = request_id_ctx.set(request_id)                     # a ContextVar for log records
+
+        async def send_with_id(message):
+            if message["type"] == "http.response.start":
+                message.setdefault("headers", []).append((b"x-request-id", request_id.encode()))
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            request_id_ctx.reset(token)
 
 # ── CORS middleware ────────────────────────────────────────
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://myfrontend.com"],
+    allow_origins=["https://myfrontend.com"],  # with credentials, never "*"
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# CORS is enforced by BROWSERS only; it is not an auth mechanism.
 
 # ── TrustedHost middleware ─────────────────────────────────
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -790,50 +721,54 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# ── Register middleware ────────────────────────────────────
+# ── Register middleware (last added = outermost) ───────────
 app.add_middleware(TimingMiddleware)
-app.add_middleware(RequestIDMiddleware)
+app.add_middleware(RequestIDMiddleware)   # outermost of these two: ID exists before timing logs
 ```
 
 ### Lifecycle Events
 
 ```python
-# ── Startup and shutdown events ────────────────────────────
+# ── Lifespan: the only startup/shutdown API to use ─────────
+# Added in FastAPI 0.93 (2023). @app.on_event("startup"/"shutdown") is
+# deprecated, and Starlette 1.0 (March 2026) removed its own on_startup/
+# on_shutdown/on_event. Pick lifespan; don't mix it with on_event handlers.
 from contextlib import asynccontextmanager
+from typing import TypedDict
+import httpx
+
+class State(TypedDict):
+    http: httpx.AsyncClient
+    engine: AsyncEngine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifespan context manager (FastAPI 2.0+).
-    Replaces the deprecated on_event("startup")/on_event("shutdown").
-    """
-    # ── Startup ────────────────────────────────────────────
-    logger.info("Starting up...")
-    app.state.db = await create_database_pool()
-    app.state.cache = await create_cache_client()
-    app.state.ml_model = await load_ml_model()
-    logger.info("Startup complete")
-    
-    yield  # App runs here
-    
-    # ── Shutdown ───────────────────────────────────────────
-    logger.info("Shutting down...")
-    await app.state.db.close()
-    await app.state.cache.close()
-    logger.info("Shutdown complete")
+    # Startup: runs once per WORKER PROCESS, before it accepts traffic.
+    # If it raises, the worker fails to start (fail fast on bad config).
+    engine = create_async_engine(settings.database_url, pool_size=10, pool_pre_ping=True)
+    http = httpx.AsyncClient(timeout=5)
+    try:
+        # Yielding a dict exposes it as request.state.<key> in every request
+        # (Starlette "lifespan state"); app.state.x = ... also works.
+        yield State(http=http, engine=engine)
+    finally:
+        # Shutdown: runs after the server stops accepting connections and
+        # in-flight requests finish (or the graceful timeout expires).
+        await http.aclose()
+        await engine.dispose()
 
 app = FastAPI(lifespan=lifespan)
 
-# ── Access app state in routes ─────────────────────────────
-@app.get("/health")
-async def health(request: Request):
-    db_ok = await request.app.state.db.health_check()
-    cache_ok = await request.app.state.cache.ping()
-    return {
-        "database": "healthy" if db_ok else "unhealthy",
-        "cache": "healthy" if cache_ok else "unhealthy",
-    }
+@app.get("/health/ready")
+async def ready(request: Request):
+    async with request.state.engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    return {"status": "ok"}
+# Keep /health/live dependency-free: a DB outage should take pods out of
+# rotation (readiness), not restart them all (liveness).
 ```
+
+**Probe next:** with 4 workers, lifespan runs 4 times, so you get 4 pools and 4 copies of an ML model in memory. Size the DB pool per process. For big models, load before forking (Gunicorn `preload_app`) or run one larger process per container. `TestClient` only runs lifespan when used as a context manager (`with TestClient(app) as c:`).
 
 ---
 
@@ -842,119 +777,119 @@ async def health(request: Request):
 ### OAuth2 with JWT
 
 ```python
+from datetime import datetime, timedelta, UTC
+from typing import Annotated
+
+import jwt                                    # PyJWT; python-jose is unmaintained
+from jwt.exceptions import InvalidTokenError
+from pwdlib import PasswordHash               # Argon2 by default; passlib is unmaintained
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from pydantic import BaseModel
-from datetime import datetime, timedelta
-from typing import Optional
-import secrets
 
-# ── Password hashing ───────────────────────────────────────
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+password_hash = PasswordHash.recommended()
+DUMMY_HASH = password_hash.hash("dummy-password")
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
-
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-# ── JWT tokens ─────────────────────────────────────────────
-SECRET_KEY = secrets.token_urlsafe(32)
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+# Secret comes from config. secrets.token_urlsafe() at import time would
+# give every worker a different key and log everyone out on each deploy.
+SECRET_KEY = settings.jwt_secret
+ALGORITHM = "HS256"            # RS256/EdDSA when other services verify tokens
+ACCESS_TOKEN_TTL = timedelta(minutes=15)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+def create_access_token(user_id: int, scopes: list[str]) -> str:
+    now = datetime.now(UTC)
+    claims = {
+        "sub": str(user_id),   # PyJWT 2.10+ rejects a non-string "sub"
+        "scopes": scopes,
+        "iat": now,
+        "exp": now + ACCESS_TOKEN_TTL,
+        "iss": "https://auth.example.com",
+        "aud": "orders-api",
+    }
+    return jwt.encode(claims, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    """Decode JWT and return current user"""
-    credentials_exception = HTTPException(
+async def authenticate_user(db, username: str, password: str):
+    user = await get_user_by_email(db, username)
+    if user is None:
+        password_hash.verify(password, DUMMY_HASH)   # same timing for unknown users
+        return None
+    if not password_hash.verify(password, user.hashed_password):
+        return None
+    return user
+
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: DB) -> User:
+    unauthorized = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    
-    user = await get_user(user_id)
-    if user is None:
-        raise credentials_exception
+        payload = jwt.decode(
+            token, SECRET_KEY,
+            algorithms=[ALGORITHM],        # pin it: never trust the token's "alg" header
+            audience="orders-api", issuer="https://auth.example.com",
+        )
+    except InvalidTokenError:              # bad signature, expired, wrong aud/iss...
+        raise unauthorized
+    user = await db.get(User, int(payload["sub"]))
+    if user is None or not user.is_active:
+        raise unauthorized
     return user
 
-# ── Token endpoint ─────────────────────────────────────────
 @app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = await authenticate_user(form_data.username, form_data.password)
+async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: DB):
+    user = await authenticate_user(db, form.username, form.password)
     if not user:
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
-    
-    access_token = create_access_token(
-        data={"sub": user.id, "scopes": user.scopes},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    return {"access_token": create_access_token(user.id, user.scopes), "token_type": "bearer"}
 
-# ── Protected endpoint ─────────────────────────────────────
 @app.get("/users/me")
-async def read_users_me(current_user: User = Depends(get_current_user)):
-    return current_user
+async def read_users_me(user: Annotated[User, Depends(get_current_user)]):
+    return user
 ```
+
+**What interviewers probe on JWTs:** a JWT can't be revoked before `exp`. Keep access tokens short-lived (5-15 min), use rotating refresh tokens stored server-side, and keep a denylist (by `jti`) only if you must kill sessions instantly. Don't put secrets or PII in claims: they are signed, not encrypted. In most companies the API **verifies** tokens issued by an identity provider (Auth0, Cognito, Keycloak, Entra) against its JWKS, and doesn't mint them itself.
 
 ### API Key Authentication
 
 ```python
-from fastapi.security import APIKeyHeader, APIKeyQuery, APIKeyCookie
+import hashlib
+from dataclasses import dataclass
+from fastapi import Security
+from fastapi.security import APIKeyHeader
 
-api_key_header = APIKeyHeader(name="X-API-Key")
-api_key_query = APIKeyQuery(name="api_key")
+# auto_error=False: a missing header returns None instead of an immediate
+# 403, so the dependency decides (and can fall back to another scheme).
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+# Avoid API keys in query strings: they end up in access logs and browser history.
 
-async def verify_api_key(
-    api_key_header: str = Security(api_key_header),
-    api_key_query: str = Security(api_key_query),
-):
-    """Verify API key from header or query parameter"""
-    api_key = api_key_header or api_key_query
-    if not api_key:
-        raise HTTPException(status_code=401, detail="API key required")
-    
-    key_data = await get_api_key_data(api_key)
-    if not key_data:
-        raise HTTPException(status_code=403, detail="Invalid API key")
-    
-    return key_data
-
-# ── Scoped API keys ────────────────────────────────────────
 @dataclass
 class APIKeyData:
-    key: str
+    key_id: str
     user_id: str
     scopes: list[str]
     rate_limit: int  # requests per minute
 
-async def require_scope(required_scope: str):
-    """Dependency factory that requires a specific scope"""
-    async def scope_checker(api_key: APIKeyData = Depends(verify_api_key)):
-        if required_scope not in api_key.scopes:
-            raise HTTPException(status_code=403, detail=f"Scope '{required_scope}' required")
-        return api_key
-    return scope_checker
+async def verify_api_key(api_key: Annotated[str | None, Security(api_key_header)]) -> APIKeyData:
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    # Store only a hash of each key, and look it up by that hash
+    digest = hashlib.sha256(api_key.encode()).hexdigest()
+    key_data = await get_api_key_by_hash(digest)
+    if key_data is None:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return key_data
 
-# Usage:
+def require_scope(required: str):          # plain def: Depends() needs the inner function
+    async def checker(key: Annotated[APIKeyData, Depends(verify_api_key)]) -> APIKeyData:
+        if required not in key.scopes:
+            raise HTTPException(status_code=403, detail=f"Scope '{required}' required")
+        return key
+    return checker
+
 # @app.get("/admin/data")
-# async def admin_data(key: APIKeyData = Depends(require_scope("admin:read"))):
-#     ...
+# async def admin_data(key: Annotated[APIKeyData, Depends(require_scope("admin:read"))]): ...
 ```
 
 ---
@@ -964,6 +899,7 @@ async def require_scope(required_scope: str):
 ### SQLAlchemy 2.0 Async
 
 ```python
+from collections.abc import AsyncIterator
 from sqlalchemy.ext.asyncio import (
     create_async_engine, AsyncSession, async_sessionmaker, AsyncAttrs
 )
@@ -972,13 +908,18 @@ from sqlalchemy import select, text
 
 # ── Engine & session setup ─────────────────────────────────
 DATABASE_URL = "postgresql+asyncpg://user:pass@localhost/db"
-engine = create_async_engine(
+engine = create_async_engine(          # create in lifespan in real apps
     DATABASE_URL,
-    echo=True,
-    pool_size=20,
-    max_overflow=10,
-    pool_pre_ping=True,  # Connection health check
+    echo=False,           # echo=True logs every statement: dev only
+    pool_size=10,         # PER PROCESS: workers x (pool_size + max_overflow) <= DB limit
+    max_overflow=5,
+    pool_timeout=5,       # fail fast instead of queueing requests for 30 s
+    pool_pre_ping=True,   # check liveness on checkout (one round trip)
+    pool_recycle=1800,    # recycle before LB/DB idle timeouts kill connections
 )
+# expire_on_commit=False: after commit, attributes stay loaded. With async
+# you can't lazy-load on attribute access (it would need an await), so
+# expired attributes would raise MissingGreenlet.
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -993,13 +934,9 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(default=True)
 
 # ── Dependency for DB session ──────────────────────────────
-async def get_db() -> AsyncSession:
-    """Provides a database session with automatic cleanup"""
-    async with async_session() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+async def get_db() -> AsyncIterator[AsyncSession]:
+    async with async_session() as session:   # closes (and rolls back if uncommitted) on exit
+        yield session
 
 # ── CRUD operations ────────────────────────────────────────
 from sqlalchemy import select
@@ -1008,7 +945,8 @@ from typing import Annotated
 db_dep = Annotated[AsyncSession, Depends(get_db)]
 
 class UserRepository:
-    """Repository pattern for database operations"""
+    """Repository for queries. It doesn't commit: the caller (service or
+    unit of work) owns the transaction, so two repo calls can share one."""
     
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -1022,33 +960,29 @@ class UserRepository:
         )
         return result.scalar_one_or_none()
     
-    async def list_active(self, skip: int = 0, limit: int = 20) -> list[User]:
-        result = await self.session.execute(
+    async def list_active(self, after_id: int = 0, limit: int = 20) -> list[User]:
+        # Keyset pagination: stable and O(limit) at any depth, unlike OFFSET
+        result = await self.session.scalars(
             select(User)
-            .where(User.is_active == True)
-            .offset(skip)
+            .where(User.is_active.is_(True), User.id > after_id)
+            .order_by(User.id)
             .limit(limit)
         )
-        return list(result.scalars().all())
-    
-    async def create(self, user: User) -> User:
+        return list(result)
+
+    async def add(self, user: User) -> User:
         self.session.add(user)
-        await self.session.commit()
-        await self.session.refresh(user)
+        await self.session.flush()      # INSERT now, so user.id is populated
         return user
-    
-    async def update(self, user: User, **kwargs) -> User:
-        for key, value in kwargs.items():
-            setattr(user, key, value)
-        await self.session.commit()
-        await self.session.refresh(user)
-        return user
-    
+
     async def delete(self, user: User) -> None:
         await self.session.delete(user)
-        await self.session.commit()
 
-@app.get("/users/{user_id}")
+# Relationships: async SQLAlchemy can't lazy-load. Eager-load what the
+# response needs, e.g. select(User).options(selectinload(User.orders)),
+# or use AsyncAttrs: `await user.awaitable_attrs.orders`.
+
+@app.get("/users/{user_id}", response_model=UserOut)   # never return ORM rows unfiltered
 async def get_user(
     user_id: int,
     db: db_dep,
@@ -1085,65 +1019,40 @@ class DatabaseService:
             return await conn.execute(query, *args)
 
 # ── Transaction management ─────────────────────────────────
-async def transactional(db: AsyncSession = Depends(get_db)):
-    """Dependency that manages transactions"""
-    try:
-        yield db
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+# See §4: commit before the response is sent, either explicitly in the
+# service (`async with session.begin(): ...`) or with a
+# Depends(..., scope="function") dependency.
 ```
 
 ### Redis Integration
 
 ```python
-import redis.asyncio as aioredis
-from typing import Optional
 import json
+import redis.asyncio as redis
+from fastapi import Request
 
 class CacheService:
-    """Async Redis cache service"""
-    
-    def __init__(self, redis_url: str = "redis://localhost:6379/0"):
-        self.redis_url = redis_url
-        self.redis: Optional[aioredis.Redis] = None
-    
-    async def connect(self):
-        self.redis = await aioredis.from_url(
-            self.redis_url,
-            max_connections=50,
-            decode_responses=True,
-        )
-    
-    async def disconnect(self):
-        if self.redis:
-            await self.redis.close()
-    
-    async def get(self, key: str) -> Optional[str]:
-        return await self.redis.get(key)
-    
-    async def set(self, key: str, value: str, expire: int = 300):
-        await self.redis.set(key, value, ex=expire)
-    
-    async def delete(self, key: str):
-        await self.redis.delete(key)
-    
-    async def get_or_compute(
-        self, key: str, compute_fn, expire: int = 300
-    ):
-        """Cache-aside pattern"""
-        cached = await self.get(key)
-        if cached:
+    def __init__(self, url: str):
+        # from_url() is synchronous: it builds a client and a lazy pool,
+        # and connects on first command. Don't await it.
+        self.redis = redis.from_url(url, max_connections=50, decode_responses=True)
+
+    async def close(self):
+        await self.redis.aclose()          # close() is deprecated in redis-py 5
+
+    async def get_or_compute(self, key: str, compute_fn, ttl: int = 300):
+        cached = await self.redis.get(key)
+        if cached is not None:             # "" or "0" are valid cached values
             return json.loads(cached)
-        
         value = await compute_fn()
-        await self.set(key, json.dumps(value), expire)
+        await self.redis.set(key, json.dumps(value), ex=ttl)
         return value
 
-# ── Dependency ─────────────────────────────────────────────
-async def get_cache() -> CacheService:
+# Created in lifespan: app.state.cache = CacheService(settings.redis_url)
+def get_cache(request: Request) -> CacheService:
     return request.app.state.cache
+
+Cache = Annotated[CacheService, Depends(get_cache)]
 ```
 
 ---
@@ -1174,28 +1083,25 @@ async def send_email(
     background_tasks.add_task(send_email_task, email)
     return {"message": "Email queued"}
 
-# ── Background tasks with dependencies ─────────────────────
-async def process_upload(
-    file_id: str,
-    db: Annotated[Session, Depends(get_db)],
-):
-    """Runs after response — keeps DB session alive"""
-    # Process file...
-    await update_file_status(db, file_id, "completed")
+# ── Background tasks and DB sessions ───────────────────────
+# Depends() does NOT work in task functions; they're plain callables.
+# Don't hand them the request's session either: it belongs to the
+# request's dependency lifecycle. Open a fresh session inside the task.
+async def process_upload(file_id: str):
+    async with async_session() as db, db.begin():
+        await update_file_status(db, file_id, "completed")
 
-@app.post("/upload")
-async def upload_file(
-    file: UploadFile,
-    background_tasks: BackgroundTasks,
-    db: db_dep,
-):
+@app.post("/upload", status_code=202)
+async def upload_file(file: UploadFile, background_tasks: BackgroundTasks, db: db_dep):
     file_id = str(uuid.uuid4())
     await save_file_metadata(db, file_id, file.filename)
-    
-    # The task receives dependencies via closure
-    background_tasks.add_task(process_upload, file_id, db)
-    
+    await db.commit()                     # commit BEFORE the task can look for the row
+    background_tasks.add_task(process_upload, file_id)
     return {"file_id": file_id}
+
+# How BackgroundTasks run: in the same process, after the response body
+# is sent, on the same event loop (sync functions go to the thread pool).
+# Not durable: a deploy, crash or OOM loses them, and nothing retries.
 
 # ── Task queue for heavy work ──────────────────────────────
 # BackgroundTasks are for LIGHT work only.
@@ -1232,15 +1138,16 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("Client disconnected")
 
 # ── WebSocket with auth ────────────────────────────────────
+# Browsers can't set an Authorization header on a WebSocket. Options: a
+# cookie session, a short-lived single-use ticket in the query string
+# (it ends up in access logs, so make it expire in seconds), or an auth
+# message as the first frame after accept.
 @app.websocket("/ws/chat")
-async def chat_websocket(
-    websocket: WebSocket,
-    token: str = Query(...),
-):
-    # Authenticate before accepting
-    user = await verify_token(token)
+async def chat_websocket(websocket: WebSocket, ticket: str):
+    user = await redeem_ws_ticket(ticket)      # single use, ~30 s TTL
     if not user:
-        await websocket.close(code=4001)
+        # Closing before accept() rejects the handshake (HTTP 403)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     
     await websocket.accept()
@@ -1272,26 +1179,38 @@ class ConnectionManager:
     
     async def disconnect(self, room: str, websocket: WebSocket):
         async with self._lock:
-            self.active_connections.get(room, set()).discard(websocket)
-            if not self.active_connections.get(room):
-                del self.active_connections[room]
+            conns = self.active_connections.get(room)
+            if conns is not None:
+                conns.discard(websocket)
+                if not conns:
+                    del self.active_connections[room]
     
     async def broadcast(self, room: str, message: dict):
-        """Send message to all clients in a room"""
+        """Send to every client in a room, concurrently, WITHOUT holding
+        the lock during I/O (one slow client must not stall the room)."""
         async with self._lock:
-            for ws in self.active_connections.get(room, set()).copy():
-                try:
-                    await ws.send_json(message)
-                except WebSocketDisconnect:
-                    self.active_connections[room].discard(ws)
+            targets = list(self.active_connections.get(room, ()))
+        results = await asyncio.gather(
+            *(asyncio.wait_for(ws.send_json(message), timeout=2) for ws in targets),
+            return_exceptions=True,
+        )
+        for ws, res in zip(targets, results):
+            if isinstance(res, Exception):         # dead or too slow: drop it
+                await self.disconnect(room, ws)
 
 manager = ConnectionManager()
+
+# ⚠️ This manager is per PROCESS. With N workers or pods, users in the
+# same room land on different processes. Fan out through Redis pub/sub
+# (or NATS/Kafka): each process subscribes to the rooms it hosts and
+# broadcasts locally. Also plan for reconnects (clients resume from a
+# last-seen message ID) and use sticky sessions only as an optimisation.
 
 @app.websocket("/ws/room/{room_id}")
 async def room_websocket(
     websocket: WebSocket,
     room_id: str,
-    user: User = Depends(get_current_user),  # Auth via query param
+    user: Annotated[User, Depends(get_ws_user)],  # a WebSocket-aware auth dep (ticket/cookie)
 ):
     await manager.connect(room_id, websocket)
     await manager.broadcast(
@@ -1325,18 +1244,23 @@ import pytest
 
 # ── Sync tests with TestClient ────────────────────────────
 def test_read_main():
-    client = TestClient(app)
-    response = client.get("/")
+    # `with` runs lifespan startup/shutdown; a bare TestClient(app) does NOT,
+    # so anything created in lifespan (pools, clients) would be missing.
+    with TestClient(app) as client:
+        response = client.get("/")
     assert response.status_code == 200
     assert response.json() == {"message": "Hello World"}
 
-# ── Async tests ───────────────────────────────────────────
-@pytest.mark.asyncio
+# ── Async tests (when the test itself must await things) ───
+# Needs an async test runner: pytest-asyncio (@pytest.mark.asyncio) or
+# AnyIO's pytest plugin (@pytest.mark.anyio). ASGITransport does NOT run
+# lifespan; wrap the app with asgi-lifespan's LifespanManager if needed.
+@pytest.mark.anyio
 async def test_async_endpoint():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/async")
-        assert response.status_code == 200
+    assert response.status_code == 200
 
 # ── Test with dependency overrides ────────────────────────
 from app.dependencies import get_db
@@ -1349,21 +1273,26 @@ class MockDB:
 async def override_get_db():
     yield MockDB()
 
-app.dependency_overrides[get_db] = override_get_db
-
-def test_with_mock_db():
-    client = TestClient(app)
-    response = client.get("/items/")
-    assert response.status_code == 200
-
-# ── Clean up overrides ────────────────────────────────────
+# ── Overrides belong in a fixture, so they're always cleaned up ──
 @pytest.fixture
 def client():
     app.dependency_overrides[get_db] = override_get_db
-    yield TestClient(app)
+    with TestClient(app) as c:
+        yield c
     app.dependency_overrides.clear()
 
+def test_with_mock_db(client):
+    response = client.get("/items/")
+    assert response.status_code == 200
+
+# Staff-level testing advice: mocking the DB tests your mocks. Prefer a
+# real Postgres (testcontainers or a CI service), one transaction per test
+# rolled back at the end, and override only true externals (payment
+# provider, email) at the dependency boundary.
+
 # ── Test authentication ───────────────────────────────────
+# Faster: override get_current_user to return a fixture user, and test
+# the login flow once, separately.
 def test_authenticated_endpoint(client):
     # Login
     login_response = client.post("/token", data={
@@ -1380,8 +1309,7 @@ def test_authenticated_endpoint(client):
     assert response.status_code == 200
 
 # ── Test WebSocket ─────────────────────────────────────────
-def test_websocket():
-    client = TestClient(app)
+def test_websocket(client):
     with client.websocket_connect("/ws") as websocket:
         websocket.send_text("Hello")
         data = websocket.receive_text()
@@ -1409,7 +1337,11 @@ import io
 import pstats
 
 class ProfileMiddleware(BaseHTTPMiddleware):
-    """Profile specific endpoints"""
+    """Profile specific endpoints (dev only).
+    ⚠️ cProfile isn't async-aware: it measures the event-loop thread, so
+    other requests' work interleaves into the profile and awaited time is
+    misattributed. pyinstrument (async mode) is better per request; py-spy
+    (sampling, attach to the PID, no code change) is better in production."""
     
     async def dispatch(self, request: Request, call_next):
         if request.url.path.startswith("/slow"):
@@ -1429,21 +1361,25 @@ class ProfileMiddleware(BaseHTTPMiddleware):
         return response
 
 # ── Database query optimization ────────────────────────────
-# 1. Use selectinload/eager loading for relationships
-# 2. Use only() / load_only() to select specific columns
-# 3. Use limit/offset for pagination
-# 4. Use connection pooling with proper pool size
-# 5. Use indexing on frequently queried columns
+# 1. selectinload/joinedload for relationships (lazy loads fail in async anyway)
+# 2. load_only() to select specific columns
+# 3. Keyset pagination for deep pages; OFFSET scans and discards rows
+# 4. Pool sized per process; watch pool wait time, not just DB CPU
+# 5. Indexes for the actual WHERE/ORDER BY; check EXPLAIN ANALYZE
 ```
 
 ### Response Compression & Caching
 
 ```python
-from fastapi.responses import ORJSONResponse
-import orjson
-
-# ── Use ORJSON for faster serialization ────────────────────
-app = FastAPI(default_response_class=ORJSONResponse)
+# ── Serialization: declare a response model / return type ──
+# Recent FastAPI serialises straight to JSON bytes with Pydantic (Rust)
+# when an endpoint has a response_model or return annotation. That's
+# the fast path, and ORJSONResponse/UJSONResponse are now DEPRECATED.
+# Returning raw dicts without a model goes through jsonable_encoder,
+# which is slower.
+@app.get("/items/{item_id}")
+async def get_item(item_id: int) -> ItemOut:      # return type = response model
+    return await load_item(item_id)
 
 # ── Cache headers ─────────────────────────────────────────
 from fastapi.responses import Response
@@ -1468,18 +1404,18 @@ async def get_item_with_etag(
     item_id: int,
     if_none_match: str | None = Header(None),
 ):
-    item = await get_item(item_id)
-    item_json = item.model_dump_json()
-    etag = hashlib.md5(item_json.encode()).hexdigest()
-    
-    if if_none_match == etag:
-        return Response(status_code=304)  # Not Modified
-    
-    return Response(
-        content=item_json,
-        media_type="application/json",
-        headers={"ETag": etag},
-    )
+    item = await load_item(item_id)
+    body = item.model_dump_json()
+    etag = f'"{hashlib.sha256(body.encode()).hexdigest()[:32]}"'   # ETags are quoted strings
+
+    # If-None-Match may hold several tags or "*", possibly weak (W/"...")
+    if if_none_match and (if_none_match.strip() == "*" or etag in
+                          [t.strip().removeprefix("W/") for t in if_none_match.split(",")]):
+        return Response(status_code=304, headers={"ETag": etag})
+
+    return Response(content=body, media_type="application/json", headers={"ETag": etag})
+# Hashing the body still costs the DB read and serialisation; a stored
+# version column (updated_at / row version) as the ETag skips both.
 ```
 
 ### Async Performance Patterns
@@ -1488,12 +1424,17 @@ async def get_item_with_etag(
 # ── Process large datasets in chunks ──────────────────────
 @app.get("/process-large")
 async def process_large_dataset():
-    """Process millions of rows without memory overflow"""
-    results = []
+    """Process millions of rows with bounded memory: keep aggregates,
+    not rows. (Accumulating every result in a list defeats batching.)"""
+    count, sample = 0, []
     async for batch in fetch_large_dataset_batches(batch_size=1000):
         processed = await process_batch(batch)
-        results.extend(processed)
-    return {"count": len(results), "results": results[:100]}
+        count += len(processed)
+        if len(sample) < 100:
+            sample.extend(processed[: 100 - len(sample)])
+    return {"count": count, "sample": sample}
+# If this takes more than a few seconds, it's a job, not a request:
+# enqueue it and return 202 + a status URL.
 
 # ── Use asyncio.gather for independent tasks ───────────────
 @app.get("/aggregated")
@@ -1519,48 +1460,45 @@ async def get_aggregated():
 
 ### ASGI Servers
 
-```python
-# ── Uvicorn (most common) ─────────────────────────────────
-# uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+!!! tip "30-second answer"
+    On **Kubernetes/containers**, run **one Uvicorn process per container** (no `--workers`) and let the orchestrator scale replicas and restart crashes; set CPU requests to about one core. On a **VM or bare metal**, run several worker processes per box: `uvicorn --workers N` (Uvicorn has supervised its own workers since 0.30), `fastapi run --workers N`, or Gunicorn with `-k uvicorn_worker.UvicornWorker`. One process uses one core for Python code, so N ≈ cores. Unlike WSGI, async workers don't need `2 × cores + 1`.
 
-# ── Gunicorn with Uvicorn workers ─────────────────────────
-# gunicorn main:app \
-#     --worker-class uvicorn.workers.UvicornWorker \
-#     --workers 8 \
-#     --bind 0.0.0.0:8000 \
-#     --timeout 120 \
-#     --keepalive 5 \
-#     --max-requests 1000 \
-#     --max-requests-jitter 50
+```bash
+# ── FastAPI CLI (wraps Uvicorn) ───────────────────────────
+fastapi run main.py --port 8000 --workers 4        # production defaults (no reload)
 
-# ── Uvicorn with Gunicorn (recommended) ──────────────────
-# Run: gunicorn -k uvicorn.workers.UvicornWorker main:app
+# ── Uvicorn directly ──────────────────────────────────────
+# --proxy-headers/--forwarded-allow-ips: trust X-Forwarded-* only from the LB
+# --timeout-graceful-shutdown: keep below k8s terminationGracePeriodSeconds
+# --timeout-keep-alive: longer than the LB idle timeout
+# --limit-max-requests: recycle workers to cap slow leaks
+uvicorn main:app --host 0.0.0.0 --port 8000 \
+    --workers 4 \
+    --proxy-headers --forwarded-allow-ips="10.0.0.0/8" \
+    --timeout-graceful-shutdown 25 \
+    --timeout-keep-alive 75 \
+    --limit-max-requests 10000
 
-# ── Hypercorn (supports HTTP/2, WebSocket) ─────────────────
-# hypercorn main:app --bind 0.0.0.0:8000 --worker-class uvloop
+# ── Gunicorn as the process manager ───────────────────────
+# uvicorn.workers.UvicornWorker is deprecated; use the uvicorn-worker package
+gunicorn main:app -k uvicorn_worker.UvicornWorker -w 4 \
+    --bind 0.0.0.0:8000 --graceful-timeout 25 --max-requests 10000 --max-requests-jitter 1000
 
-# ── Supervisor/Systemd for process management ─────────────
-# [Unit]
-# Description=FastAPI Application
-# After=network.target
-#
-# [Service]
-# User=www-data
-# WorkingDirectory=/opt/app
-# ExecStart=/opt/app/venv/bin/uvicorn main:app --workers 4
-# Restart=always
-# RestartSec=10
-# Environment=PYTHONPATH=/opt/app
-#
-# [Install]
-# WantedBy=multi-user.target
+# ── Alternatives ──────────────────────────────────────────
+# Hypercorn: HTTP/2 and HTTP/3 support. Granian: Rust server, fast, own worker model.
+# uvloop and httptools are used automatically when installed (uvicorn[standard]).
 ```
+
+**Why the keep-alive detail matters:** if the app closes an idle connection at the same moment the load balancer reuses it, the client gets a 502. Make the server's keep-alive timeout **longer** than the LB's idle timeout (AWS ALB defaults to 60 s).
+
+**Graceful shutdown on Kubernetes:** on SIGTERM, Uvicorn stops accepting connections, waits for in-flight requests (up to `--timeout-graceful-shutdown`), then runs lifespan shutdown. Endpoints are removed from the Service asynchronously, so add a short `preStop` sleep (5-10 s) so the pod stops receiving new traffic *before* it stops listening.
 
 ### Configuration Management
 
 ```python
 # ── Pydantic Settings ──────────────────────────────────────
-from pydantic_settings import BaseSettings
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
 class Settings(BaseSettings):
@@ -1580,25 +1518,27 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     
     # Auth
-    secret_key: str
+    secret_key: SecretStr          # repr shows '**********', so it won't leak into logs
     access_token_expire_minutes: int = 30
-    
+
     # External APIs
-    openai_api_key: str = ""
+    openai_api_key: SecretStr | None = None
     sentry_dsn: str = ""
     
     # Rate limiting
     rate_limit_per_minute: int = 60
     
-    model_config = {
-        "env_file": ".env",
-        "env_file_encoding": "utf-8",
-        "case_sensitive": False,
-    }
+    model_config = SettingsConfigDict(
+        env_file=".env",              # local dev only; real env vars take precedence
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+    # Missing required fields (database_url, secret_key) raise at startup:
+    # fail fast instead of on the first request that needs them.
 
-@lru_cache()
+@lru_cache
 def get_settings() -> Settings:
-    """Singleton settings — cached for performance"""
+    """One Settings per process; override get_settings in tests."""
     return Settings()
 
 # ── Dependency ─────────────────────────────────────────────
@@ -1613,15 +1553,25 @@ async def info(settings: Settings = Depends(get_settings)):
 ### Production Middleware Stack
 
 ```python
-# ── Complete production middleware ─────────────────────────
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
 app = FastAPI(
     lifespan=lifespan,
-    docs_url=None if is_production else "/docs",  # Disable in prod
+    docs_url=None if is_production else "/docs",   # or keep docs behind auth
     redoc_url=None if is_production else "/redoc",
 )
 
-# Security first
+# add_middleware WRAPS the stack: the LAST added is the OUTERMOST.
+# Add innermost first:
+app.add_middleware(GZipMiddleware, minimum_size=1000)            # innermost: compresses the final body
+app.add_middleware(TimingMiddleware)
+app.add_middleware(RateLimitMiddleware, limit=settings.rate_limit_per_minute)
+app.add_middleware(RequestIDMiddleware)                           # ID exists for every log line below
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+# Outermost: handled errors (4xx, HTTPException) also get CORS headers.
+# Unhandled exceptions are turned into 500s by ServerErrorMiddleware, which
+# sits OUTSIDE all user middleware, so those responses carry no CORS headers.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -1630,55 +1580,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Performance
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# ── Error handling: one consistent error shape ─────────────
+def _rid(request: Request) -> str | None:
+    return getattr(request.state, "request_id", None)   # may be unset if a middleware failed early
 
-# Observability
-app.add_middleware(TimingMiddleware)
-app.add_middleware(RequestIDMiddleware)
-
-# Rate limiting
-app.add_middleware(RateLimitMiddleware, rate_limit=settings.rate_limit_per_minute)
-
-# ── Error handling ─────────────────────────────────────────
-@app.exception_handler(ValidationError)
-async def validation_exception_handler(request, exc):
+@app.exception_handler(RequestValidationError)              # bad request input → 422
+async def request_validation_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors(), "body": exc.body},
+        content={"detail": jsonable_encoder(exc.errors()), "request_id": _rid(request)},
+        # Don't echo exc.body back: it may contain passwords or PII
     )
 
-@app.exception_handler(RequestValidationError)
-async def request_validation_handler(request, exc):
-    return JSONResponse(
-        status_code=422,
-        content={
-            "detail": exc.errors(),
-            "body": exc.body,
-            "request_id": request.state.request_id,
-        },
-    )
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
+@app.exception_handler(StarletteHTTPException)   # Starlette's class also catches routing 404/405
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "detail": exc.detail,
-            "request_id": request.state.request_id,
-        },
+        content={"detail": exc.detail, "request_id": _rid(request)},
+        headers=getattr(exc, "headers", None),   # keep WWW-Authenticate etc.
     )
 
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    logger.exception("Unhandled exception")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "detail": "Internal server error",
-            "request_id": request.state.request_id,
-        },
-    )
+@app.exception_handler(Exception)                # catch-all → 500, never leak internals
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception", extra={"request_id": _rid(request)})
+    return JSONResponse(status_code=500,
+                        content={"detail": "Internal server error", "request_id": _rid(request)})
+
+# Note: a pydantic ValidationError raised INSIDE your code (e.g. validating
+# a downstream response) is a server bug → 500, not a client 422. FastAPI
+# raises ResponseValidationError when your return value fails response_model.
 ```
 
 ---
@@ -1686,6 +1616,8 @@ async def general_exception_handler(request, exc):
 ## 13. OpenAPI & Documentation Customization
 
 ### Customizing the OpenAPI Schema
+
+FastAPI generates **OpenAPI 3.1** (since 0.99, mid-2023), which aligns with JSON Schema 2020-12. Some older client generators only understand 3.0, so check your codegen before you upgrade.
 
 ```python
 from fastapi import FastAPI, APIRouter
@@ -1792,14 +1724,15 @@ async def get_item(item_id: int):
 ```python
 # ── Separating business logic from routes ─────────────────
 # services/item_service.py
-from dataclasses import dataclass
-from typing import Optional
+# The service knows nothing about HTTP: it raises domain errors, and an
+# exception handler maps them to status codes in one place.
+class DomainError(Exception): ...
+class ValidationFailed(DomainError): ...
 
-@dataclass
-class CreateItemRequest:
+class CreateItemRequest(BaseModel):
     name: str
-    price: float
-    tax: Optional[float] = None
+    price: Decimal
+    tax: Decimal | None = None
 
 class ItemService:
     """Business logic for items"""
@@ -1810,20 +1743,17 @@ class ItemService:
         self.repo = ItemRepository(db)
     
     async def create_item(self, request: CreateItemRequest) -> Item:
-        # Business validation
-        if request.price < 0:
-            raise ValueError("Price cannot be negative")
-        if request.tax and request.tax > request.price:
-            raise ValueError("Tax exceeds price")
-        
-        # Create
-        item = Item(**request.dict())
-        created = await self.repo.create(item)
-        
-        # Cache
-        await self.cache.set(f"item:{created.id}", created.model_dump_json())
-        
-        return created
+        # Business rules (shape/type rules already ran in Pydantic)
+        if request.tax is not None and request.tax > request.price:
+            raise ValidationFailed("Tax exceeds price")
+
+        created = await self.repo.add(ItemRow(**request.model_dump()))
+        await self.db.commit()                         # the service owns the transaction
+        item = Item.model_validate(created)            # needs from_attributes=True
+
+        # Cache after commit; a failure here must not fail the request
+        await self.cache.set(f"item:{item.id}", item.model_dump_json())
+        return item
     
     async def get_item(self, item_id: int) -> Optional[Item]:
         # Try cache first
@@ -1839,16 +1769,19 @@ class ItemService:
         return item
 
 # routes/items.py
-@router.post("/items/")
+def get_item_service(db: DB, cache: Cache) -> ItemService:
+    return ItemService(db, cache)
+
+@router.post("/items/", status_code=201)
 async def create_item(
     request: CreateItemRequest,
-    service: ItemService = Depends(get_item_service),
-):
-    try:
-        item = await service.create_item(request)
-        return item
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    service: Annotated[ItemService, Depends(get_item_service)],
+) -> Item:
+    return await service.create_item(request)
+
+@app.exception_handler(ValidationFailed)
+async def on_validation_failed(request: Request, exc: ValidationFailed):
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
 ```
 
 ### Repository Pattern
@@ -1907,12 +1840,11 @@ class InMemoryItemRepository(Repository[Item]):
     # ... etc
 
 # ── Dependency ─────────────────────────────────────────────
-def get_item_repository(
-    db: AsyncSession = Depends(get_db),
-) -> Repository[Item]:
-    if settings.environment == "test":
-        return InMemoryItemRepository()
+def get_item_repository(db: DB) -> Repository[Item]:
     return PostgresItemRepository(db)
+
+# Tests swap it without any `if environment == "test"` branch in prod code:
+# app.dependency_overrides[get_item_repository] = lambda: InMemoryItemRepository()
 ```
 
 ### Unit of Work Pattern
@@ -1972,7 +1904,7 @@ async def create_order(
 - **Async-first:** Built on ASGI, supports async/await natively (Flask is WSGI/sync)
 - **Auto-documentation:** Automatic OpenAPI/Swagger docs from Python type hints
 - **Validation:** Built-in request/response validation via Pydantic (Flask needs separate libraries)
-- **Performance:** Significantly faster — on par with Node.js and Go (Flask is slower due to WSGI)
+- **Performance:** Higher throughput than Flask for I/O-bound work, because one async worker can serve many concurrent requests. The "as fast as Node and Go" claim comes from framework micro-benchmarks; in real services the DB and your code dominate. Flask 2.0+ also supports `async def` views, but each request still occupies a WSGI worker.
 - **Dependency Injection:** Built-in DI system (Flask uses global `request` object)
 - **WebSocket support:** Native WebSocket support (Flask needs extensions)
 - **Type safety:** Full type hint support with IDE autocomplete
@@ -2027,9 +1959,11 @@ async def async_view():
     return {"hello": "world"}
 ```
 
-- **Sync views:** FastAPI runs them in a thread pool using `run_in_executor`. They don't block the main event loop.
-- **Async views:** Run directly on the event loop. Best for I/O-bound operations (DB queries, API calls, file I/O).
-- **Mixing:** You can mix both. Async views should not call blocking code directly.
+- **Sync views (`def`):** run in AnyIO's worker thread pool (`anyio.to_thread.run_sync`), 40 threads per process by default. They don't block the event loop, but concurrency is capped at the pool size.
+- **Async views (`async def`):** run on the event loop. Best when every I/O call is awaited (async DB driver, httpx). One blocking call (`requests`, `time.sleep`, sync DB driver, heavy CPU) stalls **every** request on that worker.
+- **Rule:** if in doubt, `def` is the safe default; `async def` is a promise that you never block. Inside `async def`, push unavoidable blocking calls to `await anyio.to_thread.run_sync(fn)` or `asyncio.to_thread(fn)`.
+
+**Probe next:** "How would you find a blocking call in production?" Turn on asyncio debug mode (`PYTHONASYNCIODEBUG=1` logs callbacks slower than 100 ms), watch event-loop lag metrics, and take `py-spy dump` stack samples, or on 3.14 `python -m asyncio pstree <pid>`.
 </details>
 
 ### Intermediate
@@ -2049,8 +1983,8 @@ async def async_view():
 ```python
 @app.get("/items/{item_id}", response_model=Item)
 async def get_item(
-    item_id: int = Path(..., ge=1),           # Path parameter
-    q: str = Query(None, max_length=50),       # Query parameter
+    item_id: Annotated[int, Path(ge=1)],                       # Path parameter
+    q: Annotated[str | None, Query(max_length=50)] = None,     # Query parameter
 ):
     """
     Get an item by ID.
@@ -2059,21 +1993,20 @@ async def get_item(
     return await get_item_from_db(item_id)
 ```
 
-This generates complete OpenAPI 3.0 JSON, which Swagger UI and ReDoc render as interactive documentation.
+This generates OpenAPI 3.1 JSON (since FastAPI 0.99), which Swagger UI and ReDoc render as interactive documentation. Pydantic produces the JSON Schemas for the models, and they appear under `components/schemas`. Gotcha: input and output schemas for the same model can differ (fields with defaults are required in output), so FastAPI emits `Model-Input`/`Model-Output` unless you set `separate_input_output_schemas=False`.
 </details>
 
 <details>
 <summary><b>Q5: How do you handle database transactions in FastAPI?</b></summary>
 
-**Answer:** Using dependency injection with context managers:
+**30-second answer:** one `AsyncSession` per request from a `yield` dependency. The commit must happen **before the response is sent**: either explicitly in the service layer, or in a dependency declared with `Depends(..., scope="function")`. With the default `scope="request"`, code after `yield` runs after the response has gone out, so a failed commit still returns 200 to the client.
 
 ```python
 async def get_session():
     async with async_session() as session:
         yield session
 
-async def transactional(db = Depends(get_session)):
-    """Manages transaction lifecycle"""
+async def transactional(db: Annotated[AsyncSession, Depends(get_session)]):
     try:
         yield db
         await db.commit()
@@ -2081,16 +2014,20 @@ async def transactional(db = Depends(get_session)):
         await db.rollback()
         raise
 
-@app.post("/items")
-async def create_item(
-    item: Item,
-    db = Depends(transactional),
-):
-    db.add(item)
-    return item  # Auto-committed
+Tx = Annotated[AsyncSession, Depends(transactional, scope="function")]
+
+@app.post("/items", status_code=201)
+async def create_item(item: ItemIn, db: Tx) -> ItemOut:
+    row = ItemRow(**item.model_dump())      # ORM object, not the Pydantic model
+    db.add(row)
+    await db.flush()                         # assigns row.id; still uncommitted
+    return ItemOut.model_validate(row)       # commit happens before the response is sent
 ```
 
-For nested transactions, use savepoints within the same session.
+**Probe next:**
+- *Savepoints:* `async with db.begin_nested():` lets you roll back part of the work.
+- *Side effects:* publish events or enqueue tasks only after commit; for guaranteed delivery, use an outbox row written in the same transaction.
+- *Long transactions:* never hold one open across an outbound HTTP call. It pins a pooled connection and holds locks.
 </details>
 
 <details>
@@ -2112,20 +2049,19 @@ async def override_get_db():
 # Override
 app.dependency_overrides[get_db] = override_get_db
 
-# Clean up
-def test_with_client():
-    client = TestClient(app)
-    response = client.get("/items")
-    assert response.status_code == 200
-    app.dependency_overrides.clear()
-
-# Or use fixture
+# Use a fixture so overrides are always removed, even if the test fails
 @pytest.fixture
 def client():
     app.dependency_overrides[get_db] = override_get_db
-    yield TestClient(app)
+    with TestClient(app) as c:        # `with` also runs lifespan
+        yield c
     app.dependency_overrides.clear()
+
+def test_list_items(client):
+    assert client.get("/items").status_code == 200
 ```
+
+Overrides match by the **original callable's identity**, so override the exact function used in `Depends(...)`, not a re-import or a wrapper. They apply anywhere in the graph, including sub-dependencies and router-level dependencies.
 </details>
 
 <details>
@@ -2137,6 +2073,7 @@ def client():
 |---------|-----------------|------------|
 | **Execution** | Same process, after response | Separate worker processes |
 | **Persistence** | In-memory only | Backed by Redis/RabbitMQ |
+| **Durability** | Lost on deploy, crash or OOM | Survives restarts (with `acks_late`) |
 | **Retries** | None | Built-in with backoff |
 | **Monitoring** | None | Flower, Prometheus |
 | **Scheduling** | No | Periodic tasks (Celery Beat) |
@@ -2150,11 +2087,13 @@ async def notify(background_tasks: BackgroundTasks):
     return {"message": "Email queued"}
 
 # Celery — production task queue
-@app.post("/generate-report")
-async def generate_report():
-    task = generate_report.delay(params)
-    return {"task_id": task.id}
+@app.post("/reports", status_code=202)
+async def create_report(params: ReportParams):
+    task = generate_report_task.delay(params.model_dump())
+    return {"task_id": task.id, "status_url": f"/reports/{task.id}"}
 ```
+
+Celery's client API is sync. `.delay()` does a quick broker write that is usually acceptable, but under load push it to a thread, or use an async-native queue (ARQ, Taskiq, SAQ). Rule of thumb: if losing the work on a deploy is acceptable and it takes under a second, use `BackgroundTasks`; otherwise use a queue.
 </details>
 
 ### Advanced
@@ -2162,209 +2101,162 @@ async def generate_report():
 <details>
 <summary><b>Q8: Design a rate-limiting system for a FastAPI application handling 100K+ req/s.</b></summary>
 
-**Answer:**
+**30-second answer:** at 100K req/s, don't do a Redis round trip per request for every request in Python. Rate-limit **at the edge** (API gateway, Envoy, nginx, CDN/WAF) for per-IP and coarse limits. In the app, enforce per-tenant/API-key limits with an **atomic** Redis script (token bucket or sliding-window counter), sharded by key across a Redis Cluster. Optionally keep a local in-process allowance that syncs to Redis periodically, trading exactness for no per-request network hop.
 
 ```python
-# ── Token bucket with Redis ────────────────────────────────
 import time
-import hashlib
+import redis.asyncio as redis
+from starlette.responses import JSONResponse
 
-class SlidingWindowRateLimiter:
-    """
-    Sliding window counter using Redis sorted sets.
-    More accurate than fixed window, less memory than exact sliding log.
-    """
-    
-    def __init__(self, redis_client):
-        self.redis = redis_client
-    
-    async def is_allowed(
-        self, key: str, max_requests: int, window_seconds: int = 60
-    ) -> bool:
-        now = time.time()
-        window_start = now - window_seconds
-        
-        pipe = self.redis.pipeline()
-        # Remove old entries
-        pipe.zremrangebyscore(key, 0, window_start)
-        # Count current entries
-        pipe.zcard(key)
-        # Add current request
-        pipe.zadd(key, {str(now): now})
-        # Set TTL
-        pipe.expire(key, window_seconds)
-        
-        _, count, _, _ = pipe.execute()
-        
-        return count < max_requests
+# Token bucket in Lua: atomic, O(1) memory per key, allows bursts up to capacity
+TOKEN_BUCKET = """
+local key = KEYS[1]
+local rate, capacity, now = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local b = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(b[1]) or capacity
+local ts = tonumber(b[2]) or now
+tokens = math.min(capacity, tokens + (now - ts) * rate)
+local allowed = tokens >= 1
+if allowed then tokens = tokens - 1 end
+redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', key, math.ceil(capacity / rate * 1000) + 1000)
+return {allowed and 1 or 0, tostring(tokens)}
+"""
 
-# ── Middleware ──────────────────────────────────────────────
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-IP rate limiting middleware"""
-    
-    def __init__(self, app, limiter: SlidingWindowRateLimiter):
-        super().__init__(app)
-        self.limiter = limiter
-    
-    async def dispatch(self, request: Request, call_next):
-        # Rate limit by API key or IP
-        api_key = request.headers.get("X-API-Key")
-        key = f"ratelimit:{api_key or request.client.host}"
-        
-        if not await self.limiter.is_allowed(key, max_requests=100):
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "detail": "Rate limit exceeded",
-                    "retry_after": 60,
-                },
-                headers={"Retry-After": "60"},
-            )
-        
-        return await call_next(request)
+class TokenBucketLimiter:
+    def __init__(self, client: redis.Redis):
+        self._script = client.register_script(TOKEN_BUCKET)
+
+    async def allow(self, key: str, rate_per_s: float, burst: int) -> tuple[bool, float]:
+        allowed, remaining = await self._script(keys=[f"rl:{{{key}}}"],   # {hash tag} for Cluster
+                                                args=[rate_per_s, burst, time.time()])
+        return bool(allowed), float(remaining)
+
+class RateLimitMiddleware:                      # pure ASGI: cheap on the hot path
+    def __init__(self, app, limiter: TokenBucketLimiter):
+        self.app, self.limiter = app, limiter
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = dict(scope["headers"])
+        api_key = headers.get(b"x-api-key", b"").decode()
+        key = api_key or (scope.get("client") or ("unknown",))[0]  # client IP is correct only with --proxy-headers
+        try:
+            ok, remaining = await self.limiter.allow(key, rate_per_s=10, burst=20)
+        except redis.RedisError:
+            ok, remaining = True, 0             # fail OPEN; the edge limit is the backstop
+        if not ok:
+            resp = JSONResponse({"detail": "Rate limit exceeded"}, status_code=429,
+                                headers={"Retry-After": "1"})
+            return await resp(scope, receive, send)
+        await self.app(scope, receive, send)
 ```
 
 Key considerations:
-- Use Redis sorted sets or sliding window counter
-- Tiered limits per API key (free: 10/min, pro: 1000/min)
-- Use `Retry-After` header for client-side backoff
-- Distribute rate limit state across Redis cluster
-- Use approximate counting (HyperLogLog) for ultra-high-scale
+- **Atomicity:** read-count-then-write from Python with separate commands lets concurrent requests all pass. A `MULTI` pipeline queues ZADD *before* you see the count, so rejected requests still consume quota. Use one Lua script.
+- **Clock:** the script trusts the app server's clock; use `redis.call('TIME')` inside the script if servers' clocks drift.
+- **Tiers:** look up the plan's rate by API key (cache it in memory for a minute).
+- **Headers:** `429` + `Retry-After`; optionally `RateLimit-Limit`/`RateLimit-Remaining` (IETF draft).
+- **Hot keys:** one huge tenant concentrates load on one Redis shard. Split its key into N sub-buckets, each with 1/N of the rate.
 </details>
 
 <details>
 <summary><b>Q9: How would you implement a CQRS pattern with FastAPI?</b></summary>
 
-**Answer:**
+**30-second answer:** commands go through the domain model and the primary DB. Each command writes its state change **and an outbox event in the same transaction**. A relay (a poller, or CDC with Debezium) publishes the events, and projectors update read models (a denormalised table, Elasticsearch, a cache). Queries hit only the read models. The cost is eventual consistency and more moving parts, so justify it with a real read/write asymmetry.
 
 ```python
-# ── Command side (writes) ──────────────────────────────────
-@router.post("/orders")
-async def create_order(
-    command: CreateOrderCommand,
-    uow: UnitOfWork = Depends(get_uow),
-    event_bus: EventBus = Depends(get_event_bus),
-):
-    async with uow:
-        order = Order.create(command.user_id, command.items)
-        uow.orders.add(order)
-        
-        # Publish event for read model sync
-        await event_bus.publish(OrderCreatedEvent(
-            order_id=order.id,
-            user_id=order.user_id,
-            total=order.total,
-        ))
-    
-    return OrderResponse.from_entity(order)
+# ── Command side ────────────────────────────────────────────
+@router.post("/orders", status_code=202)
+async def create_order(command: CreateOrderCommand, db: Tx):
+    order = Order.create(command.user_id, command.items)
+    db.add(order)
+    await db.flush()                                 # order.id assigned
+    db.add(OutboxEvent(                              # same transaction as the order
+        aggregate_id=order.id,
+        type="OrderCreated",
+        payload={"order_id": order.id, "user_id": order.user_id, "total": str(order.total)},
+    ))
+    return {"order_id": order.id}
+    # Publishing to Kafka directly here would be a dual write: the commit
+    # can succeed and the publish fail (or the reverse) → read model drifts.
 
-# ── Query side (reads from denormalized view) ─────────────
-@router.get("/orders")
-async def list_orders(
-    user_id: int,
-    query_service: OrderQueryService = Depends(),
-):
-    """Reads from pre-joined materialized view"""
-    return await query_service.get_user_orders(user_id)
+# ── Relay (separate process) ───────────────────────────────
+# SELECT ... FROM outbox WHERE published_at IS NULL ORDER BY id
+#   FOR UPDATE SKIP LOCKED LIMIT 100 → publish → mark published.
+# At-least-once: consumers must be idempotent.
 
-# ── Event handler (syncs read model) ──────────────────────
-@event_bus.on(OrderCreatedEvent)
-async def on_order_created(event: OrderCreatedEvent):
-    """Update denormalized read model"""
-    async with read_session() as session:
-        summary = OrderSummary(
-            order_id=event.order_id,
-            user_id=event.user_id,
-            total=event.total,
-            status="pending",
+# ── Projector (consumer) ───────────────────────────────────
+async def on_order_created(event: dict):
+    async with read_session() as s, s.begin():
+        await s.execute(
+            insert(OrderSummary)
+            .values(order_id=event["order_id"], user_id=event["user_id"],
+                    total=event["total"], status="pending")
+            .on_conflict_do_nothing(index_elements=["order_id"])   # idempotent replay
         )
-        session.add(summary)
-        await session.commit()
+
+# ── Query side ─────────────────────────────────────────────
+@router.get("/orders")
+async def list_orders(user: CurrentUser, q: Annotated[OrderQueries, Depends()]):
+    return await q.for_user(user.id)            # reads the denormalised table only
 ```
 
-Benefits:
-- Read queries don't touch transactional tables
-- Each side can be independently optimized
-- Read replicas for scaling reads
-- Different storage engines for different concerns
+Trade-offs to state: read-your-own-writes needs handling (return the new state from the command, or read from the write side briefly); projections must be rebuildable by replaying events; ordering is only guaranteed per aggregate (partition by `aggregate_id`).
 </details>
 
 <details>
 <summary><b>Q10: How do you handle graceful shutdown in FastAPI with in-flight requests?</b></summary>
 
-**Answer:**
+**30-second answer:** mostly, let the server do it and configure it correctly. On SIGTERM, Uvicorn (and Gunicorn) **stop accepting new connections, let in-flight requests finish** up to a timeout, then run your lifespan shutdown code. Your job: (1) make the platform stop routing traffic first, (2) set timeouts that nest correctly, (3) release resources in lifespan, (4) handle long-lived connections (websockets, SSE) and background work explicitly. Don't install your own SIGTERM handler: it replaces the server's.
 
 ```python
-import signal
-import asyncio
-from contextlib import asynccontextmanager
-
-class GracefulShutdown:
-    """Manages graceful shutdown with in-flight request tracking"""
-    
-    def __init__(self):
-        self.active_requests = set()
-        self.shutdown_event = asyncio.Event()
-        self._lock = asyncio.Lock()
-    
-    async def track_request(self, request_id: str):
-        async with self._lock:
-            self.active_requests.add(request_id)
-    
-    async def complete_request(self, request_id: str):
-        async with self._lock:
-            self.active_requests.discard(request_id)
-            if self.shutdown_event.is_set() and not self.active_requests:
-                self.shutdown_event.set()  # Signal ready to shut down
-    
-    async def wait_for_drain(self, timeout: int = 30):
-        """Wait for active requests to complete"""
-        try:
-            await asyncio.wait_for(
-                self._wait_for_empty(),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"Drain timeout: {len(self.active_requests)} still active")
-    
-    async def _wait_for_empty(self):
-        while self.active_requests:
-            await asyncio.sleep(0.1)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    shutdown = GracefulShutdown()
-    app.state.shutdown = shutdown
-    
-    # Register signal handlers
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(
-            sig,
-            lambda: asyncio.create_task(shutdown.wait_for_drain())
-        )
-    
+    app.state.draining = False
+    app.state.http = httpx.AsyncClient()
     yield
-    
-    # Shutdown
-    await app.state.db.disconnect()
-    await app.state.cache.disconnect()
-    logger.info("Shutdown complete")
+    # Runs AFTER uvicorn has stopped accepting and drained HTTP requests
+    await app.state.http.aclose()
+    await engine.dispose()
 
-# Middleware to track requests
-class RequestTrackerMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        request_id = str(uuid.uuid4())
-        await request.app.state.shutdown.track_request(request_id)
-        try:
-            return await call_next(request)
-        finally:
-            await request.app.state.shutdown.complete_request(request_id)
+@app.get("/health/ready")
+async def ready(request: Request):
+    # A preStop hook can flip this (e.g. POST /internal/drain) so the
+    # load balancer marks the pod unready before SIGTERM arrives.
+    if request.app.state.draining:
+        return JSONResponse({"status": "draining"}, status_code=503)
+    return {"status": "ok"}
 ```
+
+**Timeline on Kubernetes**
+
+```mermaid
+sequenceDiagram
+    participant K as Kubelet
+    participant E as Endpoints and LB
+    participant P as Pod (uvicorn)
+    K->>E: remove pod from Service endpoints (asynchronous)
+    K->>P: preStop hook (sleep 5-10 s while the LB catches up)
+    K->>P: SIGTERM
+    P->>P: stop accepting, finish in-flight (timeout-graceful-shutdown)
+    P->>P: lifespan shutdown (close pools and clients)
+    K->>P: SIGKILL if terminationGracePeriodSeconds is exceeded
+```
+
+**Settings that must nest:** `preStop sleep` + `--timeout-graceful-shutdown` + lifespan cleanup < `terminationGracePeriodSeconds` (default 30 s).
+
+**What isn't covered automatically:**
+- **WebSockets/SSE:** they never "finish". Track them and close them with code 1001 (going away) on shutdown so clients reconnect elsewhere.
+- **BackgroundTasks** still running are lost if the grace period ends, which is another reason durable work belongs in a queue.
+- **Consumers** (Kafka, SQS loops started in lifespan): stop polling, finish the current batch, commit offsets, then exit.
 </details>
 
 <details>
 <summary><b>Q11: Design a multi-tenant FastAPI application with tenant isolation.</b></summary>
+
+**30-second answer:** resolve the tenant **from the authenticated identity** (a claim in the token), not from a header the client can change. Carry it in a dependency or ContextVar, and enforce isolation at the data layer: row-level `tenant_id` plus PostgreSQL Row-Level Security for most SaaS, schema- or database-per-tenant for enterprise or regulated tiers. The same trade-off table as in the Django notes applies (rows: cheapest, weakest; DB per tenant: strongest, most operational cost).
 
 **Answer:**
 
@@ -2374,6 +2266,9 @@ class TenantMiddleware(BaseHTTPMiddleware):
     """Resolves tenant from subdomain or header"""
     
     async def dispatch(self, request, call_next):
+        # ⚠️ A raw X-Tenant-ID header is client-controlled. Only accept it
+        # if auth later verifies the user belongs to that tenant; better,
+        # take the tenant from a verified token claim.
         tenant_id = request.headers.get("X-Tenant-ID")
         subdomain = request.url.hostname.split(".")[0]
         
@@ -2390,8 +2285,11 @@ class TenantMiddleware(BaseHTTPMiddleware):
 
 # ── Dynamic database connection per tenant ────────────────
 class TenantDatabaseRouter:
-    """Routes to tenant-specific database"""
-    
+    """Routes to tenant-specific database.
+    ⚠️ One pool per tenant per worker: 200 tenants × 8 workers × 5 conns
+    = 8,000 connections. Bound the cache (LRU with dispose() on evict),
+    or put PgBouncer in front and use small pools."""
+
     _engines: dict[str, AsyncEngine] = {}
     
     async def get_engine(self, tenant: Tenant) -> AsyncEngine:
@@ -2432,11 +2330,25 @@ class TenantAwareQuery:
         return select(model).where(model.tenant_id == self.tenant_id)
 
 # ── Schema-based isolation (PostgreSQL) ────────────────────
-async def set_tenant_schema(tenant: Tenant, connection):
-    """Set PostgreSQL search_path to tenant schema"""
-    await connection.execute(
-        text(f"SET search_path TO {tenant.schema_name}, public")
-    )
+import re
+_SCHEMA_RE = re.compile(r"^tenant_[a-z0-9_]{1,40}$")
+
+async def set_tenant_schema(tenant: Tenant, session: AsyncSession):
+    # Identifiers can't be bound parameters, so validate strictly:
+    # an f-string with an unchecked name is SQL injection.
+    if not _SCHEMA_RE.fullmatch(tenant.schema_name):
+        raise ValueError("bad schema name")
+    # SET LOCAL lasts only for this transaction. A plain SET would stick
+    # to the pooled connection and leak into the NEXT tenant's request.
+    await session.execute(text(f'SET LOCAL search_path TO "{tenant.schema_name}", public'))
+
+# ── Row-Level Security: the DB enforces the filter ─────────
+# CREATE POLICY tenant_isolation ON orders
+#   USING (tenant_id = current_setting('app.tenant_id')::bigint);
+# ALTER TABLE orders ENABLE ROW LEVEL SECURITY;  -- and FORCE for the table owner
+# Per request, inside the transaction:
+#   await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(tid)})
+# (true = transaction-local, so it's safe with pooling.)
 ```
 </details>
 
@@ -2446,6 +2358,7 @@ async def set_tenant_schema(tenant: Tenant, connection):
 **Answer:**
 
 ```python
+from typing import Literal
 from fastapi.responses import StreamingResponse
 import orjson
 
@@ -2463,14 +2376,12 @@ async def stream_items(db_query):
 
 @app.get("/large-dataset")
 async def get_large_dataset():
-    return StreamingResponse(
-        stream_items(fetch_all_items()),
-        media_type="application/json",
-        headers={
-            "Transfer-Encoding": "chunked",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    # Don't set Transfer-Encoding yourself: the server chunks automatically
+    # when there's no Content-Length (and HTTP/2 forbids that header).
+    return StreamingResponse(stream_items(fetch_all_items()), media_type="application/json")
+
+# Better format for huge exports: NDJSON (one JSON object per line).
+# Clients can parse it incrementally, and a truncated stream is detectable.
 
 # ── Stream CSV ─────────────────────────────────────────────
 async def stream_csv(query):
@@ -2480,65 +2391,72 @@ async def stream_csv(query):
         yield f"{row.id},{row.name},{row.email}\n"
 
 @app.get("/export/users")
-async def export_users(format: str = "csv"):
-    generators = {"csv": stream_csv, "json": stream_json}
+async def export_users(fmt: Literal["csv", "json"] = "csv"):   # validated: no KeyError → 500
+    generators = {"csv": stream_csv, "json": stream_items}
     content_type = {"csv": "text/csv", "json": "application/json"}
-    
+
     return StreamingResponse(
-        generators[format](fetch_users()),
-        media_type=content_type[format],
-        headers={"Content-Disposition": f"attachment; filename=users.{format}"},
+        generators[fmt](fetch_users()),
+        media_type=content_type[fmt],
+        headers={"Content-Disposition": f"attachment; filename=users.{fmt}"},
     )
+# Use the csv module (csv.writer over an io.StringIO per batch), not
+# f-strings: names containing commas or quotes break hand-built CSV.
+
+# ── The source must stream too ─────────────────────────────
+# SQLAlchemy: `await session.stream(select(User).execution_options(yield_per=1000))`,
+# or a server-side cursor (asyncpg conn.cursor()). A plain .all() loads every
+# row first and defeats the point. Remember the DB connection is held for
+# the whole download: cap concurrent exports, or write the file to object
+# storage in a background job and return a presigned URL.
 
 # ── Compression for streaming ──────────────────────────────
-# Use nginx or CDN for compression (gzip/brotli)
-# Don't compress in-app for streaming responses
+# Let the proxy/CDN compress (gzip/brotli). Compressing in the app costs
+# worker CPU and can buffer the stream.
 ```
 </details>
 
 <details>
 <summary><b>Q13: Explain FastAPI's response_model and how it handles type coercion.</b></summary>
 
-**Answer:** `response_model` defines the schema FastAPI uses for serialization and documentation:
+**30-second answer:** the response model (from `response_model=` or, preferably, the return annotation) is a **contract and a filter**. FastAPI validates your return value against it, drops fields the model doesn't declare (so an ORM row's `hashed_password` never leaks), serialises it to JSON with Pydantic, and documents it in OpenAPI. A return value that doesn't match raises `ResponseValidationError` → 500, because that's a server bug, not a client error.
 
 ```python
-@app.get("/items", response_model=list[Item])
-async def list_items():
-    return await get_items()  # Auto-serialized to Item schema
+class ItemPublic(BaseModel):
+    model_config = ConfigDict(from_attributes=True)   # accept ORM objects
+    id: int
+    name: str
 
-@app.get("/items/{id}", response_model=Item)
-async def get_item(id: int):
-    return await get_item(id)
+@app.get("/items/{item_id}")
+async def get_item(item_id: int, db: DB) -> ItemPublic:      # return type = response model
+    return await db.get(ItemRow, item_id)   # ORM row: extra columns are filtered out
 
-# ── response_model features:
-# 1. Serialization: Converts ORM/DB models to Pydantic models
-# 2. Filtering: Only includes fields defined in the model
-# 3. Validation: Ensures response conforms to schema
-# 4. Documentation: Used in OpenAPI response schema
-# 5. Response filtering:
-@app.get("/items/public", response_model=ItemPublic)
-async def get_public_items():
-    # ItemPublic might exclude 'internal_notes' field
-    return await get_items()
-    # Internal fields are automatically filtered out
+# When the declared return type differs from what you return
+# (e.g. you return a dict or a Response), use response_model= explicitly:
+@app.get("/items", response_model=list[ItemPublic])
+async def list_items(db: DB):
+    return (await db.scalars(select(ItemRow).limit(50))).all()
 
-# ── response_model_exclude_unset ──────────────────────────
-@app.get(
-    "/items/{id}",
-    response_model=Item,
-    response_model_exclude_unset=True,  # Skip default values
-)
-async def get_item(id: int):
-    return await get_item(id)
-    # Only returns fields that were explicitly set
+# ── Trimming output ────────────────────────────────────────
+@app.patch("/items/{item_id}", response_model=ItemPublic, response_model_exclude_unset=True)
+async def patch_item(item_id: int, patch: ItemPatch, db: DB): ...
+# exclude_unset: omit fields never explicitly set (not "fields equal to their default";
+# that's response_model_exclude_defaults). exclude_none drops None values.
 ```
 
-**Type coercion:** FastAPI uses Pydantic's coercion rules:
-- `int` fields receive string→int conversion
-- `float` fields receive string→float conversion
-- `bool` fields receive "true"/"false"→bool conversion
-- `datetime` fields receive ISO format string→datetime conversion
-- `list[int]` receives `[1, 2, "3"]` → `[1, 2, 3]` (each element coerced)
+**Input coercion (Pydantic v2, lax mode by default):**
+
+| Input | Field type | Result |
+|---|---|---|
+| `"42"` | `int` | `42` |
+| `"4.2"` | `int` | **error** |
+| `4.0` / `4.2` | `int` | `4` / **error** (v2 rejects a fractional part; v1 silently truncated `4.2` to `4`) |
+| `"true"`, `"yes"`, `"1"`, `"on"` | `bool` | `True` |
+| `"2026-10-07T12:00:00Z"` | `datetime` | aware `datetime` |
+| `[1, "2"]` | `list[int]` | `[1, 2]` |
+| `123` | `str` | **error** (v2 doesn't coerce numbers to strings by default) |
+
+Query and path parameters arrive as strings, so lax coercion is what makes `?page=2` work. For JSON bodies where `"42"` signals a client bug, use `ConfigDict(strict=True)` or `Annotated[int, Strict()]`.
 </details>
 
 ---

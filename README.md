@@ -93,10 +93,10 @@
 ║  ├── compression/                   10 Q · zstd · Brotli · HPACK     ║
 ║  └── terraform/                     8 Q  · State · Providers         ║
 ║                                                                      ║
-║  🐍 python-interview/          ← 12 Q — CPython Internals            ║
+║  🐍 python-interview/          ← 13 Q — CPython Internals            ║
 ║     GIL · Async/Await · Metaclasses · C Extensions · Subinterpreters ║
 ║                                                                      ║
-║  🐹 golang-interview/          ← 12 Q — Go Runtime Internals         ║
+║  🐹 golang-interview/          ← 13 Q — Go Runtime Internals         ║
 ║     GMP Scheduler · GC · Channels · Interfaces · sync.Map            ║
 ║                                                                      ║
 ║  ☁️ aws-interview/             ← Compute · Networking · Security     ║

@@ -24,22 +24,26 @@
 
 ## 1. Concurrency Landscape in Python
 
+!!! tip "30-second answer"
+    CPython gives you three tools. **Threads** are real OS threads that overlap I/O (the GIL is released while blocked) but, on the default build, run Python bytecode one at a time. **Processes** give real CPU parallelism at the cost of pickling and IPC. **asyncio** multiplexes thousands of I/O-bound tasks on one thread with cooperative scheduling. Since 3.14 there are two more options for CPU work: the officially supported **free-threaded build** (no GIL) and **subinterpreters** (`concurrent.interpreters`, `InterpreterPoolExecutor`), each with its own GIL.
+
 ### Three Models
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Python Concurrency Models                         │
-├─────────────────┬─────────────────┬─────────────────────────────────┤
-│   threading      │  multiprocessing │      asyncio                    │
-│ (thread-based)   │ (process-based)  │ (event loop based)             │
-├─────────────────┼─────────────────┼─────────────────────────────────┤
-│ GIL-limited     │ True parallelism │ Single-thread cooperative       │
-│ Best for I/O    │ Best for CPU     │ Best for I/O with many conns    │
-│ Shared memory   │ Separate memory  │ Shared state (single thread)    │
-│ ~1MB/thread     │ ~50MB/process    │ ~2KB/task (coroutine)           │
-│ ~1000 threads   │ ~100 processes   │ ~100K+ tasks per process        │
-└─────────────────┴─────────────────┴─────────────────────────────────┘
+┌──────────────────┬──────────────────┬──────────────────────────────┐
+│   threading      │  multiprocessing │      asyncio                 │
+│ (OS threads)     │ (OS processes)   │ (event loop, one thread)     │
+├──────────────────┼──────────────────┼──────────────────────────────┤
+│ GIL-limited CPU  │ True parallelism │ Cooperative, single thread   │
+│ Good for I/O     │ Good for CPU     │ Best for many I/O conns      │
+│ Shared memory    │ Separate memory  │ Shared state, no preemption  │
+│ Stack: 8MB virt, │ Full interpreter │ ~1-2KB per coroutine/task    │
+│ little resident  │ (tens of MB RSS) │                              │
+│ 100s-low 1000s   │ ~1 per core      │ 10K-100K+ tasks              │
+└──────────────────┴──────────────────┴──────────────────────────────┘
 ```
+
+The memory and scale figures are orders of magnitude, not limits: thread stacks reserve virtual memory (8 MB by default on Linux, settable with `threading.stack_size()`) but only touched pages count, and process cost depends on start method and imports.
 
 ### Decision Matrix
 
@@ -49,7 +53,7 @@
 | I/O-bound (network) | ✅ GIL releases | ⚠️ Overkill | ✅ Best option |
 | I/O-bound (file) | ✅ Works well | ⚠️ Overkill | ✅ Works well |
 | Mixed CPU/I/O | ⚠️ Partial | ✅ Best | ⚠️ Partial |
-| Low latency required | ⚠️ GIL adds jitter | ❌ IPC overhead | ✅ Best |
+| Low tail latency | ⚠️ GIL hand-offs add jitter | ⚠️ IPC overhead | ⚠️ Good until one task blocks the loop |
 | Memory sharing needed | ✅ Easy | ⚠️ IPC needed | ✅ Single thread |
 
 ### Key Terminology
@@ -66,8 +70,8 @@
 
 # ── Multithreading ──────────────────────────────────────
 # Multiple threads sharing the same memory space
-# Python: threads are real OS threads (N:M mapping via OS)
-# But: GIL prevents parallel CPython bytecode execution
+# Python: threads are real OS threads (1:1, scheduled by the kernel)
+# But: on the default build the GIL prevents parallel bytecode execution
 
 # ── Multiprocessing ─────────────────────────────────────
 # Multiple processes with separate memory spaces
@@ -81,32 +85,24 @@
 
 ### What the GIL Actually Is
 
-```python
-# The GIL is a mutex that prevents multiple native threads from
-# executing Python bytecodes simultaneously in the same process.
-#
-# It protects CPython's internal state:
-#   - Reference counts (garbage collection)
-#   - Object allocation (arena allocator)
-#   - Internal data structures (dict, list, etc.)
-#
-# Without the GIL, every operation on PyObject would need
-# fine-grained locking — massive overhead for single-threaded code.
+The GIL is a per-interpreter mutex that a thread must hold to execute Python bytecode or touch Python objects. It exists so that reference counting, the allocator and built-in containers need no fine-grained locking, which keeps single-threaded code and C extensions simple and fast.
 
-# ═══════════════════════════════════════════════════════════
-# GIL switching mechanism (Python 3.2+, PEP 1043)
-# ═══════════════════════════════════════════════════════════
-#
-# The GIL uses a condition variable with a 5ms timeout.
-# Every 5ms, the holding thread:
-#   1. Releases the GIL
-#   2. Signals waiting threads
-#   3. Re-acquires the GIL (fair competition)
-#
-# This replaced the old bytecode-count-based switching
-# which was unfair to CPU-bound threads.
-#
-# You can adjust: sys.setswitchinterval(0.001)  # 1ms
+**How switching works (the "new GIL", Python 3.2+, by Antoine Pitrou; not a PEP):**
+
+1. A thread that wants the GIL waits on a condition variable with a timeout of `sys.getswitchinterval()` (default `0.005` s).
+2. If the timeout expires and the holder still has not released it, the waiter sets a "drop request" flag.
+3. The holder checks that flag at safe points in the eval loop (backward jumps, function calls) and releases the GIL; it then waits until another thread has actually taken it, which prevents it from immediately grabbing it back.
+4. Any blocking call (socket read, `time.sleep`, file I/O, `Lock.acquire`, many C extensions) releases the GIL voluntarily, so I/O threads rarely wait the full interval.
+
+So the holder does **not** release every 5 ms unconditionally; it only drops the GIL when someone is waiting. This replaced the pre-3.2 "every 100 ticks" scheme, which let CPU-bound threads starve others on multicore machines.
+
+**What the GIL does not give you:** atomicity of your own compound operations. `x += 1` is several bytecodes and a switch can land between them (see [Atomic Operations](#atomic-operations-no-lock-needed)).
+
+```python
+import sys
+sys.getswitchinterval()        # 0.005
+sys.setswitchinterval(0.001)   # more responsive I/O threads, more switching overhead
+sys._is_gil_enabled()          # 3.13+: False only on a free-threaded build running without the GIL
 ```
 
 ### GIL Impact Analysis
@@ -138,7 +134,8 @@ def test_cpu():
     for t in threads: t.start()
     for t in threads: t.join()
     print(f"CPU-bound with 4 threads: {time.perf_counter() - start:.2f}s")
-    # ~SAME as sequential! GIL prevents parallel execution.
+    # Same as sequential, often slightly slower (GIL hand-offs).
+    # On a free-threaded build this scales with cores.
 
 # ── I/O-bound test ───────────────────────────────────────
 def test_io():
@@ -155,63 +152,61 @@ def test_io():
 
 ### Working Around the GIL
 
+| Option | Parallel CPU? | Cost / catch | Since |
+|---|---|---|---|
+| `multiprocessing` / `ProcessPoolExecutor` | Yes | Pickling, IPC, per-process memory; start method matters | always |
+| C extensions that release the GIL (NumPy, hashlib on large inputs, zlib, Cython `with nogil:`) | Yes, inside the C code | Only helps if the hot loop is in C | always |
+| Subinterpreters: `concurrent.interpreters`, `InterpreterPoolExecutor` | Yes, one GIL per interpreter | No shared objects; data is copied or passed through queues; many third-party C extensions not yet supported | per-interpreter GIL 3.12 (PEP 684), public API 3.14 (PEP 734) |
+| Free-threaded build (`python3.14t`) | Yes, with plain threads | Separate build; ~5-10% single-thread overhead in 3.14; C extensions must opt in | experimental 3.13 (PEP 703), officially supported 3.14 (PEP 779) |
+
 ```python
-# ── Strategy 1: Multiprocessing ──────────────────────────
-# True parallelism via separate processes
-from multiprocessing import Pool
+# ── Strategy 1: processes ─────────────────────────────────
+from concurrent.futures import ProcessPoolExecutor
 
-def cpu_bound_task(data: list) -> list:
-    return [expensive_func(x) for x in data]
+def sum_squares(n: int) -> int:
+    return sum(i * i for i in range(n))
 
-with Pool(processes=4) as pool:
-    results = pool.map(cpu_bound_task, chunks)
+if __name__ == "__main__":          # required with spawn/forkserver start methods
+    with ProcessPoolExecutor() as pool:
+        print(list(pool.map(sum_squares, [10, 100, 1000])))
+        # [285, 328350, 332833500]
 
-# ── Strategy 2: C Extensions (release GIL) ──────────────
-# C extensions can release the GIL during heavy computation
-# Cython: with nogil: block
-# C: Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS
-# numpy releases GIL during array operations!
-import numpy as np
-# np.dot(A, B)  ← GIL released during computation
+# ── Strategy 2: C code that releases the GIL ──────────────
+# C:      Py_BEGIN_ALLOW_THREADS ... Py_END_ALLOW_THREADS
+# Cython: with nogil: ...
+# NumPy releases the GIL inside many array ops (e.g. np.dot on large arrays),
+# so a ThreadPoolExecutor over NumPy work can use several cores.
 
-# ── Strategy 3: Subinterpreters (Python 3.12+) ──────────
-# Each subinterpreter has its own GIL!
-import _xxsubinterpreters as interpreters
-import _xxinterpchannels as channels
+# ── Strategy 3: subinterpreters (Python 3.14+) ────────────
+from concurrent.futures import InterpreterPoolExecutor
+from concurrent import interpreters
 
-# Create a channel for sending/receiving results
-channel_id = channels.create()
+if __name__ == "__main__":
+    # High level: each worker is an isolated interpreter with its own GIL.
+    # Functions and arguments are pickled across, like ProcessPoolExecutor.
+    with InterpreterPoolExecutor(max_workers=4) as pool:
+        print(list(pool.map(sum_squares, [10, 100, 1000])))
+        # [285, 328350, 332833500]
 
-interp_id = interpreters.create()
-interpreters.run_string(interp_id, f"""
-import _xxinterpchannels as channels
+    # Low level: create one, run code in it, talk through a queue
+    interp = interpreters.create()
+    print(interp.call(sum_squares, 10))      # 285
+    q = interpreters.create_queue()
+    interp.prepare_main(q=q)                 # bind q in the interpreter's __main__
+    interp.exec("q.put(sum(range(10)))")
+    print(q.get())                           # 45
+    interp.close()
 
-def compute():
-    return sum(i ** 2 for i in range(10_000_000))
-
-# Send result back via channel
-result = compute()
-channels.send({channel_id}, result)
-""")
-
-# Receive result from subinterpreter
-result = channels.recv(channel_id)
-print(f"Computed: {result}")
-# True parallelism with independent GILs
-
-# ⚠️ Note: Subinterpreters communicate via channels, not
-# shared references. The API uses _xxinterpchannels for
-# message passing, not interpreters.get_result() or
-# interpreters.destroy() which do NOT exist.
-
-# ── Strategy 4: Free-Threaded Python (3.13t) ────────────
-# PYTHON_GIL=0 python my_script.py
-# The GIL is completely disabled!
-# BUT: all mutable objects become thread-unsafe
-# Current: ~5-8% single-threaded performance cost
+# ── Strategy 4: free-threaded build ───────────────────────
+# Install the "t" build (python3.14t; python.org installers and uv offer it).
+#   python3.14t -c "import sys; print(sys._is_gil_enabled())"   # False
+# Importing a C extension that hasn't declared free-threading support
+# re-enables the GIL with a warning; PYTHON_GIL=0 / -X gil=0 forces it off.
+# PYTHON_GIL has no effect on the normal (GIL) build.
 ```
 
----
+!!! warning "What free threading does and doesn't change"
+    Built-in `dict`, `list` and `set` use per-object locks, so a single `d[k] = v` or `lst.append(x)` still can't corrupt the object. What you lose is the *accidental* serialisation of your own compound operations: races that were rare under the GIL become frequent. Sharing one iterator across threads is not safe (items can be duplicated or skipped). Rule unchanged: protect shared mutable state with a `Lock`, or don't share it.
 
 ## 3. Threading Module
 
@@ -277,37 +272,20 @@ monitor.start()
 
 ### Thread Lifecycle
 
+```mermaid
+stateDiagram-v2
+    [*] --> Created: Thread(...)
+    Created --> Alive: start()
+    Alive --> Alive: runs / waits for GIL / blocks on I/O or locks
+    Alive --> Finished: run() returns or raises
+    Finished --> [*]
 ```
-┌──────────┐   .start()   ┌──────────┐   OS scheduler  ┌──────────┐
-│   New    │─────────────→│ Runnable │───────────────→│ Running  │
-└──────────┘              └──────────┘                └──────────┘
-                               ↑                           │
-                               │                      ┌────┴─────┐
-                               │                      │          │
-                          ┌────┴──────┐                 ↓          ↓
-                          │ Runnable  │◄───────┌────────┐  ┌──────────┐
-                          │ (re-enter)│         │Waiting │  │ Blocked  │
-                          └────┬──────┘         │ (sleep)│  │ (I/O)    │
-                               │                └────────┘  └──────────┘
-                               │                     ↑            ↑
-                               │                     │            │
-                               └─────────────────────┴────────────┘
-                                                          │
-                                                     ┌────────┐
-                                                     │  Dead  │
-                                                     └────────┘
 
-# ⚠️ Thread state transitions:
-#   New → start() → Runnable (ready to run, waiting for CPU)
-#   Runnable → OS scheduler → Running (executing on CPU)
-#   Running → sleep/I/O → Waiting/Blocked (not runnable)
-#   Waiting/Blocked → woken/ready → Runnable (re-enters queue)
-#   Running → run() completes → Dead (terminated)
-#
-# Threads NEVER go directly from Waiting/Blocked to Running. 
-# They must pass through Runnable state and wait for the
-# OS scheduler to dispatch them.
-```
+Python exposes only these states (`is_alive()`, `join()`); the runnable/running/blocked distinction lives in the OS scheduler. Things interviewers probe:
+
+- `start()` can be called once; a second call raises `RuntimeError`.
+- There is **no way to kill a thread** from outside. Design for cooperative cancellation (an `Event` the thread checks, or a sentinel on its queue).
+- An exception in `run()` does not propagate to the joiner; it goes to `threading.excepthook` (prints by default). Use `concurrent.futures` if you need the exception back.
 
 ### Thread Identification & Utilities
 
@@ -328,6 +306,7 @@ print(f"Active threads: {threading.active_count()}")
 
 # ── Thread-local data ────────────────────────────────────
 # Data isolated per thread (no race conditions)
+from uuid import uuid4
 thread_local = threading.local()
 
 def setup_thread():
@@ -343,71 +322,51 @@ def get_context():
 
 ### Thread Pools (Manual)
 
+In real code use `ThreadPoolExecutor`. Writing one by hand is a common interview exercise, and the points they check are: unique task IDs, errors returned rather than swallowed, and a clean shutdown that doesn't rely on polling.
+
 ```python
+import threading
 from queue import Queue
 from typing import Callable
 
-class ThreadPool:
-    """Simple thread pool with configurable worker count"""
-    
-    def __init__(self, num_workers: int = 4):
-        self.tasks = Queue()
-        self.results = Queue()
-        self.workers = []
-        self._stop_event = threading.Event()
-        
-        for _ in range(num_workers):
-            worker = threading.Thread(target=self._worker_loop)
-            worker.daemon = True
-            worker.start()
-            self.workers.append(worker)
-    
-    def _worker_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                task_id, func, args, kwargs = self.tasks.get(timeout=0.1)
-                try:
-                    result = func(*args, **kwargs)
-                    self.results.put((task_id, result, None))
-                except Exception as e:
-                    self.results.put((task_id, None, e))
-            except Exception:
-                pass  # Queue.Empty timeout
-    
-    def __init__(self, num_workers: int = 4):
-        self.tasks = Queue()
-        self.results = Queue()
-        self.workers = []
-        self._stop_event = threading.Event()
-        self._task_counter = 0  # Atomic counter for unique task IDs
-        self._counter_lock = threading.Lock()
-        
-        for _ in range(num_workers):
-            worker = threading.Thread(target=self._worker_loop)
-            worker.daemon = True
-            worker.start()
-            self.workers.append(worker)
+_STOP = object()   # sentinel: one per worker on shutdown
 
-    def _next_task_id(self) -> int:
-        with self._counter_lock:
-            task_id = self._task_counter
-            self._task_counter += 1
-            return task_id
+class ThreadPool:
+    def __init__(self, num_workers: int = 4):
+        self.tasks: Queue = Queue()
+        self.results: Queue = Queue()
+        self._ids = iter(range(10**18))      # next() under _id_lock
+        self._id_lock = threading.Lock()
+        self.workers = [threading.Thread(target=self._worker_loop, daemon=True)
+                        for _ in range(num_workers)]
+        for w in self.workers:
+            w.start()
+
+    def _worker_loop(self):
+        while True:
+            task = self.tasks.get()          # blocks, no busy polling
+            if task is _STOP:
+                return
+            task_id, func, args, kwargs = task
+            try:
+                self.results.put((task_id, func(*args, **kwargs), None))
+            except Exception as e:           # report, don't swallow
+                self.results.put((task_id, None, e))
 
     def submit(self, func: Callable, *args, **kwargs) -> int:
-        """Submit a task. Returns a unique task ID."""
-        task_id = self._next_task_id()
+        with self._id_lock:
+            task_id = next(self._ids)
         self.tasks.put((task_id, func, args, kwargs))
         return task_id
-    
-    def get_result(self, timeout: float = None):
-        """Get next completed result"""
-        return self.results.get(timeout=timeout)
-    
+
+    def get_result(self, timeout: float | None = None):
+        return self.results.get(timeout=timeout)   # (task_id, result, exc)
+
     def shutdown(self):
-        self._stop_event.set()
-        for worker in self.workers:
-            worker.join(timeout=1.0)
+        for _ in self.workers:               # queued tasks finish first (FIFO)
+            self.tasks.put(_STOP)
+        for w in self.workers:
+            w.join()
 ```
 
 ---
@@ -534,7 +493,7 @@ class TokenBucketRateLimiter:
             # In acquire(): while self.tokens < 1: self._cond.wait(t)
             # In _refill_tokens(): self._cond.notify()
         """
-        deadline = time.monotonic() + timeout if timeout else None
+        deadline = time.monotonic() + timeout if timeout is not None else None
         
         while True:
             with self._lock:
@@ -545,7 +504,7 @@ class TokenBucketRateLimiter:
             
             if not blocking:
                 return False
-            if deadline and time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return False
             
             # No token available — wait a bit and retry
@@ -611,54 +570,44 @@ shutdown_event.set()
 ### Condition
 
 ```python
-# ── Condition: wait for complex state changes ─────────────
+# ── Condition: wait until a predicate over shared state is true ──
 import threading
-import time
+from collections import deque
 
 class BoundedBuffer:
-    """Producer-consumer with Condition variables"""
-    
-    def __init__(self, maxsize: int = 10):
-        self.buffer = []
-        self.maxsize = maxsize
-        self.cond = threading.Condition()  # Has its own Lock
-    
-    def put(self, item):
-        with self.cond:
-            while len(self.buffer) >= self.maxsize:
-                # Wait until space is available
-                # Releases the lock, re-acquires before return
-                self.cond.wait()
-            
-            self.buffer.append(item)
-            # Notify one waiting consumer
-            self.cond.notify()
-    
-    def get(self):
-        with self.cond:
-            while len(self.buffer) == 0:
-                self.cond.wait()  # Wait until data available
-            
-            item = self.buffer.pop(0)
-            # Notify one waiting producer
-            self.cond.notify()
-            return item
-    
-    def put_many(self, items):
-        with self.cond:
-            for item in items:
-                while len(self.buffer) >= self.maxsize:
-                    self.cond.wait()
-                self.buffer.append(item)
-            # Notify ALL waiting consumers
-            self.cond.notify_all()
+    """Producer-consumer with two Conditions sharing one Lock
+    (the same design as queue.Queue)."""
 
-# ── Condition vs Event ─────────────────────────────────────
-# Condition: use when threads wait for a specific state
-#            (e.g., buffer not empty, queue size < max)
-# Event: use for simple one-shot signaling
-#         (e.g., start, shutdown, initialization complete)
+    def __init__(self, maxsize: int = 10):
+        self.buffer = deque()                    # O(1) popleft; list.pop(0) is O(n)
+        self.maxsize = maxsize
+        lock = threading.Lock()
+        self.not_full = threading.Condition(lock)
+        self.not_empty = threading.Condition(lock)
+
+    def put(self, item):
+        with self.not_full:
+            while len(self.buffer) >= self.maxsize:   # while, not if: spurious
+                self.not_full.wait()                  # wake-ups and stolen slots
+            self.buffer.append(item)
+            self.not_empty.notify()                   # wake ONE consumer
+
+    def get(self):
+        with self.not_empty:
+            while not self.buffer:
+                self.not_empty.wait()
+            item = self.buffer.popleft()
+            self.not_full.notify()                    # wake ONE producer
+            return item
 ```
+
+Why two conditions: with a single `Condition` shared by producers and consumers, `notify()` can wake a thread of the *wrong kind* (a producer when the buffer is full). That thread re-checks, goes back to sleep, and the wake-up is lost; with everyone asleep, the program deadlocks. Either use two conditions (above) or use `notify_all()` and pay for the thundering herd. `cond.wait_for(predicate, timeout)` wraps the `while` loop for you.
+
+| Use | When |
+|---|---|
+| `Event` | One-shot or level-triggered flag: "started", "shutdown requested" |
+| `Condition` | Wait until arbitrary shared state satisfies a predicate |
+| `queue.Queue` | Almost always, instead of hand-rolling the above |
 
 ### Barrier
 
@@ -667,6 +616,7 @@ class BoundedBuffer:
 # All N threads must reach the barrier before any can proceed
 
 import threading
+import time
 
 barrier = threading.Barrier(3)  # 3 threads must sync
 
@@ -777,38 +727,38 @@ t.join()
 ```python
 # ── Multi-producer, single consumer ────────────────────────
 class Pipeline:
-    def __init__(self, maxsize: int = 100):
-        self.queue = queue.Queue(maxsize)
+    def __init__(self, num_producers: int, maxsize: int = 100):
+        self.queue = queue.Queue(maxsize)    # bounded = backpressure
+        self.num_producers = num_producers
         self._stop_event = threading.Event()
-    
-    def producer(self, producer_id: int, data: list):
-        for item in data:
-            if self._stop_event.is_set():
-                break
-            self.queue.put((producer_id, item))
-        # Signal completion
-        self.queue.put((producer_id, None))
-    
-    def consumer(self):
-        active_producers = set()
-        
-        while True:
-            producer_id, item = self.queue.get()
-            
-            if item is None:
-                active_producers.discard(producer_id)
-                if not active_producers:
+
+    def producer(self, data: list):
+        try:
+            for item in data:
+                if self._stop_event.is_set():
                     break
-                continue
-            
-            active_producers.add(producer_id)
-            self.process(item)
-            self.queue.task_done()
-    
+                self.queue.put(item)
+        finally:
+            self.queue.put(None)             # ALWAYS send the sentinel
+
+    def consumer(self):
+        # Count sentinels against a number known up front. Tracking
+        # "producers seen so far" breaks if one producer finishes
+        # before another has sent anything.
+        remaining = self.num_producers
+        while remaining:
+            item = self.queue.get()
+            try:
+                if item is None:
+                    remaining -= 1
+                else:
+                    self.process(item)
+            finally:
+                self.queue.task_done()       # every get() needs one
+
     def process(self, item):
-        # Process individual item
         pass
-    
+
     def stop(self):
         self._stop_event.set()
 
@@ -827,7 +777,8 @@ class FanOut:
         self.consumers.append(t)
     
     def publish(self, item):
-        # Round-robin distribution
+        # Round-robin distribution (assumes ONE publishing thread;
+        # _counter += 1 is not atomic)
         q = self.queues[self._counter % len(self.queues)]
         self._counter += 1
         q.put(item)
@@ -876,14 +827,21 @@ with ThreadPoolExecutor(max_workers=4) as executor:
 # ── map() — simple mapping ────────────────────────────────
 with ThreadPoolExecutor(max_workers=4) as executor:
     results = executor.map(fetch_url, urls, timeout=10)
-    for url, content in results:
-        print(f"{url}: OK")
+    for url, content in results:      # results come back in INPUT order;
+        print(f"{url}: OK")           # the first exception is re-raised here
 ```
+
+Details interviewers check:
+
+- Default `max_workers` is `min(32, os.process_cpu_count() + 4)` (3.13+; `os.cpu_count()` before). Size I/O pools to the downstream limit (DB pool size, API quota), not to cores.
+- `as_completed` yields in completion order; `map` yields in input order and a slow first item holds up the rest. `map(..., buffersize=n)` (3.14) stops `map` from submitting the whole input up front.
+- `future.cancel()` only works before the task starts. `shutdown(cancel_futures=True)` (3.9+) drops queued work; running tasks still finish, since threads can't be interrupted.
+- An exception inside a task is stored on the future. If nobody calls `.result()`, it is silently lost.
 
 ### ProcessPoolExecutor
 
 ```python
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
 
 # ── CPU-bound work: processes give true parallelism ───────
@@ -895,23 +853,25 @@ def is_prime(n: int) -> bool:
             return False
     return True
 
-def find_primes(limit: int) -> list[int]:
-    return [n for n in range(limit) if is_prime(n)]
+def find_primes_in(r: range) -> list[int]:
+    return [n for n in r if is_prime(n)]
 
-# ProcessPoolExecutor uses multiprocessing under the hood
-with ProcessPoolExecutor(max_workers=4) as executor:
-    # Chunk the work
-    chunks = [range(i, i + 25000) for i in range(0, 100000, 25000)]
-    futures = [executor.submit(find_primes, chunk) for chunk in chunks]
-    
-    results = []
-    for future in as_completed(futures):
-        results.extend(future.result())
+if __name__ == "__main__":   # children re-import this module under spawn/forkserver
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        # Chunk the work: one task per chunk amortises pickling/IPC
+        chunks = [range(i, i + 25000) for i in range(0, 100000, 25000)]
+        futures = [executor.submit(find_primes_in, c) for c in chunks]
+
+        results = []
+        for future in as_completed(futures):
+            results.extend(future.result())
+    print(len(results))   # 9592 primes below 100,000
 
 # ── Thread vs Process ──────────────────────────────────────
 # ThreadPoolExecutor:  GIL-bound, good for I/O
 # ProcessPoolExecutor: True parallel, good for CPU
-# ProcessPoolExecutor: Arguments must be picklable!
+# ProcessPoolExecutor: function, arguments and results must be picklable
+# (no lambdas or local functions), and the worker must be importable.
 ```
 
 ### Custom Executor Patterns
@@ -961,9 +921,12 @@ class ProgressExecutor:
         return future
     
     def _on_complete(self, future):
+        # Runs in the worker thread that finished the task (or immediately,
+        # in the caller, if the future is already done).
         with self.lock:
             self.completed += 1
-        print(f"Progress: {self.completed}/{self.total} ({self.completed*100//self.total}%)")
+            done = self.completed            # read under the lock
+        print(f"Progress: {done}/{self.total} ({done*100//self.total}%)")
 
 # Usage:
 # executor = ProgressExecutor(4, len(urls))
@@ -974,6 +937,16 @@ class ProgressExecutor:
 ---
 
 ## 7. Multiprocessing — True Parallelism
+
+### Start Methods (a frequent production bug source)
+
+| Method | How the child starts | Default on | Catch |
+|---|---|---|---|
+| `fork` | `fork()` copy of the parent, copy-on-write | nowhere since 3.14 (was Linux) | Copies held locks and only the forking thread. If another thread held a lock (logging, an HTTP client, a DB driver), the child can deadlock. 3.12+ emits a `DeprecationWarning` when forking a multi-threaded process |
+| `spawn` | Fresh interpreter, re-imports your main module | macOS (3.8+), Windows | Slow start; everything must be picklable; needs `if __name__ == "__main__":` |
+| `forkserver` | Forks from a clean single-threaded server process | Linux and other POSIX since **3.14** | Same picklability and main-guard rules as `spawn` |
+
+Code that "worked on Linux" because `fork` let children inherit globals and lambdas breaks on 3.14 Linux for the same reason it always broke on macOS. Fix the code (picklable top-level functions, main guard) or opt in explicitly with `multiprocessing.get_context("fork")`.
 
 ### Process Basics
 
@@ -1170,7 +1143,8 @@ p.join()
 # 1. Many concurrent I/O connections (1000s of open sockets)
 # 2. Network services (HTTP servers, WebSocket handlers)
 # 3. Microservices communicating over the network
-# 4. File I/O (async file operations)
+# 4. (Not disk I/O: there is no async file I/O in asyncio; aiofiles and
+#    asyncio.to_thread just run blocking file calls in a thread pool)
 # 5. Any workload that spends most time waiting for I/O
 
 # ── AsyncIO is NOT good for ────────────────────────────────
@@ -1209,32 +1183,34 @@ asyncio.run(main())
 # ── Mixed threading and asyncio ────────────────────────────
 # Run blocking code in a thread pool
 async def fetch_with_fallback(url: str):
-    loop = asyncio.get_event_loop()
-    
-    # Run sync function in thread pool — doesn't block event loop
-    result = await loop.run_in_executor(
-        None,  # Default ThreadPoolExecutor
-        sync_http_request, url
-    )
-    return result
+    # Simplest (3.9+): run a sync function in the default thread pool
+    # and copy contextvars across. Doesn't block the event loop.
+    return await asyncio.to_thread(sync_http_request, url)
+
+    # Equivalent lower-level form (use get_running_loop inside coroutines;
+    # get_event_loop() with no running loop raises RuntimeError since 3.14):
+    # loop = asyncio.get_running_loop()
+    # return await loop.run_in_executor(None, sync_http_request, url)
 ```
 
 ### Running Blocking Code with AsyncIO
 
 ```python
 import asyncio
+import functools
 from concurrent.futures import ThreadPoolExecutor
-import time
 
 # ── Thread pool with asyncio ───────────────────────────────
-async def process_items():
-    loop = asyncio.get_event_loop()
-    
+async def process_items(items):
+    loop = asyncio.get_running_loop()
+
+    # A dedicated pool caps concurrency for this workload separately
+    # from the default executor. Blocking I/O belongs here; CPU-bound
+    # pure-Python work still holds the GIL, so use a ProcessPoolExecutor.
     with ThreadPoolExecutor(max_workers=4) as pool:
         tasks = []
         for item in items:
-            # CPU-bound or blocking work runs in thread pool
-            task = loop.run_in_executor(pool, cpu_bound_func, item)
+            task = loop.run_in_executor(pool, blocking_func, item)
             tasks.append(task)
         
         results = await asyncio.gather(*tasks)
@@ -1246,8 +1222,10 @@ class ThreadPoolAsync:
         self.pool = ThreadPoolExecutor(max_workers)
     
     async def run(self, fn, *args, **kwargs):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.pool, fn, *args, **kwargs)
+        loop = asyncio.get_running_loop()
+        # run_in_executor takes positional args only; bind kwargs first
+        return await loop.run_in_executor(
+            self.pool, functools.partial(fn, *args, **kwargs))
     
     async def __aenter__(self):
         return self
@@ -1309,8 +1287,8 @@ from concurrent.futures import ProcessPoolExecutor
 async def hybrid_pipeline(data: list) -> list:
     """Use asyncio for I/O, processes for CPU work"""
     
-    loop = asyncio.get_event_loop()
-    
+    loop = asyncio.get_running_loop()
+
     with ProcessPoolExecutor(max_workers=4) as pool:
         # Phase 1: CPU-bound processing in parallel
         cpu_results = await loop.run_in_executor(
@@ -1329,16 +1307,14 @@ async def hybrid_pipeline(data: list) -> list:
 
 ### Performance Comparison Table
 
-| Aspect | Threading | Multiprocessing | AsyncIO |
-|--------|-----------|-----------------|---------|
-| **True parallelism** | ❌ | ✅ | ❌ |
-| **Memory overhead** | ~1MB/thread | ~50MB/process | ~2KB/task |
-| **Startup time** | Fast | Slow (fork) | Fast |
-| **IPC required** | No (shared memory) | Yes | No (single thread) |
-| **GIL-limited** | Yes (CPU work) | No | N/A (single thread) |
-| **Max scale** | ~1000 threads | ~100 processes | ~100K tasks |
-| **Debug complexity** | Medium | High | Medium |
-| **Best for** | I/O-bound, shared state | CPU-bound, isolation | I/O-bound, many conns |
+| Aspect | Threading | Multiprocessing | AsyncIO | Subinterpreters (3.14) | Free-threaded (3.14t) |
+|--------|-----------|-----------------|---------|----|----|
+| **Parallel CPU** | No (GIL build) | Yes | No | Yes | Yes |
+| **Memory per unit** | Small resident; 8 MB virtual stack | Tens of MB | ~1-2 KB per task | Several MB per interpreter | Same as threads |
+| **Startup** | Fast | `fork` fast; `spawn`/`forkserver` slow (imports) | Very fast | Slower than threads, faster than spawn | Fast |
+| **Data sharing** | Shared objects | Pickle / shared_memory | Shared (one thread) | Copy / queues / memoryview | Shared objects |
+| **Typical scale** | 10s-1000s | ~1 per core | 10K-100K+ | ~1 per core | ~1 per core for CPU |
+| **Main risk** | Races, deadlocks | Pickling, start-method bugs | One blocking call stalls everything | Extension support | Races that the GIL used to hide; extension support |
 
 ---
 
@@ -1408,138 +1384,110 @@ class ThreadLocalLogger:
 
 ### Atomic Operations (No Lock Needed)
 
+Short answer: a **single operation on a built-in container** (`d[k] = v`, `d.get(k)`, `lst.append(x)`, `lst.pop()`, `deque.append`/`popleft`) can't corrupt the object, on both the GIL build and the free-threaded build (which uses per-object locks). **Read-modify-write sequences are never atomic.** The language spec guarantees none of this, so treat it as a CPython implementation detail: fine for a `deque` used as a log buffer, not something to build correctness on.
+
 ```python
-# ── In CPython, some operations are atomic ─────────────────
-# Due to the GIL, these single bytecode operations are safe:
+# ✅ Single operation on a built-in (won't corrupt the container)
+value = shared_dict['key']
+shared_dict['key'] = value     # unless key's __hash__/__eq__ or the old
+shared_list.append(item)       # value's __del__ runs Python code
+item = shared_deque.popleft()
 
-# ✅ Atomic (single bytecode):
-value = shared_dict['key']    # dict lookup
-shared_dict['key'] = value    # dict assignment in many cases
-shared_list.append(item)      # list append
-shared_list[i] = value        # list index assignment
+# ❌ Read-modify-write: another thread can run in between
+shared_dict['key'] += 1
+counter += 1
+if key not in cache:           # check-then-act
+    cache[key] = compute()
 
-# ❌ NOT atomic (multiple bytecodes):
-shared_dict['key'] += 1       # read + modify + write
-shared_list[i] += 1           # read + modify + write
-shared_counter -= 1            # read + subtract + write
-
-# ── Even with GIL, += is NOT safe! ─────────────────────────
-# counter += 1 compiles to:
-# LOAD_FAST counter
-# LOAD_CONST 1
-# INPLACE_ADD       ← Thread switch can happen here!
-# STORE_FAST counter
-
-# This is why threading.Lock is still needed for compound ops.
+# What `counter += 1` compiles to (Python 3.14, `dis`):
+#   LOAD_GLOBAL      counter
+#   LOAD_SMALL_INT   1
+#   BINARY_OP        13 (+=)     <- a switch here loses an update
+#   STORE_GLOBAL     counter
+# Bytecode names change between versions (INPLACE_ADD before 3.11);
+# the point is that it's a load, an add and a store.
 ```
+
+Atomic alternatives that need no explicit lock: `dict.setdefault(k, v)` (one call, so first writer wins), `queue.Queue`, and `itertools.count()` for IDs on the GIL build. For anything else, use a `Lock`.
 
 ### Read-Copy-Update (RCU) Pattern
 
 ```python
-# ── Lock-free reads with atomic pointer swap ───────────────
-import copy
+# ── Lock-free reads, copy-on-write updates ─────────────────
 import threading
+from types import MappingProxyType
 
 class RCUCache:
-    """Read-Copy-Update pattern for high-read workloads"""
-    
-    def __init__(self, initial_data: dict = None):
-        self._lock = threading.Lock()
-        self._data = initial_data or {}  # Immutable snapshot
-        self._version = 0
-    
-    def get(self, key: str, default=None):
-        # Lock-free read! Always safe because _data is never mutated
-        data = self._data  # Atomic reference assignment (GIL)
-        return data.get(key, default)
-    
-    def update(self, key: str, value):
-        """Copy data, modify copy, swap atomically"""
-        with self._lock:
-            # Copy whole structure (expensive but read-safe)
-            new_data = copy.deepcopy(self._data)
-            new_data[key] = value
-            # Atomic swap — subsequent reads see new version
-            self._data = new_data
-            self._version += 1
-    
-    def batch_update(self, updates: dict):
-        """Multiple updates with single atomic swap"""
-        with self._lock:
-            new_data = copy.deepcopy(self._data)
-            new_data.update(updates)
-            self._data = new_data
-            self._version += 1
+    """Readers never lock: they grab the current snapshot reference,
+    which is never mutated after publication. Writers copy, modify
+    and publish a new snapshot under a lock."""
 
-# Usage:
-# cache = RCUCache({'config': 'initial'})
-# # Readers (no lock needed):
-# val = cache.get('config')
-# # Writers:
-# cache.update('config', 'new_value')
+    def __init__(self, initial_data: dict | None = None):
+        self._lock = threading.Lock()                 # serialises writers only
+        self._data = MappingProxyType(dict(initial_data or {}))  # read-only view of our own copy
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)           # one attribute load = consistent snapshot
+
+    def update(self, key, value):
+        self.batch_update({key: value})
+
+    def batch_update(self, updates: dict):
+        with self._lock:
+            new = dict(self._data)                    # shallow copy is enough if values are immutable
+            new.update(updates)
+            self._data = MappingProxyType(new)        # publish: single reference assignment
 ```
+
+Trade-off: reads are as cheap as a dict lookup; each write is O(n) in the size of the map. Good for config and routing tables (many reads, rare writes), bad for hot write paths. A reader holding an old snapshot sees stale data until it re-reads, which is usually what you want (a consistent view).
 
 ### Read-Write Lock Pattern
 
 ```python
-# ── Read-Write lock for read-heavy workloads ───────────────
-# Note: Python doesn't have built-in RWLock in threading
-# Here's an implementation:
+# ── Read-write lock (writer-preferring) ────────────────────
+# The stdlib has no RWLock. In CPython, critical sections are usually
+# short and the GIL serialises reads anyway, so a plain Lock often
+# wins. An RWLock pays off when reads are long (I/O or C code that
+# releases the GIL) or on the free-threaded build.
+import threading
+from contextlib import contextmanager
 
 class RWLock:
-    """
-    Read-Write lock: multiple readers, exclusive writer.
-    
-    ⚠️ Design notes:
-    - Readers hold a shared lock; writers wait for ALL readers to finish.
-    - This implementation prioritizes readers over writers (reader-biased).
-      If there's a constant stream of readers, writers may starve.
-      For writer-priority, see Python's ``readerwriterlock`` package.
-    - The Condition variable's Lock() protects the _readers count.
-      Between a reader incrementing _readers and actually reading,
-      a writer might check and wait. That's correct — the writer waits.
-      But the TOCTOU risk is: a reader increments, writer starts waiting,
-      reader finishes and decrements, writer wakes up, but ANOTHER reader
-      snuck in before the writer re-acquired the lock.
-      The while-loop re-check handles this correctly.
-    """
-    
+    """Many concurrent readers OR one writer.
+    Writer-preferring: once a writer is waiting, new readers queue
+    behind it, so a steady stream of readers can't starve writers."""
+
     def __init__(self):
         self._cond = threading.Condition(threading.Lock())
-        self._readers = 0
-        self._writer_waiting = False  # Tracks if a writer is queued
-    
+        self._readers = 0            # active readers
+        self._writer = False         # a writer holds the lock
+        self._writers_waiting = 0
+
     def acquire_read(self):
-        """Multiple readers can acquire simultaneously.
-        
-        ⚠️ If a writer is waiting, new readers queue behind it
-        to prevent writer starvation (writer-priority mode).
-        """
         with self._cond:
-            # Wait if a writer is waiting (prevents writer starvation)
-            while self._writer_waiting:
+            while self._writer or self._writers_waiting:
                 self._cond.wait()
             self._readers += 1
-    
+
     def release_read(self):
         with self._cond:
             self._readers -= 1
             if self._readers == 0:
-                self._cond.notify_all()  # Wake waiting writer
-    
+                self._cond.notify_all()   # a writer may be waiting
+
     def acquire_write(self):
-        """Exclusive — waits for all readers to finish."""
         with self._cond:
-            self._writer_waiting = True
-            while self._readers > 0:
-                self._cond.wait()  # Releases lock, re-acquires before return
-            # Now: _readers == 0, _writer_waiting == True
-    
+            self._writers_waiting += 1
+            while self._writer or self._readers:   # excludes other writers too
+                self._cond.wait()
+            self._writers_waiting -= 1
+            self._writer = True
+
     def release_write(self):
         with self._cond:
-            self._writer_waiting = False
-            self._cond.notify_all()  # Wake waiting readers
-    
+            self._writer = False
+            self._cond.notify_all()       # wake readers and writers; they re-check
+
     @contextmanager
     def read_lock(self):
         self.acquire_read()
@@ -1547,7 +1495,7 @@ class RWLock:
             yield
         finally:
             self.release_read()
-    
+
     @contextmanager
     def write_lock(self):
         self.acquire_write()
@@ -1555,18 +1503,9 @@ class RWLock:
             yield
         finally:
             self.release_write()
-
-# Usage:
-# rwlock = RWLock()
-# 
-# # Readers (concurrent):
-# with rwlock.read_lock():
-#     print(cache.data)
-# 
-# # Writer (exclusive):
-# with rwlock.write_lock():
-#     cache.data = new_data
 ```
+
+Follow-ups to expect: the lock isn't reentrant (a reader that tries to take the write lock deadlocks, because upgrades need a separate protocol), and writer preference trades writer starvation for reader latency spikes.
 
 ### Pipeline Pattern (Thread-Safe)
 
@@ -1656,18 +1595,21 @@ def bad_increment():
     global counter
     counter += 1  # NOT safe! Read, modify, write are not atomic
 
-# ── 3. False Sharing (Cache Line Ping-Pong) ──────────────
-# Multiple threads modify different variables on the same cache line
-# CPU caches invalidate each other → performance collapse
+# ── 3. Lost wake-up / missed signal ──────────────────────
+# Checking a condition with `if` instead of `while`, or notifying
+# before the waiter starts waiting. Fix: always `while not pred: wait()`
+# (or cond.wait_for), and keep the state change under the same lock.
 
-# ── 4. Thread Starvation ─────────────────────────────────
-# Low-priority threads never get CPU time
-# Fix: fairness mechanisms, explicit scheduling
+# ── 4. Starvation ─────────────────────────────────────────
+# Python threads have no priorities. Starvation here means a reader-
+# preferring RWLock starving writers, or an unfair lock always being
+# re-taken by the same thread. Fix: fair/writer-preferring designs, queues.
 
-# ── 5. GIL Convoy ─────────────────────────────────────────
-# Multiple CPU-bound threads all competing for GIL
-# Each gets ~5ms before switching → worse than sequential!
-# Fix: use multiprocessing for CPU work
+# ── 5. GIL convoy effect ──────────────────────────────────
+# One CPU-bound thread + I/O-bound threads: every time an I/O thread's
+# read completes it must wait up to the switch interval (5 ms) to get
+# the GIL back, so I/O throughput and latency collapse (bpo-7946).
+# Fix: move CPU work to processes, or lower sys.setswitchinterval().
 
 # ── 6. Holding Lock During I/O ────────────────────────────
 with lock:
@@ -1679,118 +1621,78 @@ with lock:
 ### Debugging Tools
 
 ```python
-# ── 1. Trace all threads ──────────────────────────────────── 
-import traceback
-import sys
+# ── 1. Dump every thread's stack (hung process) ──────────────
+import faulthandler, signal, sys
+faulthandler.register(signal.SIGUSR1, all_threads=True)  # kill -USR1 <pid>
+faulthandler.dump_traceback_later(60, repeat=True)       # watchdog: dump every 60 s if still running
+faulthandler.dump_traceback(file=sys.stderr, all_threads=True)  # on demand
 
-def dump_threads():
-    """Print stack traces for all threads"""
-    for thread_id, stack in sys._current_frames().items():
-        thread = threading._active.get(thread_id)
-        thread_name = thread.name if thread else f"Thread-{thread_id}"
-        print(f"\n=== {thread_name} (ID: {thread_id}) ===")
-        traceback.print_stack(stack)
+# From outside, without code changes:
+#   py-spy dump --pid <pid>        # all thread stacks, shows who holds/waits on the GIL
+#   python3.14 -m pdb -p <pid>     # 3.14+: attach a debugger to a live process (PEP 768)
+#   python3.14 -m asyncio pstree <pid>   # 3.14+: async task tree of a running process
 
-# Register as signal handler for debugging
-import signal
-signal.signal(signal.SIGUSR1, lambda sig, frame: dump_threads())
-
-# ── 2. Logging threading events ────────────────────────────
+# ── 2. Put the thread name in every log line ─────────────────
 import logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(threadName)s] %(message)s',
 )
 
-# ── 3. Deadlock detection ──────────────────────────────────
+# ── 3. Surface exceptions from bare threads ──────────────────
 import threading
-import time
-from collections import defaultdict
+def excepthook(args):  # args.exc_type, args.exc_value, args.thread
+    logging.error("Thread %s died", args.thread.name,
+                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+threading.excepthook = excepthook
+```
+
+```python
+# ── 4. Lock-order checker (finds deadlock *risk* before it hangs) ──
+import threading
 
 class TrackedLock:
-    """
-    Wraps a threading.Lock to track acquisition order across threads.
-    
-    ⚠️ threading.Lock is implemented in C and cannot be subclassed.
-       We use composition (wrap) instead of inheritance (mixin).
-    
-    Detects potential deadlocks by tracking lock ordering.
-    If a thread acquires locks in a different order than another
-    thread already did, it logs a warning — this is a potential
-    deadlock (lock ordering violation).
-    """
-    
-    _lock_order = threading.local()  # Per-thread acquisition stack
-    _global_order = {}  # (lock_id_1, lock_id_2) → first_seen_order
-    _global_lock = threading.Lock()
-    
-    def __init__(self):
+    """Wraps a Lock (composition; threading.Lock can't be subclassed).
+    Records "held A, then took B" edges; seeing B-then-A anywhere
+    means two threads could deadlock. This is the idea behind
+    lockdep in Linux and TSan's lock-order checks."""
+
+    _held = threading.local()   # per-thread stack of held lock ids
+    _edges: set[tuple[int, int]] = set()
+    _edges_lock = threading.Lock()
+
+    def __init__(self, name: str):
         self._lock = threading.Lock()
-        self._lock_id = id(self)
-    
+        self.name = name
+
     def acquire(self, blocking=True, timeout=-1):
-        result = self._lock.acquire(blocking, timeout)
-        if result:
-            self._record_acquisition()
-        return result
-    
+        ok = self._lock.acquire(blocking, timeout)
+        if ok:
+            stack = self._held.__dict__.setdefault("stack", [])
+            with TrackedLock._edges_lock:
+                for held in stack:
+                    if (id(self), held) in TrackedLock._edges:
+                        print(f"WARNING lock-order inversion: {self.name} "
+                              f"taken while holding another lock in reverse order")
+                    TrackedLock._edges.add((held, id(self)))
+            stack.append(id(self))
+        return ok
+
     def release(self):
+        self._held.stack.remove(id(self))
         self._lock.release()
-        self._record_release()
-    
-    def _record_acquisition(self):
-        if not hasattr(self._lock_order, 'stack'):
-            self._lock_order.stack = []
-        
-        # Check ordering against previously held locks
-        for held_id in self._lock_order.stack:
-            key = (held_id, self._lock_id)
-            with self._global_lock:
-                if key not in self._global_order:
-                    self._global_order[key] = time.monotonic()
-                # If we see the REVERSE order later, that's a deadlock risk
-                reverse_key = (self._lock_id, held_id)
-                if reverse_key in self._global_order:
-                    print(
-                        f"WARNING: Potential deadlock! Thread "
-                        f"'{threading.current_thread().name}' acquired "
-                        f"lock {self._lock_id} while holding {held_id}, "
-                        f"but another thread acquired them in reverse order."
-                    )
-        
-        self._lock_order.stack.append(self._lock_id)
-    
-    def _record_release(self):
-        if hasattr(self._lock_order, 'stack'):
-            try:
-                self._lock_order.stack.remove(self._lock_id)
-            except ValueError:
-                pass
-    
-    def __enter__(self):
-        self.acquire()
-        return self
-    
-    def __exit__(self, *args):
+
+    __enter__ = acquire
+    def __exit__(self, *exc):
         self.release()
 
-# ── 4. ThreadSanitizer (requires compile flag) ─────────────
-# python3.12 -X tsan my_script.py
-# Or compile with: --with-thread-sanitizer
-# Detects: data races, lock ordering violations
-
-# ── 5. objgraph for reference cycle detection ──────────────
-import objgraph
-
-def find_leaking_objects():
-    """Find objects that shouldn't be alive"""
-    gc.collect()
-    
-    # Show most common types
-    objgraph.show_most_common_types(limit=20)
-    
-    # Show growth since last call
-    objgraph.show_growth(limit=10)
+# ── 5. ThreadSanitizer ───────────────────────────────────────
+# There is no runtime flag. Build CPython with
+#   ./configure --with-thread-sanitizer   (3.13+, mainly for the
+#   free-threaded build: --disable-gil)
+# and run your tests to find data races in C extensions and the
+# interpreter. For pure-Python races, use stress tests: many threads,
+# sys.setswitchinterval(1e-6) to force frequent switches.
 ```
 
 ### Profiling Concurrent Code
@@ -1895,7 +1797,9 @@ from multiprocessing import Pool
 2. **Internal data structures:** Objects like dicts and lists need protection from concurrent modification
 3. **Simplicity:** Without the GIL, CPython would need fine-grained locks on every object, making single-threaded code much slower
 
-The GIL makes single-threaded code fast (~15% speed loss vs no GIL) at the cost of multithreaded CPU performance.
+The trade-off: fast, simple single-threaded code and C extensions, at the cost of multithreaded CPU scaling. The free-threaded build (officially supported since 3.14, PEP 779) shows the price of removing it: roughly 5-10% slower single-threaded code (per the 3.14 release notes; it varies by platform), plus a separate ABI that C extensions must opt into.
+
+**Probe next:** "Does the GIL make my code thread-safe?" No. It makes individual bytecodes and built-in operations atomic, not your read-modify-write sequences.
 </details>
 
 <details>
@@ -1905,8 +1809,9 @@ The GIL makes single-threaded code fast (~15% speed loss vs no GIL) at the cost 
 - **Threading:** I/O-bound work with moderate concurrency (<1000 connections), when you need shared state, or when using libraries that don't support asyncio
 - **AsyncIO:** I/O-bound work with very high concurrency (1000s of connections), network servers, when you want lightweight tasks
 - **Multiprocessing:** CPU-bound work, when you need true parallelism, or when isolating workloads for fault tolerance
+- **3.14 options for CPU work:** `InterpreterPoolExecutor` (isolated interpreters, own GIL each) or the free-threaded build, if your C dependencies support them
 
-Choose by workload type first, then by concurrency requirements.
+Choose by workload type first, then by concurrency requirements. In practice you often combine them: an asyncio service that offloads blocking calls with `asyncio.to_thread` and CPU work to a process pool.
 </details>
 
 ### Intermediate
@@ -1914,15 +1819,16 @@ Choose by workload type first, then by concurrency requirements.
 <details>
 <summary><b>Q4: How does the GIL switch between threads? Can you control it?</b></summary>
 
-**Answer:** Since Python 3.2 (PEP 1043), the GIL uses a time-based switching mechanism:
-- The GIL is released and re-acquired every 5ms (default)
-- Uses a condition variable for fairness
-- The holding thread signals waiting threads when it releases
+**Answer:** Since Python 3.2 (Antoine Pitrou's "new GIL"; there is no PEP for it), switching is time-based and request-driven:
+- A waiting thread waits on a condition variable for the switch interval (default 5 ms).
+- If it times out, it sets a drop request; the holder notices at the next eval-loop check and releases.
+- The releasing thread waits until another thread has actually taken the GIL, so it can't immediately re-grab it.
+- Blocking calls release the GIL voluntarily, so a holder with no waiters never switches.
 
 You can control it with:
 ```python
 sys.setswitchinterval(0.001)  # 1ms — more frequent switching
-sys.setswitchinterval(10.0)   # 10s — almost no switching
+sys.setswitchinterval(0.1)    # 100ms — fewer switches, worse I/O latency
 
 # Check current interval:
 print(sys.getswitchinterval())  # Default: 0.005 (5ms)
@@ -1950,16 +1856,9 @@ NumPy, Pandas, and many C extensions release the GIL during heavy computation.
 4. **Minimize lock scope:** Only hold locks for the shortest time necessary
 5. **Avoid nested locks:** If possible, restructure to use a single lock or lock-free patterns
 
-**Detection:**
-```python
-# Check for deadlocked threads
-import threading
-for thread in threading.enumerate():
-    if thread.is_alive() and thread.ident:
-        # Thread is stuck — likely deadlocked
-        import traceback
-        traceback.print_stack(sys._current_frames()[thread.ident])
-```
+**Detection:** a live process can't tell "deadlocked" from "slow", so look at stacks. Dump all threads (`faulthandler.dump_traceback(all_threads=True)`, `py-spy dump --pid`, or `python -m pdb -p` on 3.14) and look for two threads each blocked in `acquire()` on a lock the other holds. To catch it before production, run tests with a lock-order checker (see [Debugging Tools](#debugging-tools)).
+
+**Probe next:** "Is `RLock` a fix?" Only for self-deadlock (one thread re-entering), never for two threads in a cycle.
 </details>
 
 <details>
@@ -2033,7 +1932,7 @@ worker.start()
 1. **Queues** (`queue.Queue`): Pass messages, not shared state
 2. **Thread-local storage** (`threading.local`): Each thread has its own copy
 3. **Locks** (`Lock`, `RLock`): Protect critical sections
-4. **Atomic operations**: Simple reads/writes (GIL-protected for single bytecodes)
+4. **Single built-in operations** (`append`, `d[k] = v`): won't corrupt the container, but are a CPython implementation detail, not a guarantee
 5. **Immutable data**: No mutation means no races
 
 ```python
@@ -2056,9 +1955,10 @@ with lock:
     if condition:
         shared_list.append(item)
 
-# ❌ Unsafe: Shared mutable state without synchronization
-shared_dict[key] = value  # Safe in CPython (single bytecode)
-shared_dict[key] += 1     # UNSAFE (read + modify + write)
+# ⚠️ Single built-in operation: won't corrupt the dict (CPython detail)
+shared_dict[key] = value
+# ❌ Unsafe: read-modify-write without a lock
+shared_dict[key] += 1
 ```
 </details>
 
@@ -2067,60 +1967,57 @@ shared_dict[key] += 1     # UNSAFE (read + modify + write)
 <details>
 <summary><b>Q9: Implement a thread-safe bounded buffer (producer-consumer) using Condition variables.</b></summary>
 
-**Answer:**
+**30-second answer:** one lock, two conditions (`not_full`, `not_empty`), always wait in a `while` loop, and notify the *other* side after changing state. That's exactly how `queue.Queue` is built, and in production you'd just use `queue.Queue(maxsize=n)`.
+
 ```python
 import threading
+from collections import deque
 
 class BoundedBuffer:
     def __init__(self, capacity: int):
-        self.buffer = []
+        self.buf = deque()
         self.capacity = capacity
-        self.cond = threading.Condition()
-    
-    def put(self, item):
-        with self.cond:
-            while len(self.buffer) >= self.capacity:
-                self.cond.wait()  # Buffer full, wait
-            self.buffer.append(item)
-            self.cond.notify()  # Wake one consumer
-    
-    def get(self):
-        with self.cond:
-            while len(self.buffer) == 0:
-                self.cond.wait()  # Buffer empty, wait
-            item = self.buffer.pop(0)
-            self.cond.notify()  # Wake one producer
-            return item
-    
-    def put_many(self, items):
-        with self.cond:
-            for item in items:
-                while len(self.buffer) >= self.capacity:
-                    self.cond.wait()
-                self.buffer.append(item)
-            self.cond.notify_all()  # Wake all consumers
-    
-    def size(self):
-        with self.cond:
-            return len(self.buffer)
+        lock = threading.Lock()
+        self.not_full = threading.Condition(lock)
+        self.not_empty = threading.Condition(lock)
 
-# Usage:
+    def put(self, item, timeout: float | None = None) -> None:
+        with self.not_full:
+            if not self.not_full.wait_for(lambda: len(self.buf) < self.capacity, timeout):
+                raise TimeoutError("buffer full")
+            self.buf.append(item)
+            self.not_empty.notify()
+
+    def get(self, timeout: float | None = None):
+        with self.not_empty:
+            if not self.not_empty.wait_for(lambda: self.buf, timeout):
+                raise TimeoutError("buffer empty")
+            item = self.buf.popleft()
+            self.not_full.notify()
+            return item
+
 buffer = BoundedBuffer(10)
+received = []
 
 def producer():
     for i in range(100):
-        buffer.put(f"item-{i}")
+        buffer.put(i)
 
 def consumer():
     for _ in range(100):
-        item = buffer.get()
-        print(f"Got: {item}")
+        received.append(buffer.get())
 
 t1 = threading.Thread(target=producer)
 t2 = threading.Thread(target=consumer)
 t1.start(); t2.start()
 t1.join(); t2.join()
+print(received == list(range(100)))   # True
 ```
+
+**What they probe next:**
+- *Why `while`/`wait_for` and not `if`?* Spurious wake-ups, and another consumer may take the item between the notify and this thread re-acquiring the lock.
+- *Why two conditions?* With one shared condition, `notify()` can wake a producer when only a consumer can make progress; the wake-up is lost and everything can deadlock. One condition only works with `notify_all()`.
+- *Shutdown?* Add a `closed` flag checked in both predicates, and `notify_all()` on close.
 </details>
 
 <details>
@@ -2157,16 +2054,19 @@ def cpu_heavy():
     for t in threads: t.join()
     return time.perf_counter() - start
 
-# Results:
-# I/O-bound: 4 threads ≈ 4x faster than 1
-# CPU-bound: 4 threads ≈ SAME as 1 (GIL contention adds overhead)
-# CPU-bound with multiprocessing: 4 processes ≈ 3.5x faster
+# Typical results (shape, not exact numbers):
+# I/O-bound:  4 threads take about as long as ONE request (waits overlap)
+# CPU-bound:  4 threads take about as long as running the 4 jobs
+#             sequentially, sometimes longer (GIL hand-off overhead)
+# CPU-bound, 4 processes / InterpreterPoolExecutor / 3.14t threads:
+#             close to 4x faster on 4 idle cores, minus startup and pickling
 ```
 
 **The GIL impact:**
 - I/O-bound: Threads work great (GIL released during I/O)
 - CPU-bound: Threads don't help (GIL serializes)
 - Mixed: Threads help with I/O portion, CPU portion is serialized
+- Mixed, with one hot CPU thread: also hurts the I/O threads' latency (convoy effect)
 </details>
 
 <details>
@@ -2218,7 +2118,9 @@ class ThreadedScraper:
         self.url_queue = queue.Queue()
         self.result_queue = queue.Queue()
         self.num_workers = num_workers
-        self.rate_limiter = threading.Semaphore(int(rate_limit))
+        # Shared token bucket from §4; a Semaphore released by Timers
+        # allows bursts and spawns a thread per request.
+        self.rate_limiter = TokenBucketRateLimiter(max(1, int(rate_limit)), 1.0)
         self._stop = threading.Event()
     
     def _worker(self):
@@ -2226,23 +2128,20 @@ class ThreadedScraper:
         while not self._stop.is_set():
             try:
                 url = self.url_queue.get(timeout=1)
-                self.rate_limiter.acquire()
-                
-                try:
-                    resp = requests.get(url, timeout=10)
-                    self.result_queue.put({
-                        'url': url,
-                        'status': resp.status_code,
-                        'size': len(resp.text),
-                    })
-                except Exception as e:
-                    self.result_queue.put({'url': url, 'error': str(e)})
-                
-                # Schedule rate limit token refill
-                threading.Timer(1.0, self.rate_limiter.release).start()
-                
             except queue.Empty:
                 continue
+            try:
+                self.rate_limiter.acquire()
+                resp = requests.get(url, timeout=10)
+                self.result_queue.put({
+                    'url': url,
+                    'status': resp.status_code,
+                    'size': len(resp.text),
+                })
+            except Exception as e:
+                self.result_queue.put({'url': url, 'error': str(e)})
+            finally:
+                self.url_queue.task_done()   # without this, join() below hangs forever
     
     def scrape(self, urls: list[str]) -> list[dict]:
         workers = []
@@ -2264,7 +2163,10 @@ class ThreadedScraper:
         
         return results
 
-# ── Approach 3: ProcessPoolExecutor (for CPU+IO mixed) ────
+# ── Approach 3: ProcessPoolExecutor ───────────────────────
+# Only worth it if parsing each page is CPU-heavy. For plain fetching
+# it just adds process startup and pickling; better: asyncio for the
+# fetches + a process pool for the parse step.
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def scrape_url(url: str) -> dict:
@@ -2294,340 +2196,248 @@ def parallel_scrape(urls: list[str]) -> list[dict]:
 <details>
 <summary><b>Q12: Explain free-threaded Python (PEP 703). What changes and what breaks?</b></summary>
 
-**Answer:** PEP 703 (Python 3.13t) makes the GIL optional. Key implications:
+**30-second answer:** It's a separate CPython build (`python3.13t`, `python3.14t`) with no GIL, so plain threads run Python code on many cores. It was experimental in 3.13 and is **officially supported but not the default** in 3.14 (PEP 779). Single-threaded code is roughly 5-10% slower, C extensions must declare support, and races your code always had become much more likely to show up.
 
-**What changes:**
-- `--disable-gil` configure option or `PYTHON_GIL=0` environment variable
-- Multiple threads can execute Python bytecodes simultaneously
-- True parallelism with `threading` for CPU-bound work
-- ~5-8% single-threaded performance penalty (biasing GC, reference counting changes)
+**Timeline**
 
-**What breaks:**
-- C extensions that assume GIL protection must be updated
-- Thread-unsafe became the default — all mutable objects need explicit synchronization
-- Atomic operations under GIL (dict lookup, list append) are no longer atomic
-- JIT compilers (PyPy) need updates
-- Reference counting changes: deferred reference counting, immortal objects
+| Version | Status |
+|---|---|
+| 3.13 (Oct 2024) | Experimental build (PEP 703); specializing interpreter disabled, so single-threaded overhead was large |
+| 3.14 (Oct 2025) | Phase II, officially supported (PEP 779); specialization re-enabled; ~5-10% single-thread cost |
+| Future | Making it the default needs a separate decision (Phase III) |
 
-**Migration path:**
-1. Run with `PYTHON_GIL=1` for GIL-enabled (default until at least 3.13)
-2. Test with `PYTHON_GIL=0` and fix C extensions
-3. For Python code: ensure proper locking on all shared mutable state
+**How the interpreter stays safe without the GIL:**
+- **Biased reference counting:** the owning thread updates refcounts without atomics; other threads use atomic operations on a shared count.
+- **Immortal objects** (PEP 683) such as `None`, small ints and interned strings skip refcounting entirely; deferred refcounting for functions, modules and code objects.
+- **Per-object locks** (critical sections) inside `dict`, `list`, `set` and friends.
+- **mimalloc** as the allocator, and a stop-the-world garbage collector.
+
+**What changes for you:**
+- Detect it: `sysconfig.get_config_var("Py_GIL_DISABLED")` tells you the build; `sys._is_gil_enabled()` tells you whether the GIL is actually off right now.
+- Importing a C extension that hasn't declared support (`Py_mod_gil`) **re-enables the GIL** for the whole process, with a warning. `PYTHON_GIL=0` / `-X gil=0` forces it off anyway (at your own risk). These settings do nothing on the default build.
+- Built-ins stay internally consistent, but sharing one iterator between threads, and calling `frame.f_locals` across threads, are not safe.
+- 3.14 turns on `thread_inherit_context` and context-aware `warnings` by default in this build, so `catch_warnings()` and contextvars flow into threads started inside them.
+
+**What breaks / costs:**
+- C extensions need a rebuild for the `t` ABI (separate wheels such as `cp314t`) and an audit of code that relied on the GIL.
+- Latent races in pure Python surface far more often.
+- Memory use is somewhat higher, and some objects become immortal (never freed).
+
+**Migration path:** run the test suite on `3.14t` with stress settings, check `sys._is_gil_enabled()` after imports to catch dependencies that turn the GIL back on, then benchmark. The win only exists for CPU-bound work in threads; I/O-bound services gain little.
 </details>
 
 <details>
 <summary><b>Q13: Design a thread-safe connection pool for a database.</b></summary>
 
-**Answer:**
+**30-second answer:** a deque of idle connections, a count of open connections, and one `Condition`. `acquire` takes an idle connection, or reserves a slot and creates one **outside the lock**, or waits with a deadline. `release` returns the connection and notifies one waiter. Hand connections out through a context manager so they can't leak.
+
 ```python
 import threading
 import time
 from collections import deque
-from typing import Optional, Callable, TypeVar
+from contextlib import contextmanager
+from typing import Callable, Generic, TypeVar
 
-T = TypeVar('T')
+T = TypeVar("T")
 
-class ConnectionPool:
-    """Thread-safe connection pool with health checks and max connections"""
-    
-    def __init__(
-        self,
-        create_conn: Callable[[], T],
-        close_conn: Callable[[T], None],
-        max_connections: int = 10,
-        min_connections: int = 2,
-        timeout: float = 30.0,
-        health_check: Optional[Callable[[T], bool]] = None,
-    ):
-        self._create = create_conn
-        self._close = close_conn
-        self._max = max_connections
-        self._min = min_connections
-        self._timeout = timeout
-        self._health = health_check or (lambda c: True)
-        
-        self._pool = deque()
-        self._in_use = set()
-        self._count = 0
-        self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
-        
-        # Create minimum connections
-        for _ in range(min_connections):
-            conn = self._create()
-            self._pool.append(conn)
-            self._count += 1
-    
+class ConnectionPool(Generic[T]):
+    def __init__(self, create: Callable[[], T], close: Callable[[T], None],
+                 max_size: int = 10, timeout: float = 30.0,
+                 is_healthy: Callable[[T], bool] = lambda c: True):
+        self._create, self._close, self._healthy = create, close, is_healthy
+        self._max, self._timeout = max_size, timeout
+        self._idle: deque[T] = deque()
+        self._open = 0                       # idle + in use + being created
+        self._cond = threading.Condition()
+
     def acquire(self) -> T:
-        """Get a connection from the pool, creating if needed"""
+        deadline = time.monotonic() + self._timeout
         with self._cond:
-            # Try existing connections first
-            while self._pool:
-                conn = self._pool.popleft()
-                if self._health(conn):
-                    self._in_use.add(conn)
-                    return conn
-                # Dead connection — close and replace
-                self._close(conn)
-                self._count -= 1
-            
-            # No available connections — create one if under max
-            if self._count < self._max:
-                conn = self._create()
-                self._count += 1
-                self._in_use.add(conn)
+            while True:
+                if self._idle:
+                    conn = self._idle.pop()  # LIFO: reuse warm connections
+                    break
+                if self._open < self._max:
+                    self._open += 1          # reserve the slot, create below
+                    conn = None
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cond.wait(remaining):
+                    raise TimeoutError("connection pool exhausted")
+        # Slow work (network) happens OUTSIDE the lock
+        try:
+            if conn is not None and self._healthy(conn):
                 return conn
-            
-            # At max — wait for a release
-            if not self._cond.wait(timeout=self._timeout):
-                raise TimeoutError("Connection pool timeout")
-            
-            # Wake up — try again (another thread released a connection)
-            return self.acquire()
-    
-    def release(self, conn: T):
-        """Return a connection to the pool"""
-        with self._cond:
-            self._in_use.discard(conn)
-            if self._health(conn):
-                self._pool.append(conn)
-            else:
-                # Dead connection — close it
+            if conn is not None:
                 self._close(conn)
-                self._count -= 1
-                # Try to maintain minimum pool size
-                if self._count < self._min:
-                    new_conn = self._create()
-                    self._pool.append(new_conn)
-                    self._count += 1
-            self._cond.notify()  # Wake waiting acquirers
-    
+            return self._create()
+        except BaseException:
+            with self._cond:                 # give the slot back on failure
+                self._open -= 1
+                self._cond.notify()
+            raise
+
+    def release(self, conn: T, broken: bool = False) -> None:
+        if broken:
+            self._close(conn)
+        with self._cond:
+            if broken:
+                self._open -= 1
+            else:
+                self._idle.append(conn)
+            self._cond.notify()
+
     @contextmanager
     def connection(self):
-        """Context manager for automatic release"""
         conn = self.acquire()
         try:
             yield conn
-        finally:
+        except Exception:
+            self.release(conn, broken=True)  # don't return a conn mid-transaction
+            raise
+        else:
             self.release(conn)
-    
-    def close_all(self):
-        """Close all connections in the pool"""
-        with self._cond:
-            for conn in list(self._pool) + list(self._in_use):
-                self._close(conn)
-            self._pool.clear()
-            self._in_use.clear()
-            self._count = 0
-
-# Usage:
-# pool = ConnectionPool(
-#     create_conn=lambda: sql.connect("postgresql://..."),
-#     close_conn=lambda c: c.close(),
-#     max_connections=20,
-#     min_connections=5,
-# )
-# with pool.connection() as conn:
-#     conn.execute("SELECT * FROM users")
 ```
+
+**Design points they'll probe:**
+- **Never do I/O under the pool lock.** Creating a connection can take seconds, and every other thread would queue behind it.
+- **Timeouts with a deadline,** not a fresh timeout per wake-up (the original recursive "wait then call acquire again" approach could wait forever in total).
+- **Health checks:** validate on checkout (costs a round trip) or check in the background plus `max_lifetime` recycling, which is what HikariCP and SQLAlchemy's `pool_pre_ping`/`pool_recycle` do.
+- **Sizing:** connections are a database-side resource. Total = pool size × processes × hosts must fit under the DB's `max_connections`; that's why PgBouncer exists.
+- **Leaks:** the context manager guarantees release; production pools also log connections checked out longer than a threshold.
 </details>
 
 <details>
-<summary><b>Q14: How do subinterpreters (Python 3.12+) enable true parallelism? What are the limitations?</b></summary>
+<summary><b>Q14: How do subinterpreters enable true parallelism? What are the limitations?</b></summary>
 
-**Answer:** Subinterpreters (PEP 684) provide isolated Python interpreters within the same process. Each subinterpreter has its own GIL, enabling true parallel execution of Python code.
+**30-second answer:** Since 3.12 (PEP 684) each subinterpreter can have its **own GIL**, so several interpreters in one process run Python code on different cores. Since 3.14 there is a public API: `concurrent.interpreters` (PEP 734) and `concurrent.futures.InterpreterPoolExecutor`. Think "processes, but in one address space": isolation like multiprocessing, cheaper than processes, but no sharing of ordinary objects.
 
 **How they work:**
-- Each subinterpreter has its own: GIL, memory allocator, module state, exception state
-- Communication via channels (queue-like queues between interpreters)
-- No shared mutable state between subinterpreters
+- Each interpreter has its own modules, `sys`, builtins, object allocator state and GIL. Objects belong to exactly one interpreter.
+- Data crosses by copy (pickling for most objects), or through `interpreters.Queue`. Truly shared memory is limited to buffers such as `memoryview`.
+- Immortal and static objects (e.g. `None`, small ints) are shared safely.
 
 ```python
-import _xxsubinterpreters as interpreters
-import _xxinterpchannels as channels
+from concurrent.futures import InterpreterPoolExecutor
+from concurrent import interpreters
 
-# Create a channel for communication
-channel_id = channels.create()
+def sum_squares(n: int) -> int:
+    return sum(i * i for i in range(n))
 
-# Create and start a subinterpreter
-interp_id = interpreters.create()
-interpreters.run_string(interp_id, f"""
-import _xxinterpchannels as channels
+if __name__ == "__main__":
+    with InterpreterPoolExecutor(max_workers=4) as pool:      # 3.14+
+        print(list(pool.map(sum_squares, [10, 100, 1000])))
+        # [285, 328350, 332833500]
 
-# Receive data
-data = channels.recv({channel_id})
-result = process_data(data)
-
-# Send result back
-channels.send({channel_id}, result)
-""")
-
-# Send data to subinterpreter
-channels.send(channel_id, {"items": [1, 2, 3]})
-
-# Receive result
-result = channels.recv(channel_id)
+    interp = interpreters.create()
+    q = interpreters.create_queue()
+    interp.prepare_main(q=q)              # make q visible in the interpreter
+    interp.exec("q.put(sum(range(10)))")  # runs in interp, in this thread
+    print(q.get())                        # 45
+    t = interp.call_in_thread(sum_squares, 1000)  # run concurrently in a new thread
+    t.join()
+    interp.close()
 ```
 
-**Limitations:**
-1. **No shared state** — all objects must be pickled/serialized for channel communication
-2. **C extension compatibility** — many C extensions aren't subinterpreter-safe (PEP 684 addresses this)
-3. **API is low-level** — `_xxsubinterpreters` is an internal module, not a public API yet
-4. **Module isolation** — modules are loaded per-interpreter, increasing memory usage
-5. **No direct object sharing** — can't pass complex Python objects between interpreters
+**Limitations (as of 3.14):**
+1. **Extension support:** a C extension must support multi-phase init and per-interpreter state; many popular ones (historically including NumPy) don't yet, and importing one fails.
+2. **No shared objects:** arguments and results are copied, so large data has the same cost as with processes unless it fits in a buffer.
+3. **Startup and memory:** interpreter creation isn't optimised yet and each one re-imports what it needs.
+4. **No crash isolation:** a segfault in one interpreter kills the whole process, unlike multiprocessing.
 
-**vs multiprocessing:** Subinterpreters are lighter (no separate process), share the same address space, but can't share Python objects directly. Multiprocessing can share memory via `shared_memory`.
+**vs multiprocessing:** lighter and faster to start, no fork/spawn pitfalls, shared address space; but less mature, weaker isolation, and narrower library support. **vs free threading:** free threading shares objects and needs locks; subinterpreters share nothing and need messages.
 </details>
 
 <details>
-<summary><b>Q15: Implement a thread-safe, lock-free concurrent counter using only atomic operations (considering the GIL).</b></summary>
+<summary><b>Q15: Can you write a lock-free concurrent counter in Python?</b></summary>
 
-**Answer:**
+**30-second answer:** Not in pure Python in any meaningful sense. The standard library exposes no compare-and-swap or atomic integer, and `x += 1` is a load, an add and a store. The honest options are a lock, a counter that is atomic by construction in CPython (`itertools.count`), or sharding so threads don't contend at all.
+
 ```python
+import itertools
 import threading
-import ctypes
 
-class LockFreeCounter:
-    """
-    Lock-free counter using CTypes for atomic operations.
-    
-    Note: Python doesn't have native CAS (Compare-And-Swap)
-    in the standard library. This uses ctypes to access 
-    hardware-level atomic operations.
-    
-    In practice, the GIL makes simple operations atomic,
-    but this demonstrates lock-free patterns.
-    """
-    
-    def __init__(self, initial: int = 0):
-        # Windows: LONG type
-        # Linux/macOS: c_long
-        self._value = ctypes.c_long(initial)
-    
+# 1. Lock: correct everywhere, including the free-threaded build.
+class LockedCounter:
+    def __init__(self):
+        self._value = 0
+        self._lock = threading.Lock()
+
     def increment(self) -> int:
-        """Atomic increment, returns new value"""
-        # InterlockedIncrement is atomic on all modern CPUs
-        if hasattr(ctypes, 'windll'):
-            # Windows
-            return ctypes.windll.kernel32.InterlockedIncrement(
-                ctypes.byref(self._value)
-            )
-        else:
-            # Fallback: GIL makes this safe for simple cases
-            # In production, use C extension or Cython
-            with threading.Lock():
-                self._value.value += 1
-                return self._value.value
-    
-    def decrement(self) -> int:
-        if hasattr(ctypes, 'windll'):
-            return ctypes.windll.kernel32.InterlockedDecrement(
-                ctypes.byref(self._value)
-            )
-        else:
-            with threading.Lock():
-                self._value.value -= 1
-                return self._value.value
-    
-    def add(self, n: int) -> int:
-        """Atomic add"""
-        if hasattr(ctypes, 'windll'):
-            return ctypes.windll.kernel32.InterlockedExchangeAdd(
-                ctypes.byref(self._value), n
-            ) + n
-        else:
-            with threading.Lock():
-                self._value.value += n
-                return self._value.value
-    
+        with self._lock:
+            self._value += 1
+            return self._value
+
+# 2. itertools.count: next() is a single C call, so on the GIL build
+#    each thread gets a unique value. Good for ID generation. Treat as
+#    a CPython detail, and use a lock on the free-threaded build.
+ids = itertools.count(1)
+next(ids)   # 1
+
+# 3. Sharded counter: each thread increments its own slot, readers sum.
+#    No contention on the hot path; reads are approximate while writers run.
+class ShardedCounter:
+    def __init__(self):
+        self._local = threading.local()
+        self._shards: list[list[int]] = []
+        self._lock = threading.Lock()          # only for registering shards
+
+    def increment(self) -> None:
+        shard = getattr(self._local, "shard", None)
+        if shard is None:
+            shard = self._local.shard = [0]
+            with self._lock:
+                self._shards.append(shard)
+        shard[0] += 1                          # only this thread writes it
+
     def value(self) -> int:
-        """Read current value"""
-        return self._value.value
+        with self._lock:
+            return sum(s[0] for s in self._shards)
 
-# ── Simpler approach: use threading's atomic guarantee ─────
-# The GIL ensures simple reads/writes are safe:
-class SimpleLockFreeCounter:
-    """Relies on GIL for atomicity of simple operations"""
-    
-    def __init__(self, initial: int = 0):
-        self._value = initial  # Simple int, GIL-protected read/write
-    
-    def read(self) -> int:
-        return self._value  # Safe: single LOAD_FAST bytecode
-    
-    # ⚠️ increment is NOT safe without lock!
-    # self._value += 1  # LOAD_FAST + LOAD_CONST + INPLACE_ADD + STORE_FAST
-
-# ── Production approach: use multiprocessing.Value ────────
-from multiprocessing import Value
-
-class ProductionCounter:
-    def __init__(self, initial: int = 0):
-        self._counter = Value('i', initial)  # Shared memory with lock
-    
-    def increment(self) -> int:
-        with self._counter.get_lock():
-            self._counter.value += 1
-            return self._counter.value
-    
-    def value(self) -> int:
-        with self._counter.get_lock():
-            return self._counter.value
+c = LockedCounter()
+threads = [threading.Thread(target=lambda: [c.increment() for _ in range(10_000)])
+           for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(c._value)   # 40000
 ```
+
+**Common wrong answers to avoid:** `with threading.Lock():` creates a *new* lock on every call, so it protects nothing; `ctypes` calls to OS atomics on a `c_long` work on one platform and break the moment anything reads `.value` non-atomically; `multiprocessing.Value` is for *processes* and still takes a lock.
+
+**Probe next:** "Where would you get real lock-free atomics?" In a C/Rust extension (`std::atomic`, `AtomicU64` via PyO3), or by pushing the counter to Redis `INCR` if it must be shared across processes or hosts.
 </details>
 
 <details>
 <summary><b>Q16: Explain Python's async/await protocol and how it relates to generator-based coroutines.</b></summary>
 
-**Answer:** Python's async/await is built on top of the generator protocol:
-
-**The await protocol:**
-1. `async def` creates a coroutine function (returns a coroutine object)
-2. `await x` requires `x` to be an awaitable (implements `__await__`)
-3. `__await__` must return an iterator
-4. The `for x in y: yield x` pattern is how coroutines suspend
+**30-second answer:** A native coroutine is a suspendable frame, implemented with the same machinery as generators. `await x` calls `x.__await__()`, which must return an iterator, and delegates to it like `yield from`. Whatever bottoms out in a `yield` (in asyncio, a pending `Future`) travels all the way up to the event loop, which resumes the coroutine with `.send()` when the future completes. The return value arrives as `StopIteration.value`.
 
 ```python
-# Under the hood, async/await is syntactic sugar for generators:
+class Ready:
+    """Minimal awaitable: suspends once, then returns a value."""
+    def __init__(self, value):
+        self.value = value
+    def __await__(self):
+        received = yield "suspend me"      # surfaces to whoever calls .send()
+        return self.value + received
 
-# This:
-async def fetch_data():
-    response = await http_get(url)
-    return response.json()
+async def main():
+    result = await Ready(40)               # delegates like `yield from`
+    return result
 
-# Is equivalent to:
-def fetch_data():
-    return fetch_data_impl().__await__()
-
-def fetch_data_impl():
-    # Each await is a yield from delegation
-    response = yield from http_get(url).__await__()
-    return response.json()
-
-# The event loop drives this:
-# coro.send(None)  → advances to first yield
-# coro.send(result) → passes result back
-# StopIteration(value) → return value
+coro = main()
+print(coro.send(None))   # suspend me   <- what the event loop would see (a Future)
+try:
+    coro.send(2)         # the loop resumes us with the future's result
+except StopIteration as stop:
+    print(stop.value)    # 42
 ```
 
-**Event loop mechanics:**
-```python
-# Simplified event loop:
-loop = asyncio.new_event_loop()
-
-# 1. Create coroutine
-coro = my_async_function()
-
-# 2. Send None to start
-coro.send(None)  # Returns a Future object
-
-# 3. When Future completes, send result back
-coro.send(result)  # Returns next Future or raises StopIteration
-
-# 4. catch StopIteration.value for the return value
-```
-
-**Key insight:** Async/await doesn't add anything new to Python — it's all generators and event loops. The syntax just makes it readable.
+**Facts that are easy to get wrong:**
+- Native coroutines are a separate type (`types.CoroutineType`), not generators: you can't iterate them, and `await` only accepts awaitables. The old `@asyncio.coroutine` + `yield from` style was removed in Python 3.11.
+- Calling an `async def` function runs nothing; it only creates the coroutine object. Forgetting `await` gives "coroutine was never awaited".
+- In asyncio, a `Task` wraps a coroutine and drives `send()`/`throw()`; cancellation is delivered as `CancelledError` thrown in at the current `await`.
+- What async/await added beyond generators: a distinct type the event loop and type checkers can recognise, `async with` / `async for`, and async generators. The suspension mechanism itself is the generator one.
 </details>
 
 ---
@@ -2646,6 +2456,7 @@ coro.send(result)  # Returns next Future or raises StopIteration
 | Barrier | `threading.Barrier` | Synchronize N threads at a point |
 | Queue | `queue.Queue` | Thread-safe data passing |
 | Process pool | `concurrent.futures.ProcessPoolExecutor` | CPU-bound parallel tasks |
+| Interpreter pool | `concurrent.futures.InterpreterPoolExecutor` (3.14+) | CPU-bound work, pure-Python deps, lighter than processes |
 | Shared memory | `multiprocessing.shared_memory` | Zero-copy data sharing |
 | Async I/O | `asyncio` | High-concurrency network I/O |
 | Thread-local | `threading.local` | Per-thread data isolation |
