@@ -1,6 +1,9 @@
 # 🔍 Agent Observability — Debugging, Monitoring & Production Visibility
 
-> **Target:** Principal Engineer | **Focus:** Full observability stack for AI agent systems in production
+> **Target:** Principal Engineer | **Focus:** Full observability stack for AI agent systems in production | **Reviewed:** October 2026
+
+!!! tip "30-second answer"
+    Agent observability = **one trace per run** with a span for every model call and every tool call (OpenTelemetry, using the GenAI semantic conventions so any backend can read it), carrying model id, token usage, latency, finish reason and, when enabled and redacted, the actual prompts and outputs. On top of traces: metrics for rates and cost, **online evaluations** that score a sample of production traces (groundedness, task success, policy violations), and user feedback joined back to the trace. Debugging a bad answer means opening the trace, finding the first wrong step, and turning it into a regression eval.
 
 ---
 
@@ -89,7 +92,7 @@ print(f"Relevant info pushed out: {context.find_missing_info()}")
 
 ```python
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC   # datetime.utcnow() is deprecated since 3.12
 from typing import Optional
 
 class ConversationManager:
@@ -107,14 +110,14 @@ class ConversationManager:
         """Create a new conversation with a unique ID."""
         conv_id = (
             f"{session_type}_"
-            f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
+            f"{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_"
             f"{uuid.uuid4().hex[:8]}"
         )
         
         self.storage.store_conversation({
             "conversation_id": conv_id,
             "user_id": user_id,
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(UTC),
             "status": "active",
             "message_count": 0,
             "total_tokens_used": 0,
@@ -127,7 +130,7 @@ class ConversationManager:
     async def append_message(self, conv_id: str, message: dict):
         """Append a message to the conversation."""
         message["conversation_id"] = conv_id
-        message["timestamp"] = datetime.utcnow().isoformat()
+        message["timestamp"] = datetime.now(UTC).isoformat()
         message["message_id"] = f"msg_{uuid.uuid4().hex[:12]}"
         
         await self.storage.store_message(message)
@@ -151,10 +154,12 @@ class ConversationManager:
 
 #### 1.3.3 Database Schema
 
+PostgreSQL syntax. Two rules that trip people up: on a partitioned table every PRIMARY KEY or UNIQUE constraint **must include the partition key**, and indexes are created with separate `CREATE INDEX` statements (inline `INDEX ...` is MySQL syntax).
+
 ```sql
 -- Conversations table
 CREATE TABLE conversations (
-    conversation_id    VARCHAR(64) PRIMARY KEY,
+    conversation_id    VARCHAR(64) NOT NULL,
     user_id           VARCHAR(128) NOT NULL,
     session_type      VARCHAR(32) NOT NULL DEFAULT 'agent',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -164,19 +169,22 @@ CREATE TABLE conversations (
     total_tokens      BIGINT NOT NULL DEFAULT 0,
     total_cost        DECIMAL(10,6) NOT NULL DEFAULT 0.0,
     metadata          JSONB DEFAULT '{}',
-    
-    -- Index for fast user lookup
-    INDEX idx_conversations_user (user_id, created_at DESC)
+    PRIMARY KEY (conversation_id, created_at)      -- must include the partition key
 ) PARTITION BY RANGE (created_at);
+
+-- Index for fast user lookup (created on each partition automatically)
+CREATE INDEX idx_conversations_user ON conversations (user_id, created_at DESC);
 
 -- Monthly partitions
 CREATE TABLE conversations_2026_07 PARTITION OF conversations
     FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
 
 -- Messages table (separate for efficient partial loading)
+-- (No FK to conversations: a FK must reference a unique key, and
+--  conversation_id alone isn't unique on the partitioned parent.)
 CREATE TABLE messages (
-    message_id        VARCHAR(64) PRIMARY KEY,
-    conversation_id   VARCHAR(64) NOT NULL REFERENCES conversations(conversation_id),
+    message_id        VARCHAR(64) NOT NULL,
+    conversation_id   VARCHAR(64) NOT NULL,
     role              VARCHAR(16) NOT NULL,  -- system, user, assistant, tool
     content           TEXT NOT NULL,
     tool_calls        JSONB,
@@ -184,13 +192,14 @@ CREATE TABLE messages (
     tokens_used       INTEGER,
     cost              DECIMAL(10,6),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
-    INDEX idx_messages_conv (conversation_id, created_at)
+    PRIMARY KEY (message_id, created_at)
 ) PARTITION BY RANGE (created_at);
+CREATE INDEX idx_messages_conv ON messages (conversation_id, created_at);
 
 -- Traces table (step-by-step execution)
 CREATE TABLE agent_traces (
-    trace_id          VARCHAR(64) PRIMARY KEY,
+    trace_id          VARCHAR(64) NOT NULL,     -- OTel trace id (32 hex chars)
+    span_id           VARCHAR(32) NOT NULL,
     conversation_id   VARCHAR(64) NOT NULL,
     step_number       INTEGER NOT NULL,
     step_type         VARCHAR(32) NOT NULL,  -- thought, tool_call, tool_result, error
@@ -199,16 +208,16 @@ CREATE TABLE agent_traces (
     duration_ms       INTEGER,
     tokens_used       INTEGER,
     model             VARCHAR(64),
-    temperature       DECIMAL(3,2),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
-    INDEX idx_traces_conv (conversation_id, step_number)
+    PRIMARY KEY (trace_id, span_id, created_at)
 ) PARTITION BY RANGE (created_at);
+CREATE INDEX idx_traces_conv ON agent_traces (conversation_id, step_number);
 
 -- Feedback table
 CREATE TABLE agent_feedback (
     feedback_id       VARCHAR(64) PRIMARY KEY,
     conversation_id   VARCHAR(64) NOT NULL,
+    trace_id          VARCHAR(64),              -- join feedback to the exact run
     rating            INTEGER CHECK (rating >= 1 AND rating <= 5),
     is_correct        BOOLEAN,
     user_comment      TEXT,
@@ -216,6 +225,8 @@ CREATE TABLE agent_feedback (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
+
+In practice many teams don't hand-roll the traces table: they send OTel spans to a tracing backend (Langfuse, Arize Phoenix, LangSmith, Datadog, Honeycomb, Grafana Tempo) and keep only conversations, feedback and audit records in their own database, linked by `trace_id`.
 
 ### 1.4 Failure Identification: Reactive vs Proactive
 
@@ -298,7 +309,7 @@ class ProactiveMonitor:
     async def proactive_scan(self, time_window_minutes: int = 15):
         """Scan recent conversations for quality issues proactively."""
         recent_convs = await self.storage.get_recent_conversations(
-            since=datetime.utcnow() - timedelta(minutes=time_window_minutes),
+            since=datetime.now(UTC) - timedelta(minutes=time_window_minutes),
             limit=500
         )
         
@@ -308,9 +319,10 @@ class ProactiveMonitor:
             if signals["issues"]:
                 results.append(signals)
         
-        # Aggregate and alert
+        # Aggregate and alert. Rates must use ALL scanned conversations as
+        # the denominator, not just the ones that had issues.
         if results:
-            await self._aggregate_and_alert(results)
+            await self._aggregate_and_alert(results, scanned=len(recent_convs))
         
         return {
             "scanned": len(recent_convs),
@@ -318,10 +330,11 @@ class ProactiveMonitor:
             "issue_rate": len(results) / len(recent_convs) if recent_convs else 0
         }
     
-    async def _aggregate_and_alert(self, issues: list):
+    async def _aggregate_and_alert(self, issues: list, scanned: int):
         """Aggregate issues and trigger alerts if thresholds exceeded."""
-        # Calculate rates
-        total = len(issues)
+        # Calculate rates over everything scanned (dividing by len(issues)
+        # would make every rate look huge)
+        total = scanned
         
         wrong_answers = sum(
             1 for i in issues 
@@ -357,22 +370,55 @@ class ProactiveMonitor:
             await self.alerting_service.send(alert)
 ```
 
+### 1.5 Tracing with OpenTelemetry GenAI Semantic Conventions
+
+OpenTelemetry defines `gen_ai.*` semantic conventions for model calls, agents and tools. They are still marked **Development** (not stable), so attribute names can change; instrumentation libraries let you opt into the latest version. The point is portability: the same spans render in any OTel-compatible backend.
+
+**Span tree for one agent run:**
+
+```
+invoke_agent support_agent                 (gen_ai.operation.name=invoke_agent, gen_ai.agent.name)
+├── chat <model-id>                        (operation=chat: tokens, finish reason)
+├── execute_tool get_order                 (gen_ai.tool.name, gen_ai.tool.call.id)
+│   └── HTTP GET orders-service/...        (ordinary OTel HTTP span: propagation still works)
+├── chat <model-id>
+└── execute_tool send_reply
+```
+
+| Attribute | Example | Why |
+|-----------|---------|-----|
+| `gen_ai.operation.name` | `chat`, `invoke_agent`, `execute_tool`, `embeddings` | Span type |
+| `gen_ai.provider.name` | `anthropic`, `openai`, `aws.bedrock` | Replaced the older `gen_ai.system` |
+| `gen_ai.request.model` / `gen_ai.response.model` | requested alias vs the exact snapshot that answered | Catch silent model changes |
+| `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` | `1834` / `212` | Cost and context pressure (older names `prompt_tokens`/`completion_tokens` are deprecated) |
+| `gen_ai.response.finish_reasons` | `["tool_use"]`, `["max_tokens"]` | Truncation and refusal detection |
+| `gen_ai.conversation.id` | `conv_abc123` | Group runs into a conversation |
+| `gen_ai.tool.name`, `gen_ai.tool.call.id` | `get_order`, `toolu_01...` | Join tool spans to model tool calls |
+
+Standard metrics: `gen_ai.client.token.usage` and `gen_ai.client.operation.duration` (histograms). Span naming is `"{operation} {target}"`, e.g. `chat claude-sonnet-...` or `execute_tool get_order`.
+
+**Content capture** (prompts, completions, tool arguments) is opt-in in the conventions because it carries PII and secrets. Common practice: capture full content for a sample or for internal users, redact at the collector, restrict access, and set a short retention. Without content you can see *that* step 3 went wrong but not *why*, so decide this deliberately rather than by default.
+
+Propagate trace context across MCP calls and sub-agents (the MCP spec documents `traceparent` in request `_meta`), so a multi-agent run is one trace, not ten.
+
 ---
 
 ## 2. WHY HALLUCINATIONS OCCUR
 
 ### 2.1 Root Causes
 
-| Cause | Description | Frequency | Mitigation |
+| Cause | Description | Typical prevalence (qualitative) | Mitigation |
 |-------|-------------|-----------|------------|
 | **Extrapolation** | LLM fills in gaps when it doesn't know | High | RAG + tool use for facts |
 | **Context pressure** | Relevant info was pushed out of context | Medium | Better context management |
 | **Instruction confusion** | Conflicting instructions in prompt | Medium | Clear system prompts |
 | **Auto-regressive drift** | Small errors compound over long generation | Medium | Chunk generation + verify |
-| **Overconfidence** | LLM states guesses as facts | High | Calibration + uncertainty markers |
+| **Overconfidence** | LLM states guesses as facts | High | Allow and reward "I don't know"; require citations to tool results |
 | **Training data bias** | Recency or popularity bias | Low | Fact-checking layer |
 
 ### 2.2 Hallucination Detection
+
+The heuristics below are cheap first-pass signals. Embedding similarity measures *topic overlap*, not *support*: "The refund was approved" and "The refund was denied" embed very close together. For real groundedness checks, use an NLI model or an LLM judge that is asked, per claim, whether the retrieved evidence entails it, and calibrate that judge against human labels.
 
 ```python
 class HallucinationDetector:
@@ -458,7 +504,7 @@ class HallucinationDetector:
 
 ### 3.1 What Are Budget Values?
 
-An agent system has a **finite context window** (e.g., 128K tokens for GPT-4). The **budget** defines how those tokens are allocated across different types of content:
+An agent system has a **finite context window**. Current frontier models offer from a few hundred thousand up to about a million tokens (check the model's documentation or models API; these numbers change). Even with a large window, budgets still matter: every token is paid for on every turn, latency grows with input size, and answer quality tends to degrade as relevant facts get buried in long contexts. The **budget** defines how tokens are allocated across different types of content:
 
 ```python
 CONTEXT_BUDGET = {
@@ -469,7 +515,7 @@ CONTEXT_BUDGET = {
     "long_term_memory": 2000,        # 2K tokens — retrieved facts
     "response_room": 1000,           # 1K tokens — space for LLM output
     
-    "total": 10000                   # 10K tokens (out of 128K available)
+    "total": 10000                   # a deliberately small working set, far below the window
 }
 ```
 
@@ -509,8 +555,8 @@ class BudgetAwareContextManager:
     Prioritizes the most important content.
     """
     
-    def __init__(self, max_tokens: int = 128000):
-        self.max_tokens = max_tokens
+    def __init__(self, max_tokens: int):
+        self.max_tokens = max_tokens   # from the model's config, minus output headroom
         self.budget = {
             "system": {"max": 2000, "priority": 1},     # Always included
             "tools": {"max": 4000, "priority": 2},       # Always included
@@ -564,8 +610,9 @@ class BudgetAwareContextManager:
             recent_messages.insert(0, msg)
             recent_tokens += msg_tokens
         
-        # Summarize the rest
-        older_messages = history[:-len(recent_messages)]
+        # Summarize the rest. (Careful: history[:-0] is [], so handle the
+        # case where not even the newest message fit.)
+        older_messages = history[:len(history) - len(recent_messages)]
         if older_messages:
             summary = self._summarize_conversation(older_messages, budget * 0.4)
             return f"[Previous conversation summary]: {summary}\n\n" + \
@@ -594,6 +641,9 @@ class BudgetAwareContextManager:
 class BudgetMonitor:
     """Monitor and alert on context budget usage."""
     
+    def __init__(self, context_window: int):
+        self.context_window = context_window   # per model, from config / models API
+
     def analyze_budget_usage(self, state: AgentState) -> dict:
         """Analyze how the budget is being used."""
         context = state.get("context", "")
@@ -602,8 +652,8 @@ class BudgetMonitor:
         
         return {
             "total_tokens": count_tokens(context),
-            "max_tokens": 128000,
-            "usage_percentage": count_tokens(context) / 128000 * 100,
+            "max_tokens": self.context_window,
+            "usage_percentage": count_tokens(context) / self.context_window * 100,
             "by_category": {
                 "conversation_history": sum(
                     count_tokens(m) for m in conversation
@@ -623,7 +673,7 @@ class BudgetMonitor:
         warnings = []
         total = count_tokens(str(state))
         
-        if total > 100000:  # >80% of 128K
+        if total > 0.8 * self.context_window:
             warnings.append({
                 "type": "context_window_critical",
                 "message": "Context window >80% full — quality degradation likely",
@@ -647,96 +697,64 @@ class BudgetMonitor:
 
 ### 4.1 What Temperature Controls
 
-**Temperature** controls the **randomness** of LLM output:
+**Temperature** rescales the model's next-token probability distribution before sampling: low values sharpen it toward the most likely token, high values flatten it.
 
 | Temperature | Behavior | Use Case |
 |-------------|----------|----------|
-| `0.0` | Deterministic — always picks highest probability token | Code generation, fact extraction |
-| `0.2 - 0.3` | Very low variance | Structured output, classification |
-| `0.5 - 0.7` | Moderate creativity | General conversation, summarization |
-| `0.8 - 1.0` | High creativity | Creative writing, brainstorming |
-| `> 1.0` | Very high randomness (experimental) | Novel generation |
+| `0.0` | Near-greedy: (almost) always the most likely token | Extraction, classification |
+| `0.2 - 0.5` | Low variance | Structured output, most agent work |
+| `0.7 - 1.0` | More diverse | Brainstorming, creative writing |
+
+Three facts that matter more than the table:
+
+- **`temperature=0` is not fully deterministic** on hosted APIs: batching, hardware and floating-point effects still change outputs between identical requests. Some providers offer a `seed` parameter for best-effort reproducibility.
+- **Many current models don't expose it.** Reasoning models commonly reject or ignore sampling parameters (several recent Anthropic and OpenAI models return an error if you send `temperature`); you control behaviour through reasoning effort and prompting instead. Check each model's docs before baking temperature into config.
+- **Variance in an agent isn't only sampling.** Tool results, retrieval, timing and model snapshot changes all vary between runs, so even a "deterministic" model gives a non-deterministic agent.
 
 ### 4.2 Temperature and the Example
 
 > **What happened:** The agent would pass integration tests 7 out of 10 times. The test suite had no way to distinguish between a legitimate improvement and random variance.
 
-**Root cause:** The agent was running with `temperature=0.7`, which means even with the same input, it produces different outputs 30% of the time. These were **not real improvements** — they were **random variance** from the temperature setting.
+**Root cause:** the tests treated a stochastic system as deterministic. Lowering temperature reduces variance but does not remove it (see above), and testing at a different temperature from production tests the wrong system.
 
-**Mathematically:**
-```
-At temperature=0.7:
-- Probability of selecting the most likely token: ~0.65
-- Probability of selecting an alternative token: ~0.35
+**The fix:** measure, don't assume.
 
-For a 10-step reasoning chain:
-- Probability of consistent high-quality output: 0.65^10 ≈ 1.3%  (way too low!)
-- Expected pass rate: ~70% (which matches the 7/10 observation)
-```
+- Run each eval case several times **with production settings** and score pass rates.
+- Report **pass@k** (succeeds at least once in k tries: "can it do this?") and **pass^k** (succeeds in all k tries: "will it do this reliably?"). For user-facing agents, pass^k is the one that hurts.
+- Compare two versions on the **same cases**, paired, and only call it an improvement if the difference is bigger than run-to-run noise.
 
-**The fix:**
 ```python
-# For testing: use temperature=0 for deterministic results
-TEST_TEMPERATURE = 0.0
+import random
+import statistics
 
-# For production: use temperature=0.1-0.3 for slight variety
-PRODUCTION_TEMPERATURE = 0.1
+async def pass_rates(agent, cases, n_runs: int = 5) -> dict[str, float]:
+    """Pass rate per case, using production settings."""
+    rates = {}
+    for case in cases:
+        results = [await case.check(await agent.run(case.input)) for _ in range(n_runs)]
+        rates[case.id] = sum(results) / n_runs
+    return rates
 
-# Only use temperature>0.3 when variety is needed
-CREATIVE_TEMPERATURE = 0.7
-
-# Statistical testing approach
-class StatisticalTestRunner:
-    """
-    Run tests multiple times at different temperatures 
-    to distinguish improvement from variance.
-    """
-    
-    async def evaluate_change(self, agent, test_suite, n_runs: int = 10):
-        """Evaluate an agent change with statistical rigor."""
-        baseline_results = []
-        new_results = []
-        
-        for _ in range(n_runs):
-            # Run baseline agent
-            base_result = await agent.run(test_suite, temperature=0.0)
-            baseline_results.append(base_result)
-            
-            # Run new agent
-            new_result = await agent.run(test_suite, temperature=0.0)
-            new_results.append(new_result)
-        
-        # Statistical comparison
-        from scipy import stats
-        
-        baseline_mean = statistics.mean(baseline_results)
-        new_mean = statistics.mean(new_results)
-        
-        # Paired t-test
-        t_stat, p_value = stats.ttest_rel(new_results, baseline_results)
-        
-        # Effect size (Cohen's d)
-        pooled_std = math.sqrt(
-            (statistics.variance(baseline_results) + 
-             statistics.variance(new_results)) / 2
-        )
-        effect_size = (new_mean - baseline_mean) / pooled_std
-        
-        return {
-            "baseline_mean": baseline_mean,
-            "new_mean": new_mean,
-            "improvement": new_mean - baseline_mean,
-            "p_value": p_value,
-            "is_significant": p_value < 0.05,
-            "effect_size": effect_size,
-            "is_large_effect": abs(effect_size) > 0.8,
-            "conclusion": (
-                "Change is a real improvement" 
-                if (p_value < 0.05 and effect_size > 0.3)
-                else "Change is within random variance — not significant"
-            )
-        }
+def compare(baseline: dict, candidate: dict, n_boot: int = 10_000) -> dict:
+    """Paired bootstrap over cases: is the mean improvement distinguishable from 0?"""
+    ids = list(baseline)
+    diffs = [candidate[i] - baseline[i] for i in ids]
+    boot = []
+    for _ in range(n_boot):
+        sample = [random.choice(diffs) for _ in ids]
+        boot.append(statistics.mean(sample))
+    boot.sort()
+    lo, hi = boot[int(0.025 * n_boot)], boot[int(0.975 * n_boot)]
+    return {
+        "mean_improvement": statistics.mean(diffs),
+        "ci95": (lo, hi),
+        "significant": lo > 0 or hi < 0,
+        # Never let an average hide a new catastrophic failure:
+        "regressed_cases": [i for i in ids if candidate[i] < baseline[i] - 0.5],
+    }
 ```
+
+With a few dozen cases and 5 runs each, only fairly large differences are detectable. Grow the eval set before trusting small wins, and gate releases on "no regressions in critical cases" as well as the average.
 
 ---
 
@@ -745,6 +763,8 @@ class StatisticalTestRunner:
 ### 5.1 Storage Requirements
 
 Agent logs are **much larger** than traditional application logs:
+
+Illustrative sizes (they vary by an order of magnitude with conversation length and how much content you capture):
 
 | Type | Size per Interaction | Monthly (1M conversations) |
 |------|---------------------|---------------------------|
@@ -764,6 +784,10 @@ class LogStorageManager:
     Hot (30 days):  PostgreSQL/TimescaleDB — fast query, indexed
     Warm (90 days): S3/Parquet — columnar, compressed
     Cold (7 years): S3 Glacier — cheap, archived
+
+    Logs are always written HOT. Moving them to warm/cold happens later via
+    batch export jobs and storage lifecycle rules (e.g. S3 lifecycle
+    transitions), not by routing at write time.
     """
     
     STORAGE_TIERS = {
@@ -771,32 +795,31 @@ class LogStorageManager:
             "backend": "timescaledb",
             "retention_days": 30,
             "compression": False,
-            "cost_per_gb_month": 0.50,   # ~$0.50/GB/month
+            "cost_per_gb_month": 0.50,   # rough managed-DB storage cost; check current pricing
         },
         "warm": {
             "backend": "s3_parquet",
             "retention_days": 90,
             "compression": True,  # Parquet + gzip ≈ 10x compression
-            "cost_per_gb_month": 0.023,  # S3 Standard
+            "cost_per_gb_month": 0.023,  # S3 Standard list price (us-east-1, first tier); check current
         },
         "cold": {
             "backend": "s3_glacier",
             "retention_days": 2555,  # 7 years
             "compression": True,
-            "cost_per_gb_month": 0.004,  # S3 Glacier Deep Archive
+            "cost_per_gb_month": 0.001,  # S3 Glacier Deep Archive is ~$0.001/GB-month; retrieval takes hours
         }
     }
     
     async def store_log(self, log_entry: dict):
-        """Store a log entry with appropriate partitioning."""
-        age_days = self._age_in_days(log_entry["timestamp"])
-        
-        if age_days <= 30:
-            await self._store_hot(log_entry)
-        elif age_days <= 90:
-            await self._store_warm(log_entry)
-        else:
-            await self._store_cold(log_entry)
+        """New logs always land in the hot tier."""
+        await self._store_hot(log_entry)
+
+    async def tier_down(self):
+        """Nightly job: export partitions older than 30 days to Parquet on S3,
+        then drop them from the database. S3 lifecycle rules move objects to
+        Glacier after 90 days and expire them at the retention limit."""
+        ...
     
     async def query_logs(self, conversation_id: str, 
                          time_range: tuple) -> list:
@@ -854,6 +877,8 @@ DATA_RETENTION_POLICY = {
 }
 ```
 
+Two compliance points interviewers like: **deletion requests** (GDPR right to erasure and similar) must reach every tier, including warm Parquet files, trace backends and eval datasets built from production data, so keep user ids in a form you can find and purge; and **using customer conversations for training or evals** needs a legal basis and usually consent or a contract clause. Redacting PII at ingestion is far easier than redacting it later.
+
 ---
 
 ## 6. ALERTING & MONITORING RULES
@@ -864,7 +889,10 @@ groups:
   - name: agent-quality-alerts
     rules:
     - alert: HighWrongAnswerRate
-      expr: rate(agent_wrong_answer_total[15m]) > 0.05
+      # Ratio of judged-wrong to judged answers (rate() alone is events/second)
+      expr: |
+        sum(rate(agent_wrong_answer_total[15m]))
+          / sum(rate(agent_judged_answers_total[15m])) > 0.05
       for: 5m
       labels:
         severity: critical
@@ -884,7 +912,9 @@ groups:
         summary: "Agent quality score dropped below 0.7"
     
     - alert: HallucinationSpike
-      expr: rate(agent_hallucination_detected_total[5m]) > 10
+      expr: |
+        sum(rate(agent_hallucination_detected_total[5m]))
+          / sum(rate(agent_responses_total[5m])) > 0.1
       for: 2m
       labels:
         severity: critical
@@ -899,13 +929,16 @@ groups:
       annotations:
         summary: "Context window >80% full — quality degradation likely"
     
-    - alert: CostAnomalyPerUser
-      expr: sum by (user_id) (rate(agent_cost_total[1h])) > 1.0
+    - alert: CostAnomalyPerTenant
+      # increase() over 1h gives dollars per hour; rate() would be dollars/second.
+      # Label by tenant or plan, NOT user_id: per-user labels explode
+      # Prometheus cardinality. Enforce per-user budgets in the app instead.
+      expr: sum by (tenant) (increase(agent_cost_total[1h])) > 50
       for: 5m
       labels:
         severity: warning
       annotations:
-        summary: "User {{ $labels.user_id }} exceeding $1/hour in agent costs"
+        summary: "Tenant {{ $labels.tenant }} spent > $50 in the last hour"
 ```
 
 ---

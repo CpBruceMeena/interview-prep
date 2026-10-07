@@ -3,6 +3,9 @@
 > **Your guide to landing roles at the intersection of software engineering and AI**  
 > **Target Roles:** AI Engineer · Forward Deployed Engineer (FDE) · AI Infrastructure Engineer · ML Engineer (Applied)
 
+!!! tip "30-second version"
+    Pick the role first, because the loops differ. **AI Engineer:** agents, RAG, tool use, context engineering and, above all, evaluation. **FDE:** decomposition of vague customer problems, practical full-stack and infrastructure work, deployment under constraints, customer judgement. **AI Infra:** model serving, GPU scheduling, KV-cache and batching, cost per token. Across all three, interviewers reward the same habit: clarify the goal and the metric before proposing an architecture, and say how you'd know it works.
+
 ---
 
 ## Table of Contents
@@ -32,8 +35,9 @@
 | Prompt engineering & optimization | 🟡 High | Quality depends on prompt design |
 | Evaluation (LLM-as-judge, test suites) | 🟡 High | Non-deterministic outputs need rigorous testing |
 | Vector databases & embeddings | 🟡 High | Memory, RAG, semantic search |
-| MCP Protocol | 🟢 Medium | Emerging standard for tool integration |
-| Fine-tuning basics | 🟢 Medium | When RAG isn't enough |
+| Context engineering | 🟡 High | What goes into the window each turn: compaction, retrieval, tool-output size, caching |
+| MCP (Model Context Protocol) | 🟡 High | The de facto standard for connecting tools and data to agents; now governed by the Linux Foundation's Agentic AI Foundation (since Dec 2025) |
+| Fine-tuning basics | 🟢 Medium | When prompting, retrieval and tools aren't enough |
 
 **Typical interview loop:**
 1. **Phone screen** — Background, project deep-dive, system design light
@@ -59,7 +63,7 @@
 
 **Typical interview loop:**
 1. **Phone screen** — Background, customer-facing experience
-2. **Coding** — LeetCode medium-hard (polymorphism, system design coding)
+2. **Coding** — Practical rather than pure LeetCode: build an endpoint, transform data, wire up an API or a small agent
 3. **System design / Whiteboarding** — "Design a solution for a customer who wants to..."
 4. **Problem decomposition** — Given a vague customer request, break it down
 5. **Behavioral (heavy)** — Customer empathy, trade-off stories, "ship and iterate"
@@ -70,11 +74,11 @@
 
 | Skill | Weight | Why |
 |-------|--------|-----|
-| Model serving (vLLM, TGI, Triton) | 🔴 Critical | Core of the role |
+| Model serving (vLLM, SGLang, TensorRT-LLM, NVIDIA Dynamo/Triton) | 🔴 Critical | Core of the role |
 | GPU orchestration (K8s, SLURM) | 🔴 Critical | Managing expensive GPU resources |
 | Quantization & optimization | 🟡 High | AWQ, GPTQ, FP8, speculative decoding |
 | Networking (RDMA, InfiniBand) | 🟡 High | Multi-node inference |
-| Storage (object, shared FS) | 🟡 High | Model weights, KV cache |
+| Storage (object, shared FS) | 🟡 High | Model weights load times, KV-cache offload |
 | CI/CD for ML | 🟡 High | Automating model deployments |
 | Monitoring & observability | 🟡 High | GPU utilization, latency, throughput |
 
@@ -91,7 +95,7 @@
 
 ### Key Trend: Decomposition Over Memorization
 
-The #1 reason candidates fail AI interviews is **not** lack of knowledge — it's **jumping to implementation without decomposing the problem**.
+A very common way candidates fail AI design interviews is not lack of knowledge but **jumping to implementation without decomposing the problem**.
 
 ```diff
 - ❌ "Let's build an agent with LangGraph that uses RAG..."
@@ -112,11 +116,12 @@ The #1 reason candidates fail AI interviews is **not** lack of knowledge — it'
 
 | Archetype | Example | Interview Style |
 |-----------|---------|-----------------|
+| **Frontier labs** | Anthropic, OpenAI, Google DeepMind | Practical coding, systems design, model-API depth; applied-AI and FDE teams run customer-scenario rounds |
 | **AI-Native Startup** | Sarvam AI, Cohere, Glean | Deep agent architecture, RAG design, hands-on coding |
 | **Big Tech AI** | Google, Meta, Microsoft | LeetCode + system design + ML fundamentals |
 | **Enterprise AI** | Salesforce, ServiceNow | System design with legacy integration, customer stories |
-| **AI Infra** | Together AI, Fireworks, Replicate | Model serving, GPU orchestration, distributed systems |
-| **Forward Deployed** | Palantir, Databricks, Anduril | Problem decomposition, customer empathy, full-stack |
+| **AI Infra** | Together AI, Fireworks, Baseten, Modal | Model serving, GPU orchestration, distributed systems |
+| **Forward Deployed** | Palantir (originated the title), OpenAI, Anthropic, Databricks, Anduril | Problem decomposition, customer empathy, full-stack |
 | **Consulting / Agency** | McKinsey QuantumBlack, BCG X | Business impact, rapid prototyping, data pipelines |
 
 ---
@@ -180,7 +185,7 @@ Week 1-2: Systems Foundations
   └── Concurrency & parallelism patterns
 
 Week 3-4: Model Serving
-  ├── Inference architectures (vLLM, TGI, Triton)
+  ├── Inference engines (vLLM, SGLang, TensorRT-LLM; Dynamo/Triton for multi-model serving)
   ├── Quantization (AWQ, GPTQ, FP8, INT4)
   ├── Speculative decoding & KV cache optimization
   ├── GPU architecture basics (SM, memory hierarchy, CUDA)
@@ -235,7 +240,7 @@ Some coverage in [Agent Observability](agents/07_AGENT_OBSERVABILITY.md) and [Ag
 
 - **Deterministic tests** — Tool call order, parameter validation, output format checks
 - **Semantic tests** — LLM-as-judge with rubrics (accuracy, groundedness, safety)
-- **Statistical testing** — Run each test N times, track pass rate and variance
+- **Statistical testing** — Run each test N times, track pass rate and variance (pass@k vs pass^k)
 - **Trajectory evaluation** — Not just final answer, but the path taken
 - **Production metrics** — Success rate, escalation rate, cost per task, user satisfaction
 - **Debugging workflow** — "How do you investigate an agent that gave a wrong answer?"
@@ -245,7 +250,7 @@ Some coverage in [Agent Observability](agents/07_AGENT_OBSERVABILITY.md) and [Ag
 Covered in existing content. Key interview themes:
 
 - **Defense in depth** — Input validation → Auth → Rate limiting → Tool validation → Output filtering
-- **Prompt injection prevention** — Input sanitization, parameterized tool calls
+- **Prompt injection containment** — No filter reliably prevents it, so limit the blast radius: least-privilege tools, egress control, approvals for outbound actions, never combining private data + untrusted content + an exfiltration path (see [Harness Engineering](harness-engineering/01_HARNESS_ENGINEERING.md#35-prompt-injection-containment))
 - **PII detection & redaction** — Both input and output
 - **Human-in-the-loop** — When to escalate, approval workflows
 - **Failure modes** — Tool loops, context swamping, hallucination cascades
@@ -254,12 +259,12 @@ Covered in existing content. Key interview themes:
 
 Key interview topics (especially for FDE and Infra roles):
 
-- **Model serving** — vLLM, TGI, Triton Inference Server
+- **Model serving** — vLLM, SGLang, TensorRT-LLM, NVIDIA Dynamo-Triton (Hugging Face TGI went into maintenance mode in Dec 2025 and now points users to vLLM/SGLang)
 - **GPU orchestration** — K8s with GPU scheduling, node pools, spot instances
 - **Quantization** — AWQ, GPTQ, FP8 — when to use each
 - **Speculative decoding** — Draft model + target model for faster inference
 - **KV cache management** — PagedAttention, prefix caching, continuous batching
-- **Prompt caching** — Reusing common prefixes across requests
+- **Prefix / prompt caching** — Self-hosted engines (e.g. vLLM automatic prefix caching) reuse the KV cache of a shared prompt prefix; hosted APIs expose the same idea as prompt caching, billed at a discount. Either way: stable content first, volatile content last
 - **CI/CD for AI** — Model validation, A/B testing, canary deployments, rollback
 
 ---
@@ -366,7 +371,7 @@ external APIs (air-gapped)."
 ```
 
 **Key decisions:**
-- Local LLM (Llama, Mistral) vs on-premise API (vLLM on customer infra)
+- Which open-weight model (decided by an eval on the customer's real questions), served with vLLM or similar on customer GPUs
 - Containerized deployment (Docker + K8s on customer cluster)
 - Data pipeline: Change Data Capture (CDC) or batch ETL?
 - Auth: Integrate with customer SSO (SAML/OIDC)
@@ -451,12 +456,12 @@ Weekends:
 
 | Topic | Resource |
 |-------|----------|
-| **Agent architectures** | Anthropic's agent patterns guide, LangGraph docs |
+| **Agent architectures** | Anthropic engineering blog: "Building effective agents", "Effective context engineering for AI agents", "Writing effective tools for agents", "Effective harnesses for long-running agents"; LangGraph docs |
 | **RAG patterns** | LlamaIndex docs, "Advanced RAG" by Pinecone |
 | **System design** | Alex Xu's System Design Interview, our [CS Architecture notes](../cs-interview/software-architecture/INTERVIEW_QUESTIONS.md) |
-| **FDE preparation** | Sundeep Teki's FDE Guide, Palantir engineering blog |
-| **Model serving** | vLLM docs, TGI docs, NVIDIA Triton docs |
-| **Evaluation** | LangSmith docs, "LLM-as-Judge" papers |
+| **FDE preparation** | Palantir's blog posts on the Forward Deployed Software Engineer role; current FDE job descriptions at the companies you target |
+| **Model serving** | vLLM docs, SGLang docs, NVIDIA Dynamo docs |
+| **Evaluation** | Anthropic's "Demystifying evals for AI agents", Hamel Husain's writing on evals, Zheng et al. 2023 ("Judging LLM-as-a-Judge") |
 | **Behavioral** | "Cracking the PM Interview" (customer stories), your own experience |
 
 ### The Week Before Interviews

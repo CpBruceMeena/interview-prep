@@ -1,125 +1,109 @@
 # 📚 RAG Pipeline Implementation
 
-This directory contains runnable Python implementations of the Retrieval-Augmented Generation (RAG) pipeline components described in the [RAG documentation](../05_CODE_BASE_DESIGN.md).
+A small, runnable RAG chatbot: sentence-transformers embeddings, ChromaDB, a FastAPI server and any OpenAI-compatible LLM (LM Studio by default). The design rationale is in [Code Base Design](../05_CODE_BASE_DESIGN.md) and [Low-Level Design](../06_LOW_LEVEL_DESIGN.md).
+
+**What it deliberately leaves out** (covered in the docs, good extension exercises): hybrid BM25 search, reranking, MMR, query rewriting, streaming, auth and per-user ACLs.
 
 ## Module Overview
 
 ```
 implementation/
-├── config.py                # Configuration management
-├── document_loader.py       # Document ingestion (PDF, text, web)
-├── embedding_service.py     # Text embedding generation
-├── vector_store.py          # Vector storage and similarity search
-├── retrieval_engine.py      # Document retrieval with hybrid search
-├── rag_pipeline.py          # End-to-end RAG pipeline orchestrator
-├── llm_service.py           # LLM interaction (OpenAI, LM Studio)
-├── chatbot_api.py           # FastAPI chatbot interface
-├── main.py                  # CLI entry point
-├── requirements.txt         # Python dependencies
-└── __init__.py
+├── config.py             # Settings (pydantic-settings): env vars / .env override defaults
+├── document_loader.py    # PDF (pypdf), text/markdown and HTML loaders + loader_for() factory
+├── embedding_service.py  # EmbeddingService ABC; SentenceTransformer (default) and OpenAI backends
+├── vector_store.py       # Chunk, SearchResult, VectorStore ABC, ChromaVectorStore (cosine, upsert)
+├── retrieval_engine.py   # embed query → vector search → similarity threshold → context string
+├── llm_service.py        # LLMService ABC; OpenAI-compatible, LM Studio and Mock clients
+├── rag_pipeline.py       # RAGPipeline facade: chunk + index documents, answer queries
+├── chatbot_api.py        # FastAPI app: /health, /api/query, /api/index, /api/index-directory
+├── main.py               # CLI entry point
+└── requirements.txt
 ```
 
 ## Core Components
 
 ### Configuration (`config.py`)
 
-Central configuration management using Pydantic:
-
 ```python
-class RAGConfig(BaseSettings):
-    embedding_model: str = "text-embedding-ada-002"
-    llm_model: str = "gpt-4o-mini"
-    chunk_size: int = 512
+class Settings(BaseSettings):
+    embedding_model: str = "all-MiniLM-L6-v2"   # 384-dim
+    chunk_size: int = 500                        # characters
     chunk_overlap: int = 50
     top_k: int = 5
-    vector_store_path: str = "./data/vector_store"
+    similarity_threshold: float = 0.3
+    lm_studio_url: str = "http://localhost:1234"
+    llm_model: str = "google/gemma-4-e4b"        # must match GET /v1/models
+    persist_directory: str = "./data/vector_store"
+    data_directory: str = "./data"
+    ...
 ```
 
-Supports environment variables, `.env` files, and direct initialization.
+Override with environment variables or `.env`, e.g. `LLM_MODEL=qwen/qwen3-4b`, `EMBEDDING_DEVICE=mps`. Relative paths resolve against the current working directory.
 
 ### Document Loader (`document_loader.py`)
 
-Multi-format document ingestion:
-- **PDF loading** — Text extraction with page metadata
-- **Text file loading** — Plain text and markdown
-- **Web scraping** — URL content extraction
-- **Chunking** — Configurable chunk size and overlap with semantic boundary detection
+- `PDFLoader`: one `Document` per page (`page` in metadata), via LangChain's `PyPDFLoader` (pypdf)
+- `TextFileLoader`: `.txt` and `.md`
+- `HTMLLoader`: BeautifulSoup; drops script/style/nav/header/footer
+- `loader_for(path)`: picks the loader by extension; `load_directory()` walks a folder recursively
 
-```python
-from implementation.document_loader import DocumentLoader
-
-loader = DocumentLoader(chunk_size=512, chunk_overlap=50)
-chunks = loader.load("path/to/document.pdf")
-```
+Chunking happens in `RAGPipeline` with `RecursiveCharacterTextSplitter` from `langchain-text-splitters`.
 
 ### Embedding Service (`embedding_service.py`)
 
-Abstract embedding provider with multiple backends:
-- **OpenAIEmbeddings** — OpenAI API (`text-embedding-ada-002`, `text-embedding-3-small`)
-- **LMStudioEmbeddings** — Local embeddings via LM Studio
-- **HuggingFaceEmbeddings** — Open-source models via sentence-transformers
-
-Supports batch processing, caching, and configurable dimensions.
+- `SentenceTransformerEmbedding`: local model, unit-normalised vectors, batched encoding
+- `OpenAIEmbedding`: `text-embedding-3-small/large`, optional Matryoshka `dimensions` (needs `pip install openai`)
+- `embed_query()` hook for models that need a query prefix or instruction
 
 ### Vector Store (`vector_store.py`)
 
-Vector database abstraction layer:
-- **FAISS** — In-memory similarity search for development
-- **ChromaDB** — Persistent storage with metadata filtering
-- **Hybrid search** — Combines vector similarity with keyword matching (BM25)
+`ChromaVectorStore` uses a persistent Chroma collection with cosine distance and returns `score = 1 − distance`. Writes are **upserts** in batches no larger than Chroma's max batch size; `delete_source()` removes a document's old chunks before re-indexing.
 
 ```python
-from implementation.vector_store import VectorStore
-
-store = VectorStore(backend="chroma", persist_dir="./data/chroma")
-store.add_documents(chunks, embeddings)
-results = store.similarity_search(query_embedding, k=5)
+store = ChromaVectorStore(persist_directory="./data/vector_store")
+results = store.search(query_embedding, top_k=5)   # List[SearchResult(chunk, score)]
 ```
 
 ### Retrieval Engine (`retrieval_engine.py`)
 
-Advanced retrieval with multiple strategies:
-- **Simple retrieval** — Top-k vector similarity
-- **Hybrid retrieval** — Weighted combination of dense + sparse
-- **Contextual retrieval** — Window expansion around matched chunks
-- **MMR (Maximal Marginal Relevance)** — Diversity-enhanced results
+Dense top-k retrieval with a similarity floor, plus `format_context()` that labels chunks `[Source N: path]` for citation.
 
 ### RAG Pipeline (`rag_pipeline.py`)
 
-End-to-end pipeline orchestrating the full RAG flow:
-
 ```python
-from implementation.rag_pipeline import RAGPipeline
+from rag_pipeline import RAGPipeline          # run from implementation/ (top-level imports)
 
-pipeline = RAGPipeline()
-answer = pipeline.query("What is the capital of France?")
-# Returns: "The capital of France is Paris."
+pipeline = RAGPipeline()                       # defaults: MiniLM + Chroma + LM Studio
+pipeline.index_directory("./data")
+result = pipeline.query("What is chunk overlap?")
+# {"answer": "...[Source 1]...", "sources": [{"text", "score", "source"}], "latency_ms": ...}
 ```
 
-Pipeline flow: `query → embed → retrieve → format → generate → answer`
+Flow: `retrieve once → format context → system prompt (rules + context) + user question → LLM → answer + the same sources`. Chunk IDs are `hash(source|page|chunk_index)`, so re-indexing is idempotent.
 
 ### LLM Service (`llm_service.py`)
 
-LLM interaction abstraction:
-- **OpenAI** — GPT-4o, GPT-4o-mini
-- **LM Studio** — Local LLM inference
-- **Custom** — Configurable endpoint and model
+- `OpenAICompatibleClient(api_url=".../v1", api_key, model)`: any OpenAI-compatible server
+- `LMStudioClient()`: the same, pointed at `settings.lm_studio_url`
+- `MockLLMService("fixed text")`: for tests
 
-Supports streaming, structured output, and system prompts.
+`generate()` logs and returns `None` on failure; `is_available()` probes `GET /v1/models`.
 
 ### Chatbot API (`chatbot_api.py`)
 
-FastAPI-based REST API for the RAG chatbot:
-
 ```bash
-# Start the API server
-uvicorn implementation.chatbot_api:app --host 0.0.0.0 --port 8000
+cd ai-engineering/rag/implementation
+uvicorn chatbot_api:app --host 127.0.0.1 --port 8000      # or: python main.py --serve
 
-# Query the chatbot
-curl -X POST http://localhost:8000/chat \
+curl -X POST http://localhost:8000/api/query \
   -H "Content-Type: application/json" \
-  -d '{"message": "What is RAG?", "session_id": "abc123"}'
+  -d '{"question": "What is RAG?", "top_k": 5}'
+
+curl -X POST http://localhost:8000/api/index -F "file=@notes.md"
+curl http://localhost:8000/health
 ```
+
+Blocking work (embedding, LLM calls) runs in worker threads, so one slow request doesn't stall the event loop. `/api/index-directory` only accepts paths inside `DATA_DIRECTORY`. There is no authentication, so keep it on localhost.
 
 ## Running the Pipeline
 
@@ -127,14 +111,14 @@ curl -X POST http://localhost:8000/chat \
 cd ai-engineering/rag
 pip install -r implementation/requirements.txt
 
-# CLI mode
-python -m implementation.main --query "Your question here"
+# End-to-end check (temp Chroma dir, MockLLM; downloads the embedding model on first run)
+python test_pipeline.py
 
-# API mode
-python -m implementation.chatbot_api
-
-# Test mode
-python -m pytest tests/
+# CLI (run from ai-engineering/rag so ./data paths resolve)
+python implementation/main.py --index --docs ./data
+python implementation/main.py --query "Your question here"     # needs LM Studio serving a model
+python implementation/main.py --interactive
+python implementation/main.py --serve
 ```
 
 ## Architecture
@@ -143,28 +127,21 @@ python -m pytest tests/
 User Query
     │
     ▼
-┌─────────────┐     ┌──────────────────┐
-│  LLM Service │◄────│  RAG Pipeline    │
-│  (openai/    │     │  (orchestrator)  │
-│   lmstudio)  │     └────────┬─────────┘
-└─────────────┘              │
-                             ▼
-              ┌──────────────────────────┐
-              │   Retrieval Engine       │
-              │  (hybrid + MMR search)   │
-              └────────┬─────────────────┘
-                       │
-              ┌────────▼─────────┐
-              │   Vector Store    │
-              │  (FAISS/Chroma)  │
-              └────────┬─────────┘
-                       │
-              ┌────────▼─────────┐
-              │ Embedding Service │
-              └────────┬─────────┘
-                       │
-              ┌────────▼─────────┐
-              │ Document Loader   │
-              │ (PDF/text/web)   │
-              └──────────────────┘
+┌──────────────────┐        ┌──────────────┐
+│  RAG Pipeline    │──────▶ │ LLM Service  │  (LM Studio / OpenAI-compatible)
+│  (facade)        │        └──────────────┘
+└────────┬─────────┘
+         ▼
+┌──────────────────┐        ┌───────────────────┐
+│ Retrieval Engine │──────▶ │ Embedding Service │
+└────────┬─────────┘        └───────────────────┘
+         ▼
+┌──────────────────┐
+│  Vector Store    │  (Chroma, cosine)
+└──────────────────┘
+         ▲
+         │ upsert chunks
+┌────────┴─────────┐
+│ Document Loader  │  (PDF / text / HTML) → chunk → embed
+└──────────────────┘
 ```

@@ -1,33 +1,26 @@
-# 🔧 MCP Common Library
+# MCP Common Library
 
-Shared infrastructure and utilities used across MCP server implementations.
-
-## Module Overview
+Small, dependency-light building blocks shared by the servers in [servers/](../servers/index.md).
 
 ```
 common/
-├── auth.py              # Authentication and authorization
-├── rate_limiter.py      # Rate limiting utilities
-├── circuit_breaker.py   # Circuit breaker for resilience
+├── auth.py              # Bearer-JWT validation, per-request identity, permission decorators
+├── rate_limiter.py      # Per-client token bucket
+├── circuit_breaker.py   # CLOSED → OPEN → HALF_OPEN breaker for a downstream dependency
 └── __init__.py
 ```
 
-## Components
+## `auth.py`
 
-### Auth (`auth.py`)
-Authentication and authorization middleware for MCP servers:
-- **Token validation** — JWT-based token verification
-- **API key auth** — Key-based authentication for internal services
-- **Role-based access** — Permission checking for tool operations
+- `authenticate_bearer(token)` validates a JWT: signature with a pinned algorithm, `exp`, and, when configured, **audience** (`JWT_AUDIENCE`, this server's resource URI) and issuer. Audience checking is what stops a token minted for another service being replayed here; the MCP authorization spec requires it.
+- The caller's identity lives in a `ContextVar` (`set_current_context` / `get_current_context`), so concurrent requests each see their own caller. A module-level "current user" would leak identities between requests.
+- `@require_permission("database:read")` and `@require_role("admin")` go **under** `@mcp.tool()`. Permissions come from the token's `permissions` claim or its OAuth `scope`.
+- Over **stdio** there is no OAuth: the server is a local subprocess and takes credentials from its environment. `MCP_STDIO_PERMISSIONS` grants permissions to the local user; without it, protected tools fail closed.
 
-### Rate Limiter (`rate_limiter.py`)
-Rate limiting to prevent abuse:
-- **Token bucket algorithm** — Configurable rate and burst limits
-- **Per-client tracking** — Separate limits per connected client
-- **Sliding window** — Time-based window enforcement
+## `rate_limiter.py`
 
-### Circuit Breaker (`circuit_breaker.py`)
-Resilience pattern for external service calls:
-- **State machine** — CLOSED → OPEN → HALF_OPEN → CLOSED
-- **Configurable thresholds** — Failure count and timeout window
-- **Fallback handling** — Graceful degradation on failure
+Token bucket per client key (`tenant:user`): refills at `rate` tokens/second up to `burst`. `check_rate_limit()` is thread-safe; `get_retry_after()` says how long until the next token. The per-client map is in-process and unbounded, so a multi-replica deployment needs a shared store (for example Redis) and eviction of idle keys.
+
+## `circuit_breaker.py`
+
+Opens after `failure_threshold` **consecutive** failures, rejects calls for `reset_timeout` seconds, then lets exactly one probe through (HALF_OPEN). The probe's result closes or re-opens the circuit. State changes are guarded by a lock because sync MCP tools run on worker threads; the lock is never held while the protected call runs.

@@ -1,100 +1,100 @@
-"""LLM service — interfaces with LM Studio / OpenAI-compatible API."""
+"""LLM service — interfaces with LM Studio / any OpenAI-compatible API."""
 
-from abc import ABC, abstractmethod
-from typing import List, Dict, Optional
-import requests
 import json
+import logging
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional
+
+import requests
 
 from config import settings
 
+# Log (to stderr) rather than print: stdout may be a protocol channel (MCP stdio).
+log = logging.getLogger(__name__)
+
 
 class LLMService(ABC):
-    """Abstract LLM service — supports LM Studio and OpenAI."""
+    """Abstract LLM service. Returns None on failure so callers can degrade."""
 
     @abstractmethod
     def generate(self, messages: List[Dict[str, str]],
                  temperature: Optional[float] = None,
                  max_tokens: Optional[int] = None) -> Optional[str]:
         """Generate a response from the LLM given a message list."""
-        pass
+
+    def is_available(self) -> bool:
+        """Cheap liveness probe for health checks."""
+        return True
 
 
-class LMStudioClient(LLMService):
-    """Client for LM Studio's OpenAI-compatible API endpoint."""
-
-    def __init__(self, base_url: Optional[str] = None,
-                 model: Optional[str] = None):
-        self.base_url = (base_url or settings.lm_studio_url).rstrip("/")
-        self.model = model or settings.llm_model
-        self.api_url = f"{self.base_url}/v1/chat/completions"
-
-    def generate(self, messages: List[Dict[str, str]],
-                 temperature: Optional[float] = None,
-                 max_tokens: Optional[int] = None) -> Optional[str]:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature or settings.temperature,
-            "max_tokens": max_tokens or settings.max_tokens,
-        }
-
-        try:
-            response = requests.post(
-                self.api_url,
-                json=payload,
-                timeout=120,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
-
-        except requests.exceptions.ConnectionError:
-            print(f"❌ Cannot connect to LM Studio at {self.base_url}")
-            print("   Start LM Studio, load model, and enable server.")
-            return None
-        except requests.exceptions.Timeout:
-            print("❌ LM Studio request timed out (120s)")
-            return None
-        except (KeyError, json.JSONDecodeError) as e:
-            print(f"❌ Invalid response from LM Studio: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ LM Studio error: {e}")
-            return None
+def _payload(model: str, messages, temperature, max_tokens) -> dict:
+    # `is None`, not `or`: temperature=0.0 is a valid (greedy) setting.
+    return {
+        "model": model,
+        "messages": messages,
+        "temperature": settings.temperature if temperature is None else temperature,
+        "max_tokens": settings.max_tokens if max_tokens is None else max_tokens,
+    }
 
 
 class OpenAICompatibleClient(LLMService):
-    """Generic client for any OpenAI-compatible API."""
+    """Client for any server exposing POST {base}/v1/chat/completions."""
 
-    def __init__(self, api_url: str, api_key: str, model: str):
-        self.api_url = api_url.rstrip("/") + "/chat/completions"
+    def __init__(self, api_url: str, api_key: str = "", model: str = "",
+                 timeout: float = 120):
+        # api_url is the ".../v1" base, e.g. "http://localhost:1234/v1".
+        self.v1_url = api_url.rstrip("/")
+        self.base_url = self.v1_url
+        self.api_url = self.v1_url + "/chat/completions"
         self.api_key = api_key
         self.model = model
+        self.timeout = timeout
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def generate(self, messages: List[Dict[str, str]],
                  temperature: Optional[float] = None,
                  max_tokens: Optional[int] = None) -> Optional[str]:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature or settings.temperature,
-            "max_tokens": max_tokens or settings.max_tokens,
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
         try:
             response = requests.post(
-                self.api_url, json=payload, headers=headers, timeout=120
+                self.api_url,
+                json=_payload(self.model, messages, temperature, max_tokens),
+                headers=self._headers(),
+                timeout=self.timeout,
             )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"❌ API error: {e}")
-            return None
+        except requests.exceptions.ConnectionError:
+            log.error("Cannot connect to LLM server at %s", self.base_url)
+        except requests.exceptions.Timeout:
+            log.error("LLM request timed out after %ss", self.timeout)
+        except requests.exceptions.HTTPError as e:
+            # e.g. 404/400 when `model` doesn't match a loaded model id
+            log.error("LLM server returned an error: %s — %s", e, e.response.text[:300])
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            log.error("Unexpected LLM response shape: %r", e)
+        return None
+
+    def is_available(self) -> bool:
+        try:
+            return requests.get(self.v1_url + "/models", headers=self._headers(),
+                                timeout=2).ok
+        except requests.exceptions.RequestException:
+            return False
+
+
+class LMStudioClient(OpenAICompatibleClient):
+    """LM Studio's OpenAI-compatible server (default http://localhost:1234/v1)."""
+
+    def __init__(self, base_url: Optional[str] = None,
+                 model: Optional[str] = None):
+        root = (base_url or settings.lm_studio_url).rstrip("/")
+        super().__init__(api_url=f"{root}/v1", model=model or settings.llm_model)
+        self.base_url = root  # server root, as before; v1_url adds "/v1"
 
 
 class MockLLMService(LLMService):

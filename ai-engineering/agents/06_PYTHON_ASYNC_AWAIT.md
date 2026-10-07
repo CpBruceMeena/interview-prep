@@ -1,6 +1,9 @@
 # ⚡ Python Async & Await — Concurrency for AI Agents
 
-> **Target:** Staff/Principal Engineer | **Focus:** Async Python patterns for high-throughput agent systems
+> **Target:** Staff/Principal Engineer | **Focus:** Async Python patterns for high-throughput agent systems | **Reviewed:** October 2026 (Python 3.11–3.14)
+
+!!! tip "30-second answer"
+    `asyncio` runs many I/O-bound tasks on **one thread** by switching at every `await`: while one task waits on an LLM or database, the event loop runs another. That fits agents, which spend most of their time waiting. The rules that matter in production: never block the loop (no `time.sleep`, sync HTTP or heavy CPU in a coroutine; offload with `asyncio.to_thread` or a process pool), bound concurrency with a semaphore, put deadlines on everything (`asyncio.timeout`), and use **structured concurrency** (`asyncio.TaskGroup`, 3.11+) so failures and cancellation propagate instead of leaking orphan tasks.
 
 ---
 
@@ -108,21 +111,21 @@ Total: ~5 time units — I/O wait is overlapped!
 
 ```python
 import asyncio
+import os
 from openai import AsyncOpenAI
 
 client = AsyncOpenAI()
+MODEL = os.environ["LLM_MODEL"]            # model ids change; keep them in config
+llm_slots = asyncio.Semaphore(8)           # bound concurrency: provider rate limits are finite
 
 async def call_llm_parallel(prompts: list[str]) -> list[str]:
     """Call multiple LLM prompts in parallel."""
     async def single_call(prompt: str) -> str:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        return response.choices[0].message.content
+        async with llm_slots:
+            response = await client.responses.create(model=MODEL, input=prompt)
+            return response.output_text
     
-    # All calls run concurrently
+    # All calls run concurrently (up to the semaphore limit)
     tasks = [single_call(p) for p in prompts]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -145,6 +148,8 @@ results = await call_llm_parallel([
 # All 3 calls run concurrently — ~2s instead of ~6s
 ```
 
+`gather(..., return_exceptions=True)` gives partial results when some calls fail. If any failure should abort the rest, use a `TaskGroup` instead (3.6).
+
 ### 3.2 Async Agent Loop with Timeout
 
 ```python
@@ -153,13 +158,12 @@ async def run_agent_with_timeout(
 ) -> str:
     """Run an agent with a deadline — prevents runaway agents."""
     try:
-        result = await asyncio.wait_for(
-            agent_fn(query),
-            timeout=timeout
-        )
-        return result
-    except asyncio.TimeoutError:
-        return f"Agent did not complete within {timeout}s — response truncated"
+        async with asyncio.timeout(timeout):      # 3.11+; wait_for() also works
+            return await agent_fn(query)
+    except TimeoutError:                          # asyncio.TimeoutError is an alias since 3.11
+        # The agent coroutine has been CANCELLED, not paused: any work it did
+        # is lost unless it checkpoints. Return a clear failure, not a fake answer.
+        return f"Agent did not complete within {timeout}s"
 
 # ─── Usage ────────────────────────────────────────
 async def my_agent(query: str) -> str:
@@ -170,10 +174,18 @@ async def my_agent(query: str) -> str:
 result = await run_agent_with_timeout(my_agent, "Hello", timeout=5.0)
 ```
 
+Timeouts work by cancellation: `CancelledError` is raised at the coroutine's current `await`. Code that catches it must clean up and **re-raise**; swallowing it breaks timeouts and shutdown. Timeouts also only fire at an `await`, so a coroutine stuck in blocking code can't be timed out.
+
 ### 3.3 Async Generator for Streaming Agent Outputs
 
 ```python
-async def stream_agent_response(query: str):
+import json
+
+def sse(event: dict) -> str:
+    # Server-Sent Events wire format: "data: <payload>\n\n"
+    return f"data: {json.dumps(event)}\n\n"
+
+async def stream_agent_events(query: str):
     """Stream agent thoughts and actions as they happen."""
     agent = Agent()
     
@@ -195,18 +207,19 @@ async def stream_agent_response(query: str):
 # FastAPI endpoint
 @app.get("/chat")
 async def chat(query: str):
-    return StreamingResponse(
-        stream_agent_response(query),
-        media_type="text/event-stream"
-    )
+    async def body():
+        async for event in stream_agent_events(query):
+            yield sse(event)           # StreamingResponse needs str/bytes, not dicts
+    return StreamingResponse(body(), media_type="text/event-stream")
 ```
+
+When the client disconnects, the server cancels the generator at its current `await`; make sure that also cancels the in-flight model call (or the run keeps burning tokens), and send periodic heartbeat comments so proxies and load balancers don't cut idle streams.
 
 ### 3.4 Async Rate Limiting
 
 ```python
 import asyncio
-from dataclasses import dataclass
-from time import time
+from time import monotonic as time   # monotonic: immune to wall-clock jumps
 
 class AsyncRateLimiter:
     """Token-bucket rate limiter for async contexts."""
@@ -270,7 +283,13 @@ class AsyncCircuitBreaker:
         self._lock = asyncio.Lock()
     
     async def call(self, coro_factory):
-        """Execute a coroutine with circuit breaking."""
+        """Execute a coroutine with circuit breaking.
+
+        Simplification: in half-open state every caller gets through; a real
+        breaker lets one (or a few) trial calls through and fails the rest fast.
+        Count only failures that indicate an unhealthy dependency (timeouts,
+        5xx, 429), not caller errors like 400s.
+        """
         async with self._lock:
             if self.state == "open":
                 if time() - self.last_failure_time > self.recovery_timeout:
@@ -297,8 +316,29 @@ class AsyncCircuitBreaker:
                 if self.failure_count >= self.failure_threshold:
                     self.state = "open"
             
-            raise e
+            raise
 ```
+
+### 3.6 Structured Concurrency with TaskGroup (3.11+)
+
+```python
+async def gather_context(query: str) -> dict:
+    async with asyncio.TaskGroup() as tg:
+        user = tg.create_task(get_user(query))
+        docs = tg.create_task(search_kb(query))
+        hist = tg.create_task(load_history(query))
+    # Leaving the block means ALL tasks finished. If any task raised, the
+    # others were cancelled and the errors are raised together as an
+    # ExceptionGroup (handle with `except* SomeError:`).
+    return {"user": user.result(), "docs": docs.result(), "history": hist.result()}
+```
+
+| | `asyncio.gather` | `asyncio.TaskGroup` |
+|---|---|---|
+| One task fails | Other tasks **keep running** (default) | Other tasks are **cancelled** |
+| Error reporting | First exception, or all results with `return_exceptions=True` | All exceptions in an `ExceptionGroup` |
+| Leaked tasks | Possible | Impossible: the block waits for every task |
+| Use when | You want partial results | All-or-nothing work, clean cancellation |
 
 ---
 
@@ -309,10 +349,12 @@ class AsyncCircuitBreaker:
 | **Concurrency model** | Cooperative (single-threaded) | Preemptive (OS threads) | Parallel (separate processes) |
 | **Best for** | I/O-bound tasks | I/O-bound + blocking calls | CPU-bound tasks |
 | **Memory** | Low (single process) | Medium (shared memory) | High (separate memory) |
-| **GIL limitation** | Not affected | Affected (CPU-bound) | Not affected |
+| **GIL limitation** | One thread, so no CPU parallelism | No CPU parallelism on the default build (see note) | Not affected |
 | **Overhead** | Very low | Moderate | High |
 | **Race conditions** | Fewer (single-thread) | Common (shared state) | Fewer (separate memory) |
 | **Example use** | 1000 concurrent API calls | 10 blocking I/O threads | 4 CPU cores for ML inference |
+
+**GIL note (3.13+):** CPython now ships an optional **free-threaded** build (PEP 703; experimental in 3.13, officially supported but still not the default in 3.14) where threads can run Python code in parallel. The default build still has the GIL, and many C extensions need to opt in, so treat it as something to evaluate, not assume.
 
 ### When to Use Each in Agent Systems:
 
@@ -324,34 +366,22 @@ async def agent_handler(request):
     response = await llm.generate(context, user_data)
     return response
 
-# ✅ Threading: When you must use blocking libraries
-from concurrent.futures import ThreadPoolExecutor
-
+# ✅ Threading: When you must use blocking (I/O) libraries
 async def run_blocking_code():
-    with ThreadPoolExecutor() as pool:
-        result = await asyncio.get_event_loop().run_in_executor(
-            pool,
-            blocking_function,  # e.g., CPU-intensive parsing
-            arg1, arg2
-        )
-    return result
+    # 3.9+: runs in the loop's default ThreadPoolExecutor
+    return await asyncio.to_thread(blocking_io_function, arg1, arg2)
 
-# ✅ Multiprocessing: For CPU-bound agent tasks
-from multiprocessing import Pool
+# ✅ Multiprocessing: For CPU-bound agent tasks (parsing, embeddings on CPU)
+from concurrent.futures import ProcessPoolExecutor
 
-class BatchProcessor:
-    def __init__(self):
-        self.pool = Pool(processes=4)
-    
-    async def process_batch(self, items: list) -> list:
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            None,  # Uses default ProcessPoolExecutor
-            self.pool.map,
-            cpu_intensive_task,
-            items
-        )
-        return results
+process_pool = ProcessPoolExecutor(max_workers=4)   # create once, reuse
+
+async def process_batch(items: list) -> list:
+    loop = asyncio.get_running_loop()               # not get_event_loop() inside a coroutine
+    # Note: run_in_executor(None, ...) uses a THREAD pool, not a process pool.
+    return await loop.run_in_executor(
+        process_pool, cpu_intensive_batch, items   # function and args must be picklable
+    )
 ```
 
 ---
@@ -412,22 +442,34 @@ async def better_sync_function():
 async def bad():
     asyncio.create_task(some_work())  # If it fails, nobody knows
 
-# ✅ GOOD: Track tasks
+# ✅ GOOD: Keep a strong reference AND surface failures
 class TaskTracker:
     def __init__(self):
         self.tasks = set()
     
     def create_tracked_task(self, coro):
         task = asyncio.create_task(coro)
-        self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        self.tasks.add(task)          # the loop only holds a WEAK ref: an
+                                      # unreferenced task can be garbage-collected mid-run
+        task.add_done_callback(self._done)
         return task
+
+    def _done(self, task: asyncio.Task):
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("background task failed", exc_info=task.exception())
 
 tracker = TaskTracker()
 
 async def good():
     tracker.create_tracked_task(some_work())  # Tracked and logged
 ```
+
+Better still, when the work belongs to a request, run it inside a `TaskGroup` so it can't outlive its parent.
+
+### 5.5 Unbounded Fan-out
+
+`gather(*[call(x) for x in ten_thousand_items])` starts everything at once: you hit provider 429s, exhaust connection pools and memory. Bound it with a `Semaphore` (as in 3.1) or a fixed pool of worker tasks reading from an `asyncio.Queue`.
 
 ---
 
@@ -450,21 +492,24 @@ class AsyncAgentTuner:
             
             async def limited_call():
                 async with sem:
-                    start = time.time()
+                    start = time.perf_counter()
                     await test_fn()
-                    return time.time() - start
+                    return time.perf_counter() - start
             
             async def run_batch():
                 tasks = [limited_call() for _ in range(100)]
                 return await asyncio.gather(*tasks)
             
+            wall_start = time.perf_counter()
             latencies = asyncio.run(run_batch())
-            throughput = len(latencies) / sum(latencies)
+            wall = time.perf_counter() - wall_start
+            throughput = len(latencies) / wall          # completed calls per second of WALL time
             avg_latency = sum(latencies) / len(latencies)
             results.append((n, throughput, avg_latency))
         
-        # Find elbow point
-        return results  # Plot to find optimal concurrency
+        # Throughput rises with concurrency until the provider or pool
+        # saturates; past that point latency climbs and 429s appear.
+        return results  # Plot to find the elbow
     
     @staticmethod
     def connection_pool_size(max_connections: int = 100):
@@ -488,21 +533,21 @@ class AsyncAgentTuner:
 import pytest
 
 @pytest.mark.asyncio
-async def test_parallel_llm_calls():
-    """Test that parallel LLM calls complete within expected time."""
-    start = asyncio.get_event_loop().time()
-    
-    results = await call_llm_parallel([
-        "Say 'hello'",
-        "Say 'world'",
-        "Say 'foo'",
-        "Say 'bar'",
-    ])
-    
-    duration = asyncio.get_event_loop().time() - start
-    
-    assert len(results) == 4
-    assert duration < 5.0  # Should be ~1x latency, not 4x
+async def test_calls_run_concurrently(monkeypatch):
+    """Concurrency test with a FAKE client: deterministic, no network."""
+    class FakeResponses:
+        async def create(self, **kwargs):
+            await asyncio.sleep(0.2)                 # pretend LLM latency
+            return type("R", (), {"output_text": "ok"})()
+    monkeypatch.setattr(client, "responses", FakeResponses())
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    results = await call_llm_parallel(["a", "b", "c", "d"])
+    duration = loop.time() - start
+
+    assert results == ["ok"] * 4
+    assert duration < 0.5  # ~1x latency (0.2s), not 4x (0.8s)
 
 @pytest.mark.asyncio
 async def test_rate_limiter():
@@ -521,6 +566,8 @@ async def test_rate_limiter():
     # First 10 should be immediate, rest should be delayed
     assert len(calls) == 20
 ```
+
+With pytest-asyncio, set `asyncio_mode = "auto"` in config to drop the per-test marker. For timing-sensitive tests, prefer fake clocks or loose bounds; CI machines are noisy.
 
 ---
 
@@ -560,8 +607,8 @@ Time ─────────────────────────
 
 asyncio.run(outer())
   │
-  ├── 1. Creates a new event loop (if none exists)
-  ├── 2. Creates a Task for outer()
+  ├── 1. Creates a NEW event loop (raises if called from a running loop)
+  ├── 2. Wraps outer() in a Task (the only Task in this example)
   └── 3. Runs the event loop
         │
         ▼
@@ -575,7 +622,7 @@ asyncio.run(outer())
 │  6. middle() starts executing                                   │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  SUB-TASK: middle() entered                                │  │
+│  │  COROUTINE (same Task): middle() entered                   │  │
 │  │                                                            │  │
 │  │  ── Line: result = await inner() ──                       │  │
 │  │                                                            │  │
@@ -584,7 +631,7 @@ asyncio.run(outer())
 │  │  9. inner() starts executing                               │  │
 │  │                                                            │  │
 │  │  ┌──────────────────────────────────────────────────┐    │  │
-│  │  │  SUB-SUB-TASK: inner() entered                     │    │  │
+│  │  │  COROUTINE (same Task): inner() entered            │    │  │
 │  │  │                                                    │    │  │
 │  │  │  ── Line: await asyncio.sleep(0.1) ──            │    │  │
 │  │  │                                                    │    │  │
@@ -601,7 +648,7 @@ asyncio.run(outer())
 │  │  │  ── Event loop runs OTHER tasks for 100ms ──     │    │  │
 │  │  │                                                    │    │  │
 │  │  │  16. After 100ms, the Future is resolved           │    │  │
-│  │  │  17. Event loop schedules inner() to resume        │    │  │
+│  │  │  17. Loop resumes the Task: outer→middle→inner     │    │  │
 │  │  │  18. inner() resumes, gets None from sleep()       │    │  │
 │  │  │  19. inner() returns "inner done"                 │    │  │
 │  │  └──────────────────────────────────────────────────┘    │  │
@@ -619,181 +666,91 @@ asyncio.run(outer())
 
 ### 8.3 The Call Stack (How It Really Works)
 
+A plain `await other_coro()` does **not** create a new task. The awaiting coroutine delegates to the awaited one (like `yield from`), so the whole chain `outer → middle → inner` runs inside **one Task**. When `inner` hits a real suspension point (a Future that isn't done), the Future is passed *up* through every frame to the Task, which hands control back to the event loop.
+
 ```ascii
-NORMAL FUNCTION CALLS:                      ASYNC AWAIT CHAIN:
-(Real stack frames, one per call)          (Coroutine objects, not stack frames)
-
-┌─────────────┐                            ┌─────────────────┐
-│  main()     │                            │  Event Loop     │
-│  calls a()  │                            │  (single thread)│
-├─────────────┤                            └────────┬────────┘
-│  a()        │                                     │
-│  calls b()  │                            ┌────────▼────────┐
-├─────────────┤                            │  Task for       │
-│  b()        │                            │  outer()        │
-│  calls c()  │                            │                 │
-├─────────────┤                            │  → awaits       │
-│  c()        │                            │    middle()     │
-│  does work  │                            └────────┬────────┘
-├─────────────┤                                     │
-│  returns    │                            ┌────────▼────────┐
-│  to b()     │                            │  Coroutine      │
-├─────────────┤                            │  middle()       │
-│  b()        │                            │                 │
-│  returns    │                            │  → awaits       │
-│  to a()     │                            │    inner()      │
-├─────────────┤                            └────────┬────────┘
-│  a()        │                                     │
-│  returns    │                            ┌────────▼────────┐
-│  to main()  │                            │  Coroutine      │
-└─────────────┘                            │  inner()        │
-                                           │                 │
-Thread has a REAL stack.                   │  → awaits       │
-Each frame uses actual memory.             │    sleep()      │
-                                           └────────┬────────┘
-                                                    │
-                                           ┌────────▼────────┐
-                                           │  Future         │
-                                           │  (sleep 100ms)  │
-                                           └─────────────────┘
-
-The coroutines are Python objects on the heap,
-NOT stack frames. They can be suspended and
-resumed without consuming stack space.
+Event loop
+   │  task.step()  (resumes the Task)
+   ▼
+Task(outer)
+   │  outer frame ── send() ──► middle frame ── send() ──► inner frame
+   │                                                          │
+   │                         awaits sleep() Future (not done) │
+   ◄──────────── Future bubbles back up through each frame ───┘
+   │
+   ▼  Task registers a callback on the Future, returns to the loop
+Event loop runs other Tasks; when the Future completes, it resumes Task(outer),
+which re-enters outer → middle → inner and continues after the await.
 ```
+
+While **suspended**, the coroutine frames live on the heap and hold no thread stack, which is why 10,000 concurrent idle tasks are cheap. But while **running**, a deep `await` chain is resumed frame by frame, and each level counts toward Python's recursion limit, exactly like normal calls.
 
 ### 8.4 The Technical Mechanism: Generators + Yield
 
-Under the hood, `async`/`await` is implemented using **generators** with `yield`:
+`async`/`await` is built on the same machinery as generators. `await x` calls `x.__await__()` and delegates to that iterator, roughly like `yield from`. Only the innermost object, an `asyncio.Future`, actually *yields*, which suspends the whole chain:
 
 ```python
-# What you write:
+# Conceptually (not literally what CPython emits):
 async def my_coro():
     result = await other_coro()
     return result
 
-# What Python roughly compiles it to:
-@types.coroutine
-def my_coro():
-    result = yield from other_coro().__await__()
+# behaves like a generator-based coroutine:
+def my_coro_gen():
+    result = yield from other_coro().__await__()   # delegate until it returns
     return result
 
-# What __await__ returns:
-class Coroutine:
-    def __await__(self):
-        # This is what makes 'await' work!
-        # It returns an iterator that the event loop drives
-        return self._iterate()
-    
-    def _iterate(self):
-        # This generator yields control at each await point
-        try:
-            while True:
-                # Get the next future to wait on
-                future = self._get_next_step()
-                if future is None:
-                    break
-                # Yield the future to the event loop
-                yield future
-        except StopIteration as e:
-            # Return the final value
-            return e.value
+# And asyncio.Future.__await__ is, in essence:
+def __await__(self):
+    if not self.done():
+        yield self            # hand the Future to the Task / event loop
+    return self.result()      # resumed after the loop marks it done
 ```
 
 ### 8.5 The Event Loop's Perspective
 
 ```python
-# Simplified event loop — this is what actually runs
+# Simplified event loop: what asyncio's BaseEventLoop does, minus details
 class EventLoop:
     def __init__(self):
-        self._ready = []       # Tasks ready to run
-        self._waiting = {}      # Future → [tasks waiting on it]
-    
-    def run_until_complete(self, main_coro):
-        # Wrap coroutine in a Task
-        main_task = Task(main_coro, self)
-        self._ready.append(main_task)
-        
-        while self._ready or self._waiting:
-            # Run all ready tasks one step each
-            while self._ready:
-                task = self._ready.pop(0)
-                try:
-                    # Resume the task — it runs until the next await
-                    # If await encounters a Future, the task yields it
-                    yielded_future = task.step()
-                    
-                    if yielded_future is not None:
-                        # Task is waiting for this future
-                        self._waiting[id(yielded_future)] = task
-                        yielded_future.add_done_callback(
-                            lambda f: self._ready.append(
-                                self._waiting.pop(id(f))
-                            )
-                        )
-                except StopIteration as e:
-                    # Task completed — store its return value
-                    task.set_result(e.value)
-            
-            # No tasks ready — either done or all waiting
-            # This is where the loop would block on I/O (select/poll/epoll)
-            if not self._ready and self._waiting:
-                self._wait_for_io()  # Blocks until something is ready
+        self._ready = collections.deque()   # callbacks ready to run now
+        self._scheduled = []                # heap of (when, callback) timers
+
+    def run_forever(self):
+        while True:
+            timeout = self._time_until_next_timer()  # 0 if _ready is non-empty
+            events = self._selector.select(timeout)  # epoll/kqueue: wait for I/O
+            self._process_io_events(events)          # their callbacks -> _ready
+            self._move_due_timers_to_ready()
+            for _ in range(len(self._ready)):
+                callback = self._ready.popleft()
+                callback()        # usually Task.__step: resume a coroutine
+                                  # until its next suspension point
 ```
+
+A `Task` is the bridge: its `__step` resumes the coroutine with `send()`; when the coroutine yields a Future, the Task adds `add_done_callback(self.__wakeup)` and returns. When the Future completes, the wake-up callback is put on `_ready`. Nothing runs in parallel; everything is "run until the next await".
 
 ### 8.6 What This Means for Deeply Nested Async
 
 ```python
-# This works: infinitely nested async calls
-async def level_5():
-    return await level_4()
-
-async def level_4():
-    return await level_3()
-
-async def level_3():
-    return await level_2()
-
-async def level_2():
-    return await level_1()
-
-async def level_1():
-    await asyncio.sleep(0)
-    return "deep result"
-
-# ❗ This works because coroutines don't use the CALL STACK
-# They use HEAP-ALLOCATED coroutine objects.
-# You can nest 1000 levels without stack overflow (memory permitting).
-
 async def very_deep(n: int):
     if n == 0:
+        await asyncio.sleep(0)
         return "base"
-    result = await very_deep(n - 1)  # Recursive async call!
-    return f"level {n}: {result}"
+    return await very_deep(n - 1)   # recursive await, all in ONE task
 
-# This works fine even with n=5000:
-result = asyncio.run(very_deep(5000))
-print(result)  # "level 5000: ... level 1: base"
-
-# Compare with sync recursion:
-def sync_deep(n: int):
-    if n == 0:
-        return "base"
-    result = sync_deep(n - 1)  # Uses REAL stack frames!
-    return f"level {n}: {result}"
-
-# This will stack overflow at ~1000 (depends on Python's recursion limit):
-# sync_deep(5000)  # RecursionError: maximum recursion depth exceeded
+asyncio.run(very_deep(900))    # fine
+asyncio.run(very_deep(5000))   # RecursionError (default limit 1000), same as sync recursion
 ```
 
-**Key insight:** `await` chains don't consume stack space. Each coroutine frame is a Python object on the heap, not a C stack frame. This means:
+Measured on CPython 3.14: `very_deep(900)` succeeds and `very_deep(1100)` raises `RecursionError`, matching a plain recursive function. Recursive `await` is **not** a way around the recursion limit. If you genuinely need deep recursion, convert it to iteration, or break the chain by running sub-steps as separate tasks.
 
-| Property | Sync Functions | Async Coroutines |
-|----------|---------------|-----------------|
-| **Frame location** | C stack (limited, ~1MB total) | Python heap (can be GB) |
-| **Max recursion depth** | ~1000 (sys.getrecursionlimit()) | Limited only by memory |
-| **Suspend/Resume** | Not possible | Built-in via `await` |
-| **State preservation** | Automatic (stack frame) | Manual (coroutine object) |
+| Property | Sync call chain | `await` chain (one Task) | Separate Tasks |
+|----------|-----------------|--------------------------|----------------|
+| Counts toward recursion limit | Yes | Yes, while running | No (each task starts a fresh chain) |
+| Can be suspended mid-chain | No | Yes, at any `await` | Yes |
+| Memory while idle | Thread stack held | Heap frames only | Heap frames + Task object |
+| Runs concurrently with siblings | No | No | Yes |
 
 ### 8.7 Nested Async in Agent Systems
 
@@ -835,18 +792,19 @@ class AIAgent:
         return {"profile": profile, "prefs": prefs, "perms": perms}
 ```
 
-**Nesting depth in this example:** `handle_request` → `_gather_context` → `_get_user_context` → `_db.get_user_profile` → (some DB driver's async call) → (socket I/O). That's **6 levels** of nested async, and it works perfectly because each level is a heap-allocated coroutine object.
+**Nesting depth in this example:** `handle_request` → `_gather_context` → `_get_user_context` → `_db.get_user_profile` → (some DB driver's async call) → (socket I/O). That's about 6 levels of nested `await`, trivially within limits. Note where the concurrency actually comes from: the two `gather` calls each create Tasks; the plain nested awaits just run inside their parent's Task.
 
 ### 8.8 Performance Characteristics of Nested Async
 
-| Metric | Value | Explanation |
-|--------|-------|-------------|
-| **Coroutine creation** | ~0.5μs | Python object allocation (heap) |
-| **Await overhead** | ~0.2μs | Yield/resume cycle |
-| **Nested chain (10 levels)** | ~7μs | Total overhead for 10 awaits |
-| **Nested chain (100 levels)** | ~70μs | Still negligible for practical use |
-| **Memory per coroutine** | ~200 bytes | Coroutine object + frame |
-| **Memory for 10K coroutines** | ~2MB | Entirely feasible |
+Rough numbers measured on CPython 3.14 on a laptop (order of magnitude only; measure on your own hardware):
+
+| Operation | Approximate cost |
+|-----------|------------------|
+| `await` of a coroutine that returns immediately | tens of nanoseconds |
+| Creating and running a Task (via `gather`) | about a microsecond |
+| Size of a coroutine object (`sys.getsizeof`) | ~200 bytes, plus its frame |
+
+Compared with a 1–30 s LLM call, async overhead is noise. What actually hurts agent latency is accidental serialization (awaiting in a loop when calls are independent), blocking calls on the loop, and unbounded fan-out hitting rate limits.
 
 ### 8.9 Common Nested Async Patterns
 
@@ -907,13 +865,19 @@ async def cancellable_deep():
 
 | Takeaway | Why It Matters |
 |----------|---------------|
-| **Await chains don't stack overflow** | Coroutines are heap objects, not C stack frames |
-| **Depth is practically unlimited** | Limited by memory, not stack size |
-| **Each await is a suspension point** | The event loop can interleave other work
-| **Cancellation propagates through nesting** | Cancelling the outer task cancels all inner awaits |
-| **Exception handling works naturally** | try/except around the outer await catches inner exceptions |
-| **Parallelism within nesting works** | `asyncio.gather()` inside a nested await creates sub-tasks |
-| **Overhead is negligible** | ~0.2μs per await, ~200 bytes per coroutine |
+| **A nested `await` is not a new task** | The chain runs inside one Task; only `create_task`, `gather` and `TaskGroup` create concurrency |
+| **Deep `await` recursion still hits the recursion limit** | Frames are resumed one inside another while running |
+| **Idle coroutines are cheap** | Suspended frames sit on the heap; thousands of waiting tasks are fine |
+| **Each `await` on an unfinished Future is a suspension point** | The event loop can interleave other work only there |
+| **Cancellation propagates down the chain** | Cancelling the Task raises `CancelledError` at the innermost `await` |
+| **Exceptions propagate up naturally** | try/except around the outer await catches inner exceptions |
+| **Overhead is negligible next to I/O** | Nanoseconds per await vs seconds per LLM call |
+
+### 8.11 What Interviewers Probe Next
+
+- **"How do you find what's blocking the loop?"** Enable debug mode (`PYTHONASYNCIODEBUG=1` or `asyncio.run(..., debug=True)`), which logs callbacks slower than `loop.slow_callback_duration` (100 ms by default). Python 3.14 adds `python -m asyncio ps <PID>` / `pstree <PID>` to inspect running tasks of a live process.
+- **"How do you shut down cleanly?"** On SIGTERM stop accepting work, cancel or drain in-flight tasks with a deadline, and make sure handlers re-raise `CancelledError`.
+- **"Why is my async service slow at 100 concurrent requests?"** Usually a sync client hiding in the path (`requests`, a sync DB driver, a CPU-heavy JSON parse), or a connection pool smaller than your concurrency.
 
 ---
 
@@ -922,12 +886,16 @@ async def cancellable_deep():
 ```python
 # ─── Key Functions ─────────────────────────────────
 
-asyncio.run(main())                           # Run async from sync
-await coroutine                                # Wait for result
-asyncio.create_task(coro)                      # Run in background
-asyncio.gather(*tasks, return_exceptions=True) # Parallel execution
-asyncio.wait_for(coro, timeout=10.0)          # With timeout
-asyncio.shield(coro)                           # Prevent cancellation
+asyncio.run(main())                           # Run async from sync (creates a new loop)
+await coroutine                                # Wait for result (same task)
+asyncio.create_task(coro)                      # Run concurrently (keep a reference!)
+async with asyncio.TaskGroup() as tg: ...      # Structured concurrency (3.11+)
+asyncio.gather(*tasks, return_exceptions=True) # Parallel execution, partial results
+async with asyncio.timeout(10): ...            # Deadline (3.11+)
+asyncio.wait_for(coro, timeout=10.0)          # Deadline (older style)
+asyncio.shield(coro)                           # Protect inner work from outer cancellation
+asyncio.to_thread(blocking_fn, *args)          # Offload blocking I/O (3.9+)
+asyncio.get_running_loop()                     # Inside coroutines (not get_event_loop())
 asyncio.sleep(0.1)                            # Non-blocking sleep
 
 # ─── Async Context Managers ───────────────────────

@@ -1,6 +1,9 @@
 # 🏗️ Agent Production Architecture — Deployment, Guardrails & Tradeoffs
 
-> **Target:** Principal Engineer | **Focus:** Production-grade agent deployment, enterprise security, monitoring
+> **Target:** Principal Engineer | **Focus:** Production-grade agent deployment, enterprise security, monitoring | **Reviewed:** October 2026
+
+!!! tip "30-second answer"
+    A production agent is a **stateless, horizontally scaled service** whose state (conversation, task progress, pending approvals) lives in a durable store, so any replica can resume any session and a deploy doesn't kill in-flight work. Around the loop you need: authentication and per-user authorization on every tool, hard budgets (steps, tokens, dollars, wall-clock), human approval as a *durable pause* rather than a blocked request, tracing of every model and tool call, and an eval suite gating every prompt/model/tool change. Agents are I/O-bound (most time is spent waiting on the model), so scale on concurrency, not CPU.
 
 ---
 
@@ -52,7 +55,7 @@
         │                                               │
         │  ┌──────────┐ ┌──────────┐ ┌─────────────┐  │
         │  │ MCP Serv.│ │ REST API │ │ RAG Pipeline│  │
-        │  │ (Stdio)  │ │ (HTTP)   │ │ (Internal)  │  │
+        │  │(HTTP/std)│ │ (HTTP)   │ │ (Internal)  │  │
         │  └──────────┘ └──────────┘ └─────────────┘  │
         └─────────────────────────────────────────────┘
                              │
@@ -91,9 +94,11 @@ spec:
       labels:
         app: agent-orchestrator
     spec:
+      # Long agent runs and SSE streams need time to drain on deploy/scale-in.
+      terminationGracePeriodSeconds: 300
       containers:
       - name: agent
-        image: myregistry/agent-orchestrator:latest
+        image: myregistry/agent-orchestrator:1.42.0   # pin a version or digest; never :latest
         ports:
         - containerPort: 8080
           name: http
@@ -140,6 +145,9 @@ spec:
     name: agent-orchestrator
   minReplicas: 3
   maxReplicas: 20
+  # Agents spend most of their time waiting on LLM APIs, so CPU stays low
+  # while the pod is saturated. Scale primarily on concurrent sessions
+  # (custom metric via Prometheus Adapter or KEDA); keep CPU as a backstop.
   metrics:
   - type: Resource
     resource:
@@ -160,9 +168,9 @@ spec:
 
 ```python
 # Session state management for fault tolerance
+import json
 import redis.asyncio as redis
-import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional
 
 @dataclass
@@ -185,19 +193,24 @@ class SessionManager:
     
     async def save(self, session: AgentSession):
         key = f"agent_session:{session.session_id}"
+        # JSON, not pickle: unpickling bytes from a shared store is remote
+        # code execution if the store is ever compromised, and pickle breaks
+        # across code versions during a rolling deploy.
         await self.redis.setex(
             key, 
-            3600,  # 1 hour TTL
-            pickle.dumps(session)
+            3600,  # 1 hour idle TTL, refreshed on every save
+            json.dumps(asdict(session))
         )
     
     async def load(self, session_id: str) -> Optional[AgentSession]:
         data = await self.redis.get(f"agent_session:{session_id}")
-        return pickle.loads(data) if data else None
+        return AgentSession(**json.loads(data)) if data else None
     
     async def delete(self, session_id: str):
         await self.redis.delete(f"agent_session:{session_id}")
 ```
+
+Redis with a TTL suits short-lived session state. For long-running or audited workflows, persist to a database (Postgres) after every step, which is what LangGraph's Postgres checkpointer or a durable-execution engine (Temporal, AWS Step Functions) gives you. Guard against two replicas processing the same session concurrently (a per-session lock or a single-consumer queue per session).
 
 ---
 
@@ -241,6 +254,9 @@ INPUT                     OUTPUT
 ### 2.2 Implementation
 
 ```python
+import re
+from collections import defaultdict
+
 class GuardrailViolation(Exception):
     """Raised when a guardrail is triggered."""
     def __init__(self, guardrail: str, message: str, severity: str = "warning"):
@@ -265,7 +281,11 @@ class InputGuard:
                 f"Input exceeds {self.MAX_INPUT_LENGTH} characters"
             )
         
-        # Prompt injection detection
+        # Prompt injection "detection": a regex deny-list only stops the
+        # laziest attempts (paraphrases, other languages and encodings pass).
+        # Use a classifier model as a signal, and rely on least privilege and
+        # approvals as the actual control. Also: injections mostly arrive via
+        # TOOL RESULTS (web pages, emails, files), not the user's message.
         for pattern in self.BLOCKED_PATTERNS:
             if re.search(pattern, user_input, re.IGNORECASE):
                 raise GuardrailViolation(
@@ -274,7 +294,7 @@ class InputGuard:
                     severity="critical"
                 )
         
-        # PII detection (simplified)
+        # PII detection (simplified; real systems use a PII service + Luhn check)
         if re.search(r"\b\d{16}\b", user_input):  # Credit card
             raise GuardrailViolation(
                 "pii_detected",
@@ -314,12 +334,15 @@ class OutputGuard:
 class ToolCallGuard:
     """Validates every tool call the agent makes."""
     
+    ROLE_LEVEL = {"user": 1, "editor": 2, "admin": 3}
+
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
-        self.token_bucket = TokenBucket(rate=50, burst=100)
+        # One bucket per (user, tool): a global bucket lets one user starve all.
+        self.buckets = defaultdict(lambda: TokenBucket(rate=5, burst=10))
     
     def validate(self, tool_name: str, params: dict, 
-                 user_role: str = "user") -> bool:
+                 user_id: str, user_role: str = "user") -> bool:
         tool = self.registry.get_tool(tool_name)
         if not tool:
             return False
@@ -330,12 +353,12 @@ class ToolCallGuard:
         except jsonschema.ValidationError:
             return False
         
-        # Role-based access
-        if user_role not in ["admin", "editor", "user"]:
+        # Role-based access: the USER's role must meet the tool's requirement
+        if self.ROLE_LEVEL.get(user_role, 0) < self.ROLE_LEVEL[tool.required_role]:
             return False
         
         # Rate limit
-        return self.token_bucket.consume(tool_name)
+        return self.buckets[(user_id, tool_name)].consume(1)
 ```
 
 ---
@@ -345,43 +368,38 @@ class ToolCallGuard:
 ### 3.1 Tracing Agent Decisions
 
 ```python
-# Full trace logging of every agent decision
+# Trace every model call and tool call using the OpenTelemetry GenAI
+# semantic conventions (still "Development" status; names may change).
 from opentelemetry import trace
-from opentelemetry.trace import SpanKind
+from opentelemetry.trace import SpanKind, Status, StatusCode
 import json
-import time
 
 tracer = trace.get_tracer("agent.orchestrator")
 
-class AgentTracer:
-    """Creates detailed traces of agent execution for debugging."""
-    
-    def trace_step(self, step: int, thought: str, action: str, 
-                   params: dict, result: str, duration_ms: float):
-        with tracer.start_as_current_span("agent_step") as span:
-            span.set_attribute("step", step)
-            span.set_attribute("thought", thought[:500])
-            span.set_attribute("action", action)
-            span.set_attribute("params", json.dumps(params)[:1000])
-            span.set_attribute("result_summary", result[:500])
-            span.set_attribute("duration_ms", duration_ms)
-            
-            # Record for audit
-            self._log_to_audit({
-                "timestamp": time.time(),
-                "step": step,
-                "thought": thought[:1000],
-                "action": action,
-                "params": params,
-                "result": result[:2000],
-                "duration_ms": duration_ms
-            })
-    
-    def _log_to_audit(self, entry: dict):
-        """Write to immutable audit log."""
-        with open(f"audit/{entry['timestamp']}.json", "a") as f:
-            f.write(json.dumps(entry) + "\n")
+async def traced_tool_call(tool_name: str, call_id: str, params: dict, fn):
+    # Span name convention: "{operation} {target}"; durations come from the span.
+    with tracer.start_as_current_span(f"execute_tool {tool_name}",
+                                      kind=SpanKind.INTERNAL) as span:
+        span.set_attribute("gen_ai.operation.name", "execute_tool")
+        span.set_attribute("gen_ai.tool.name", tool_name)
+        span.set_attribute("gen_ai.tool.call.id", call_id)
+        try:
+            result = await fn(**params)
+            return result
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR))
+            raise
+
+def record_llm_usage(span, request_model: str, response):
+    span.set_attribute("gen_ai.operation.name", "chat")
+    span.set_attribute("gen_ai.request.model", request_model)
+    span.set_attribute("gen_ai.response.model", response.model)
+    span.set_attribute("gen_ai.usage.input_tokens", response.usage.input_tokens)
+    span.set_attribute("gen_ai.usage.output_tokens", response.usage.output_tokens)
 ```
+
+Arguments, prompts and results can contain PII and secrets: capture content only when explicitly enabled, redact it, and keep it in a store with access control and retention. The **audit log** is a separate concern from traces: an append-only record (who, which tool, which args, which approval) in a write-once store (e.g. object storage with object lock, or an append-only table), not a local file on an ephemeral container. See [Agent Observability](07_AGENT_OBSERVABILITY.md) for the full model.
 
 ### 3.2 Prometheus Metrics
 
@@ -422,11 +440,8 @@ agent_tool_calls_total = Counter(
     ['tool_name', 'status']  # success, error, rate_limited, denied
 )
 
-agent_tool_error_rate = Gauge(
-    'agent_tool_error_rate',
-    'Error rate per tool',
-    ['tool_name']
-)
+# Don't export pre-computed ratios as Gauges; derive error rates in PromQL
+# from the counter above (rate(errors) / rate(all)), which aggregates correctly.
 
 # Safety metrics
 agent_guardrail_violations = Counter(
@@ -435,10 +450,6 @@ agent_guardrail_violations = Counter(
     ['guardrail', 'severity']
 )
 
-agent_escalation_rate = Gauge(
-    'agent_escalation_rate',
-    'Fraction of requests escalated to humans'
-)
 
 # Cost metrics
 agent_llm_cost_total = Counter(
@@ -449,9 +460,9 @@ agent_llm_cost_total = Counter(
 
 agent_tokens_per_request = Histogram(
     'agent_tokens_per_request',
-    'Tokens consumed per request',
-    ['type'],  # prompt, completion
-    buckets=[500, 1000, 2000, 4000, 8000, 16000]
+    'Tokens consumed per request (summed over every model call in the run)',
+    ['type'],  # input, cached_input, output (reasoning tokens bill as output)
+    buckets=[1_000, 4_000, 16_000, 64_000, 256_000, 1_000_000]  # agents resend history
 )
 
 # Active sessions
@@ -475,7 +486,10 @@ groups:
   - name: agent-alerts
     rules:
     - alert: HighFailureRate
-      expr: rate(agent_requests_total{status="failure"}[5m]) > 0.1
+      # A ratio, not a raw rate: rate(failures) alone is failures/second.
+      expr: |
+        sum(rate(agent_requests_total{status="failure"}[5m]))
+          / sum(rate(agent_requests_total[5m])) > 0.1
       for: 5m
       labels:
         severity: critical
@@ -483,7 +497,9 @@ groups:
         summary: "Agent failure rate > 10%"
     
     - alert: HighEscalationRate
-      expr: agent_escalation_rate > 0.3
+      expr: |
+        sum(rate(agent_requests_total{status="escalated"}[15m]))
+          / sum(rate(agent_requests_total[15m])) > 0.3
       for: 10m
       labels:
         severity: warning
@@ -491,7 +507,9 @@ groups:
         summary: "Agent escalation rate > 30% — may need tuning"
     
     - alert: ToolErrorSpike
-      expr: rate(agent_tool_calls_total{status="error"}[5m]) > 10
+      expr: |
+        sum by (tool_name) (rate(agent_tool_calls_total{status="error"}[5m]))
+          / sum by (tool_name) (rate(agent_tool_calls_total[5m])) > 0.2
       for: 5m
       labels:
         severity: critical
@@ -499,7 +517,7 @@ groups:
         summary: "Tool error rate spike for {{ $labels.tool_name }}"
     
     - alert: HighLatency
-      expr: histogram_quantile(0.95, agent_request_duration_seconds) > 30
+      expr: histogram_quantile(0.95, sum by (le) (rate(agent_request_duration_seconds_bucket[5m]))) > 30
       for: 5m
       labels:
         severity: warning
@@ -515,7 +533,7 @@ groups:
         summary: "Critical guardrail violations detected"
     
     - alert: CostAnomaly
-      expr: rate(agent_llm_cost_total[1h]) > 50
+      expr: sum(increase(agent_llm_cost_total[1h])) > 50   # rate() would be $/second
       labels:
         severity: warning
       annotations:
@@ -596,6 +614,15 @@ class HumanInTheLoop:
         return False  # Reject on timeout
 ```
 
+This version is fine for a demo but wrong for production: it holds a request (and a worker) open for up to 5 minutes, keeps pending approvals in process memory (lost on restart, invisible to other replicas) and polls. Real approvals take hours. The production shape is a **durable pause**:
+
+1. Persist the run state and the proposed action, mark the run `awaiting_approval`, return to the caller.
+2. Notify the reviewer with the exact action, arguments and a diff of what will change.
+3. The approve/reject callback (verified, authorized, idempotent) resumes the run from the checkpoint on any replica.
+4. Re-validate before executing: the world may have changed while waiting.
+
+LangGraph's `interrupt()` + `Command(resume=...)` with a persistent checkpointer, the OpenAI Agents SDK's tool approval flow, or a workflow engine (Temporal signals, Step Functions task tokens) implement this pattern.
+
 ### 4.2 Escalation Rules
 
 ```python
@@ -608,7 +635,9 @@ ESCALATION_RULES = {
         "send_email": "if_recipients > 100",
     },
     
-    # Confidence-based: escalate when agent confidence is low
+    # Confidence-based: escalate when a CHECKABLE signal is weak (retrieval
+    # score, groundedness check, classifier probability). Self-reported LLM
+    # confidence is poorly calibrated; calibrate any score on labelled data.
     "confidence_based": {
         "threshold": 0.7,
         "action": "escalate_if_below"
@@ -773,16 +802,17 @@ class CostManager:
     def track_llm_call(self, model: str, prompt_tokens: int, 
                         completion_tokens: int):
         """Track LLM API costs."""
-        # Example rates (replace with actual API pricing)
-        RATES = {
-            "gpt-4": {"prompt": 0.03/1000, "completion": 0.06/1000},
-            "gpt-4o-mini": {"prompt": 0.00015/1000, "completion": 0.0006/1000},
-            "claude-3-sonnet": {"prompt": 0.003/1000, "completion": 0.015/1000},
-        }
-        
-        rate = RATES.get(model, RATES["gpt-4o-mini"])
-        cost = (prompt_tokens * rate["prompt"] + 
-                completion_tokens * rate["completion"])
+        # Prices change often: load them from config (USD per 1M tokens),
+        # keyed by the exact model id, and check the provider's pricing page.
+        rate = PRICE_TABLE.get(model)
+        if rate is None:
+            # Fail loudly: silently defaulting to a cheap model's price hides spend.
+            raise KeyError(f"No price configured for model {model!r}")
+        cost = (prompt_tokens * rate["input"] +
+                completion_tokens * rate["output"]) / 1_000_000
+        # Real bills also distinguish cached-input reads (much cheaper), cache
+        # writes (more expensive than plain input on Anthropic), and reasoning
+        # tokens (billed as output). Use the usage fields the API returns.
         
         self.current_cost += cost
         
@@ -798,6 +828,18 @@ class CostManager:
 
 ---
 
+### 6.2 Cost levers, in the order to pull them
+
+1. **Prompt caching** of the stable prefix (system prompt + tool definitions + long documents). Agent loops resend the same prefix every turn, so this is usually the biggest, lowest-risk saving. Keep the prefix byte-stable (no timestamps, deterministic tool order).
+2. **Trim what goes back into context:** truncate or summarize large tool results, clear old ones, compact long histories.
+3. **Fewer steps:** better tool design and descriptions cut wasted calls more than any model change.
+4. **Right-size the model per step:** a smaller model for routing, extraction and sub-agents; reasoning effort turned down for easy steps.
+5. **Batch APIs** (typically about half price) for offline, non-interactive work.
+
+Measure **cost per successfully completed task**, not per request: a cheaper model that needs twice the turns or fails more often is not cheaper.
+
+---
+
 ## 7. TRADEOFF ANALYSIS
 
 ### 7.1 Agent Patterns Decision Matrix
@@ -809,18 +851,25 @@ class CostManager:
 | **Debug-ability** | Medium | High | Medium | High |
 | **Latency** | Low | Medium | High | High |
 | **Cost** | Low | Medium | High | High |
-| **Quality** | Medium | Medium | High | Very High |
+| **Quality** | Medium | Medium | High | High when the critic has real signal (tests, sources) |
 | **When to use** | Quick answers, dynamic | Complex workflows | Multi-skill tasks | Quality-critical output |
 
 ### 7.2 Framework Decision
 
 | Framework | Best For | Tradeoff |
 |-----------|----------|----------|
-| **LangGraph** | Production, regulated | Steep learning curve, graph complexity |
-| **Custom (DIY)** | Full control, simple needs | Rebuilding infrastructure |
-| **MCP + simple loop** | MCP-native environments | Limited to MCP tools |
-| **CrewAI** | Quick prototyping | Production readiness limits |
+| **LangGraph** | Durable, resumable workflows with human-in-the-loop | Learning curve, graph complexity, framework churn |
+| **OpenAI Agents SDK / Claude Agent SDK** | Fast path on one provider's strengths (handoffs, built-in tools, tracing) | Ties you to that provider's abstractions |
+| **Custom (DIY) loop + MCP for tools** | Full control, simple needs, provider-agnostic | You build persistence, approvals and tracing yourself |
+| **CrewAI** | Quick prototyping | Less control over the loop and state |
+
+### 7.3 What interviewers probe next
+
+- **"A deploy happens mid-run. What breaks?"** Nothing, if state is checkpointed per step and pods drain gracefully; otherwise the run is lost or, worse, a side effect is repeated on retry (idempotency keys).
+- **"How do you stop one user's runaway agent from eating your provider rate limit?"** Per-user token and spend budgets, per-tenant queues, and provider-level rate-limit headroom with backoff.
+- **"How do you roll out a new model or prompt?"** Offline eval suite first, then shadow or canary traffic with per-variant quality, latency and cost metrics, with fast rollback (the prompt and model id are config, versioned).
+- **"Where is the security boundary?"** Not the system prompt. It's credentials, authorization, sandboxing and approvals.
 
 ---
 
-> **End of Agents Module** — Covers architecture, interview questions, implementation, and production deployment.
+> **Next:** [LangGraph Notes](05_LANGGRAPH_NOTES.md) → graph-based agents, checkpointers and human-in-the-loop

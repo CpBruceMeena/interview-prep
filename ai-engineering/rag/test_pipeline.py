@@ -3,10 +3,17 @@ End-to-end verification of the RAG pipeline.
 Indexes sample documents, runs queries, and validates retrieval quality.
 """
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import time
-import json
+
+# This is a script (`python test_pipeline.py`), not a pytest module: its
+# test_* functions take a pipeline argument, which pytest would treat as a
+# missing fixture.
+__test__ = False
 
 # Add implementation to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "implementation"))
@@ -195,6 +202,7 @@ def test_document_count(pipeline: RAGPipeline):
     if hasattr(store, '_collection'):
         print(f"   Collection: {store._collection.name}")
         print(f"   Collection metadata: {store._collection.metadata}")
+        print(f"   HNSW config: {store._collection.configuration.get('hnsw')}")
     print(f"✅ PASSED: {count} chunks available")
     return True
 
@@ -237,15 +245,20 @@ def main():
     print(f"   Chunk size: {settings.chunk_size}, Overlap: {settings.chunk_overlap}")
     print(f"   Top-K: {settings.top_k}, Threshold: {settings.similarity_threshold}")
     print(f"   Vector store: {settings.vector_store}")
-    print(f"   Documents directory: ai-engineering/rag/data/documents")
-    print(f"   Persist directory: {settings.persist_directory}")
+    docs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    # Use a throwaway Chroma directory so the test neither depends on nor
+    # mutates the committed data/vector_store, and re-runs start clean.
+    persist_dir = tempfile.mkdtemp(prefix="rag-test-chroma-")
+    atexit.register(shutil.rmtree, persist_dir, ignore_errors=True)
+    print(f"   Documents directory: {docs_dir}")
+    print(f"   Persist directory (temp): {persist_dir}")
 
     # Initialize pipeline with MockLLM (no LM Studio needed)
     print(f"\n🚀 Initializing RAG pipeline...")
     print(f"   Using MockLLMService (no real LLM connection needed)")
     pipeline = RAGPipeline(
         embedder=SentenceTransformerEmbedding(),
-        store=ChromaVectorStore(),
+        store=ChromaVectorStore(persist_directory=persist_dir),
         llm=MockLLMService(),
         loader=TextFileLoader(),
     )
@@ -253,7 +266,6 @@ def main():
 
     # Run tests
     results = []
-    docs_dir = os.path.join(os.path.dirname(__file__), "data", "documents")
 
     results.append(("Indexing", test_indexing(pipeline, docs_dir)))
     results.append(("Retrieval Quality", test_retrieval(pipeline)))
@@ -277,7 +289,8 @@ def main():
     else:
         print("  ⚠️  Some tests had issues — review details above")
     print(f"{'='*70}\n")
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

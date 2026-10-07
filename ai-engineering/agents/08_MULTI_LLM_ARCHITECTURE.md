@@ -1,6 +1,18 @@
 # 🌐 Multi-LLM Architecture — Routing, Cost Management & Fallback
 
-> **Target:** Principal Engineer | **Focus:** Production architecture for orchestrating multiple LLM providers
+> **Target:** Principal Engineer | **Focus:** Production architecture for orchestrating multiple LLM providers | **Reviewed:** October 2026
+
+!!! tip "30-second answer"
+    Put a thin **model gateway** between your app and providers. Callers ask for a *capability tier* ("small", "mid", "frontier", "code"), never a hard-coded model id; config maps tiers to concrete models per provider. The gateway routes (rules first, a cheap classifier for ambiguous cases), enforces per-tenant budgets, retries transient errors, fails over across providers behind circuit breakers, and records tokens, cost and latency per call. Every routing or fallback target must have passed the same eval suite, because a fallback that answers badly is worse than a clear error.
+
+**Model names below are tier aliases on purpose.** Model ids, prices and context windows change every few months; keep them in config and check each provider's models and pricing pages. As of October 2026, examples per tier:
+
+| Tier alias | Use for | Examples (illustrative, check current lineups) |
+|------------|---------|-----------------------------------------------|
+| `small` | Classification, routing, extraction, simple Q&A | Claude Haiku 4.5, GPT-6 Luna, small open-weight models |
+| `mid` | Most agent and RAG work | Claude Sonnet 5.5, GPT-6.1 Sol |
+| `frontier` | Hard reasoning, long-horizon agents, research | Claude Opus 5.5, GPT-6 Astra |
+| `open` | Self-hosted / data-residency / cost floor | Open-weight families (DeepSeek, Qwen, Llama, Mistral) |
 
 ---
 
@@ -27,8 +39,8 @@ No single LLM is optimal for every task. A Multi-LLM architecture allows:
               ┌────────────┘      │      │      └────────────┐
               ▼                   ▼      ▼                   ▼
         ┌──────────┐      ┌──────────┐      ┌──────────┐
-        │  GPT-4o  │      │ Claude 4 │      │DeepSeek  │
-        │(Complex) │      │(Reasoning)│     │(Coding)  │
+        │Provider A│      │Provider B│      │Self-hosted│
+        │(frontier)│      │  (mid)   │      │  (open)   │
         └──────────┘      └──────────┘      └──────────┘
 ```
 
@@ -46,8 +58,8 @@ import re
 @dataclass
 class RouteDecision:
     """Decision result from the router."""
-    model: str
-    temperature: float = 0.3
+    model: str                      # a tier alias, resolved to a concrete id by config
+    temperature: Optional[float] = None   # many reasoning models reject sampling params
     complexity: str = "simple"
     requires_tools: bool = False
     reason: str = ""
@@ -65,35 +77,32 @@ class RuleBasedRouter:
         {
             "name": "code_generation",
             "pattern": r"(write|generate|create|implement).*(code|function|class|api)",
-            "model": "deepseek-coder-v3",
+            "model": "code",
             "priority": 1
         },
         {
             "name": "complex_reasoning",
             "pattern": r"(analyze|compare|evaluate|why|how|explain).*(complex|trade-off|impact)",
-            "model": "claude-4-sonnet",
-            "temperature": 0.2,
+            "model": "mid",
             "priority": 2
         },
         {
             "name": "simple_qa",
             "pattern": r"^(what|when|where|who|define|tell me about)\b",
-            "model": "gpt-4o-mini",
-            "temperature": 0.0,
+            "model": "small",
             "priority": 3
         },
         {
             "name": "creative_writing",
             "pattern": r"(write|draft|compose).*(story|email|blog|article|content)",
-            "model": "gpt-4o",
+            "model": "mid",
             "temperature": 0.8,
             "priority": 2
         },
         {
             "name": "data_analysis",
             "pattern": r"(analyze|chart|graph|plot|report|dashboard)",
-            "model": "claude-4-opus",
-            "temperature": 0.1,
+            "model": "frontier",
             "priority": 1
         }
     ]
@@ -104,19 +113,22 @@ class RuleBasedRouter:
             if re.search(rule["pattern"], query, re.IGNORECASE):
                 return RouteDecision(
                     model=rule["model"],
-                    temperature=rule.get("temperature", 0.3),
+                    temperature=rule.get("temperature"),
                     reason=f"Matched rule: {rule['name']}",
-                    cost_estimate=self._estimate_cost(rule["model"])
+                    cost_estimate=self._estimate_cost(rule["model"]),
+                    confidence=0.9,
                 )
         
-        # Default
+        # Default: low confidence, so a hybrid router escalates to the LLM router
         return RouteDecision(
-            model="gpt-4o-mini",
-            temperature=0.3,
+            model="small",
             reason="No rule matched — using default",
-            cost_estimate=0.002
+            cost_estimate=self._estimate_cost("small"),
+            confidence=0.0,
         )
 ```
+
+Regex routing is brittle (note `"data_analysis"` and `"complex_reasoning"` both match "analyze"). Treat it as a fast path for unambiguous traffic, and measure routing accuracy on labelled queries like any other classifier.
 
 ### 2.2 LLM-as-Router (Intelligent Routing)
 
@@ -127,27 +139,27 @@ class LLMRouter:
     More flexible than rule-based, but adds latency and cost.
     """
     
-    ROUTING_PROMPT = """Analyze this user query and respond with JSON:
+    ROUTING_PROMPT = """Classify this user query. Respond with JSON:
 {
     "complexity": "simple|medium|complex",
     "type": "code|reasoning|creative|analysis|factual|general",
     "requires_tools": true|false,
-    "suggested_model": "model_name",
+    "suggested_tier": "small|mid|frontier|code",
     "reasoning": "brief explanation"
 }
 
-Model options:
-- gpt-4o-mini: Simple Q&A, factual lookups, greetings. Cost: $0.15/M tokens
-- gpt-4o: General purpose, creativity, analysis. Cost: $2.50/M tokens
-- claude-4-sonnet: Complex reasoning, long context, safety. Cost: $3.00/M tokens
-- deepseek-coder-v3: Code generation, debugging. Cost: $0.90/M tokens
-- claude-4-opus: Research, deep analysis, math. Cost: $15.00/M tokens
+Tiers:
+- small: simple Q&A, factual lookups, greetings, classification
+- mid: general purpose, analysis, most tool use
+- frontier: multi-step reasoning, research, hard math, long-horizon tasks
+- code: code generation and debugging
 
 Query: {query}
 """
     
-    def __init__(self, classifier_model: str = "gpt-4o-mini"):
-        self.classifier_llm = ChatOpenAI(model=classifier_model, temperature=0)
+    def __init__(self, classifier_model: str = "small"):
+        # Use structured outputs / a JSON schema so the reply always parses.
+        self.classifier_llm = get_chat_model(classifier_model)
     
     async def route(self, query: str) -> RouteDecision:
         """Use LLM to classify and route the query."""
@@ -161,14 +173,16 @@ Query: {query}
             return self._fallback_route(query)
         
         return RouteDecision(
-            model=self._map_to_available_model(classification["suggested_model"]),
+            model=self._map_to_available_model(classification["suggested_tier"]),
             temperature=self._get_temperature(classification["type"]),
             complexity=classification["complexity"],
             requires_tools=classification["requires_tools"],
             reason=classification.get("reasoning", "LLM classified"),
-            cost_estimate=self._estimate_cost(classification["suggested_model"])
+            cost_estimate=self._estimate_cost(classification["suggested_tier"])
         )
 ```
+
+Routing pays off only when the router costs much less than it saves. A small-model classification call adds a few hundred milliseconds and a little cost to *every* request; it is worth it when a large share of traffic can safely go to a much cheaper tier. Alternatives: a fine-tuned small classifier or an embedding-similarity router (no generation at all), or a **cascade** (try the cheap model, escalate when a verifier rejects the answer).
 
 ### 2.3 Hybrid Routing (Recommended)
 
@@ -230,17 +244,12 @@ class LLMCallRecord:
 class CostTracker:
     """Real-time cost tracking and budgeting."""
     
-    # Current API pricing (per 1M tokens)
-    PRICING = {
-        "gpt-4o": {"input": 2.50, "output": 10.00},
-        "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-        "claude-4-sonnet": {"input": 3.00, "output": 15.00},
-        "claude-4-opus": {"input": 15.00, "output": 75.00},
-        "deepseek-coder-v3": {"input": 0.90, "output": 3.60},
-        "deepseek-v4-flash": {"input": 0.40, "output": 1.60},
-    }
-    
-    def __init__(self, monthly_budget: float = 10000.0):
+    def __init__(self, pricing: dict, monthly_budget: float = 10000.0):
+        # pricing: {concrete_model_id: {"input": usd_per_1M, "output": usd_per_1M,
+        #           "cached_input": ..., "cache_write": ...}}
+        # Load from config and keep it in sync with provider pricing pages;
+        # prices change too often to hard-code.
+        self.pricing = pricing
         self.monthly_budget = monthly_budget
         self.current_month_cost = 0.0
         self.records: List[LLMCallRecord] = []
@@ -248,7 +257,7 @@ class CostTracker:
     
     def calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         """Calculate cost for a model call."""
-        pricing = self.PRICING.get(model, self.PRICING["gpt-4o-mini"])
+        pricing = self.pricing[model]   # KeyError on unknown models: never guess cheap
         return (
             (input_tokens / 1_000_000) * pricing["input"] +
             (output_tokens / 1_000_000) * pricing["output"]
@@ -256,6 +265,9 @@ class CostTracker:
     
     async def track_call(self, record: LLMCallRecord):
         """Track an LLM call and check budget."""
+        # In-process state is per replica. With N replicas, keep the running
+        # total in a shared store (e.g. Redis INCRBYFLOAT per tenant per month)
+        # and reconcile against the provider's usage/billing API daily.
         async with self._lock:
             self.current_month_cost += record.cost
             self.records.append(record)
@@ -308,7 +320,7 @@ class CostTracker:
                     "type": "model_downgrade",
                     "route": route,
                     "savings_estimate": data["cost"] * 0.8,
-                    "suggestion": f"Route '{route}' uses expensive model. Switch to gpt-4o-mini."
+                    "suggestion": f"Route '{route}' uses an expensive tier. Evaluate the 'small' tier on it."
                 })
         
         # Check for cache opportunities
@@ -334,22 +346,26 @@ class BudgetAllocator:
     def __init__(self, monthly_budget: float = 10000.0):
         self.monthly_budget = monthly_budget
         self.allocations = {
-            "complex_reasoning": {"percentage": 0.30, "model": "claude-4-sonnet"},
-            "code_generation": {"percentage": 0.25, "model": "deepseek-coder-v3"},
-            "analysis": {"percentage": 0.20, "model": "gpt-4o"},
-            "simple_qa": {"percentage": 0.10, "model": "gpt-4o-mini"},
-            "creative": {"percentage": 0.10, "model": "gpt-4o"},
-            "research": {"percentage": 0.05, "model": "claude-4-opus"},
+            "complex_reasoning": {"percentage": 0.30, "model": "mid"},
+            "code_generation": {"percentage": 0.25, "model": "code"},
+            "analysis": {"percentage": 0.20, "model": "mid"},
+            "simple_qa": {"percentage": 0.10, "model": "small"},
+            "creative": {"percentage": 0.10, "model": "mid"},
+            "research": {"percentage": 0.05, "model": "frontier"},
         }
+        self.spent = defaultdict(float)     # per query type, this month
     
     def can_afford(self, query_type: str, estimated_cost: float) -> bool:
-        """Check if a query can be processed within budget."""
+        """Check if a query fits in what's LEFT of its allocation."""
         allocation = self.allocations.get(query_type)
         if not allocation:
             return False
         
         monthly_allocation = self.monthly_budget * allocation["percentage"]
-        return estimated_cost <= monthly_allocation
+        return self.spent[query_type] + estimated_cost <= monthly_allocation
+
+    def record(self, query_type: str, actual_cost: float):
+        self.spent[query_type] += actual_cost
 ```
 
 ---
@@ -388,8 +404,11 @@ Respond with JSON:
 }
 """
     
-    def __init__(self, judge_model: str = "gpt-4o"):
-        self.judge = ChatOpenAI(model=judge_model, temperature=0)
+    def __init__(self, judge_model: str = "mid"):
+        # Prefer a judge from a different model family than the one being
+        # judged (models tend to favour their own outputs), and validate the
+        # judge's scores against human labels before trusting thresholds.
+        self.judge = get_chat_model(judge_model)
         self.thresholds = {
             "pass": 0.8,
             "review": 0.6,
@@ -436,11 +455,8 @@ class CrossModelValidator:
     Only for high-stakes queries (financial, medical, legal).
     """
     
-    VALIDATION_MODELS = [
-        "gpt-4o",
-        "claude-4-sonnet",
-        "deepseek-coder-v3"
-    ]
+    # Different providers/families: models from one family share failure modes.
+    VALIDATION_MODELS = ["provider_a:mid", "provider_b:mid", "open:large"]
     
     async def validate(self, query: str, primary_response: str) -> ValidationResult:
         """Run the same query through multiple models and compare."""
@@ -490,6 +506,8 @@ class CrossModelValidator:
         }
 ```
 
+Caveat: embedding similarity measures topic overlap, so "the dose is 5 mg" and "the dose is 50 mg" look like agreement. For high-stakes checks, extract the key claims or values and compare them directly, or ask a judge model whether the answers *agree on the facts*. And agreement is not correctness: several models can share the same wrong belief.
+
 ---
 
 ## 5. FALLBACK MECHANISMS
@@ -503,12 +521,13 @@ class FallbackChain:
     Tries progressively cheaper fallback models.
     """
     
+    # Each chain starts with the primary. Prefer "same tier, other provider"
+    # before "lower tier, same provider": an outage is usually per provider.
     FALLBACK_CHAINS = {
-        "claude-4-opus": ["claude-4-sonnet", "gpt-4o", "gpt-4o-mini"],
-        "claude-4-sonnet": ["gpt-4o", "gpt-4o-mini", "deepseek-coder-v3"],
-        "gpt-4o": ["gpt-4o-mini", "claude-4-sonnet"],
-        "deepseek-coder-v3": ["gpt-4o", "gpt-4o-mini"],
-        "gpt-4o-mini": ["deepseek-v4-flash"],  # Last resort
+        "frontier": ["provider_a:frontier", "provider_b:frontier", "provider_a:mid"],
+        "mid":      ["provider_a:mid", "provider_b:mid", "provider_a:small"],
+        "small":    ["provider_a:small", "provider_b:small", "open:small"],
+        "code":     ["provider_a:mid", "provider_b:mid"],
     }
     
     def __init__(self):
@@ -519,10 +538,7 @@ class FallbackChain:
         self, route_decision: RouteDecision, query: str
     ) -> FallbackResult:
         """Execute with automatic fallback on failure."""
-        chain = self.FALLBACK_CHAINS.get(
-            route_decision.model, 
-            [route_decision.model, "gpt-4o-mini"]
-        )
+        chain = self.FALLBACK_CHAINS[route_decision.model]
         
         errors = []
         for model in chain:
@@ -548,10 +564,14 @@ class FallbackChain:
                     success=True
                 )
             
-            except Exception as e:
+            except (TimeoutError, RateLimitError, ServerError, ConnectionError) as e:
+                # Only availability failures should fall through the chain.
                 errors.append(f"{model}: {str(e)}")
                 self._record_failure(model)
                 continue
+            # A 400 (bad request, context too long, policy refusal) will fail
+            # the same way on the next model, or worse, succeed with different
+            # semantics: let it propagate instead of burning the whole chain.
         
         # All models failed
         return FallbackResult(
@@ -640,6 +660,16 @@ async def handle_with_degradation(
 
 ---
 
+### 5.3 What Makes Cross-Provider Fallback Hard
+
+- **Different APIs and features:** message formats, tool-call shapes, structured-output support, prompt caching and system-prompt handling differ. Hide them behind one internal interface (a gateway such as LiteLLM, Portkey or a cloud AI gateway, or your own adapter layer).
+- **Prompts are tuned per model.** A prompt optimized for one model can underperform on another; keep per-model prompt variants and evaluate each fallback path.
+- **Caches don't transfer.** Prompt caches are per provider and per model, so a failover starts cold (slower and pricier for a while).
+- **Data and compliance:** the fallback provider must be approved for the same data (region, retention, zero-data-retention terms).
+- **Thundering herd:** when a primary fails over, the secondary receives all its traffic at once; make sure you have the rate-limit headroom there.
+
+---
+
 ## 6. PRODUCTION ARCHITECTURE
 
 ```python
@@ -663,9 +693,12 @@ class MultiLLMOrchestrator:
         # Step 1: Route the query
         route = await self.router.route(query)
         
+        context = context or {}
+        accuracy = None
+
         # Step 2: Check budget
         if not await self._check_budget(route):
-            route.model = "gpt-4o-mini"  # Downgrade to cheapest
+            route.model = "small"  # Downgrade (or reject: decide per product)
         
         # Step 3: Execute with fallback
         result = await self.fallback.execute_with_fallback(route, query)
@@ -682,8 +715,7 @@ class MultiLLMOrchestrator:
             if accuracy.verdict == "fail":
                 # Automatic retry with better model
                 retry_route = RouteDecision(
-                    model="claude-4-sonnet",
-                    temperature=0.1,
+                    model="frontier",
                     complexity="complex"
                 )
                 retry_result = await self.fallback.execute_with_fallback(
@@ -692,27 +724,28 @@ class MultiLLMOrchestrator:
                 if retry_result.success:
                     result = retry_result
         
-        # Step 5: Track cost
+        # Step 5: Track cost (of EVERY call made, including the judge and any
+        # retry, not just the final one)
+        cost = self.cost_tracker.calculate_cost(
+            result.model_used, result.prompt_tokens or 0, result.completion_tokens or 0
+        )
         await self.cost_tracker.track_call(LLMCallRecord(
             model=result.model_used,
             prompt_tokens=result.prompt_tokens or 0,
             completion_tokens=result.completion_tokens or 0,
-            cost=self.cost_tracker.calculate_cost(
-                result.model_used,
-                result.prompt_tokens or 0,
-                result.completion_tokens or 0
-            ),
+            cost=cost,
             latency_ms=result.latency_ms,
-            timestamp=datetime.utcnow(),
-            route_reason=route.reason
+            timestamp=datetime.now(UTC),
+            route_reason=route.reason,
+            success=True,
         ))
         
         return {
             "response": result.response,
             "model_used": result.model_used,
-            "cost": result.cost,
+            "cost": cost,
             "latency_ms": result.latency_ms,
-            "accuracy_score": accuracy.overall_score if context.get("check_accuracy") else None
+            "accuracy_score": accuracy.overall_score if accuracy else None,
         }
 ```
 
@@ -720,14 +753,22 @@ class MultiLLMOrchestrator:
 
 ## 7. COMPARISON MATRIX
 
-| Model | Best For | Cost (Input/M) | Cost (Output/M) | Latency | Context Window |
-|-------|----------|----------------|-----------------|---------|---------------|
-| **GPT-4o** | General, creative | $2.50 | $10.00 | Medium | 128K |
-| **GPT-4o-mini** | Simple Q&A, cheap | $0.15 | $0.60 | Fast | 128K |
-| **Claude 4 Sonnet** | Reasoning, analysis | $3.00 | $15.00 | Medium | 200K |
-| **Claude 4 Opus** | Research, complex | $15.00 | $75.00 | Slow | 200K |
-| **DeepSeek Coder V3** | Code generation | $0.90 | $3.60 | Fast | 128K |
-| **DeepSeek V4 Flash** | Fast inference | $0.40 | $1.60 | Very Fast | 64K |
+Compare tiers by their *relative* properties; look up exact prices and limits on the providers' pages when you need them.
+
+| Tier | Relative cost per token | Latency | Typical context window (Oct 2026) | Watch out for |
+|------|------------------------|---------|-----------------------------------|---------------|
+| `small` | 1x (baseline) | Fastest | ~200K+ | Weaker multi-step reasoning and tool selection |
+| `mid` | Several times `small` | Medium | Up to ~1M on current Claude/GPT models | Default for agents; check effort/reasoning settings |
+| `frontier` | Several times `mid` | Slowest, long reasoning turns | Up to ~1M | Cost explodes in agent loops; use for planning, not every step |
+| `open` (self-hosted) | GPU cost, not per token | Depends on your hardware | Model-dependent | You own scaling, safety filters and upgrades |
+
+Levers that often matter more than the per-token list price: **prompt caching** (cached input is typically billed at a fraction of normal input), **batch APIs** (roughly half price for async work), **reasoning effort** settings, and the number of agent turns a model needs to finish the task. Compare models on **cost per successfully completed task** from your own evals.
+
+### 7.1 What Interviewers Probe Next
+
+- **"How do you know the cheap route isn't hurting quality?"** Shadow-score a sample of cheap-route answers with a stronger judge, and track per-route task success and escalation rates.
+- **"Provider A is down. Walk me through the next 60 seconds."** Breakers open after N availability failures, traffic shifts to the same tier on provider B, alerts fire, caches are cold so cost and latency rise, and half-open probes restore A gradually.
+- **"How do you upgrade a model?"** Pin exact model ids (not floating aliases) in config, run the eval suite on the candidate, canary a slice of traffic with per-version metrics, then switch. Re-tune prompts: new models often need less prescriptive prompting.
 
 ---
 

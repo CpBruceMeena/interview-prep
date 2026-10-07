@@ -1,6 +1,9 @@
 # 🛠️ Agent Implementation Guide — Building Production Agents
 
-> **Target:** Staff Engineer | **Focus:** Runnable code, design patterns, MCP integration
+> **Target:** Staff Engineer | **Focus:** Runnable code, design patterns, MCP integration | **Reviewed:** October 2026
+
+!!! tip "30-second answer: how do you implement an agent?"
+    A `while` loop around the provider's **native tool-calling API**: send messages + tool schemas, execute any tool calls the model returns (validated, authorized, with timeouts), append the results with the matching call ids, repeat until the model answers without a tool call or a budget runs out. Everything else (registries, memory, orchestration, MCP) is structure around that loop. Section 2.1 shows the classic text-parsing ReAct loop because it is model-agnostic and easy to read; section 2.2 shows what production code does instead.
 
 ---
 
@@ -14,15 +17,14 @@ agents/
 ├── 04_AGENT_PRODUCTION_ARCHITECTURE.md
 ├── implementation/
 │   ├── __init__.py
-│   ├── simple_react_agent.py              # Basic ReAct agent
-│   ├── agent_with_tools.py                # Tool-registry agent
+│   ├── simple_react_agent.py              # Basic ReAct agent (uses common/tool_registry.py)
 │   ├── orchestrated_agent.py              # Orchestrator-Worker
 │   ├── agent_with_mcp.py                  # Agent using MCP servers
 │   ├── common/
 │   │   ├── __init__.py
 │   │   ├── tool_registry.py               # Tool registration & validation
 │   │   ├── memory.py                      # Short-term + working memory
-│   │   ├── llm_client.py                  # LLM abstraction (OpenAI, LM Studio)
+│   │   ├── llm_client.py                  # LLM abstraction (Mock, OpenAI Responses, local OpenAI-compatible)
 │   │   └── guardrails.py                  # Input/output guardrails
 │   └── requirements.txt
 └── tests/
@@ -38,7 +40,7 @@ agents/
 ### 2.1 Basic ReAct Loop
 
 ```python
-# implementation/simple_react_agent.py
+# Simplified, self-contained version of implementation/simple_react_agent.py
 """
 A minimal ReAct (Reasoning + Acting) agent.
 Demonstrates the core loop: Thought → Action → Observation → Repeat.
@@ -184,9 +186,8 @@ Be concise. Use tools when you need external information."""
 # ── Usage Example ──
 
 def mock_llm(prompt: str) -> str:
-    """Mock LLM for demonstration (replace with real LLM API)."""
-    # In production, call: openai.chat.completions.create(...) or similar
-    if "search_web" in prompt:
+    """Mock LLM for demonstration (replace with a real model call, see 2.2)."""
+    if "Observation:" not in prompt:       # first turn: no tool result yet
         return """Thought: I need to search for information about this topic.
 Action: search_web
 ActionInput: {"query": "latest AI developments 2026"}"""
@@ -220,6 +221,102 @@ if __name__ == "__main__":
     main()
 ```
 
+**Why production code doesn't parse text like this:** the model can emit malformed JSON, put two actions in one reply, or write `Action:` inside an answer, and an observation that contains `Answer:` can end the loop early. Native tool calling returns structured calls, supports several calls per turn, and lets strict schemas guarantee valid arguments.
+
+### 2.2 Native tool calling (what production agents use)
+
+The same loop against the Anthropic Messages API. Model ids change; read them from config.
+
+```python
+import os
+import anthropic
+
+client = anthropic.Anthropic()                     # reads ANTHROPIC_API_KEY
+MODEL = os.environ["AGENT_MODEL"]                  # e.g. a current Claude Sonnet/Opus id
+MAX_STEPS = 20
+
+TOOLS = [{
+    "name": "get_order",
+    "description": "Look up an order by id. Use when the user asks about an order's status.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"order_id": {"type": "string"}},
+        "required": ["order_id"],
+        "additionalProperties": False,
+    },
+    "strict": True,                                # arguments guaranteed to match the schema
+}]
+
+def run(user_msg: str, dispatch) -> str:
+    messages = [{"role": "user", "content": user_msg}]
+    for _ in range(MAX_STEPS):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=16000,
+            system="You are an order-support agent. Use tools; never guess order data.",
+            tools=TOOLS, messages=messages,
+        )
+        # Append the FULL content (text, thinking and tool_use blocks), not just text:
+        # thinking blocks must be passed back unchanged in a tool loop.
+        messages.append({"role": "assistant", "content": resp.content})
+
+        if resp.stop_reason != "tool_use":         # end_turn, max_tokens, refusal, ...
+            return "".join(b.text for b in resp.content if b.type == "text")
+
+        results = []
+        for block in resp.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                output = dispatch(block.name, block.input)   # validate + authorize + run
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": output})
+            except Exception as e:                           # errors are observations
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": f"Error: {e}", "is_error": True})
+        # All results for one turn go back in ONE user message.
+        messages.append({"role": "user", "content": results})
+    return "Stopped: step limit reached."
+```
+
+The OpenAI Responses API version differs only in shapes:
+
+```python
+from openai import OpenAI
+import json
+
+client = OpenAI()
+TOOLS = [{"type": "function", "name": "get_order",
+          "description": "Look up an order by id.",
+          "parameters": {"type": "object",
+                         "properties": {"order_id": {"type": "string"}},
+                         "required": ["order_id"], "additionalProperties": False},
+          "strict": True}]
+
+def run(user_msg: str, dispatch) -> str:
+    items = [{"role": "user", "content": user_msg}]
+    for _ in range(MAX_STEPS):
+        resp = client.responses.create(model=MODEL, instructions=SYSTEM,
+                                       tools=TOOLS, input=items)
+        calls = [i for i in resp.output if i.type == "function_call"]
+        if not calls:
+            return resp.output_text
+        items += resp.output                       # keep reasoning + call items
+        for c in calls:
+            items.append({"type": "function_call_output", "call_id": c.call_id,
+                          "output": dispatch(c.name, json.loads(c.arguments))})
+    return "Stopped: step limit reached."
+```
+
+| Concern | Anthropic Messages | OpenAI Responses |
+|---------|--------------------|------------------|
+| Tool schema field | `input_schema` | `parameters` (with `"type": "function"`) |
+| "Model wants a tool" | `stop_reason == "tool_use"`, `tool_use` blocks | `function_call` items in `output` |
+| Return a result | `tool_result` block with `tool_use_id`, in a `user` message | `function_call_output` item with `call_id` |
+| Server-side state | None: resend history (cache the prefix) | Optional: `previous_response_id` or the Conversations API |
+| Built-in hosted tools | Web search/fetch, code execution, MCP connector | Web search, file search, code interpreter, remote MCP |
+
+Production details the loop above leaves out: prompt caching of the stable prefix (system + tools), retries with backoff on 429/5xx, a token budget across the loop, streaming, and tracing each model and tool call. Agent SDKs (OpenAI Agents SDK, Anthropic's tool runner, LangGraph) wrap exactly this loop.
+
 ---
 
 ## 3. IMPLEMENTATION — AGENT WITH TOOL REGISTRY
@@ -227,10 +324,10 @@ if __name__ == "__main__":
 ### 3.1 Full Tool Registry with Guardrails
 
 ```python
-# implementation/agent_with_tools.py
+# Sketch of a fuller registry (the runnable version is
+# implementation/common/tool_registry.py).
 """
 Agent with comprehensive tool registry, validation, and guardrails.
-Integrates with the MCP common/ modules for rate limiting and auth.
 """
 
 import json
@@ -245,7 +342,7 @@ class ToolSpec:
     """Full tool specification with security metadata."""
     name: str
     description: str
-    parameters: dict  # JSON Schema
+    parameters: dict  # JSON Schema object: {"type": "object", "properties": ..., "required": [...]}
     fn: Callable
     required_role: str = "user"
     requires_approval: bool = False
@@ -269,7 +366,7 @@ class ToolRegistry:
         self.tools[tool.name] = tool
         
         # Initialize rate limiter for this tool
-        from agents.implementation.common.guardrails import TokenBucket
+        from implementation.common.guardrails import TokenBucket
         self.rate_limiters[tool.name] = TokenBucket(
             rate=tool.rate_limit, burst=int(tool.rate_limit * 2)
         )
@@ -278,8 +375,8 @@ class ToolRegistry:
         return self.tools.get(name)
     
     def list_tools(self) -> List[dict]:
-        """Return tools in MCP-compatible format."""
-        return [t for t in self.tools.values()]
+        """Return tool definitions in MCP format (name, description, inputSchema)."""
+        return self.to_mcp_format()
     
     def validate_and_execute(self, tool_name: str, params: dict, 
                               user_role: str = "user") -> str:
@@ -296,13 +393,10 @@ class ToolRegistry:
         if not tool:
             return f"Error: Unknown tool '{tool_name}'"
         
-        # 1. Schema validation
+        # 1. Schema validation (the schema decides which params are required;
+        #    don't mark every property required, or optional params break)
         try:
-            jsonschema.validate(
-                instance=params, 
-                schema={"type": "object", "properties": tool.parameters,
-                       "required": list(tool.parameters.keys())}
-            )
+            jsonschema.validate(instance=params, schema=tool.parameters)
         except jsonschema.ValidationError as e:
             return f"Error: Invalid parameters - {e.message}"
         
@@ -311,17 +405,23 @@ class ToolRegistry:
         if roles_hierarchy.get(user_role, 0) < roles_hierarchy.get(tool.required_role, 0):
             return f"Error: Insufficient permissions for '{tool_name}'"
         
+        # 2b. Approval gate (in a real system: pause the run, ask a human, resume)
+        if tool.requires_approval:
+            return f"Error: '{tool_name}' requires human approval"
+        
         # 3. Rate limit
         limiter = self.rate_limiters[tool_name]
         if not limiter.consume():
             return f"Error: Rate limit exceeded for '{tool_name}'. Try again later."
         
-        # 4. Execute
+        # 4. Execute (enforce tool.timeout_seconds: run in a worker thread /
+        #    subprocess, or use asyncio.wait_for for async tools)
         try:
             result = tool.fn(**params)
             return str(result)
         except Exception as e:
             return f"Error executing {tool_name}: {str(e)}"
+        # 5. Audit log: user, tool, args, result size, latency, trace id
     
     def to_mcp_format(self) -> List[dict]:
         """Export all tools in MCP format for agent consumption."""
@@ -329,11 +429,7 @@ class ToolRegistry:
             {
                 "name": t.name,
                 "description": t.description,
-                "inputSchema": {
-                    "type": "object",
-                    "properties": t.parameters,
-                    "required": list(t.parameters.keys()),
-                }
+                "inputSchema": t.parameters,
             }
             for t in self.tools.values()
         ]
@@ -358,15 +454,20 @@ registry = ToolRegistry()
 registry.register(ToolSpec(
     name="search_kb",
     description="Search the internal knowledge base for information",
-    parameters={"query": {"type": "string", "description": "Search query"},
-                "top_k": {"type": "integer", "description": "Number of results"}},
+    parameters={"type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query"},
+                               "top_k": {"type": "integer", "minimum": 1, "maximum": 20}},
+                "required": ["query"],              # top_k is optional
+                "additionalProperties": False},
     fn=search_knowledge_base,
     category="read"
 ))
 registry.register(ToolSpec(
     name="get_user",
     description="Get user account information by user ID",
-    parameters={"user_id": {"type": "integer", "description": "User ID"}},
+    parameters={"type": "object",
+                "properties": {"user_id": {"type": "integer", "description": "User ID"}},
+                "required": ["user_id"], "additionalProperties": False},
     fn=get_user_account,
     required_role="user",
     category="read"
@@ -374,7 +475,9 @@ registry.register(ToolSpec(
 registry.register(ToolSpec(
     name="send_notification",
     description="Send a notification to a user",
-    parameters={"user_id": {"type": "integer"}, "message": {"type": "string"}},
+    parameters={"type": "object",
+                "properties": {"user_id": {"type": "integer"}, "message": {"type": "string"}},
+                "required": ["user_id", "message"], "additionalProperties": False},
     fn=send_notification,
     required_role="editor",
     requires_approval=True,
@@ -389,15 +492,15 @@ registry.register(ToolSpec(
 ### 4.1 Multi-Agent Orchestration
 
 ```python
-# implementation/orchestrated_agent.py
+# Simplified version of implementation/orchestrated_agent.py
 """
 Orchestrator-Worker agent pattern.
 The orchestrator decomposes tasks and delegates to specialized workers.
 """
 
 import asyncio
-import json
-from typing import List, Dict, Optional, Callable, Any
+import time
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
 
 
@@ -425,7 +528,7 @@ class Plan:
 class WorkerAgent:
     """A specialized worker that can execute specific types of tasks."""
     
-    def __init__(self, name: str, description: str, tools: List[Tool]):
+    def __init__(self, name: str, description: str, tools: List[Any]):
         self.name = name
         self.description = description
         self.tools = {t.name: t for t in tools}
@@ -434,7 +537,9 @@ class WorkerAgent:
         """Execute a task using the worker's tools."""
         task.status = "running"
         try:
-            # Simple execution: use the description as prompt
+            # Simple execution: use the description as prompt.
+            # In production, run a tool loop (section 2.2) with a brief built
+            # from task.description + the outputs of task.dependencies.
             # In production, this would use an LLM with the worker's tools
             result = f"[{self.name}] Completed: {task.description}"
             task.result = result
@@ -502,11 +607,13 @@ class OrchestratorAgent:
             if not ready:
                 raise RuntimeError("Deadlock in task dependencies")
             
-            # Execute ready tasks in parallel
+            # Execute ready tasks in parallel. Each worker catches its own
+            # exceptions; the per-task timeout turns a hung worker into a
+            # TimeoutError that fails the run instead of hanging it forever.
             tasks = []
             for task in ready:
                 worker = self.workers[task.assigned_to]
-                tasks.append(worker.execute(task))
+                tasks.append(asyncio.wait_for(worker.execute(task), timeout=120))
             
             results = await asyncio.gather(*tasks)
             for result in results:
@@ -564,6 +671,8 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+This runs "waves" of ready tasks: a slow task in wave 1 delays every wave-2 task, even ones that only depended on a fast task. For better latency, start each task as soon as its own dependencies finish (one `asyncio.Task` per node awaiting its parents), which is what graph runtimes like LangGraph do.
+
 ---
 
 ## 5. IMPLEMENTATION — AGENT WITH MCP TOOLS
@@ -571,7 +680,7 @@ if __name__ == "__main__":
 ### 5.1 Connecting an Agent to MCP Servers
 
 ```python
-# implementation/agent_with_mcp.py
+# Long-lived-session version of implementation/agent_with_mcp.py
 """
 Agent that discovers and uses tools from MCP servers.
 Connects to calculator_server, database_server, and rag_server.
@@ -579,9 +688,9 @@ Connects to calculator_server, database_server, and rag_server.
 
 import asyncio
 import json
-from typing import List, Dict, Optional
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from contextlib import AsyncExitStack
+from typing import List, Dict
+from mcp import Client, StdioServerParameters   # mcp>=2 (Python SDK v2)
 
 
 class MCPToolAgent:
@@ -589,7 +698,7 @@ class MCPToolAgent:
     Agent that connects to MCP servers and uses their tools.
     
     Architecture:
-    1. Connect to each MCP server
+    1. Connect to each MCP server and KEEP the client open
     2. Discover tools via tools/list
     3. Present unified tool registry to LLM
     4. Route tool calls to the correct server
@@ -598,50 +707,41 @@ class MCPToolAgent:
     def __init__(self):
         self.servers: Dict[str, dict] = {}
         self.tool_to_server: Dict[str, str] = {}
+        self._stack = AsyncExitStack()   # owns every open client (and its subprocess)
     
     async def connect_server(self, name: str, command: str, args: List[str]):
         """Connect to an MCP server and discover its tools."""
-        server_params = StdioServerParameters(
-            command=command,
-            args=args
-        )
+        params = StdioServerParameters(command=command, args=args)
+        # enter_async_context keeps the subprocess and client alive after this
+        # method returns. (A plain `async with` here would close the client on
+        # exit, leaving a dead object behind.) mcp.Client replaces v1's
+        # stdio_client + ClientSession + initialize(): against a 2026-07-28
+        # server there is no handshake (it probes server/discover and sends
+        # version + capabilities in every request's _meta); against older
+        # servers it falls back to initialize automatically.
+        client = await self._stack.enter_async_context(Client(params))
         
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                
-                # Discover tools
-                tools = await session.list_tools()
-                
-                # Store server info
-                self.servers[name] = {
-                    "session": session,
-                    "tools": tools.tools,
-                    "read": read,
-                    "write": write,
-                    "params": server_params,
-                }
-                
-                # Map tool names to server
-                for tool in tools.tools:
-                    self.tool_to_server[tool.name] = name
-                
-                print(f"Connected to '{name}': {len(tools.tools)} tools discovered")
-                for t in tools.tools:
-                    print(f"  - {t.name}: {t.description}")
+        tools = (await client.list_tools()).tools
+        self.servers[name] = {"client": client, "tools": tools}
+        for tool in tools:
+            if tool.name in self.tool_to_server:
+                raise ValueError(f"Tool name collision: {tool.name}; namespace it")
+            self.tool_to_server[tool.name] = name
+        print(f"Connected to '{name}': {len(tools)} tools discovered")
+    
+    async def close(self):
+        await self._stack.aclose()
     
     async def call_mcp_tool(self, tool_name: str, arguments: dict) -> str:
-        """Call a tool on the appropriate MCP server."""
+        """Call a tool on the appropriate MCP server, reusing its client."""
         server_name = self.tool_to_server.get(tool_name)
         if not server_name:
             return f"Error: Unknown tool '{tool_name}'"
-        
-        server = self.servers[server_name]
-        async with stdio_client(server["params"]) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
-                return result.content[0].text
+        client = self.servers[server_name]["client"]
+        result = await client.call_tool(tool_name, arguments)
+        text = "\n".join(c.text for c in result.content if getattr(c, "text", None))
+        # Tool failures are results with is_error=True (SDK v2 snake_case), not exceptions.
+        return f"Error: {text}" if result.is_error else text
     
     def get_tool_descriptions(self) -> str:
         """Format all tools for LLM consumption."""
@@ -711,25 +811,15 @@ Answer: <final answer>"""
 
 ```txt
 # implementation/requirements.txt
-# Core
-openai>=1.0.0              # LLM API (or use LM Studio)
-jsonschema>=4.0.0          # Tool parameter validation
-
-# MCP Integration
-mcp>=1.0.0                 # MCP SDK for agent-to-server communication
-
-# Memory
-redis>=5.0.0               # Long-term memory store (optional)
-chromadb>=0.4.0            # Vector memory for episodic recall (optional)
-
-# Testing
+openai>=1.66.0             # Responses API client (optional; default LLM is a mock)
+jsonschema>=4.0.0          # Tool parameter validation (optional; fallback built in)
+httpx>=0.27.0              # OpenAI-compatible local servers (optional)
+mcp>=2.0,<3               # MCP SDK v2 (mcp.Client); spec 2026-07-28
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
-
-# Utility
-python-dotenv>=1.0.0       # Environment configuration
-httpx>=0.27.0              # HTTP client for API calls
 ```
+
+Add `anthropic` if you use the Messages API example in 2.2, and a store client (`redis`, a vector DB SDK) when you move memory out of process.
 
 ### 6.2 Running the Agent
 
@@ -744,8 +834,12 @@ python -m implementation.simple_react_agent
 # Run the orchestrator agent
 python -m implementation.orchestrated_agent
 
-# Run the MCP-connected agent (with MCP servers running)
+# Run the MCP-connected agent (spawns the MCP server over stdio itself)
 python -m implementation.agent_with_mcp
+
+# Use a real model instead of the mock
+USE_MOCK_LLM=false LLM_PROVIDER=openai LLM_MODEL=<current model id> \
+  OPENAI_API_KEY=... python -m implementation.simple_react_agent
 ```
 
 ---

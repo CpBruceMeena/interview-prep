@@ -2,6 +2,10 @@
 Simple ReAct (Reasoning + Acting) Agent implementation.
 Demonstrates the core agent loop: Thought → Action → Observation → Repeat.
 
+This uses the original text-parsing ReAct format so it runs with any model
+(or the mock). Production agents use the provider's native tool calling
+(structured tool_use / function_call items) instead of parsing free text.
+
 Run: python -m implementation.simple_react_agent
 """
 
@@ -29,6 +33,9 @@ def calculate(expression: str) -> str:
     allowed = set("0123456789+-*/.() ")
     if not all(c in allowed for c in expression):
         return "Error: Invalid characters in expression"
+    if "**" in expression or len(expression) > 200:
+        # 9**9**9 would pin a CPU: even "safe" eval needs resource limits.
+        return "Error: Expression not allowed"
     try:
         return str(eval(expression, {"__builtins__": {}}, {}))
     except Exception as e:
@@ -98,6 +105,11 @@ class ReActAgent:
 
                 observation = self.tools.execute(tool_name, action_input)
                 self.memory.add_conversation_turn("observation", observation)
+            else:
+                # Neither a tool call nor an answer: tell the model, don't spin.
+                self.memory.add_conversation_turn(
+                    "observation",
+                    "Error: reply with either Action/ActionInput or Answer.")
 
         return ("I've taken too many steps to answer this. "
                 "Please try rephrasing your question.")

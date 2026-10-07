@@ -1,360 +1,250 @@
 # 🎯 MCP Explained — Step by Step with a Live Example (draw.io)
 
-> **A practical, hands-on walkthrough of how the Model Context Protocol works — using a draw.io diagramming server as our concrete example.**
+> **A hands-on walkthrough of how the Model Context Protocol works, using a draw.io diagramming server as the concrete example.** Current as of spec **2026-07-28** and Python SDK v2; the server code below runs as written.
+
+!!! tip "30-second version"
+    The user asks the host for a diagram. The host already fetched the server's tool list and gave those tool definitions to the model. The model answers with a tool call; the host turns it into a JSON-RPC `tools/call`, the server runs a Python function and returns content (plus `structuredContent` if the tool has an output schema), and the host feeds that back to the model as a tool result. Repeat until the model answers the user. MCP is only the host ↔ server leg.
 
 ---
 
 ## 1. THE BIG PICTURE
 
-Before we dive into code, let's understand **where MCP fits** in the AI stack:
+Before the code, here is **where MCP fits**:
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────────────┐
-│                       USER (You)                                      │
-│  "Create a class diagram for a parking lot system"                    │
+│                         USER (You)                                   │
+│   "Create a class diagram for a parking lot system"                  │
 └──────────────────────────┬───────────────────────────────────────────┘
                            │
                            ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                    MCP HOST (Claude Desktop / Agent)                   │
-│                                                                       │
-│  1. LLM receives your request                                         │
-│  2. LLM decides: "I need a diagramming tool"                          │
-│  3. LLM asks host: "What tools do I have?"                            │
-│  4. Host connects to MCP Server → discovers tools                     │
-│  5. LLM chooses a tool → Host sends `tools/call` to server           │
-│  6. Server executes → returns result                                  │
-│  7. LLM processes result → responds to you                            │
+│               MCP HOST (Claude Desktop / Claude Code / agent)        │
+│                                                                      │
+│  0. At startup: launch/connect to servers, call tools/list           │
+│  1. Send the user message + tool definitions to the LLM              │
+│  2. LLM replies with a tool call: create_diagram(...)                │
+│  3. Host sends tools/call to the server (after any user approval)    │
+│  4. Server executes, returns a result                                │
+│  5. Host gives the result to the LLM; LLM calls more tools or        │
+│     answers the user                                                 │
 └──────────────────────────┬───────────────────────────────────────────┘
                            │
-                           │ MCP Protocol (JSON-RPC 2.0 over stdio/HTTP)
+                           │ MCP: JSON-RPC 2.0 over stdio or Streamable HTTP
                            ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                      MCP SERVER (draw.io Server)                       │
-│                                                                       │
-│  Registers tools:                                                     │
+│                     MCP SERVER (drawio-diagrammer)                   │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │ • create_diagram(type, title)    → creates a blank diagram     │  │
-│  │ • add_class(uml_class)           → adds a UML class box        │  │
-│  │ • add_relationship(from, to)     → adds an arrow/line          │  │
-│  │ • export_diagram(format)         → exports as PNG/SVG/XML      │  │
+│  │ • create_diagram(title)                    → new diagram id    │  │
+│  │ • add_class(diagram_id, name, attrs, methods) → UML class box  │  │
+│  │ • add_relationship(diagram_id, from, to, type) → arrow         │  │
+│  │ • export_diagram(diagram_id)               → .drawio XML       │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+The model never talks to the server and never sees JSON-RPC. It sees tool definitions and tool results in its own API format; the host translates.
 
 ### Key Concept: MCP Decouples Intent from Execution
 
 | Component | Role | Example |
 |-----------|------|---------|
 | **You** | Express intent | "Draw a class diagram" |
-| **LLM** | Decides what tool to use | "I need `create_diagram` then `add_class`" |
-| **MCP Host** | Routes tool calls | Connects to draw.io server, sends JSON-RPC |
-| **MCP Server** | Executes the work | Actually draws the diagram |
-| **draw.io** | The real backend | Renders the SVG/PNG |
+| **LLM** | Chooses tools and arguments | "Call `create_diagram`, then `add_class` ×5" |
+| **MCP Host** | Owns the model loop, user approval, and the MCP clients | Translates tool calls to `tools/call` |
+| **MCP Server** | Executes the work | Builds the diagram |
+| **draw.io** | Renders the result | Opens the `.drawio` file |
 
 ---
 
 ## 2. THE LIVE EXAMPLE: draw.io MCP Server
 
-Let's build a real draw.io MCP server and walk through every step of the protocol.
-
 ### 2.1 Server Implementation
+
+A `.drawio` file is just mxGraph XML, so the server builds it directly; no draw.io library is needed. Save as `drawio_mcp_server.py`, `pip install "mcp>=2"`, and run it under the Inspector (`npx @modelcontextprotocol/inspector python drawio_mcp_server.py`).
 
 ```python
 # drawio_mcp_server.py
+"""A draw.io MCP server: builds UML class diagrams as .drawio (mxGraph XML) files.
+
+No draw.io binding is needed: a .drawio file is XML that diagrams.net opens directly.
 """
-A draw.io MCP server that lets AI agents create and edit diagrams.
-"""
+import sys
+import uuid
+from typing import Literal, TypedDict
+from xml.sax.saxutils import escape
 
-from mcp.server.fastmcp import FastMCP
-import json
-import drawpy  # Hypothetical draw.io Python binding (illustrative only — not a real pip package)
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
-# Initialize MCP server
-mcp = FastMCP("drawio-diagrammer")
+mcp = MCPServer("drawio-diagrammer")
 
-# ── In-memory diagram store ──
-diagrams = {}
-
-
-# ── Tool 1: Create a new diagram ──
-
-@mcp.tool()
-def create_diagram(diagram_type: str, title: str) -> str:
-    """Create a new blank diagram.
-    
-    Args:
-        diagram_type: Type of diagram — "class", "flowchart", "sequence", "entity"
-        title: Title for the diagram
-    """
-    diagram_id = f"diagram_{len(diagrams) + 1}"
-    
-    # Creates a draw.io diagram with appropriate template
-    if diagram_type == "class":
-        diagrams[diagram_id] = drawpy.ClassDiagram(title)
-    elif diagram_type == "flowchart":
-        diagrams[diagram_id] = drawpy.Flowchart(title)
-    else:
-        diagrams[diagram_id] = drawpy.Diagram(title)
-    
-    return json.dumps({
-        "diagram_id": diagram_id,
-        "title": title,
-        "type": diagram_type,
-        "url": f"https://embed.diagrams.net/?title={title}"
-    })
+# In-memory store keyed by a server-minted handle. Fine for one stdio process;
+# a multi-replica HTTP deployment would keep diagrams in Redis/a database.
+diagrams: dict[str, dict] = {}
 
 
-# ── Tool 2: Add a UML class ──
 
-@mcp.tool()
-def add_class(diagram_id: str, class_name: str, 
-              attributes: list, methods: list) -> str:
-    """Add a UML class box to a class diagram.
-    
-    Args:
-        diagram_id: The diagram to modify
-        class_name: Name of the class (e.g., 'ParkingLot')
-        attributes: List of attributes as strings (e.g., ['-floors: List[Floor]'])
-        methods: List of methods as strings (e.g., ['+park_vehicle(v: Vehicle): Ticket'])
-    """
+class DiagramRef(TypedDict):
+    """A TypedDict (or Pydantic model) return type becomes the tool's outputSchema.
+    A bare `dict` has no known shape, so it is returned as text only."""
+    diagram_id: str
+    title: str
+
+
+EDGE_STYLES = {
+    "inheritance": "endArrow=block;endFill=0;",
+    "composition": "endArrow=diamondThin;endFill=1;startArrow=none;",
+    "aggregation": "endArrow=diamondThin;endFill=0;",
+    "dependency": "endArrow=open;dashed=1;",
+    "association": "endArrow=open;",
+}
+
+
+def _get(diagram_id: str) -> dict:
     if diagram_id not in diagrams:
-        raise ValueError(f"Diagram {diagram_id} not found")
-    
-    diagram = diagrams[diagram_id]
-    uml_class = drawpy.UMLClass(class_name, attributes, methods)
-    diagram.add_class(uml_class)
-    
-    return json.dumps({
-        "status": "added",
-        "class": class_name,
-        "attributes": len(attributes),
-        "methods": len(methods)
-    })
+        known = ", ".join(diagrams) or "none"
+        raise ToolError(f"Diagram {diagram_id!r} not found. Known diagrams: {known}")
+    return diagrams[diagram_id]
 
-
-# ── Tool 3: Add a relationship ──
 
 @mcp.tool()
-def add_relationship(diagram_id: str, from_class: str,
-                     to_class: str, relationship_type: str) -> str:
-    """Add a relationship arrow between two classes.
-    
-    Args:
-        diagram_id: The diagram to modify
-        from_class: Source class name
-        to_class: Target class name
-        relationship_type: Type — "inheritance", "composition", 
-                          "aggregation", "dependency", "association"
-    """
-    if diagram_id not in diagrams:
-        raise ValueError(f"Diagram {diagram_id} not found")
-    
-    diagram = diagrams[diagram_id]
-    diagram.add_relationship(
-        from_class, to_class, 
-        relationship_type.upper()
-    )
-    
-    return json.dumps({
-        "status": "added",
-        "from": from_class,
-        "to": to_class,
-        "type": relationship_type
-    })
+def create_diagram(title: str) -> DiagramRef:
+    """Create a new, empty UML class diagram and return its diagram_id."""
+    diagram_id = f"d_{uuid.uuid4().hex[:8]}"
+    diagrams[diagram_id] = {"title": title, "classes": {}, "edges": []}
+    return DiagramRef(diagram_id=diagram_id, title=title)
 
-
-# ── Tool 4: Export diagram ──
 
 @mcp.tool()
-def export_diagram(diagram_id: str, format: str = "svg") -> str:
-    """Export the diagram as an image or XML.
-    
-    Args:
-        diagram_id: The diagram to export
-        format: Export format — "svg", "png", "xml", "drawio"
+def add_class(diagram_id: str, class_name: str,
+              attributes: list[str], methods: list[str]) -> dict:
+    """Add a UML class box.
+
+    attributes: e.g. ["-floors: list[Floor]"]; methods: e.g. ["+park(v: Vehicle): Ticket"]
     """
-    if diagram_id not in diagrams:
-        raise ValueError(f"Diagram {diagram_id} not found")
-    
-    diagram = diagrams[diagram_id]
-    
-    if format == "svg":
-        output = diagram.to_svg()
-    elif format == "png":
-        output = diagram.to_png()
-    elif format == "drawio":
-        output = diagram.to_drawio_xml()
-    else:
-        raise ValueError(f"Unsupported format: {format}")
-    
-    return json.dumps({
-        "diagram_id": diagram_id,
-        "format": format,
-        "content": output,          # Base64 encoded image or XML
-        "preview_url": f"https://viewer.diagrams.net/{diagram_id}"
-    })
+    d = _get(diagram_id)
+    if class_name in d["classes"]:
+        raise ToolError(f"Class {class_name!r} already exists in {diagram_id}")
+    d["classes"][class_name] = {"attributes": attributes, "methods": methods,
+                                "index": len(d["classes"])}
+    return {"status": "added", "class": class_name,
+            "attributes": len(attributes), "methods": len(methods)}
+
+
+@mcp.tool()
+def add_relationship(diagram_id: str, from_class: str, to_class: str,
+                     relationship_type: Literal["inheritance", "composition", "aggregation",
+                                                "dependency", "association"]) -> dict:
+    """Connect two existing classes. For inheritance, from_class is the subclass."""
+    d = _get(diagram_id)
+    missing = [c for c in (from_class, to_class) if c not in d["classes"]]
+    if missing:
+        raise ToolError(f"Unknown class(es) {missing}; add them with add_class first")
+    d["edges"].append((from_class, to_class, relationship_type))
+    return {"status": "added", "from": from_class, "to": to_class, "type": relationship_type}
+
+
+@mcp.tool()
+def export_diagram(diagram_id: str) -> str:
+    """Return the diagram as .drawio XML (open it in diagrams.net or the draw.io app)."""
+    d = _get(diagram_id)
+    cells, ids = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>'], {}
+    for name, c in d["classes"].items():
+        ids[name] = cid = f"c{c['index']}"
+        body = "<hr>".join([escape("<br>".join(c["attributes"])), escape("<br>".join(c["methods"]))])
+        label = escape(f"<b>{escape(name)}</b><hr>{body}")
+        x, y = 40 + (c["index"] % 4) * 240, 40 + (c["index"] // 4) * 220
+        cells.append(f'<mxCell id="{cid}" value="{label}" style="rounded=0;whiteSpace=wrap;html=1;'
+                     f'align=left;verticalAlign=top;" vertex="1" parent="1">'
+                     f'<mxGeometry x="{x}" y="{y}" width="200" height="160" as="geometry"/></mxCell>')
+    for i, (src, dst, kind) in enumerate(d["edges"]):
+        cells.append(f'<mxCell id="e{i}" style="{EDGE_STYLES[kind]}html=1;" edge="1" parent="1" '
+                     f'source="{ids[src]}" target="{ids[dst]}"><mxGeometry relative="1" as="geometry"/></mxCell>')
+    return (f'<mxfile><diagram name="{escape(d["title"])}"><mxGraphModel><root>'
+            + "".join(cells) + "</root></mxGraphModel></diagram></mxfile>")
 
 
 if __name__ == "__main__":
-    # Run with stdio transport (for local use with Claude Desktop)
-    mcp.run(transport="stdio")
+    print("drawio-diagrammer starting (stdio)", file=sys.stderr)
+    mcp.run()
 ```
+
+Things this small server demonstrates:
+
+| Detail | Why it matters |
+|---|---|
+| `Literal[...]` on `relationship_type` | Becomes an `enum` in the JSON Schema, so the model sees the valid values and bad values are rejected before your code runs |
+| `-> DiagramRef` (a `TypedDict`) | Becomes the tool's `outputSchema`; results carry `structuredContent`. A bare `dict` return has no schema and comes back as text only |
+| `ToolError` with a helpful message | Comes back as `isError: true`. "Known diagrams: d_1a2b..." lets the model fix its own mistake |
+| Server-minted `diagram_id` | Cross-call state is an explicit handle passed as a tool argument, the pattern the 2026-07-28 spec recommends now that sessions are gone |
+| In-memory `diagrams` dict | Fine for one stdio process. Behind a load balancer, put diagrams in Redis or a database, because the next call may hit another replica |
+| Log to stderr | stdout is the protocol channel |
 
 ---
 
 ## 🔍 DEEP DIVE: What Does `mcp.run(transport="stdio")` Actually Do?
 
-This single line is the entry point that starts the entire MCP server. Let's trace every step of what happens under the hood.
+`mcp.run()` (stdio is the default) starts the server and blocks until the host closes the pipe.
 
 ### 1. The Call Chain
 
 ```ascii
-mcp.run(transport="stdio")
+mcp.run(transport="stdio")                       # synchronous entry point
     │
     ▼
-FastMCP.run(transport="stdio")
+anyio.run(mcp.run_stdio_async)                   # start an event loop
     │
-    ├── 1. Create StdioServerTransport
-    │    │   • Opens stdin for reading (receive JSON-RPC requests)
-    │    │   • Opens stdout for writing (send JSON-RPC responses)
-    │    │   • Note: stderr is reserved for logging/debug output
-    │    │
-    ├── 2. Create Server instance
-    │    │   • Wraps the FastMCP app into a low-level MCP Server
-    │    │   • Registers all @mcp.tool() functions as tool handlers
-    │    │   • Registers all @mcp.resource() functions as resource handlers
-    │    │   • Registers all @mcp.prompt() functions as prompt handlers
-    │    │
-    ├── 3. Start the server loop
-    │    │   • Enters an infinite loop waiting for JSON-RPC messages on stdin
-    │    │   • Each message is parsed, dispatched to the handler, and responded to
-    │    │
-    └── 4. Cleanup (on SIGINT/SIGTERM)
-         • Closes transport
-         • Runs cleanup handlers
-         • Exits
+    ├── 1. stdio_server()
+    │       • wraps fd 0 (stdin) as the read stream, fd 1 (stdout) as the write stream
+    │       • one JSON-RPC message per line, UTF-8
+    │
+    ├── 2. low-level Server.run(read, write, ...)
+    │       • tools/resources/prompts were registered when the
+    │         @mcp.tool()/@mcp.resource()/@mcp.prompt() decorators ran at import
+    │       • a dispatcher reads messages, routes by method, runs handlers
+    │         (sync tools run on a worker thread so they don't block the loop)
+    │
+    └── 3. Shutdown
+            • stdin EOF (host closed the pipe) → loop ends → process exits
+            • hosts follow up with SIGTERM, then SIGKILL, if it doesn't
 ```
 
 ### 2. What Happens at Each Level
 
-#### Level 1: `FastMCP.run()` — The High-Level Entry
+#### Level 1: `MCPServer.run()` — The High-Level Entry
 
-```python
-# Inside the FastMCP library (simplified)
-def run(self, transport="stdio"):
-    if transport == "stdio":
-        # Create the stdio transport layer
-        transport_obj = StdioServerTransport()
-        
-        # Wrap self into a protocol-compliant server
-        server = Server(self._name)
-        
-        # Register all our tools/resources/prompts
-        for tool_name, tool_fn in self._tools.items():
-            @server.tool(tool_name)
-            async def handler(args):
-                return tool_fn(**args)
-        
-        # Start the protocol handler
-        server.run(transport_obj)
-```
+`run()` validates the transport name and starts the matching async runner: `run_stdio_async`, or `run_streamable_http_async` for HTTP (which builds an ASGI app served by uvicorn). Decorators did the registration earlier, so `run()` only wires a transport to the already-built server.
 
 #### Level 2: `StdioServerTransport` — The I/O Layer
 
+Conceptually (the SDK's real code uses anyio streams):
+
 ```python
-# Inside the MCP SDK (simplified)
-class StdioServerTransport:
-    """
-    Transport that reads JSON-RPC messages from stdin and writes to stdout.
-    
-    KEY DESIGN DECISIONS:
-    - Uses stdin/stdout (NOT stderr) for protocol messages
-    - Messages are delimited by newlines (one JSON-RPC message per line)
-    - stderr is free for the developer to use for logging
-    - Raw byte reads/writes — no framing beyond newlines
-    """
-    
-    async def receive_message(self) -> dict:
-        """Read one JSON-RPC message from stdin."""
-        # 1. Read bytes from stdin until we hit a newline
-        raw_line = await self._readline()
-        
-        # 2. Parse as JSON
-        message = json.loads(raw_line)
-        
-        # 3. Validate JSON-RPC structure
-        if "method" not in message:
-            raise InvalidMessageError("Missing 'method' field")
-        
-        return message
-    
-    async def send_message(self, response: dict):
-        """Write one JSON-RPC response to stdout."""
-        # 1. Serialize to JSON
-        raw = json.dumps(response)
-        
-        # 2. Write to stdout with newline delimiter
-        await self._writeline(raw + "\n")
-        
-        # 3. Flush to ensure immediate delivery
-        await self._flush()
+import json
+import sys
+
+for line in sys.stdin:                      # blocks until the host writes a line; EOF ends the loop
+    message = json.loads(line)              # one JSON-RPC message per line, no embedded newlines
+    response = dispatch(message)            # None for notifications
+    if response is not None:
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()                  # stdout to a pipe is block-buffered: flush every message
 ```
+
+This is also why `print()` in a stdio server breaks things: that text lands in the protocol stream and the host fails to parse it.
 
 #### Level 3: `Server` — The Protocol Handler
 
-```python
-# Inside the MCP SDK (simplified)
-class Server:
-    async def run(self, transport):
-        """Main server loop — runs forever until interrupted."""
-        # --- Phase 1: Wait for initialize ---
-        # The host MUST send initialize first. We block until we get it.
-        init_msg = await transport.receive_message()
-        assert init_msg["method"] == "initialize"
-        
-        # Respond with our capabilities
-        await transport.send_message({
-            "jsonrpc": "2.0",
-            "result": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {
-                    "tools": {},      # We have tools!
-                    "resources": {},   # We have resources!
-                    "prompts": {}      # We have prompts!
-                },
-                "serverInfo": {
-                    "name": self._name,
-                    "version": "1.0.0"
-                }
-            },
-            "id": init_msg["id"]
-        })
-        
-        # --- Phase 2: Main request loop ---
-        while True:
-            msg = await transport.receive_message()
-            
-            # Determine method type and dispatch
-            if msg["method"] == "tools/list":
-                response = self._handle_tools_list(msg)
-            elif msg["method"] == "tools/call":
-                response = await self._handle_tools_call(msg)
-            elif msg["method"] == "resources/list":
-                response = self._handle_resources_list(msg)
-            elif msg["method"] == "resources/read":
-                response = self._handle_resources_read(msg)
-            elif msg["method"] == "notifications/initialized":
-                continue  # No response needed for notifications
-            else:
-                response = {
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32601, "message": "Method not found"},
-                    "id": msg.get("id")
-                }
-            
-            await transport.send_message(response)
-```
+Routes each message by `method` and wraps the outcome as a JSON-RPC result or error:
+
+| Incoming | Handler result |
+|---|---|
+| `server/discover` (2026-07-28) | Supported versions, capabilities, server info |
+| `initialize` (legacy clients) | Negotiated version, capabilities; the SDK serves both eras |
+| `tools/list`, `resources/list`, `prompts/list` | Definitions generated from your decorated functions |
+| `tools/call` | Validate arguments → call the function → content (+ `structuredContent`), or `isError` |
+| Unknown method | JSON-RPC error `-32601 Method not found` |
 
 ### 3. The Complete stdio Transport Lifecycle
 
@@ -362,132 +252,104 @@ class Server:
 HOST (Claude Desktop)                     SERVER (Python process)
 ────────────────────────                  ────────────────────────
 
-1. Spawns server as child process:
+1. Spawns the server as a child process:
    $ python drawio_mcp_server.py
-                                          
-2. Writes to stdin:                       
-   {"method":"initialize","id":1}
-                                     ──►  Reads from stdin
-                                          Parses JSON-RPC
-                                          
-                                          Writes to stdout:
-                                     ◄──  {"result":{"protocolVersion":...},"id":1}
-                                          
-3. Reads from stdout:
-   Parses capabilities
-                                          
-4. Writes to stdin:
-   {"method":"tools/list","id":2}
-                                     ──►  
-                                          
+                                          imports module, registers tools,
+                                          blocks reading stdin
+
+2. Probe (dual-era client):
+   {"method":"server/discover","id":1}
+                                     ──►
+                                     ◄──  {"result":{"supportedVersions":[...],
+                                                     "capabilities":{"tools":{...}}},"id":1}
+   (a legacy server would reject this; the client then falls back to initialize)
+
+3. {"method":"tools/list","id":2,"params":{"_meta":{...}}}
+                                     ──►
                                      ◄──  {"result":{"tools":[...]},"id":2}
 
-5. Writes to stdin:
-   {"method":"tools/call",...}
-                                     ──►  
-                                          Calls create_diagram()
-                                     ◄──  {"result":{"content":[...]},"id":3}
+4. {"method":"tools/call","id":3,"params":{"name":"create_diagram",...}}
+                                     ──►  runs create_diagram()
+                                     ◄──  {"result":{"content":[...],
+                                                     "structuredContent":{...}},"id":3}
+... one tools/call per model tool call ...
 
-... loop continues ...
-
-6. Closes stdin pipe
-                                     ──►  Detects EOF
-                                          Runs cleanup
-                                          Exits process
+5. Closes the server's stdin
+                                     ──►  EOF → exits
 ```
 
 ### 4. Technical Details & Timing
 
 | Aspect | Detail |
 |--------|--------|
-| **Process model** | Server runs as a **child process** of the host. One process per server. |
-| **IPC mechanism** | Unix pipe (on macOS/Linux) or Windows pipe. No network sockets involved. |
-| **Message format** | One JSON object per line (newline-delimited JSON). |
-| **Latency** | ~0.1-0.5ms per round-trip (pure IPC, no network stack). |
-| **Buffering** | stdout is line-buffered by default. Each message is flushed immediately. |
-| **Memory** | ~10-50MB per server process (Python overhead). |
-| **Lifecycle** | Process lives as long as the host. Killed when host exits. |
-| **Logging** | Use stderr for logging: `print("debug", file=sys.stderr)` |
+| **Process model** | One child process per configured server, started by the host |
+| **IPC** | Anonymous pipes on stdin/stdout. No sockets, no ports |
+| **Message format** | Newline-delimited JSON-RPC 2.0, UTF-8 |
+| **Latency** | Pipe overhead is negligible (well under a millisecond); tool work and the model's turn dominate |
+| **Memory** | A Python process plus the SDK and your dependencies: tens of MB at least, far more if you load ML models |
+| **Lifecycle** | Lives as long as the host keeps it; the host closes stdin, then signals |
+| **Logging** | stderr only: `print("debug", file=sys.stderr)` or `logging` (which defaults to stderr) |
+| **Credentials** | From the environment the host passes in; no OAuth over stdio |
 
 ### 5. What This Means in Practice
 
 ```python
-# When you run this:
-mcp = FastMCP("my-server")
+from mcp.server.mcpserver import MCPServer
+
+mcp = MCPServer("my-server")
+
 
 @mcp.tool()
 def my_tool(x: int) -> int:
+    """Double a number."""
     return x * 2
 
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
 
-# The following happens:
-# 1. Python process starts
-# 2. FastMCP initializes all registered tools/resources/prompts
-# 3. Process blocks on stdin, waiting for JSON-RPC messages
-# 4. Host sends: {"method":"initialize",...}
-# 5. Server responds with capabilities
-# 6. Host sends: {"method":"tools/list",...}
-# 7. Server responds with tool schemas
-# 8. Host sends: {"method":"tools/call","params":{"name":"my_tool","arguments":{"x":5}}}
-# 9. Server calls my_tool(5), gets 10, sends: {"result":{"content":[{"text":"10"}]}}
-# 10. Repeat from step 8 for each tool call
-# 11. Host closes stdin → server detects EOF → exits
+if __name__ == "__main__":
+    mcp.run()
+
+# 1. Python starts; the decorator registers my_tool with schema {"x": integer}
+# 2. The process blocks on stdin
+# 3. Host: server/discover (or initialize, for older hosts) → capabilities
+# 4. Host: tools/list → [{"name": "my_tool", "inputSchema": {...}, "outputSchema": {...}}]
+# 5. Host: tools/call {"name": "my_tool", "arguments": {"x": 5}}
+# 6. Server: {"content": [{"type": "text", "text": "10"}], "structuredContent": {"result": 10}}
+# 7. Host closes stdin → EOF → process exits
 ```
 
 ### 6. The "stdin/stdout" Architecture Diagram
 
 ```ascii
 ┌────────────────────────────────────────────────────────────────┐
-│                      HOST PROCESS                               │
-│                                                                │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  MCP Client (Protocol Handler)                        │   │
-│  │                                                       │   │
-│  │  # Write request to child's stdin                     │   │
-│  │  os.WriteFile(stdin_pipe, json_request)               │   │
-│  │                                                       │   │
-│  │  # Read response from child's stdout                  │   │
-│  │  response = os.ReadFile(stdout_pipe)                  │   │
-│  └────────────┬───────────────────────────────────────────┘   │
-└───────────────┼───────────────────────────────────────────────┘
-                │
-                │  stdin  ──────── JSON-RPC ────────►
-                │  stdout ◄─────── JSON-RPC ──────────
-                │  stderr ──────── Logs only ─────────►
-                │
-┌───────────────┼───────────────────────────────────────────────┐
-│               ▼                                                │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │              SERVER PROCESS (child)                    │   │
-│  │                                                        │   │
-│  │  import sys                                            │   │
-│  │  import json                                           │   │
-│  │                                                        │   │
-│  │  while True:                                           │   │
-│  │      line = sys.stdin.readline()      # Block on stdin  │   │
-│  │      if not line:                     # EOF → shutdown  │   │
-│  │          break                                          │   │
-│  │      msg = json.loads(line)           # Parse JSON-RPC  │   │
-│  │      result = dispatch(msg)           # Call handler    │   │
-│  │      sys.stdout.write(json.dumps(result) + "\n")       │   │
-│  │      sys.stdout.flush()               # Send response   │   │
-│  └────────────────────────────────────────────────────────┘   │
+│                      HOST PROCESS                              │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │  MCP Client                                            │   │
+│   │   write(child.stdin,  json_request + "\n")             │   │
+│   │   read_line(child.stdout) → json_response              │   │
+│   │   read(child.stderr)      → host's log file            │   │
+│   └────────────┬───────────────────────────────────────────┘   │
+└────────────────┼───────────────────────────────────────────────┘
+                 │  stdin  ──────── JSON-RPC ────────►
+                 │  stdout ◄─────── JSON-RPC ─────────
+                 │  stderr ──────── logs only ───────►
+┌────────────────┼───────────────────────────────────────────────┐
+│                ▼        SERVER PROCESS (child)                 │
+│   for line in stdin:   parse → dispatch → write line + flush   │
+│   EOF → exit                                                   │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 ### 7. Why No Network Port?
 
-Unlike a web server that binds to `0.0.0.0:8000`, `mcp.run(transport="stdio")` does **not** open any network port. The communication happens through **standard file descriptors** that every process already has:
+`mcp.run(transport="stdio")` opens no network port; it uses the file descriptors every process already has:
 
-| File Descriptor | Direction | Used For |
+| File descriptor | Direction | Used for |
 |----------------|-----------|----------|
-| `stdin` (fd 0) | Host → Server | Receiving JSON-RPC requests |
-| `stdout` (fd 1) | Server → Host | Sending JSON-RPC responses |
-| `stderr` (fd 2) | Server → User | Logging, debug output |
+| `stdin` (fd 0) | Host → Server | JSON-RPC requests (and responses to anything the server asked) |
+| `stdout` (fd 1) | Server → Host | JSON-RPC responses and notifications |
+| `stderr` (fd 2) | Server → Host's logs | Logging, debug output |
 
-**Security benefit:** No firewall rules needed, no open ports, no network attack surface. The server is completely isolated inside its own process.
+**What this does and doesn't buy you:** there's no remote attack surface, so no firewall rules or listener to secure. But the server is **not sandboxed**: it runs as you, with your files, network and credentials. A malicious or prompt-injected stdio server can do anything you can. Treat installing one like installing any program, and run untrusted ones in a container or sandbox.
 
 ---
 
@@ -501,39 +363,40 @@ You: "Create a class diagram for a parking lot system"
 
 ### Step 2: LLM Receives the Request
 
-The MCP Host sends this to the LLM (e.g., Claude):
+The host sends the conversation **and the tool definitions** (converted from `tools/list`) to the model. Shown here in a generic chat-completions style; each provider's format differs slightly:
 
 ```json
 {
   "messages": [
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "Create a class diagram for a parking lot system" }
+  ],
+  "tools": [
     {
-      "role": "system",
-      "content": "You are a helpful assistant with access to a diagramming tool..."
-    },
-    {
-      "role": "user",
-      "content": "Create a class diagram for a parking lot system"
+      "type": "function",
+      "function": {
+        "name": "create_diagram",
+        "description": "Create a new, empty UML class diagram and return its diagram_id.",
+        "parameters": { "type": "object", "properties": { "title": { "type": "string" } }, "required": ["title"] }
+      }
     }
   ]
 }
 ```
 
-### Step 3: LLM Decides to Use a Tool
+(Other tools omitted. Hosts with many servers often prefix names, e.g. `drawio__create_diagram`, to avoid collisions.)
 
-The LLM's response includes a tool call request:
+### Step 3: LLM Decides to Use a Tool
 
 ```json
 {
   "role": "assistant",
-  "content": "I'll create a Parking Lot class diagram. Let me start by creating the diagram.",
+  "content": "I'll start by creating the diagram.",
   "tool_calls": [
     {
       "id": "call_abc123",
       "type": "function",
-      "function": {
-        "name": "create_diagram",
-        "arguments": "{\"diagram_type\": \"class\", \"title\": \"Parking Lot System\"}"
-      }
+      "function": { "name": "create_diagram", "arguments": "{\"title\": \"Parking Lot System\"}" }
     }
   ]
 }
@@ -541,112 +404,106 @@ The LLM's response includes a tool call request:
 
 ### Step 4: Host Sends JSON-RPC Request to MCP Server
 
-The MCP Host translates the tool call into a JSON-RPC 2.0 request:
+If the tool needs approval, the host asks the user first. Then:
 
 ```json
 {
   "jsonrpc": "2.0",
+  "id": 3,
   "method": "tools/call",
   "params": {
     "name": "create_diagram",
-    "arguments": {
-      "diagram_type": "class",
-      "title": "Parking Lot System"
+    "arguments": { "title": "Parking Lot System" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "io.modelcontextprotocol/clientInfo": { "name": "claude-desktop", "version": "x.y.z" }
     }
-  },
-  "id": 1
+  }
 }
 ```
 
-**This is the actual network request.** Whether over stdio (pipe to child process) or HTTP (POST to server), this JSON is what gets sent.
+**This is the MCP message on the wire:** a line on the server's stdin, or the body of a POST to `/mcp` (with `Mcp-Method: tools/call` and `Mcp-Name: create_diagram` headers) over Streamable HTTP.
 
 ### Step 5: MCP Server Processes the Request
 
-The server:
-1. Receives the JSON
-2. Validates arguments against the tool's JSON Schema
-3. Calls the `create_diagram` Python function
-4. Gets the result
-
-```python
-# Server-side validation (auto-generated from type hints + docstrings)
-# Input validation:
-#   - "diagram_type" must be one of: "class", "flowchart", "sequence", "entity"
-#   - "title" must be a string
-# Result:
-result = create_diagram(diagram_type="class", title="Parking Lot System")
-# Returns: {"diagram_id": "diagram_1", "title": "Parking Lot System", ...}
-```
+1. Parse the JSON-RPC message and look up the tool.
+2. Validate `arguments` against the tool's input schema (generated from type hints: `title` must be a string; `relationship_type` must be one of the `Literal` values).
+3. Call the Python function.
+4. Convert the return value: text content for the model, plus `structuredContent` when there's an output schema. A `ToolError` becomes `isError: true`.
 
 ### Step 6: Server Sends JSON-RPC Response
 
 ```json
 {
   "jsonrpc": "2.0",
+  "id": 3,
   "result": {
+    "resultType": "complete",
     "content": [
-      {
-        "type": "text",
-        "text": "{\"diagram_id\": \"diagram_1\", \"title\": \"Parking Lot System\", \"type\": \"class\"}"
-      }
-    ]
-  },
-  "id": 1
+      { "type": "text", "text": "{\"diagram_id\": \"d_1a2b3c4d\", \"title\": \"Parking Lot System\"}" }
+    ],
+    "structuredContent": { "diagram_id": "d_1a2b3c4d", "title": "Parking Lot System" },
+    "isError": false
+  }
 }
 ```
 
-**This is the response the host receives.** It contains structured text that gets sent back to the LLM.
-
 ### Step 7: LLM Receives the Result and Plans Next Steps
 
-The result is added as a tool response message:
+The host appends the result as a tool message:
 
 ```json
 {
   "role": "tool",
   "tool_call_id": "call_abc123",
-  "content": "{\"diagram_id\": \"diagram_1\", \"title\": \"Parking Lot System\", \"type\": \"class\"}"
+  "content": "{\"diagram_id\": \"d_1a2b3c4d\", \"title\": \"Parking Lot System\"}"
 }
 ```
 
-The LLM now knows the diagram was created and plans the next steps:
+and calls the model again, which continues:
 
 ```json
 {
   "role": "assistant",
-  "content": "Great, the diagram is created! Now let me add the main classes.",
+  "content": "Now the main classes.",
   "tool_calls": [
     {
       "id": "call_def456",
+      "type": "function",
       "function": {
         "name": "add_class",
-        "arguments": "{\"diagram_id\": \"diagram_1\", \"class_name\": \"ParkingLot\", \"attributes\": [\"-floors: List[ParkingFloor]\"], \"methods\": [\"+park_vehicle(v: Vehicle): Ticket\", \"+unpark_vehicle(ticket: Ticket): bool\"]}"
+        "arguments": "{\"diagram_id\": \"d_1a2b3c4d\", \"class_name\": \"ParkingLot\", \"attributes\": [\"-floors: list[ParkingFloor]\"], \"methods\": [\"+park_vehicle(v: Vehicle): Ticket\", \"+unpark_vehicle(t: Ticket): bool\"]}"
       }
     }
   ]
 }
 ```
 
+Models can emit several independent tool calls in one turn; hosts may run them in parallel.
+
 ### Step 8: Multiple Tool Calls Build the Complete Diagram
 
-This repeats — the LLM calls `add_class`, then `add_relationship`, then `add_class` again, etc. Each is a round-trip:
+Each step is a model turn plus a `tools/call` round trip:
 
 ```
-LLM: add_class("ParkingLot", ...)  →  Server: ✅ Added
-LLM: add_class("Vehicle", ...)     →  Server: ✅ Added
-LLM: add_class("Car", ...)         →  Server: ✅ Added
-LLM: add_relationship("Car", "Vehicle", "inheritance") → Server: ✅ Added
-LLM: add_class("ParkingSpot", ...) →  Server: ✅ Added
-LLM: add_relationship("ParkingLot", "ParkingSpot", "composition") → Server: ✅ Added
-LLM: export_diagram("diagram_1", "svg") → Server: Returns SVG
+LLM: add_class("ParkingLot", ...)                              → Server: added
+LLM: add_class("Vehicle", ...)                                 → Server: added
+LLM: add_class("Car", ...)                                     → Server: added
+LLM: add_relationship("Car", "Vehicle", "inheritance")         → Server: added
+LLM: add_class("ParkingSpot", ...)                             → Server: added
+LLM: add_relationship("ParkingLot", "ParkingSpot", "composition") → Server: added
+LLM: export_diagram("d_1a2b3c4d")                              → Server: .drawio XML
 ```
+
+Seven model turns is slow and costly. A better-designed server would offer `create_class_diagram(classes: list[ClassSpec], relationships: list[RelSpec])` and do it in one call. **Fewer, coarser tools** is the most common MCP design improvement.
 
 ### Step 9: Final Response to User
 
 ```json
 {
   "role": "assistant",
-  "content": "Here's the Parking Lot class diagram I created:\n\n![Parking Lot Class Diagram](data:image/svg+xml;base64,...)\n\nThe diagram includes:\n- **ParkingLot** — main facade class\n- **ParkingFloor** — composition with ParkingLot\n- **ParkingSpot** — managed by ParkingFloor\n- **Vehicle** (abstract) → Car, Truck, Motorcycle\n- **ParkingTicket** — tracks parking sessions\n- **FeeCalculator** — strategy pattern for pricing\n- Relationships: inheritance, composition, and dependency arrows"
+  "content": "I've created the Parking Lot class diagram (saved as parking_lot.drawio; open it in diagrams.net). It includes ParkingLot, ParkingFloor, ParkingSpot, an abstract Vehicle with Car/Truck/Motorcycle subclasses, ParkingTicket and FeeCalculator, with inheritance, composition and dependency relationships."
 }
 ```
 
@@ -654,105 +511,65 @@ LLM: export_diagram("diagram_1", "svg") → Server: Returns SVG
 
 ## 4. THE COMPLETE JSON-RPC FLOW (DIAGRAM)
 
-```ascii
-USER                    MCP HOST                    MCP SERVER              DRAW.IO
- │                          │                           │                      │
- │  "Draw class diagram"    │                           │                      │
- │─────────────────────────►│                           │                      │
- │                          │                           │                      │
- │                          │  ── 1. Initialize ──►     │                      │
- │                          │  ◄─── Capabilities ──     │                      │
- │                          │     (tools/list)          │                      │
- │                          │                           │                      │
- │                          │  ── 2. tools/list ──►     │                      │
- │                          │  ◄─── create_diagram ──   │                      │
- │                          │        add_class          │                      │
- │                          │        add_relationship   │                      │
- │                          │        export_diagram     │                      │
- │                          │                           │                      │
- │                          │  ── 3. tools/call ──►     │                      │
- │                          │    create_diagram         │── drawpy.create() ──►│
- │                          │    {"type":"class"}       │                      │
- │                          │                           │◄── diagram_id ──────│
- │                          │  ◄─── {"diagram_id": ──   │                      │
- │                          │         "diagram_1"}      │                      │
- │                          │                           │                      │
- │                          │  ── 4. tools/call ──►     │                      │
- │                          │    add_class("ParkingLot") │── drawpy.add() ────►│
- │                          │                           │                      │
- │                          │  ── 5. tools/call ──►     │                      │
- │                          │    add_class("Vehicle")   │── drawpy.add() ────►│
- │                          │                           │                      │
- │                          │  ── 6. tools/call ──►     │                      │
- │                          │    add_relationship(...)  │── drawpy.connect() ─►│
- │                          │                           │                      │
- │                          │  ── 7. tools/call ──►     │                      │
- │                          │    export_diagram("svg")  │── drawpy.export() ──►│
- │                          │                           │◄── SVG data ────────│
- │                          │  ◄─── SVG image ──────    │                      │
- │                          │                           │                      │
- │  ◄── Shows diagram ─────│                           │                      │
- │                          │                           │                      │
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant H as MCP Host + LLM
+    participant S as draw.io MCP Server
+    Note over H,S: at startup
+    H->>S: server/discover (or initialize, legacy)
+    S-->>H: versions, capabilities
+    H->>S: tools/list
+    S-->>H: create_diagram, add_class, add_relationship, export_diagram
+    U->>H: Draw a parking lot class diagram
+    Note over H: LLM chooses create_diagram
+    H->>S: tools/call create_diagram
+    S-->>H: diagram_id d_1a2b3c4d
+    loop one per LLM tool call
+        H->>S: tools/call add_class or add_relationship
+        S-->>H: added
+    end
+    H->>S: tools/call export_diagram
+    S-->>H: .drawio XML
+    H-->>U: Diagram ready
 ```
 
 ---
 
 ## 5. WHERE IS MCP ACTUALLY?
 
-Many people ask: **"Where does MCP live?"**
-
-The answer: **MCP is a protocol — it lives in the messages between the Host and Server.**
+**MCP is a protocol: it lives in the messages between the host's MCP client and the server.** Not in the model, and not between the host and the model.
 
 ```ascii
 ┌─────────────────────────────────────────────────────────────┐
-│                     YOUR COMPUTER                            │
-│                                                              │
-│  ┌────────────────────────────────────────────────────┐     │
-│  │              CLAUDE DESKTOP (Host)                   │     │
-│  │                                                      │     │
-│  │  ┌──────────────────────────────────────────────┐   │     │
-│  │  │              LLM (Claude Model)               │   │     │
-│  │  │  • Receives user message                      │   │     │
-│  │  │  • Decides to call tool                       │   │     │
-│  │  │  • Returns response                           │   │     │
-│  │  └──────────────────────────────────────────────┘   │     │
-│  │                      │                               │     │
-│  │                      │ JSON-RPC 2.0                  │     │
-│  │                      │ over stdin/stdout             │     │
-│  │                      ▼                               │     │
-│  │  ┌──────────────────────────────────────────────┐   │     │
-│  │  │         MCP CLIENT (Protocol Handler)          │   │     │
-│  │  │  • Sends JSON-RPC requests                     │   │     │
-│  │  │  • Receives JSON-RPC responses                 │   │     │
-│  │  │  • Manages transport (stdio or HTTP)           │   │     │
-│  │  └────────────┬───────────────────────────────────┘   │     │
-│  └───────────────┼──────────────────────────────────────┘     │
-│                  │ Child process pipe                         │
-│                  ▼                                            │
-│  ┌────────────────────────────────────────────────────┐     │
-│  │            MCP SERVER (drawio_server.py)             │     │
-│  │                                                      │     │
-│  │  ┌──────────────────────────────────────────────┐   │     │
-│  │  │      FastMCP (Python SDK)                     │   │     │
-│  │  │  • Parses JSON-RPC                             │   │     │
-│  │  │  • Validates against schema                    │   │     │
-│  │  │  • Calls registered functions                  │   │     │
-│  │  │  • Formats JSON-RPC response                   │   │     │
-│  │  └──────────────────────────────────────────────┘   │     │
-│  │                                                      │     │
-│  │  ┌──────────────────────────────────────────────┐   │     │
-│  │  │      Your Tool Functions                      │   │     │
-│  │  │  • create_diagram()                            │   │     │
-│  │  │  • add_class()                                │   │     │
-│  │  │  • add_relationship()                         │   │     │
-│  │  │  • export_diagram()                           │   │     │
-│  │  └──────────────────────────────────────────────┘   │     │
-│  └────────────────────────────────────────────────────┘     │
-│                                                              │
+│                       YOUR COMPUTER                         │
+│                                                             │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                CLAUDE DESKTOP (Host)                  │  │
+│  │                                                       │  │
+│  │   conversation + tool definitions                     │  │
+│  │        │  HTTPS to the model provider's API           │  │
+│  │        ▼  (NOT MCP: the provider's own tool format)   │  │
+│  │   ┌───────────────────────────┐                       │  │
+│  │   │  LLM (remote API)         │                       │  │
+│  │   └───────────────────────────┘                       │  │
+│  │        │ tool call                                    │  │
+│  │        ▼                                              │  │
+│  │   ┌───────────────────────────┐                       │  │
+│  │   │  MCP CLIENT               │                       │  │
+│  │   └────────────┬──────────────┘                       │  │
+│  └────────────────┼──────────────────────────────────────┘  │
+│                   │ MCP: JSON-RPC 2.0 over stdin/stdout     │
+│                   ▼                                         │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  MCP SERVER (drawio_mcp_server.py)                    │  │
+│  │   MCPServer (Python SDK): parse, validate, dispatch   │  │
+│  │   Your functions: create_diagram, add_class, ...      │  │
+│  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**MCP lives in the protocol layer** — the standardized JSON-RPC 2.0 messages that flow between the client and server. It's not a library, not a framework — it's a **contract** that both sides agree to speak.
+It's not a library or a framework but a **contract** both sides speak; the SDKs are just convenient implementations of it.
 
 ---
 
@@ -760,82 +577,93 @@ The answer: **MCP is a protocol — it lives in the messages between the Host an
 
 ### 6.1 Request Types
 
-| Method | Purpose | When | Example |
-|--------|---------|------|---------|
-| `initialize` | Handshake + capability negotiation | Connection start | `{"method": "initialize", "params": {...}}` |
-| `tools/list` | Discover available tools | After init | `{"method": "tools/list", "id": 1}` |
-| `tools/call` | Execute a tool | When LLM decides | `{"method": "tools/call", "params": {"name": "add_class", "arguments": {...}}}` |
-| `resources/list` | Discover available resources | After init | `{"method": "resources/list", "id": 2}` |
-| `resources/read` | Read a resource | When LLM needs data | `{"method": "resources/read", "params": {"uri": "rag://status"}}` |
-| `prompts/list` | Discover prompt templates | After init | `{"method": "prompts/list", "id": 3}` |
-| `prompts/get` | Get a prompt template | When LLM needs guidance | `{"method": "prompts/get", "params": {"name": "debug_query"}}` |
-| `notifications/initialized` | Confirm initialization complete | After init response | `{"method": "notifications/initialized"}` |
+| Method | Purpose | When |
+|--------|---------|------|
+| `server/discover` | Supported versions, capabilities, identity (2026-07-28) | Optional, before other requests |
+| `initialize` + `notifications/initialized` | Handshake (legacy, ≤ 2025-11-25) | Connection start, older servers |
+| `tools/list` / `tools/call` | Discover / execute tools | Startup / when the model asks |
+| `resources/list` / `resources/read` | Discover / read data | When the host or user attaches context |
+| `resources/templates/list` | Parameterised resource URIs | Startup |
+| `prompts/list` / `prompts/get` | Discover / expand templates | Startup / when the user picks one (slash command) |
+| `subscriptions/listen` | Long-lived stream of opted-in change notifications (2026-07-28) | When the host wants `list_changed` / resource updates |
+| `completion/complete` | Autocomplete for prompt or resource-template arguments | While the user types |
 
 ### 6.2 Response Types
 
 | Type | Structure | Example |
 |------|-----------|---------|
-| **Success** | `{"jsonrpc": "2.0", "result": {...}, "id": 1}` | Tool result, resource content |
-| **Error** | `{"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params"}, "id": 1}` | Validation failure, not found |
-| **Notification** | `{"jsonrpc": "2.0", "method": "...", "params": {...}}` (no `id`) | Server-initiated events |
+| **Result** | `{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete",...}}` | Tool result (possibly `isError: true`), resource contents |
+| **Input required** | `{"result":{"resultType":"input_required","inputRequests":{...},"requestState":"..."}}` | Server needs elicitation before finishing (2026-07-28 MRTR) |
+| **Error** | `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"..."}}` | Unknown tool, malformed params |
+| **Notification** | `{"jsonrpc":"2.0","method":"notifications/progress","params":{...}}` (no `id`) | Progress, list changes |
 
 ### 6.3 Concrete Request/Response Pair
 
 **Request** (Host → Server):
+
 ```json
 {
   "jsonrpc": "2.0",
+  "id": 7,
   "method": "tools/call",
   "params": {
     "name": "add_class",
     "arguments": {
-      "diagram_id": "diagram_1",
+      "diagram_id": "d_1a2b3c4d",
       "class_name": "ParkingTicket",
-      "attributes": [
-        "-ticket_id: str",
-        "-entry_time: datetime",
-        "-exit_time: Optional[datetime]",
-        "-status: ParkingTicketStatus"
-      ],
-      "methods": [
-        "+close(fee_calculator: FeeCalculator): float"
-      ]
-    }
-  },
-  "id": 3
+      "attributes": ["-ticket_id: str", "-entry_time: datetime", "-exit_time: datetime | None"],
+      "methods": ["+close(fee_calculator: FeeCalculator): float"]
+    },
+    "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
+  }
 }
 ```
 
 **Response** (Server → Host):
+
 ```json
 {
   "jsonrpc": "2.0",
+  "id": 7,
   "result": {
+    "resultType": "complete",
     "content": [
-      {
-        "type": "text",
-        "text": "{\"status\": \"added\", \"class\": \"ParkingTicket\", \"attributes\": 4, \"methods\": 1}"
-      }
+      { "type": "text", "text": "{\"status\": \"added\", \"class\": \"ParkingTicket\", \"attributes\": 3, \"methods\": 1}" }
     ],
     "isError": false
-  },
-  "id": 3
+  }
 }
 ```
 
+(`add_class` returns a plain `dict`, so there's no `structuredContent`; compare `create_diagram`.)
+
 ### 6.4 Error Response Example
+
+Two different failures, two different shapes:
+
+**The tool ran and failed** (unknown diagram id): a normal result with `isError`, which the model sees and can act on:
 
 ```json
 {
   "jsonrpc": "2.0",
-  "error": {
-    "code": -32602,
-    "message": "Invalid params",
-    "data": {
-      "validation_error": "diagram_id 'diagram_99' not found. Available IDs: diagram_1"
-    }
-  },
-  "id": 3
+  "id": 8,
+  "result": {
+    "resultType": "complete",
+    "isError": true,
+    "content": [
+      { "type": "text", "text": "Error executing tool add_class: Diagram 'd_99' not found. Known diagrams: d_1a2b3c4d" }
+    ]
+  }
+}
+```
+
+**The request itself is bad** (no such tool, malformed params): the spec's answer is a JSON-RPC error, handled by the host and usually not shown to the model. (SDKs vary at the edges: Python SDK v2 reports an unknown tool as an `isError` result so the model can see it.)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "error": { "code": -32602, "message": "Unknown tool: add_klass" }
 }
 ```
 
@@ -843,73 +671,63 @@ The answer: **MCP is a protocol — it lives in the messages between the Host an
 
 ## 7. MCP IN PRODUCTION
 
-In production, we don't run the MCP server as a child process of Claude Desktop. Instead, we deploy it as a microservice:
+Local tools (files, git, the IDE) stay on **stdio** in production: they need the user's machine. Shared tools that many users or agents call become **remote MCP servers** over Streamable HTTP, deployed like any stateless web service:
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────────┐
-│                        PRODUCTION ARCHITECTURE                    │
-│                                                                   │
-│  ┌────────────┐     ┌────────────┐     ┌────────────────────┐   │
-│  │  User      │────►│  AI Agent   │────►│  MCP Gateway       │   │
-│  │  (Browser) │     │  (K8s Pod)  │     │  (Kong/ALB)        │   │
-│  └────────────┘     └────────────┘     │  • Auth (JWT)       │   │
-│                                         │  • Rate Limiting    │   │
-│                                         │  • Load Balancing   │   │
-│                                         │  • TLS Termination  │   │
-│                                         └────────┬───────────┘   │
-│                                                  │               │
-│                    ┌─────────────────────────────┼────────┐      │
-│                    │                             │        │      │
-│                    ▼                             ▼        │      │
-│    ┌────────────────────────┐    ┌────────────────────┐   │      │
-│    │  draw.io MCP Server    │    │  DB MCP Server     │   │      │
-│    │  (3 replicas, HPA)     │    │  (2 replicas)      │   │      │
-│    │                        │    │                    │   │      │
-│    │  Streamable HTTP (SSE) │    │  Streamable HTTP   │   │      │
-│    │  Port: 8000            │    │  Port: 8001        │   │      │
-│    │  Scaling: 70% CPU      │    │  Scaling: 100 rps  │   │      │
-│    └────────────────────────┘    └────────────────────┘   │      │
-│                    │                                        │      │
-│                    ▼                                        │      │
-│    ┌────────────────────────────────────────────────┐       │      │
-│    │           Observability Stack                   │       │      │
-│    │  • Prometheus (metrics)                         │       │      │
-│    │  • Grafana (dashboards)                         │       │      │
-│    │  • Loki (logs)                                  │       │      │
-│    │  • OpenTelemetry (traces)                       │       │      │
-│    └────────────────────────────────────────────────┘       │      │
-└──────────────────────────────────────────────────────────────┘      │
+│                     PRODUCTION ARCHITECTURE                      │
+│                                                                  │
+│  ┌────────────┐     ┌──────────────┐     ┌────────────────────┐  │
+│  │  User      │────►│  AI host /   │────►│  Gateway / LB      │  │
+│  │            │     │  agent       │     │  • TLS             │  │
+│  └────────────┘     └──────────────┘     │  • coarse limits   │  │
+│                        OAuth token       │  • round-robin     │  │
+│                                          └─────────┬──────────┘  │
+│                         ┌──────────────────────────┴─────┐       │
+│                         ▼                                ▼       │
+│          ┌────────────────────────┐    ┌────────────────────┐    │
+│          │  draw.io MCP server    │    │  DB MCP server     │    │
+│          │  N replicas, stateless │    │  N replicas        │    │
+│          │  POST /mcp             │    │  POST /mcp         │    │
+│          │  diagrams in Redis/DB  │    │  read-only role    │    │
+│          └────────────────────────┘    └────────────────────┘    │
+│                         │ traces, metrics, audit logs            │
+│                         ▼                                        │
+│          ┌──────────────────────────────────────────────┐        │
+│          │  OpenTelemetry → metrics / logs / traces     │        │
+│          └──────────────────────────────────────────────┘        │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Production vs Development
 
-| Aspect | Development (stdio) | Production (Streamable HTTP) |
+| Aspect | Local server (stdio) | Remote server (Streamable HTTP) |
 |--------|-------------------|------------------------------|
-| **Transport** | Child process pipe | HTTP + SSE |
-| **Latency** | <1ms (IPC) | 5-50ms (network) |
-| **Scaling** | 1:1 (one client per server) | N:M (many clients, many replicas) |
-| **Security** | Trust boundary (local) | JWT auth, TLS, rate limiting |
-| **Deployment** | `python server.py` | Docker → Kubernetes |
-| **Monitoring** | Manual | Prometheus + Grafana |
-| **Resilience** | Process dies = session lost | Health checks, circuit breakers |
+| **Who runs it** | The host, as a child process | You, as a service |
+| **Transport** | Pipes | HTTPS POST; JSON or a per-request SSE stream |
+| **Overhead** | Negligible | A network round trip (more across regions) |
+| **Scaling** | One process per host | Many clients, many stateless replicas |
+| **Auth** | Environment credentials | OAuth 2.1 bearer token per request, audience-checked |
+| **State** | Process memory is fine | Externalise it (handles + Redis/DB) |
+| **Deployment** | Package on PyPI/npm, or a binary | Container → Kubernetes / serverless |
+| **Failure** | Process dies, host restarts it | Health checks, retries, circuit breakers |
 
 ### Production Deployment Steps
 
 ```bash
-# 1. Build the Docker image
-docker build -t mcp-drawio-server:latest .
+# 1. Build and push a versioned image (never deploy :latest)
+docker build -t myregistry/mcp-drawio-server:1.0.0 .
+docker push myregistry/mcp-drawio-server:1.0.0
 
-# 2. Push to registry
-docker push myregistry/mcp-drawio-server:latest
-
-# 3. Deploy to Kubernetes
+# 2. Deploy (Deployment + Service + HPA; full manifest in 04_MCP_PRODUCTION_ARCHITECTURE.md)
 kubectl apply -f k8s/mcp-drawio-server.yaml
 
-# 4. Configure the AI Agent to connect
-# The agent connects to: https://mcp-gateway.company.com/drawio
+# 3. Register the URL in the host, e.g. https://mcp.company.com/drawio/mcp
+#    The host discovers the auth server from the 401 + protected-resource metadata.
 ```
 
-**Kubernetes Config:**
+**Kubernetes config** (abridged; see [Production Architecture §1.2](04_MCP_PRODUCTION_ARCHITECTURE.md#12-kubernetes-deployment) for probes, security context and autoscaling):
+
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -927,18 +745,18 @@ spec:
     spec:
       containers:
       - name: server
-        image: myregistry/mcp-drawio-server:latest
+        image: myregistry/mcp-drawio-server:1.0.0
         ports:
         - containerPort: 8000
         env:
-        - name: MAX_DIAGRAM_SIZE
-          value: "10MB"
-        - name: RATE_LIMIT
-          value: "100/minute"
+        - name: MAX_DIAGRAM_BYTES
+          value: "10485760"
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef: { name: drawio-redis, key: url }
         resources:
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
+          requests: { memory: "256Mi", cpu: "250m" }
+          limits:   { memory: "512Mi" }
 ---
 apiVersion: v1
 kind: Service
@@ -948,7 +766,7 @@ spec:
   selector:
     app: mcp-drawio-server
   ports:
-  - port: 8000
+  - port: 80
     targetPort: 8000
 ```
 
@@ -958,39 +776,26 @@ spec:
 
 ```ascii
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    THE COMPLETE MCP FLOW                             │
+│                       THE COMPLETE MCP FLOW                         │
 │                                                                     │
-│  PHASE 1: CONNECTION                                                 │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ Host spawns/connects to MCP Server                            │  │
-│  │ Host → Server: {"method": "initialize", ...}                  │  │
-│  │ Server → Host: {"result": {"capabilities": {"tools":{}},...}  │  │
-│  └───────────────────────────────────────────────────────────────┘  │
+│  PHASE 1: CONNECTION                                                │
+│    stdio: host spawns the server.  HTTP: nothing to open.           │
+│    Optional server/discover → versions + capabilities               │
+│    (legacy servers: initialize → result → notifications/initialized)│
 │                                                                     │
-│  PHASE 2: DISCOVERY                                                  │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ Host → Server: {"method": "tools/list", "id": 1}              │  │
-│  │ Server → Host: {"result": {"tools": [{"name":"create_diagram",│  │
-│  │                                        "inputSchema":...}]}}  │  │
-│  └───────────────────────────────────────────────────────────────┘  │
+│  PHASE 2: DISCOVERY                                                 │
+│    tools/list → [{"name":"create_diagram","inputSchema":...}, ...]  │
+│    host converts these into the model's tool definitions            │
 │                                                                     │
-│  PHASE 3: EXECUTION                                                  │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ LLM decides to call "add_class"                                │  │
-│  │ Host → Server: {"method": "tools/call", "params":             │  │
-│  │                {"name":"add_class","arguments":{...}}}         │  │
-│  │ Server executes: Python function runs                          │  │
-│  │ Server → Host: {"result": {"content": [{"type":"text",        │  │
-│  │                               "text":"..."}]}}                │  │
-│  │ Host feeds result back to LLM as tool response                │  │
-│  │ LLM decides next action (more tools or respond to user)       │  │
-│  └───────────────────────────────────────────────────────────────┘  │
+│  PHASE 3: EXECUTION (repeats)                                       │
+│    model emits a tool call → host (user approval if needed)         │
+│    → tools/call {"name":"add_class","arguments":{...}}              │
+│    → server validates, runs the function                            │
+│    → {"content":[...], "structuredContent":{...}, "isError":false}  │
+│    → host feeds the result back → model calls more tools or answers │
 │                                                                     │
-│  PHASE 4: SHUTDOWN                                                   │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ Host closes transport connection                               │  │
-│  │ Server cleans up resources                                     │  │
-│  └───────────────────────────────────────────────────────────────┘  │
+│  PHASE 4: SHUTDOWN                                                  │
+│    stdio: host closes stdin → server exits.  HTTP: nothing to close.│
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -998,14 +803,14 @@ spec:
 
 ## 9. KEY TAKEAWAYS
 
-1. **MCP is a protocol, not a product** — it's the standardized way Hosts and Servers communicate via JSON-RPC 2.0
-2. **The LLM doesn't know MCP exists** — it just sees "here are your available tools" in the system prompt
-3. **The Host handles the plumbing** — it translates between LLM tool calls and JSON-RPC messages
-4. **Round-trips matter** — each `tools/call` is one network/process hop. Design tools to minimize round-trips
-5. **Schema validation protects against hallucination** — the server validates parameters before executing
-6. **Production = Streamable HTTP** — stdio is for development; SSE+HTTP POST is for production deployments
-7. **The draw.io example applies to ANY tool** — same protocol works for databases, file systems, APIs, etc.
+1. **MCP is a protocol, not a product**: JSON-RPC 2.0 messages between a host's MCP client and a server.
+2. **The model doesn't know MCP exists**: it sees tool definitions and results in its provider's API format; the host translates both ways.
+3. **The host owns the loop and the user**: tool selection happens in the model, execution approval and routing in the host.
+4. **Round trips are model turns**: each tool call usually costs a full LLM turn. Prefer fewer, coarser tools.
+5. **Schemas guide, servers enforce**: type hints and `Literal`s produce schemas that steer the model and reject bad types; business validation and security checks stay in your code.
+6. **Both transports are production transports**: stdio for local tools, Streamable HTTP for shared remote ones. HTTP+SSE is deprecated.
+7. **The draw.io example generalises**: the same pattern works for databases, filesystems, SaaS APIs and internal services.
 
 ---
 
-> **Next:** This document covers the practical flow. See [MCP Fundamentals](01_MCP_FUNDAMENTALS.md) for protocol mechanics, and [MCP Production Architecture](04_MCP_PRODUCTION_ARCHITECTURE.md) for production deployment.
+> **Next:** See [MCP Fundamentals](01_MCP_FUNDAMENTALS.md) for protocol mechanics, and [MCP Production Architecture](04_MCP_PRODUCTION_ARCHITECTURE.md) for production deployment.

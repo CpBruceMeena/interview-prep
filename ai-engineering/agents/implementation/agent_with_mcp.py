@@ -3,13 +3,20 @@ Agent that discovers and uses tools from MCP servers.
 Connects to the calculator MCP server and uses its tools.
 
 Run: python -m implementation.agent_with_mcp
-Requires: pip install mcp (or run from ai-engineering/mcp/)
+Requires: pip install "mcp>=2,<3" (the v2 SDK; v1 code using ClientSession +
+stdio_client + initialize() does not match the 2026-07-28 spec examples here)
 """
 
 import asyncio
 import json
 import os
-from typing import Dict, List
+import sys
+from typing import List
+
+
+def _server_params(command: str, args: List[str]):
+    from mcp import StdioServerParameters
+    return StdioServerParameters(command=command, args=args)
 
 
 async def discover_mcp_tools(server_name: str, command: str,
@@ -18,55 +25,57 @@ async def discover_mcp_tools(server_name: str, command: str,
     Connect to an MCP server and discover its tools.
 
     Returns a list of tool definitions compatible with the agent's tool registry.
+    Uses the mcp 2.x SDK: `mcp.Client` replaces v1's stdio_client +
+    ClientSession + initialize(). Against a 2026-07-28 server there is no
+    handshake (the client probes server/discover and sends version and
+    capabilities in each request's _meta); against older servers it falls
+    back to initialize automatically.
     """
     try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-        )
-
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await session.list_tools()
-                return [
-                    {
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": t.inputSchema,
-                        "_server": server_name,
-                        "_session_params": {
-                            "command": command,
-                            "args": args,
-                        },
-                    }
-                    for t in tools.tools
-                ]
+        from mcp import Client
     except ImportError:
-        print("⚠️  MCP SDK not installed. Install with: pip install mcp")
+        print('MCP SDK not installed. Install with: pip install "mcp>=2"')
+        return []
+
+    try:
+        async with Client(_server_params(command, args)) as client:
+            tools = await client.list_tools()
+            return [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    # v2 exposes snake_case attributes; keep the wire name here.
+                    "inputSchema": t.input_schema,
+                    "_server": server_name,
+                    "_session_params": {
+                        "command": command,
+                        "args": args,
+                    },
+                }
+                for t in tools.tools
+            ]
+    except Exception as e:  # server failed to start / speak MCP
+        print(f"Could not connect to MCP server '{server_name}': {e}")
         return []
 
 
 async def call_mcp_tool(tool_def: dict, arguments: dict) -> str:
-    """Call a tool on an MCP server and return the result."""
+    """Call a tool on an MCP server and return the result.
+
+    Demo simplification: this spawns a fresh stdio server per call. A real
+    host keeps one long-lived `Client` per server and reuses it.
+    """
     try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        from mcp import Client
 
         params = tool_def["_session_params"]
-        server_params = StdioServerParameters(
-            command=params["command"],
-            args=params["args"],
-        )
-
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_def["name"], arguments)
-                return result.content[0].text
+        async with Client(_server_params(params["command"], params["args"])) as client:
+            result = await client.call_tool(tool_def["name"], arguments)
+            text = "\n".join(
+                c.text for c in result.content if getattr(c, "text", None)
+            )
+            # Tool-level failures come back as is_error=True, not exceptions.
+            return f"Error: {text}" if result.is_error else text
     except Exception as e:
         return f"Error calling MCP tool '{tool_def['name']}': {str(e)}"
 
@@ -187,20 +196,12 @@ async def main():
     if os.path.exists(calculator_path):
         server_configs.append({
             "name": "Calculator",
-            "command": "python",
+            "command": sys.executable,
             "args": [calculator_path],
         })
     else:
         print("⚠️  Calculator MCP server not found at expected path.")
         print("   Install MCP servers first: cd ../mcp && pip install -r requirements.txt")
-
-    # If no servers found, use demo mode
-    if not server_configs:
-        server_configs.append({
-            "name": "Demo",
-            "command": "echo",
-            "args": ["MCP server not available"],
-        })
 
     await agent.connect_servers(server_configs)
 

@@ -4,8 +4,9 @@ Prevents cascading failures by failing fast when downstream services
 are unhealthy, with automatic recovery testing.
 """
 
-import time
 import logging
+import threading
+import time
 from enum import Enum
 from typing import Callable, Optional, Any
 
@@ -54,10 +55,18 @@ class CircuitBreaker:
         self._total_calls = 0
         self._total_failures = 0
         self._probe_in_flight = False  # Tracks whether a HALF_OPEN probe is in progress
+        # Sync MCP tools run on worker threads, so state changes must be atomic.
+        # The lock guards bookkeeping only; it is never held while `func` runs.
+        self._lock = threading.RLock()
 
     @property
     def state(self) -> CircuitState:
         """Get current circuit breaker state."""
+        with self._lock:
+            return self._current_state()
+
+    def _current_state(self) -> CircuitState:
+        """Advance OPEN -> HALF_OPEN once the timeout has elapsed. Caller holds the lock."""
         if self._state == CircuitState.OPEN:
             if time.time() - self._last_failure_time > self.reset_timeout:
                 self._state = CircuitState.HALF_OPEN
@@ -88,44 +97,49 @@ class CircuitBreaker:
         All other requests are rejected with CircuitBreakerOpenError
         while the probe is in flight.
         """
-        current_state = self.state
+        with self._lock:
+            current_state = self._current_state()
 
-        if current_state == CircuitState.OPEN:
-            self._total_calls += 1
-            raise CircuitBreakerOpenError(
-                f"Circuit breaker '{self.name}' is OPEN. "
-                f"Retry after {self.reset_timeout}s."
-            )
-
-        # ── HALF_OPEN guard: only one probe request at a time ──
-        if current_state == CircuitState.HALF_OPEN:
-            if self._probe_in_flight:
+            if current_state == CircuitState.OPEN:
                 self._total_calls += 1
                 raise CircuitBreakerOpenError(
-                    f"Circuit breaker '{self.name}' is in HALF_OPEN state — "
-                    f"a probe request is already in flight. Retry after probe completes."
+                    f"Circuit breaker '{self.name}' is OPEN. "
+                    f"Retry after {self.reset_timeout}s."
                 )
-            self._probe_in_flight = True
+
+            # ── HALF_OPEN guard: only one probe request at a time ──
+            if current_state == CircuitState.HALF_OPEN:
+                if self._probe_in_flight:
+                    self._total_calls += 1
+                    raise CircuitBreakerOpenError(
+                        f"Circuit breaker '{self.name}' is in HALF_OPEN state — "
+                        f"a probe request is already in flight. Retry after probe completes."
+                    )
+                self._probe_in_flight = True
 
         try:
             result = func(*args, **kwargs)
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
+        return result
 
+    def _record_success(self) -> None:
+        with self._lock:
             self._total_calls += 1
             self._last_success_time = time.time()
+            # Thresholds count CONSECUTIVE failures, so any success clears the streak.
+            self._failure_count = 0
 
             if self._state == CircuitState.HALF_OPEN:
                 # Probe succeeded — reset to CLOSED
                 self._state = CircuitState.CLOSED
-                self._failure_count = 0
                 self._probe_in_flight = False
-                logger.info(
-                    "Circuit breaker %s → CLOSED (recovered)",
-                    self.name
-                )
+                logger.info("Circuit breaker %s → CLOSED (recovered)", self.name)
 
-            return result
-
-        except Exception as e:
+    def _record_failure(self) -> None:
+        with self._lock:
             self._total_calls += 1
             self._total_failures += 1
             self._failure_count += 1
@@ -135,27 +149,20 @@ class CircuitBreaker:
                 # Probe failed — back to OPEN
                 self._state = CircuitState.OPEN
                 self._probe_in_flight = False
+                logger.warning("Circuit breaker %s → OPEN (probe failed)", self.name)
+            elif self._state == CircuitState.CLOSED and self._failure_count >= self.failure_threshold:
+                self._state = CircuitState.OPEN
                 logger.warning(
-                    "Circuit breaker %s → OPEN (probe failed)",
-                    self.name
+                    "Circuit breaker %s → OPEN (%d consecutive failures, threshold=%d)",
+                    self.name, self._failure_count, self.failure_threshold,
                 )
-            elif self._failure_count >= self.failure_threshold:
-                if self._state != CircuitState.OPEN:
-                    self._state = CircuitState.OPEN
-                    logger.warning(
-                        "Circuit breaker %s → OPEN "
-                        "(%d failures, threshold=%d)",
-                        self.name,
-                        self._failure_count,
-                        self.failure_threshold
-                    )
-
-            raise
 
     def reset(self) -> None:
         """Manually reset the circuit breaker to CLOSED state."""
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._total_calls = 0
-        self._total_failures = 0
+        with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._probe_in_flight = False
+            self._total_calls = 0
+            self._total_failures = 0
         logger.info("Circuit breaker %s manually reset to CLOSED", self.name)

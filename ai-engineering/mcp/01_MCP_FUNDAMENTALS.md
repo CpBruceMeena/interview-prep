@@ -1,54 +1,63 @@
 # 🔌 MCP Fundamentals — Architecture, Protocol Mechanics & Setup Guide
 
-> **Target:** Principal Engineer-level understanding of the Model Context Protocol (MCP)
+> **Target:** Staff/Principal-level understanding of the Model Context Protocol (MCP), current as of the **2026-07-28** spec revision and Python SDK v2.
 
 ---
 
 ## 1. WHAT IS MCP?
 
-**Model Context Protocol (MCP)** is an open standard developed by Anthropic (late 2024) that provides a universal, standardized way for AI applications to connect to external data sources, tools, and systems. It's the "**USB-C port for AI applications**" — a single protocol that replaces fragmented, custom integrations.
+!!! tip "30-second answer"
+    MCP is an open, JSON-RPC 2.0 based protocol that lets an AI application (the **host**) discover and use **tools**, **resources** and **prompts** exposed by **servers**, over stdio (local subprocess) or Streamable HTTP (remote). It turns an N×M integration problem (every app × every tool) into N+M: write a server once and every MCP host can use it. Anthropic released it in November 2024; OpenAI, Google and Microsoft adopted it in 2025, and in December 2025 it moved to the Linux Foundation's Agentic AI Foundation.
 
 ### Why MCP? (Why not just use custom API endpoints?)
 
 | Problem | Without MCP | With MCP |
 |---------|-------------|----------|
-| **Integration fragmentation** | Every AI tool needs bespoke adapters | One protocol, any MCP-compatible client |
-| **Discovery** | Hardcoded tool definitions | Runtime capability negotiation (`tools/list`) |
-| **Context management** | Manual context construction | Standardized Resources, Tools, Prompts |
-| **Security boundaries** | Inconsistent auth patterns | Protocol-level sandboxing & validation |
-| **Reusability** | Tied to specific LLM/provider | Portable across any MCP host |
+| **Integration fragmentation** | Every AI app writes its own adapter per tool | One server works in any MCP host |
+| **Discovery** | Tool definitions hard-coded in the app | Runtime discovery (`tools/list`, `resources/list`, `prompts/list`) |
+| **Context** | Each app invents how to fetch and inject data | Standard Resources, Tools and Prompts |
+| **Auth for remote tools** | Bespoke per integration | One OAuth 2.1 profile for every HTTP server |
+| **Portability** | Tied to one LLM provider's function-calling format | Model- and vendor-neutral |
+
+**What MCP is not:** it is not function calling. Function calling is how a *model* asks the host to run something; MCP is how the *host* finds and runs it. A host typically converts `tools/list` output into the provider's tool format, lets the model choose, then executes the call with `tools/call`.
+
+### Spec revisions you should know
+
+Versions are dates (`YYYY-MM-DD`) of the last backwards-incompatible change.
+
+| Revision | What changed (headline items) |
+|---|---|
+| 2024-11-05 | Initial release. Transports: stdio and HTTP+SSE (two endpoints). |
+| 2025-03-26 | **Streamable HTTP** replaces HTTP+SSE. First **OAuth 2.1** authorization framework. Tool annotations (`readOnlyHint`, `destructiveHint`...). Audio content. |
+| 2025-06-18 | **Structured tool output** (`outputSchema` / `structuredContent`). **Elicitation**. **Resource links** in tool results. MCP server formally an OAuth **resource server** (RFC 9728 metadata, RFC 8707 resource indicators). JSON-RPC batching removed. `MCP-Protocol-Version` HTTP header. |
+| 2025-11-25 | Experimental **tasks** (long-running calls). URL-mode elicitation. Tool calling inside sampling. **Client ID Metadata Documents** for client registration. Icons. |
+| **2026-07-28** (current) | **Stateless protocol**: no `initialize` handshake and no sessions; every request carries version and capabilities in `_meta`. `server/discover`. **Multi round-trip requests (MRTR)** replace server-to-client requests. `subscriptions/listen` replaces the GET stream. Tasks moved to an extension. **Roots, Sampling and Logging deprecated**; Dynamic Client Registration deprecated. |
+
+Interviewers often learned MCP on 2025-era material ("initialize handshake", "Mcp-Session-Id", "sticky sessions"). Know both, and say which revision you mean.
 
 ---
 
 ## 2. CORE ARCHITECTURE
 
-MCP follows a **client-server architecture** with three distinct roles:
+MCP has three roles. The host owns the model and the user; each client is one connection to one server.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        MCP HOST                                   │
-│  (Claude Desktop, Cursor, custom agent framework)                 │
-│  - Loads and coordinates MCP servers                              │
-│  - Manages LLM interactions                                       │
-│  - Routes tool calls / resource reads                             │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        MCP CLIENT                                 │
-│  (Protocol handler — 1:1 connection to a server)                 │
-│  - Maintains transport connection (Stdio or SSE)                 │
-│  - Sends JSON-RPC 2.0 requests                                   │
-│  - Handles capability negotiation                                │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-          ▼                ▼                ▼
-┌──────────────────┐ ┌──────────────┐ ┌──────────────────┐
-│   MCP Server A   │ │  MCP Server B│ │   MCP Server C   │
-│  (Database)       │ │ (File System)│ │  (Calculator)    │
-└──────────────────┘ └──────────────┘ └──────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                          MCP HOST                            │
+│   (Claude Desktop/Code, Cursor, VS Code, your agent)         │
+│   - owns the LLM, the conversation and user consent          │
+│   - decides which tools to expose and when to call them      │
+│                                                              │
+│   ┌────────────┐     ┌────────────┐     ┌────────────┐       │
+│   │ MCP Client │     │ MCP Client │     │ MCP Client │       │
+│   └─────┬──────┘     └─────┬──────┘     └─────┬──────┘       │
+└─────────┼──────────────────┼──────────────────┼──────────────┘
+          │ stdio            │ stdio            │ Streamable HTTP
+          ▼                  ▼                  ▼
+   ┌─────────────┐    ┌─────────────┐    ┌──────────────┐
+   │  Server A   │    │  Server B   │    │   Server C   │
+   │ (filesystem)│    │ (calculator)│    │ (remote SaaS)│
+   └─────────────┘    └─────────────┘    └──────────────┘
 ```
 
 <p align="center">
@@ -57,380 +66,364 @@ MCP follows a **client-server architecture** with three distinct roles:
     Your browser does not support the video tag.
   </video>
   <br/>
-  <em>🎬 Animated MCP Protocol Flow — User → MCP Host → Client → Server architecture with transport layer, capability negotiation, discovery, and execution lifecycle. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+  <em>🎬 Animated MCP Protocol Flow — User → MCP Host → Client → Server, with transport, discovery and execution. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
 ### Role Breakdown
 
 | Role | Responsibility | Examples |
 |------|---------------|----------|
-| **MCP Host** | The AI application that orchestrates connections | Claude Desktop, Cursor IDE, custom agent frameworks |
-| **MCP Client** | Protocol handler — one per server connection | `mcp` Python SDK's `Client`, protocol transport layer |
-| **MCP Server** | Exposes data and tools via the protocol | Database wrapper, file system access, API integrations |
+| **MCP Host** | The AI application: runs the model, aggregates tools from many servers, enforces user consent | Claude Desktop, Claude Code, Cursor, VS Code, custom agents |
+| **MCP Client** | Protocol endpoint inside the host, one per server | `mcp.Client` (Python SDK v2), `Client` (TypeScript SDK) |
+| **MCP Server** | Exposes tools, resources and prompts over the protocol | GitHub, Postgres, filesystem, Slack, your internal APIs |
+
+**Why one client per server:** isolation. Each server gets its own connection, credentials and failure domain; a compromised or crashing server can't read another server's traffic.
 
 ---
 
 ## 3. CORE PRIMITIVES
 
-MCP defines three fundamental primitives that servers can expose:
+Servers expose three primitives. The useful distinction is **who controls them**:
+
+| Primitive | Controlled by | Analogy | Example |
+|---|---|---|---|
+| **Tools** | The **model** decides to call them | POST endpoint | `create_issue`, `run_query` |
+| **Resources** | The **application** decides what to attach | GET endpoint / file | `file:///README.md`, `db://schema` |
+| **Prompts** | The **user** picks them (e.g. slash commands) | Saved template | `/review-pr` |
+
+Clients can also offer features to servers: **elicitation** (ask the user for input), and the now-deprecated **sampling** (ask the host's LLM for a completion) and **roots** (which directories the server may work in).
 
 ### 3.1 Resources
 
-**Purpose:** Structured data sources that the LLM can **read** — analogous to GET endpoints in REST.
+**Purpose:** Data the host can read and put into the model's context. Identified by URI; parameterised families use **resource templates** (RFC 6570, e.g. `db://tables/{name}`).
 
 ```json
-// resources/list response
+// resources/list result (abridged)
 {
   "resources": [
     {
-      "uri": "file:///logs/app-2025-01-01.txt",
-      "name": "Application Logs (Jan 1)",
-      "description": "Error logs for January 1st, 2025",
-      "mimeType": "text/plain",
-      "schema": { "type": "object", "properties": {...} }
-    },
-    {
-      "uri": "database://users/active",
-      "name": "Active Users",
-      "description": "List of currently active users in the system",
-      "mimeType": "application/json"
+      "uri": "file:///logs/app-2026-01-01.txt",
+      "name": "app-log-2026-01-01",
+      "title": "Application Logs (Jan 1)",
+      "description": "Error logs for January 1st",
+      "mimeType": "text/plain"
     }
   ]
 }
 ```
 
 **Key characteristics:**
-- Schema-backed: Resources declare their data shape via JSON Schema
-- Static or dynamic: Can be pre-defined or generated on read
-- URI-addressed: Each resource has a unique URI for referencing
-- Read-only by design: The LLM can consume but not modify resources
+
+- **Application-controlled:** the host (or user) chooses which resources enter context. Models don't fetch them on their own unless a tool does it.
+- **Read-only:** `resources/read` returns text or base64 blob contents. Changing data is a tool's job.
+- **Subscribable:** a client can ask to be told when a resource or the list changes. In 2026-07-28 that's done by opting in on a `subscriptions/listen` stream.
+- Resources do **not** carry a JSON Schema; they carry a `mimeType`.
 
 ### 3.2 Tools
 
-**Purpose:** Executable actions that the LLM can **invoke** — analogous to POST endpoints in REST.
+**Purpose:** Functions the model can invoke, possibly with side effects.
 
 ```json
-// tools/list response
+// tools/list result (abridged)
 {
   "tools": [
     {
       "name": "execute_sql",
+      "title": "Run SQL",
       "description": "Execute a read-only SQL query against the analytics database",
       "inputSchema": {
         "type": "object",
         "properties": {
           "query": { "type": "string", "description": "SQL SELECT query" },
-          "max_rows": { "type": "integer", "default": 100, "description": "Max rows to return" }
+          "max_rows": { "type": "integer", "default": 100 }
         },
         "required": ["query"]
-      }
-    },
-    {
-      "name": "send_email",
-      "description": "Send an email notification to a user",
-      "inputSchema": {
+      },
+      "outputSchema": {
         "type": "object",
         "properties": {
-          "to": { "type": "string", "format": "email" },
-          "subject": { "type": "string", "maxLength": 200 },
-          "body": { "type": "string" }
-        },
-        "required": ["to", "subject", "body"]
-      }
+          "columns": { "type": "array", "items": { "type": "string" } },
+          "rows": { "type": "array" }
+        }
+      },
+      "annotations": { "readOnlyHint": true, "openWorldHint": false }
     }
   ]
 }
 ```
 
 **Key characteristics:**
-- Strict schema validation: Parameters are validated against JSON Schema before execution
-- State-mutating: Tools can execute side effects (write, delete, transform)
-- Result-returning: Each tool call returns a structured result (not streaming)
-- LLM-decided: The host decides when to invoke a tool based on the conversation
+
+- **Model-controlled**, but the host must keep a human in the loop for anything risky (confirmation prompts, allow-lists).
+- **Input validation:** `inputSchema` is JSON Schema (2020-12 by default). Servers must still validate; the model can and will send bad arguments. Since 2025-11-25, validation failures should come back as **tool execution errors** (`isError: true`) rather than protocol errors, so the model can see the message and retry.
+- **Structured output (2025-06-18+):** with an `outputSchema`, results include `structuredContent` (machine-readable JSON) alongside `content` (blocks for the model).
+- **Result content types:** text, image, audio, embedded resource, and **resource links** (a URI the client can fetch later instead of inlining a large payload).
+- **Annotations are hints, not guarantees.** `readOnlyHint`/`destructiveHint` come from the server; a host must not trust them from an untrusted server.
+- **Two kinds of errors:** a protocol error (JSON-RPC `error`: unknown tool, malformed request) vs a tool execution error (a normal result with `isError: true`). Only the second reaches the model.
 
 ### 3.3 Prompts
 
-**Purpose:** Pre-defined, context-aware prompt templates stored server-side.
+**Purpose:** Reusable, parameterised message templates, usually surfaced to users as slash commands.
 
 ```json
-// prompts/list response
+// prompts/list result
 {
   "prompts": [
     {
       "name": "analyze_error_log",
+      "title": "Analyze error log",
       "description": "Analyze application error logs and suggest fixes",
       "arguments": [
-        {
-          "name": "log_date",
-          "description": "Date of logs to analyze (YYYY-MM-DD)",
-          "required": true
-        },
-        {
-          "name": "severity",
-          "description": "Minimum severity level to analyze",
-          "required": false,
-          "default": "ERROR"
-        }
+        { "name": "log_date", "description": "Date (YYYY-MM-DD)", "required": true },
+        { "name": "severity", "description": "Minimum severity", "required": false }
       ]
     }
   ]
 }
 ```
 
-**Key characteristics:**
-- Server-side: Templates live on the server, not hardcoded in the client
-- Dynamic arguments: Can accept parameters to customize the prompt
-- Context-enriched: Server can inject up-to-date data into the prompt template
-- Guided interaction: Helps the LLM ask the right questions with proper context
+`prompts/get` returns a list of messages (which can embed resources), so a server can ship a workflow ("review this PR with our checklist") rather than just a string. Prompt arguments have no `default` field; defaults live in the server's implementation.
 
 ---
 
 ## 4. TRANSPORT LAYER
 
-MCP supports two transport mechanisms, each optimized for different deployment scenarios:
+The spec defines two standard transports. Messages are JSON-RPC 2.0 either way; JSON-RPC batching was removed in 2025-06-18.
 
 ### 4.1 Stdio Transport (Standard Input/Output)
 
 ```
 ┌─────────────────────────────────────────┐
-│              MCP HOST                     │
-│                                          │
-│  ┌─────────────────────────────────┐    │
-│  │        MCP Client               │    │
-│  │  stdin  ◄── JSON-RPC 2.0 ──► stdout │
-│  └──────────────┬──────────────────┘    │
-│                 │                        │
-│                 │ Child process           │
-│                 ▼                        │
-│  ┌─────────────────────────────────┐    │
-│  │        MCP Server                │    │
-│  │  (local Python process)          │    │
-│  └─────────────────────────────────┘    │
+│                MCP HOST                 │
+│   ┌─────────────────────────────────┐   │
+│   │          MCP Client             │   │
+│   └───────┬─────────────────▲───────┘   │
+│     stdin │ JSON-RPC,        │ stdout   │
+│           │ one per line     │          │
+│   ┌───────▼─────────────────┴───────┐   │
+│   │   MCP Server (child process)    │   │
+│   │   logs → stderr only            │   │
+│   └─────────────────────────────────┘   │
 └─────────────────────────────────────────┘
 ```
 
-**Best for:** Local development, desktop applications, CLI tools
+**Best for:** local tools (filesystem, git, IDE integrations), desktop apps, CLIs.
 
 **Characteristics:**
-- **No network overhead** — IPC via pipes, sub-millisecond latency
-- **Inherently secure** — no open ports, no network attack surface
-- **Process isolation** — server runs as separate OS process
-- **Simple lifecycle** — host spawns server as child process
-- **No auth needed** — trust established via local execution
 
-**Limitations:**
-- Single client per server process
-- Server process tied to host lifecycle
-- Not suitable for distributed/remote deployments
+- The host launches the server as a subprocess; messages are newline-delimited JSON on stdin/stdout. **Anything else written to stdout corrupts the stream**, so servers log to stderr.
+- No network listener, so no remote attack surface. That is not the same as "safe": the server runs with **the user's full OS privileges**, so installing a stdio server is like installing any other program.
+- **No OAuth.** The spec says stdio servers take credentials from the environment (env vars, local config, OS keychain).
+- One client per process; the server's lifetime is tied to the host.
 
-### 4.2 Streamable HTTP (SSE - Server-Sent Events)
+### 4.2 Streamable HTTP
 
 ```
-┌──────────────────┐         ┌──────────────────────────────┐
-│    MCP Client     │  HTTP   │       MCP Server             │
-│  (Remote)         │◄──────►│  (Remote Microservice)       │
-│                   │  SSE    │                              │
-│  POST /api/mcp    │  POST   │  - Authentication (Bearer)  │
-│  GET  /api/mcp/sse│  STREAM │  - Rate limiting             │
-└──────────────────┘         │  - Load balancing            │
-                              │  - Horizontal scaling         │
-                              └──────────────────────────────┘
+┌──────────────┐  POST /mcp  (one JSON-RPC request per POST)   ┌──────────────────┐
+│  MCP Client  │ ────────────────────────────────────────────► │   MCP Server     │
+│              │  Authorization: Bearer <OAuth access token>   │  (any replica)   │
+│              │  MCP-Protocol-Version, Mcp-Method, Mcp-Name   │                  │
+│              │ ◄──────────────────────────────────────────── │                  │
+└──────────────┘  200 application/json  (single result)        └──────────────────┘
+                  or 200 text/event-stream (progress
+                  notifications, then the result; stream
+                  closes)
 ```
 
-**Best for:** Production deployments, distributed systems, multi-tenant services
+**Best for:** remote and multi-tenant servers (SaaS integrations, internal platforms).
 
-**Characteristics:**
-- **Remote access** — server can run anywhere with HTTP connectivity
-- **Scalable** — multiple clients can connect to one server
-- **Standard auth** — Bearer tokens, OAuth2, API keys
-- **Observable** — standard HTTP metrics, logging, tracing
+**How it works (2026-07-28):**
 
-**Limitations:**
-- Network latency (5-50ms per round trip)
-- Requires authentication infrastructure
-- TLS termination needed
-- Connection management (reconnection, heartbeat)
+- **One endpoint** (e.g. `https://example.com/mcp`) that accepts POST. Each JSON-RPC request is its own POST.
+- The server replies with either plain JSON or an **SSE stream scoped to that request** (progress notifications, then the final result). SSE survives as a response format; it is no longer a separate transport.
+- No sessions, no GET stream, no `Last-Event-ID` resumption. A dropped stream loses that request; the client re-sends it with a new id. Closing the stream is how a client cancels.
+- Long-lived change notifications use an explicit `subscriptions/listen` request.
+- Required headers mirror the body (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) so gateways can route and rate-limit without parsing JSON; servers reject mismatches.
+- Security musts: validate `Origin` (DNS-rebinding defence, 403 on bad Origin), bind to 127.0.0.1 when local, authenticate every request.
+
+**What changed from earlier revisions:**
+
+| | HTTP+SSE (2024-11-05) | Streamable HTTP (2025-03-26 → 2025-11-25) | Streamable HTTP (2026-07-28) |
+|---|---|---|---|
+| Endpoints | GET `/sse` + POST `/messages` | One endpoint: POST, optional GET stream | One endpoint: POST only |
+| Sessions | Implicit in the SSE connection | Optional `Mcp-Session-Id` | None |
+| Server → client requests | On the SSE stream | On SSE streams | Returned in results (MRTR) |
+| Load balancing | Sticky connection required | Sticky or shared session store | Any replica, round-robin |
+| Status | Deprecated | Legacy | Current |
+
+**Limitations:** network latency, TLS and an OAuth deployment to run, and proxies that buffer SSE (send `X-Accel-Buffering: no`).
 
 ---
 
 ## 5. PROTOCOL LIFECYCLE
 
-The MCP communication follows a structured lifecycle:
-
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    CONNECTION LIFECYCLE                       │
+│               LIFECYCLE (2026-07-28, stateless)             │
 ├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  STEP 1: Transport Connection                                │
-│  ├── Stdio: Host spawns server process                       │
-│  └── HTTP:  Client connects to server endpoint               │
-│                                                              │
-│  STEP 2: Capability Negotiation (initialize)                 │
-│  ├── Client sends: protocol version, client capabilities     │
-│  └── Server responds: protocol version, server capabilities  │
-│                                                              │
-│  STEP 3: Server Discovery                                    │
-│  ├── Client requests: tools/list                             │
-│  ├── Client requests: resources/list                         │
-│  └── Client requests: prompts/list                           │
-│                                                              │
-│  STEP 4: Operation                                           │
-│  ├── Read resource: resources/read {uri}                     │
-│  ├── Call tool: tools/call {name, arguments}                 │
-│  └── Get prompt: prompts/get {name, arguments}               │
-│                                                              │
-│  STEP 5: Shutdown                                            │
-│  ├── Close transport connection                              │
-│  └── Cleanup server resources                                │
-│                                                              │
+│  1. Connect                                                 │
+│     stdio: host spawns the server   HTTP: nothing to open   │
+│                                                             │
+│  2. (Optional) server/discover                              │
+│     → supported versions, capabilities, server identity     │
+│                                                             │
+│  3. Discovery: tools/list, resources/list, prompts/list     │
+│     (results carry ttlMs/cacheScope so clients can cache)   │
+│                                                             │
+│  4. Operation: tools/call, resources/read, prompts/get      │
+│     every request carries protocolVersion + capabilities    │
+│     in _meta; server may answer "input_required" (MRTR)     │
+│                                                             │
+│  5. Shutdown                                                │
+│     stdio: close stdin, then SIGTERM/SIGKILL                │
+│     HTTP: nothing to tear down                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Initialization Handshake
 
-```json
-// Client → Server (initialize)
-{
-  "jsonrpc": "2.0",
-  "method": "initialize",
-  "params": {
-    "protocolVersion": "2025-03-26",
-    "capabilities": {
-      "roots": { "listChanged": true },
-      "sampling": {}
-    },
-    "clientInfo": {
-      "name": "my-agent",
-      "version": "1.0.0"
-    }
-  },
-  "id": 1
-}
+**Legacy revisions (2025-11-25 and earlier)** opened every connection with a handshake, and many servers in the wild still speak it:
 
-// Server → Client (initialize result)
-{
-  "jsonrpc": "2.0",
-  "result": {
-    "protocolVersion": "2025-03-26",
-    "capabilities": {
-      "tools": {},           // Server exposes tools
-      "resources": {},       // Server exposes resources
-      "prompts": {}         // Server exposes prompts
-    },
-    "serverInfo": {
-      "name": "my-db-server",
-      "version": "1.0.0"
-    }
-  },
-  "id": 1
-}
+```json
+// Client → Server
+{ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+  "params": { "protocolVersion": "2025-11-25",
+              "capabilities": { "elicitation": {} },
+              "clientInfo": { "name": "my-agent", "version": "1.0.0" } } }
+
+// Server → Client
+{ "jsonrpc": "2.0", "id": 1,
+  "result": { "protocolVersion": "2025-11-25",
+              "capabilities": { "tools": { "listChanged": true }, "resources": {}, "prompts": {} },
+              "serverInfo": { "name": "my-db-server", "version": "1.0.0" } } }
+
+// Client → Server (notification, no id)
+{ "jsonrpc": "2.0", "method": "notifications/initialized" }
 ```
+
+**2026-07-28 removed it.** Every request is self-describing, so any replica can serve it:
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+  "params": { "name": "execute_sql", "arguments": { "query": "SELECT 1" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} },
+      "io.modelcontextprotocol/clientInfo": { "name": "my-agent", "version": "1.0.0" } } } }
+```
+
+An unsupported version gets `UnsupportedProtocolVersionError` listing what the server supports, and the client retries. Dual-era clients (like the Python SDK v2 `Client`) probe with `server/discover` and fall back to `initialize` for legacy servers.
+
+**Multi round-trip requests (MRTR).** When a server needs something mid-call (a user confirmation via elicitation, for example), it returns `{"resultType": "input_required", "inputRequests": {...}, "requestState": "..."}`. The client gathers the input and **retries the original request** with `inputResponses` and the opaque `requestState`. The server keeps no state between the two, so it must integrity-protect `requestState` (HMAC/AEAD) and bind it to the user, a short expiry and the original request.
 
 ---
 
 ## 6. SETUP GUIDE — INSTALLING & RUNNING MCP
 
-### 6.1 Python SDK — FastMCP (Recommended)
+### 6.1 Python SDK
 
-**Prerequisites:** Python 3.10+ and `uv` (recommended) or `pip`
+**Prerequisites:** Python 3.10+, and `uv` or `pip`.
 
 ```bash
-# Install the MCP Python SDK
-pip install mcp
-
-# Or with uv (faster)
-uv add mcp
+pip install "mcp[cli]"      # installs SDK v2.x (stable since July 2026)
+# or
+uv add "mcp[cli]"
 ```
+
+!!! warning "SDK v1 vs v2"
+    In v2, `FastMCP` was renamed **`MCPServer`** and `from mcp.server.fastmcp import FastMCP` raises `ModuleNotFoundError`. Python attribute names became snake_case (`input_schema`, `structured_content`, `is_error`; the JSON on the wire is unchanged), transport options moved from the constructor to `run()`, and `mcp.Client` replaced `stdio_client` + `ClientSession` + `initialize()`. Most blog posts and tutorials still show v1. To keep v1 code running, pin `mcp<2`. (The separate `fastmcp` package on PyPI is a different, third-party framework.)
 
 ### 6.2 Creating Your First MCP Server
 
 ```python
 # server.py
-from mcp.server.fastmcp import FastMCP
+import sys
 
-# Initialize server
-mcp = FastMCP("MyFirstMCPServer")
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
-# ── Define a Tool ──
+mcp = MCPServer("MyFirstMCPServer")
+
+
 @mcp.tool()
-def add(a: int, b: int) -> int:
-    """Add two numbers together."""
-    return a + b
+def divide(a: float, b: float) -> float:
+    """Divide a by b."""   # the docstring becomes the tool description the model reads
+    if b == 0:
+        raise ToolError("b must not be zero")   # returned as isError=true with this message
+    return a / b                                  # -> float becomes outputSchema
 
-# ── Define a Resource ──
+
 @mcp.resource("config://app")
 def get_config() -> str:
-    """Return application configuration as a resource."""
-    return "version: 1.0.0\ndatabase: postgresql://localhost:5432/app"
+    """Application configuration."""
+    return "version: 1.0.0\nregion: eu-west-1"
 
-# ── Define a Prompt ──
+
 @mcp.prompt()
 def analyze_error(error: str) -> str:
-    """Create a prompt template for error analysis."""
+    """Prompt template for error analysis."""
     return f"Analyze the following error and suggest a fix:\n\n{error}"
 
+
 if __name__ == "__main__":
-    # Run with stdio transport (default for local use)
-    mcp.run(transport="stdio")
+    print("starting", file=sys.stderr)   # never print to stdout on stdio
+    mcp.run()                            # stdio by default
 ```
+
+Type hints generate the JSON Schemas, so use precise types (`Literal[...]`, Pydantic models) instead of bare `str` where you can. In v2, an unexpected exception reaches the client only as "Error executing tool divide"; raise `ToolError` when the model should see the message.
 
 ### 6.3 Testing Your Server
 
 ```bash
-# Run the server directly (it will wait for stdin communication)
-python server.py
+# Browser-based inspector (official package)
+npx @modelcontextprotocol/inspector python server.py
 
-# Test with MCP Inspector (built-in debug tool)
-npx @anthropic/mcp-inspector python server.py
+# Or the SDK's dev runner, which wraps the inspector
+uv run mcp dev server.py
 ```
+
+For unit tests, connect in-process with no subprocess: `async with Client(mcp) as c: await c.call_tool(...)`.
 
 ### 6.4 Connecting from a Client
 
-**Claude Desktop (macOS):**
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+**Claude Desktop (macOS)**: add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "my-calculator": {
-      "command": "python",
+    "my-server": {
+      "command": "/absolute/path/to/venv/bin/python",
       "args": ["/absolute/path/to/server.py"]
     }
   }
 }
 ```
 
-**Custom Python Client:**
+Use absolute paths: the host doesn't run in your shell, so it won't see your virtualenv or working directory.
+
+**Custom Python client (SDK v2):**
 
 ```python
 import asyncio
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
-async def main():
-    # Configure server
-    server_params = StdioServerParameters(
-        command="python",
-        args=["server.py"]
-    )
-    
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            # Initialize
-            await session.initialize()
-            
-            # List available tools
-            tools = await session.list_tools()
-            print(f"Available tools: {[t.name for t in tools.tools]}")
-            
-            # Call a tool
-            result = await session.call_tool("add", {"a": 5, "b": 3})
-            print(f"Result: {result.content[0].text}")
-            
-            # List resources
-            resources = await session.list_resources()
-            print(f"Available resources: {[r.uri for r in resources.resources]}")
+from mcp import Client, StdioServerParameters
+
+
+async def main() -> None:
+    params = StdioServerParameters(command="python", args=["server.py"])
+    async with Client(params) as client:      # discovery/handshake handled for you
+        tools = await client.list_tools()
+        print([t.name for t in tools.tools])
+
+        result = await client.call_tool("divide", {"a": 6, "b": 3})
+        if result.is_error:
+            print("tool failed:", result.content[0].text)
+        else:
+            print(result.structured_content)   # {'result': 2.0}
+
+        resources = await client.list_resources()
+        print([str(r.uri) for r in resources.resources])
+
 
 asyncio.run(main())
 ```
@@ -439,55 +432,53 @@ asyncio.run(main())
 
 ```python
 # server_http.py
-from mcp.server.fastmcp import FastMCP
-import uvicorn
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("ProductionMCP", port=8000)
+mcp = MCPServer("ProductionMCP")
+
 
 @mcp.tool()
 def query_database(sql: str) -> str:
     """Execute a read-only SQL query."""
-    # Your database logic here
     return f"Results for: {sql}"
 
+
 if __name__ == "__main__":
-    # Run with SSE transport for remote access
-    mcp.run(transport="sse")
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=8000)
 ```
 
 ```bash
 python server_http.py
-# Server starts on http://localhost:8000
-# SSE endpoint: http://localhost:8000/api/mcp/sse
-# POST endpoint: http://localhost:8000/api/mcp
+# MCP endpoint: http://127.0.0.1:8000/mcp   (POST only)
 ```
+
+For anything beyond localhost, put it behind TLS and add OAuth: `MCPServer(token_verifier=..., auth=AuthSettings(...))` makes the server an OAuth resource server that validates every request's bearer token. See [Production Architecture](04_MCP_PRODUCTION_ARCHITECTURE.md).
 
 ---
 
 ## 7. MCP vs TRADITIONAL APPROACHES
 
-| Aspect | MCP | Custom Webhook/REST | Function Calling (OpenAI) |
+| Aspect | MCP | Custom REST integration | Provider function calling |
 |--------|-----|--------------------|--------------------------|
-| **Standardization** | Universal protocol | Ad-hoc per service | Provider-specific |
-| **Discovery** | Built-in (`list`) | Documentation | Schema definition |
-| **Auth** | Transport-level | Per-endpoint | API key |
-| **Context** | Resources + Prompts | Manual construction | System message |
-| **Transport** | Stdio / HTTP | HTTP | HTTP |
-| **Schema** | JSON Schema (strict) | Varies | JSON Schema |
-| **State** | Stateless (JSON-RPC) | Session-managed | Stateless |
-| **Security boundary** | Process isolation | Network ACLs | API boundary |
-| **LLM control** | Host decides tool calls | Hardcoded | Model decides |
+| **What it standardises** | Host ↔ tool server | Nothing beyond HTTP | Model ↔ host |
+| **Discovery** | Runtime (`*/list`) | Docs / OpenAPI | Tools passed in each request |
+| **Reuse across apps/models** | Any MCP host | Per app | Per provider format |
+| **Auth** | OAuth 2.1 profile (HTTP), env (stdio) | Anything | Your app's problem |
+| **Beyond tools** | Resources, prompts, elicitation | No | No |
+| **State** | Stateless requests (2026-07-28) | Your design | Stateless |
+
+They compose: the model emits a function call, the host maps it to an MCP `tools/call`.
 
 ---
 
 ## 8. KEY DESIGN PRINCIPLES
 
-1. **Decoupling:** Separates orchestration (host) from execution (server)
-2. **Discoverability:** Servers advertise capabilities at runtime — no hardcoding
-3. **Safety by default:** Strict schema validation prevents hallucinated parameters
-4. **Transport agnostic:** Same protocol works locally (stdio) and remotely (HTTP)
-5. **Stateless protocol:** Each request is independent — simplifies scaling
-6. **LLM-friendly:** Primitives designed for how LLMs consume and produce information
+1. **Host in control.** The host owns the model, the context window and user consent; servers can't see the conversation or other servers.
+2. **Discoverability.** Capabilities are listed at runtime, not compiled into the app.
+3. **Small, focused servers.** Each server does one integration well; the host composes them.
+4. **Transport agnostic.** Same messages over stdio and HTTP.
+5. **Stateless requests (2026-07-28).** Each request carries its version and capabilities, so remote servers scale like any stateless HTTP service. Cross-call state goes in explicit handles passed as tool arguments.
+6. **Progressive features.** Capabilities and extensions (tasks, MCP Apps UI) are opt-in, so simple servers stay simple.
 
 ---
 
@@ -495,12 +486,14 @@ python server_http.py
 
 | Challenge | Problem | Solution |
 |-----------|---------|----------|
-| **Context window overflow** | Resource returns too much data | Pagination, semantic chunking, summarization |
-| **Latency amplification** | Nested tool calls add up | Parallel tool execution, caching |
-| **Hallucinated parameters** | LLM invents tool arguments | Strict JSON Schema validation, allowlists |
-| **Infinite execution loops** | LLM retries failing tools endlessly | Max retry count, circuit breaker |
-| **State management** | MCP is stateless | Session IDs, context propagation |
-| **Auth propagation** | User auth across tool calls | JWT passthrough with validation |
+| **Tool overload** | Dozens of servers × tools flood the context and confuse tool selection | Expose fewer, higher-level tools; let the host filter or search tools; deterministic `tools/list` order helps prompt caching |
+| **Context overflow** | A tool returns megabytes | Pagination, truncation with a "narrow your query" hint, resource links instead of inline data |
+| **Prompt injection** | Tool output (web pages, tickets, emails) contains instructions | Treat tool output as untrusted data; confirm side effects with the user; least-privilege tokens |
+| **Tool poisoning / rug pulls** | A malicious server's descriptions instruct the model, or change after approval | Allow-list and pin servers; re-review on `list_changed`; show users what changed |
+| **Bad arguments** | Model invents parameters | Strict schemas plus server-side validation returning `isError` so the model can self-correct |
+| **Runaway loops** | Model retries a failing tool forever | Retry budgets in the host, idempotency keys, circuit breakers |
+| **Cross-call state** | Protocol is stateless | Server-minted handles in tool arguments; `requestState` for MRTR |
+| **Auth propagation** | Server must call downstream APIs as the user | OAuth token exchange / on-behalf-of. **Never pass the client's token through**: the spec forbids it |
 
 ---
 

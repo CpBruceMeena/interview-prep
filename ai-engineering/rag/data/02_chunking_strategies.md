@@ -16,8 +16,7 @@ Document: [0-500][450-950][900-1400]...
 
 **Pros**:
 - Simple to implement
-- Predictable number of chunks
-- Consistent embedding sizes
+- Predictable number of chunks and token budget per chunk
 
 **Cons**:
 - May split sentences or paragraphs mid-stream
@@ -64,6 +63,7 @@ chunks = group_by_boundaries(sentences, boundaries)
 - Computationally expensive
 - Requires embedding at chunking time
 - Adds latency to ingestion
+- Gains over good structural splitting are inconsistent; measure before adopting
 
 **Best for**: Long documents with multiple topics, research papers
 
@@ -92,7 +92,16 @@ Even more content...
 
 **Best for**: Documentation, wikis, manuals, web pages
 
+### 5. Context-Enriched Chunking
+A chunk embedded on its own loses its surrounding context ("revenue grew 3%": whose revenue?). Three ways to put the context back:
+
+- **Contextual chunk headers**: prepend the document title and heading path to every chunk. Free and effective.
+- **Contextual retrieval** (Anthropic, September 2024): an LLM writes a short (50-100 token) description situating each chunk within its document; it is prepended before embedding and before BM25 indexing. Anthropic reported 35% fewer top-20 retrieval failures with contextual embeddings and 49% with contextual embeddings plus contextual BM25 (67% when a reranker is added). Cost: one LLM call per chunk, reduced by prompt caching.
+- **Late chunking** (Jina AI, 2024): run a long-context embedding model over the whole document first, then average the token embeddings inside each chunk's span. Every chunk vector is informed by the full document, with no LLM calls. Requires an embedding model with a long context window that exposes token-level outputs.
+
 ## Chunk Size Considerations
+
+Sizes below are in tokens. Note that many splitters (for example LangChain's `RecursiveCharacterTextSplitter`) count characters by default; roughly 4 characters per English token.
 
 | Size | Token Range | Use Case |
 |------|------------|----------|
@@ -103,15 +112,17 @@ Even more content...
 
 ## Chunk Overlap Strategies
 
-- **10-15% overlap**: Minimum for general use
-- **15-20% overlap**: Recommended for accuracy-critical applications
-- **20-25% overlap**: For documents with high information density
-- **No overlap**: For large-scale indexing with storage constraints
+These are common starting points, not rules:
+
+- **10-20% overlap**: Typical default for prose
+- **Higher overlap**: Dense text where facts straddle boundaries (costs index size and returns near-duplicate chunks)
+- **No overlap**: Structure-based chunks (whole sections), or when storage is tight
 
 ## Best Practices
 
-1. **Match chunk size to your LLM's context window**: Ensure 3-5 chunks fit comfortably
-2. **Align with document structure**: Use headings as natural boundaries
-3. **Include metadata**: Store source, section, and position for each chunk
-4. **Test different strategies**: A/B test chunking on your specific domain
-5. **Consider hybrid approaches**: Use different strategies for different document types
+1. **Stay under the embedding model's max input length**: longer text is silently truncated
+2. **Budget the prompt**: top-k chunks × chunk size must fit the LLM context with room for the answer
+3. **Align with document structure**: Use headings as natural boundaries; never split inside tables or code blocks
+4. **Include metadata**: Store source, section, and position for each chunk
+5. **Test different strategies**: Measure Recall@k on a labelled query set for your domain
+6. **Consider hybrid approaches**: Use different strategies for different document types
