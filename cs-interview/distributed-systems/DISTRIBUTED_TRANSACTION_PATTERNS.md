@@ -27,110 +27,66 @@
 
 **What They're Really Testing:** Whether you deeply understand the impossibility of distributed ACID without coordination overhead, and can articulate the consistency/availability/latency trade-off space.
 
+!!! tip "30-second answer"
+    A database transaction only covers data that one transaction manager controls. Three services with three databases (plus a card network) need **atomic commitment** across independent participants, and the only ways to get it are coordination protocols like 2PC, which hold locks across network round trips and block when the coordinator fails. Most microservice systems therefore give up atomic *isolation* and accept **eventual consistency with explicit recovery**: sagas (compensate on failure), TCC (reserve, then confirm or cancel), and the transactional outbox (never lose the event that drives the next step). Every option trades among consistency, availability, latency and operational complexity; none removes the need for idempotent operations.
+
 ### Answer
 
-**Why Local ACID Doesn't Scale Across Services:**
+**Why Local ACID Doesn't Stretch Across Services:**
 
 ```
-Each service has its own database with local ACID:
+Order Service
+  BEGIN
+    INSERT INTO orders (id, status) VALUES (1, 'pending')
+    POST http://inventory/reserve      ← not part of this transaction
+    POST http://payment/charge         ← not part of this transaction
+    POST http://shipping/schedule      ← not part of this transaction
+    UPDATE orders SET status = 'confirmed'
+  COMMIT
 
-┌─────────────────────────────────────────────────────┐
-│                  Order Service                        │
-│  BEGIN TX                                            │
-│    INSERT INTO orders (id, status) VALUES (1, 'pending') │
-│    CALL http://inventory/reserve(1)  ← OUTSIDE TX!  │
-│    CALL http://payment/charge(100)   ← OUTSIDE TX!  │
-│    CALL http://shipping/schedule(1)  ← OUTSIDE TX!  │
-│    UPDATE orders SET status = 'confirmed'           │
-│  COMMIT TX                                           │
-│  ───────────────────────────────────────────────────  │
-│  Problem: If the DB commit succeeds but inventory     │
-│  call fails, the order is 'confirmed' but inventory   │
-│  was never reserved. Data inconsistency!              │
-└─────────────────────────────────────────────────────┘
-
-Three-Vendor Problem (also called the "distributed transaction dilemma"):
-  We need atomicity across three independent systems.
-  But each system has its own transaction manager.
-  No single transaction coordinator can span all three.
+Failure cases:
+  • payment succeeds, then COMMIT fails → customer charged, no order exists
+  • shipping call times out → did it happen? A retry may double-schedule
+  • the open transaction holds row locks and a DB connection for the
+    duration of three network calls
 ```
 
-**The Fundamental Trade-offs:**
+The order DB's `ROLLBACK` can't undo a charge in someone else's system. You need either a protocol all participants take part in (2PC/XA) or application-level recovery (sagas, TCC).
 
-```
-Any solution to distributed consistency must navigate:
+**The Trade-off Space:**
 
-                 ┌──── CONSISTENCY ─────┐
-                 │  • Strong: all see   │
-                 │    same state now    │
-                 │  • Eventual:         │
-                 │    eventually agree  │
-                 └──────────────────────┘
-                            │
-         ┌──────────────────┼──────────────────┐
-         │                  │                  │
-         ▼                  ▼                  ▼
-┌─────────────┐    ┌──────────────┐    ┌──────────────┐
-│ AVAILABILITY│    │   LATENCY   │    │  THROUGHPUT  │
-│ • 2PC blocks│    │ • 2PC = 4+RTT│   │ • 2PC serial │
-│ • Saga async│    │ • Saga = 2RTT│   │ • Saga async │
-└─────────────┘    └──────────────┘    └──────────────┘
+| Approach | Atomicity | Isolation | Availability under failure | Latency | Where it fits |
+|---|---|---|---|---|---|
+| Single DB transaction | Yes | Yes | DB's own | Lowest | Data that can live in one database (often the right answer: merge the services' data) |
+| 2PC / XA | Yes | Yes (locks held until commit) | Blocks if coordinator fails | ≥ 2 RTT + forced log writes, locks held across them | Few participants, same datacenter, all support XA |
+| Consensus-replicated 2PC (Spanner, CockroachDB) | Yes | Yes | Survives minority failures | Consensus round trips per participant | Distributed SQL, not across services |
+| TCC | Eventually (confirm/cancel) | Partial: reservations are visible | High | Try + Confirm round trips | Resources that support holds (seats, rooms, card authorizations) |
+| Saga (+ outbox) | Eventually (compensate) | **None**: intermediate states visible | High | Each step commits locally | Long-running, cross-service business workflows |
 
-The FLP impossibility result: in an asynchronous system,
-no deterministic consensus protocol can guarantee both
-safety and liveness with even one crash failure.
+**What theory says (and doesn't):**
 
-→ This means: you MUST choose between blocking (2PC/3PC)
-  and eventual consistency (Saga/Outbox).
-```
+- **Atomic commit needs agreement**, so it inherits consensus limits. 2PC is blocking: it waits on one coordinator. Non-blocking atomic commit is possible if the decision is replicated with consensus (Gray & Lamport's *Paxos Commit*, 2006), which is what distributed SQL databases do.
+- **FLP** (1985) says no deterministic protocol can *guarantee termination* in a fully asynchronous system with even one crash. It doesn't force a choice between 2PC and sagas; it says any protocol that is always safe may, in bad periods, stall. Paxos/Raft live with this by being safe always and live when timing is reasonable.
+- **CAP** applies too: during a partition, a protocol that never shows inconsistent state (2PC) must refuse or block; one that stays available (saga) must expose intermediate states.
 
-**Decision Tree for Choosing a Pattern:**
+**Choosing a Pattern:**
 
-```python
-def choose_transaction_pattern(requirements: dict) -> str:
-    """
-    requirements:
-      - strong_consistency: bool
-      - max_latency_ms: int
-      - throughput_tps: int
-      - participant_count: int
-      - can_design_compensations: bool
-      - requires_xa: bool  # JTA, WS-AtomicTransaction
-    """
-    if requirements['strong_consistency']:
-        if requirements['participant_count'] <= 3 and \
-           not requirements['can_design_compensations']:
-            return "2PC or XA transaction"
-        elif requirements['max_latency_ms'] > 100:
-            return "3PC (to avoid blocking)"
-        else:
-            return "2PC with coordinator HA"
-
-    # Eventual consistency path
-    if not requirements['can_design_compensations']:
-        raise ValueError("Must design compensations for async patterns")
-
-    if requirements['throughput_tps'] < 1000 and \
-       requirements['participant_count'] <= 5:
-        return "Orchestration Saga + Outbox"
-
-    if requirements['participant_count'] > 10:
-        return "Choreography Saga + Outbox"
-
-    if requirements['requires_xa']:
-        return "TCC (Try-Confirm/Cancel)"
-
-    return "Saga + Outbox (the default production choice)"
-```
+| Question | If yes |
+|---|---|
+| Can the data live in one database (or one distributed SQL cluster)? | Do that. Local transactions beat any pattern below |
+| Must all-or-nothing be visible instantly, participants support XA, few of them, low latency? | 2PC/XA, with an HA transaction manager and lock-timeout monitoring |
+| Can each resource be *held* cheaply and released on timeout? | TCC |
+| Long-running, many services, each step has a business undo (or can be made retriable)? | Orchestrated saga |
+| In every case | Transactional outbox for events, idempotency keys on every step |
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **FLP theorem** | Explains the fundamental impossibility of consensus in async systems |
-| **Trade-off space** | Maps consistency, availability, latency, throughput trade-offs |
-| **Pattern selection** | Can write a decision function with concrete thresholds |
-| **Production nuance** | Doesn't say "X is always better" — qualifies with constraints |
+| **Root cause** | One transaction manager per database; network calls can't join a local transaction |
+| **Trade-off space** | Maps atomicity, isolation, availability and latency per approach |
+| **Theory used correctly** | 2PC blocking, Paxos Commit, FLP as a termination (not safety) result |
+| **First question** | Asks whether the data should be in one database before reaching for a pattern |
 
 ---
 
@@ -140,346 +96,203 @@ def choose_transaction_pattern(requirements: dict) -> str:
 
 **What They're Really Testing:** Whether you understand 2PC at the protocol level — not just the high-level flow — including the write-ahead log records, timeout handling, and the specific conditions that cause blocking.
 
+!!! tip "30-second answer"
+    Phase 1: the coordinator asks every participant to **prepare**; a participant makes its changes durable, keeps its locks, **forces a PREPARED record to disk**, then votes YES (or votes NO and aborts). Phase 2: if all voted YES the coordinator **forces a COMMIT record** (the commit point) and tells everyone; otherwise it aborts. A participant that voted YES is **in doubt**: it may not commit or abort on its own, so if the coordinator dies after the votes and before participants hear the decision, they block with locks held until the coordinator (or its log) comes back. That can be seconds with an HA transaction manager or hours without one. Operators can force a **heuristic** outcome, which may break atomicity.
+
 ### Answer
 
-**Write-Ahead Log (WAL) in 2PC:**
+**Log Records (presumed-abort 2PC, the variant most systems use):**
 
 ```
-Every 2PC coordinator and participant MUST write to a write-ahead log
-before sending any network message. This is the key to crash recovery.
+PARTICIPANT
+  [PREPARED, T1, undo/redo info, coordinator id]   FORCED (fsync) before voting YES
+  [COMMITTED, T1] or [ABORTED, T1]                 written when the decision arrives
+                                                   (commit forced, then ACK)
 
-COORDINATOR WAL:
-┌──────────────────────────────────────────────────────────────┐
-│ Record 1: [BEGIN_2PC, transaction_id=T1, participants=[A,B,C]] │
-│ Record 2: [SEND_PREPARE, T1, target=ALL]                      │
-│ Record 3: [RECV_VOTE, T1, participant=A, vote=YES]            │
-│ Record 4: [RECV_VOTE, T1, participant=B, vote=YES]            │
-│ Record 5: [RECV_VOTE, T1, participant=C, vote=YES]            │
-│ Record 6: [DECISION, T1, decision=COMMIT] ← flushed to disk    │
-│           (point of no return!)                                │
-│ Record 7: [SEND_COMMIT, T1, target=ALL]                       │
-│ Record 8: [RECV_ACK, T1, participant=A, ack=COMMITTED]        │
-│ Record 9: [RECV_ACK, T1, participant=B, ack=COMMITTED]        │
-│ Record 10: [RECV_ACK, T1, participant=C, ack=COMMITTED]       │
-│ Record 11: [END_2PC, T1]                                       │
-└──────────────────────────────────────────────────────────────┘
-
-PARTICIPANT WAL:
-┌──────────────────────────────────────────────────────────────┐
-│ Record 1: [PREPARE_REQ, T1, coordinator=COORD]                │
-│ Record 2: [PREPARED, T1, resources_locked=[stock_42, fund_7]] │
-│           (forces write to disk before sending VOTE_YES!)      │
-│ Record 3: [COMMIT_REQ, T1]                                     │
-│ Record 4: [COMMITTED, T1]                                      │
-└──────────────────────────────────────────────────────────────┘
-
-KEY INSIGHT: Record 2 in the PARTICIPANT WAL must be fsync()'d
-to disk BEFORE the participant sends VOTE_YES to the coordinator.
-This ensures the participant can recover to the PREPARED state
-even after a crash.
+COORDINATOR
+  [COMMIT, T1, participants=[A,B,C]]               FORCED before sending any COMMIT
+                                                   ← the commit point
+  [END, T1]                                        lazily, after all ACKs
+  (no abort record needed: "no record" means ABORT — hence "presumed abort")
 ```
 
-**Complete Protocol Walkthrough with Timing:**
+The two forced writes are the whole trick: the participant's PREPARED record lets it survive a crash while still able to commit; the coordinator's COMMIT record makes the decision survive the coordinator's crash.
 
-```
-Phase 1: Prepare
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│              │ PREPARE │              │ PREPARE │              │
-│ Coordinator  │────────►│ Participant A│────────►│ Participant B│
-│              │         │              │         │              │
-│              │◄── VOTE_YES(disk) ────┤         │              │
-│              │         │              │◄── VOTE_YES(disk) ────┤
-│              │         │              │         │              │
-└──────────────┘         └──────────────┘         └──────────────┘
+**Protocol Flow:**
 
-Phase 2: Commit (only if ALL votes = YES)
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│              │ COMMIT  │              │ COMMIT  │              │
-│ Coordinator  │────────►│ Participant A│────────►│ Participant B│
-│              │         │              │         │              │
-│              │◄── ACK ────┤          │         │              │
-│              │         │              │◄── ACK ────┤          │
-└──────────────┘         └──────────────┘         └──────────────┘
-```
-
-**Failure Mode 1 — Coordinator crashes after Phase 1 (THE BLOCKING PROBLEM):**
-
-```
-Timeline:
-  t0: Coordinator sends PREPARE to all participants
-  t1: All participants PREPARED and fsync'd, sent VOTE_YES
-  t2: Coordinator receives all VOTE_YES
-  t3: Coordinator writes [DECISION, T1, decision=COMMIT] ← fsync'd!
-  t4: ⚡ COORDINATOR CRASHES before sending COMMIT messages
-  t5: Participants are in PREPARED state:
-        - Resources are LOCKED (rows, funds, inventory)
-        - Can't commit (don't know the decision)
-        - Can't rollback (might have been COMMIT)
-        - They are BLOCKING
-  t6-t∞: Participants poll coordinator — NO RESPONSE
-
-Duration of blocking:
-  - If coordinator has HA (standby): standby reads WAL, sends COMMIT
-    → Blocking duration: ~10-30 seconds (failover time)
-  - Without HA: manual intervention
-    → Blocking duration: MINUTES to HOURS
-    → DBA must query coordinator logs or use heuristic commit
-
-MITIGATION FOR COORDINATOR CRASH:
-  - Coordinator writes [DECISION] BEFORE sending Phase 2 messages
-  - Recovery: new coordinator reads WAL from disk
-  - If [DECISION] exists → sends the recorded decision
-  - If no [DECISION] → sends ROLLBACK (unilaterally abort)
-
-But what if coordinator crashes BEFORE writing [DECISION]?
-  - No decision was made
-  - Participants must ROLLBACK (safe because no commit was ordered)
+```mermaid
+sequenceDiagram
+    participant C as Coordinator
+    participant A as Participant A
+    participant B as Participant B
+    C->>A: PREPARE T1
+    C->>B: PREPARE T1
+    Note over A,B: write changes, keep locks, fsync PREPARED
+    A-->>C: VOTE YES
+    B-->>C: VOTE YES
+    Note over C: fsync COMMIT record (commit point)
+    C->>A: COMMIT T1
+    C->>B: COMMIT T1
+    A-->>C: ACK
+    B-->>C: ACK
+    Note over C: write END (no fsync needed)
 ```
 
-**Failure Mode 2 — Participant crashes after PREPARE:**
+**Failure Modes:**
 
-```
-Timeline:
-  t0: Participant receives PREPARE, locks resources, writes WAL
-  t1: ⚡ PARTICIPANT CRASHES before sending VOTE_YES
-  t2: Coordinator times out waiting for vote from this participant
-  t3: Coordinator decides to ROLLBACK (any NO or timeout = abort)
-  t4: Participant restarts, reads WAL:
-        - Finds [PREPARE_REQ] but no [COMMIT_REQ]
-        - Asks coordinator: "What was the decision for T1?"
-        - Coordinator says: "ROLLBACK"
-        - Participant releases locks, writes [ABORTED] to WAL
+| When | Who | What happens |
+|---|---|---|
+| Before voting | Participant crashes | Coordinator times out → ABORT. On restart the participant finds no PREPARED record and aborts locally |
+| After voting YES | Participant crashes | On restart it finds PREPARED, re-acquires locks, and asks the coordinator for the outcome. It cannot decide alone |
+| Before writing COMMIT | Coordinator crashes | No decision exists → recovery presumes ABORT. YES-voters stay in doubt until they can ask |
+| After writing COMMIT, before all hear it | Coordinator crashes | **The blocking case.** YES-voters hold locks and can't learn the outcome until the coordinator's log is readable again |
+| During phase 2 | Network drops COMMIT to B | Coordinator keeps resending; B is in doubt, holding locks, until it arrives |
 
-If participant crashes AFTER sending VOTE_YES but BEFORE receiving COMMIT:
-  - Participant restarts, finds [PREPARED] in WAL
-  - Polls coordinator until COMMIT or ROLLBACK arrives
-  - This is fine — not blocking (participant CAN recover)
-```
+**How long can blocking last?** Exactly as long as the coordinator's decision is unavailable:
 
-**XA Transactions (JTA) — Practical 2PC:**
+- Transaction manager with a replicated log / standby: failover time, typically seconds to tens of seconds.
+- Single coordinator on a dead host: until someone restores it, possibly hours. Meanwhile every row the in-doubt transactions touched is locked.
+- Way out: heuristic commit/rollback by an operator. If they guess differently from the logged decision you get a *heuristic mixed* outcome, which XA reports as an error and someone must repair by hand.
+
+Participants that time out *before* voting may abort freely. Cooperative termination (asking other participants) helps only if some participant already knows the outcome or hasn't voted.
+
+**XA in Practice:**
 
 ```sql
--- X/Open XA standard for distributed transactions
--- Used by: Java JTA, PostgreSQL, Oracle, DB2
-
--- Phase 1: Prepare
-xa start 'xid123';           -- Begin XA branch
+-- MySQL / InnoDB: XA statements (the transaction manager, e.g. a JTA
+-- implementation such as Narayana or Atomikos, issues these on each resource)
+XA START 'order-42';
   UPDATE inventory SET stock = stock - 1 WHERE id = 42;
-  UPDATE payments SET balance = balance - 100 WHERE user = 7;
-xa end 'xid123';
-xa prepare 'xid123';         -- Phase 1: prepare (writes WAL, locks)
+XA END 'order-42';
+XA PREPARE 'order-42';        -- phase 1: durable, locks kept
+XA COMMIT 'order-42';         -- phase 2 (or XA ROLLBACK 'order-42')
+XA RECOVER;                   -- list in-doubt branches after a crash
 
--- Phase 2: Commit (by transaction manager)
-xa commit 'xid123';          -- Phase 2: commit
-
--- Or rollback:
-xa rollback 'xid123';
+-- PostgreSQL: same idea, different syntax.
+-- Disabled by default: set max_prepared_transactions > 0.
+BEGIN;
+  UPDATE payments SET balance = balance - 100 WHERE user_id = 7;
+PREPARE TRANSACTION 'order-42';
+COMMIT PREPARED 'order-42';   -- or ROLLBACK PREPARED 'order-42'
+SELECT * FROM pg_prepared_xacts;   -- in-doubt transactions; they hold locks
+                                   -- and block VACUUM until resolved
 ```
 
-**Performance Characteristics of 2PC:**
+Kafka can't be an XA participant. Its transactions are 2PC-like *inside* Kafka only, so DB + Kafka atomicity is done with the outbox pattern instead.
 
-```python
-# 2PC latency model:
-# L = (N + 1) * RTT + 2 * FSYNC + N * FSYNC + N * LOCK_TIME
-# Where:
-#   N = number of participants
-#   RTT = network round-trip time (~0.5ms in same DC, ~50ms cross-region)
-#   FSYNC = disk flush time (~2-10ms for HDD, ~0.1ms for SSD/NVMe)
-#   LOCK_TIME = time to acquire database locks
+**Performance Model:**
 
-# For 3 participants in same datacenter:
-# L = 4 * 0.5ms + 2 * 2ms + 3 * 2ms + 3 * 1ms
-# L = 2ms + 4ms + 6ms + 3ms = 15ms
+```
+Latency for one transaction (coordinator in the same DC as participants):
+  prepare round trip      1 RTT     + participant forced write
+  coordinator decision              + 1 forced write
+  commit round trip       1 RTT     (+ participant commit write)
+  ≈ 2 RTT + 2–3 sequential fsyncs + the work itself
 
-# For 3 participants cross-region:
-# L = 4 * 50ms + 2 * 2ms + 3 * 2ms + 3 * 1ms
-# L = 200ms + 4ms + 6ms + 3ms = 213ms
+  Same DC:  RTT ≈ 0.5 ms, fsync on NVMe ≈ 0.05–1 ms   → a few ms
+  Cross-region: RTT ≈ 50–100 ms                        → 100–200+ ms
 
-# Throughput limit with single coordinator:
-# TP = 1 / L ≈ 66 tps (same DC), ~4.7 tps (cross-region)
-# This is why 2PC doesn't scale!
+Throughput is NOT 1/latency: a coordinator runs many transactions in parallel.
+The real limit is lock hold time on contended rows. A hot row locked for the
+whole 2PC (say 5 ms same-DC, 150 ms cross-region) caps that row at roughly
+200 or ~7 commits per second, however many machines you add.
 ```
 
-**When 2PC Is Actually Acceptable:**
+**When 2PC Is Acceptable:**
 
-```yaml
-Acceptable uses:
-  - Within a single datacenter (low latency)
-  - Small number of participants (2-3)
-  - Short-lived transactions (< 1 second)
-  - High-value operations (financial transfers, trading)
-  - When compensations are impossible or too risky
-
-Unacceptable uses:
-  - Cross-datacenter (high latency kills throughput)
-  - Many participants (> 5)
-  - Long-running transactions (> 10 seconds)
-  - High-throughput systems (> 100 tps)
-  - Microservices (different tech stacks, different databases)
-```
+- A few participants that all speak XA, same datacenter, short transactions.
+- Low contention on the rows involved.
+- An HA transaction manager and monitoring for in-doubt transactions (`XA RECOVER`, `pg_prepared_xacts`).
+- Avoid it across regions, across organisations, with long-running steps, or with participants that can't prepare (HTTP APIs, email, card networks).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **WAL details** | Can describe the exact WAL records written by coordinator and participants |
-| **Blocking duration** | Quantifies blocking time — not just "it blocks" but HOW LONG |
-| **Crash recovery** | Explains log-based recovery: reading WAL, determining decision, replaying |
-| **XA mechanics** | Familiar with XA SQL syntax, knows prepare/commit/rollback phases |
-| **Latency model** | Computes 2PC latency from first principles (RTT, fsync, locks) |
+| **Log details** | Names the two forced writes (participant PREPARED, coordinator COMMIT) and why each exists |
+| **Blocking** | Defines "in doubt" precisely and ties blocking duration to the decision's availability |
+| **Crash recovery** | Walks through each crash point, including presumed abort |
+| **XA mechanics** | Knows the prepare/commit/recover commands and that prepared transactions hold locks |
+| **Performance** | Models latency from RTTs and fsyncs; knows contention (lock hold time) is the real throughput limit |
 
 ---
 
 ## 3. Three-Phase Commit (3PC) — Why It's Rarely Used
 
-**Q:** "Explain how 3PC attempts to solve the blocking problem of 2PC. Why is 3PC still vulnerable to network partitions? Why is it rarely used in production despite being 'non-blocking'?""
+**Q:** "Explain how 3PC attempts to solve the blocking problem of 2PC. Why is 3PC still vulnerable to network partitions? Why is it rarely used in production despite being 'non-blocking'?"
 
 **What They're Really Testing:** Whether you understand that 3PC's non-blocking property depends on network assumptions that don't hold in practice, and can articulate the subtle failure modes.
+
+!!! tip "30-second answer"
+    3PC (Skeen, 1981) inserts a **PreCommit** phase between voting and committing, so no participant can commit while another is still "uncertain". That lets surviving participants finish without the coordinator: if anyone reached PreCommit they commit, otherwise they abort. The catch is the assumption that a node that doesn't answer has **crashed**. With real networks (partitions, long delays) a silent node may be alive and deciding differently, so one side commits while the other aborts: 3PC trades 2PC's *blocking* for possible *inconsistency*, at the price of an extra round trip. Systems that need non-blocking commit replicate 2PC's decision with Paxos/Raft instead.
 
 ### Answer
 
 **3PC Protocol — The Three Phases:**
 
 ```
-Phase 1: CanCommit (query, no locks)
-Phase 2: PreCommit (prepare with timeout-based recovery)
-Phase 3: DoCommit (commit or abort)
+Phase 1  CanCommit?   coordinator → all     participants vote YES/NO (and prepare)
+Phase 2  PreCommit    coordinator → all     only if every vote was YES; participants ACK
+Phase 3  DoCommit     coordinator → all     participants commit and ACK
 
-┌──────────┐    CanCommit    ┌──────────┐
-│          │────────────────►│          │
-│          │◄── VOTE_YES ────┤          │
-│          │                 │          │
-│          │    PreCommit    │          │
-│  COORD   │────────────────►│  PARTA   │
-│          │◄── ACK ─────────┤          │
-│          │                 │          │
-│          │    DoCommit     │          │
-│          │────────────────►│          │
-│          │◄── ACK ─────────┤          │
-└──────────┘                 └──────────┘
+Participant states:  INITIAL → UNCERTAIN (voted YES) → PRECOMMITTED → COMMITTED
+                                  └────────────────→ ABORTED
+Key property: no participant is COMMITTED while another is still UNCERTAIN.
 ```
 
-**3PC Timeout-Based Recovery (The Key Difference from 2PC):**
+**Termination Protocol (coordinator failed):**
 
-```
-SCENARIO: Coordinator crashes after PreCommit
+The surviving participants elect a new coordinator, which collects their states:
 
-Timeline:
-  t0: Coordinator sends CanCommit → all VOTE_YES
-  t1: Coordinator sends PreCommit  → all ACK
-  t2: ⚡ COORDINATOR CRASHES before DoCommit
+| States found among reachable participants | Decision |
+|---|---|
+| Any COMMITTED | Commit |
+| Any ABORTED | Abort |
+| Any PRECOMMITTED (none committed/aborted) | Send PreCommit to the rest, then commit |
+| All UNCERTAIN | Abort (no one can have committed, because commit requires everyone to have been PreCommitted first) |
 
-3PC Recovery (NOT blocking like 2PC):
-  t3: Participant A times out waiting for DoCommit
-  t4: A sends QUERY to Participant B: "Did you receive DoCommit?"
-  t5: B also timed out → both in PreCommit state
-  t6: A and B agree: majority have PreCommit → COMMIT
-  t7: A and B COMMIT unilaterally
-
-Why this works (the insight):
-  - PreCommit means ALL participants agreed to commit
-  - If any participant received DoCommit, they tell the others
-  - If no participant received DoCommit, but ALL got PreCommit,
-    the majority can safely decide to commit
-  - This avoids the 2PC blocking problem!
-
-Formal guarantee:
-  3PC is NON-BLOCKING as long as the network is synchronous
-  (bounded message delays).
-```
+It's not a majority vote. It's a rule based on the furthest state any reachable participant reached, and it's only correct if "unreachable" really means "crashed".
 
 **Why 3PC Fails Under Network Partitions:**
 
 ```
-SCENARIO: Network partition during PreCommit
+Coordinator sends PreCommit to A, then the network partitions {A} | {B, C}.
 
-             ┌──────────────────┐
-             │    COORDINATOR   │
-             │  (sends PreCommit)│
-             └────────┬─────────┘
-                      │
-              ┌───────┴───────┐
-              │               │
-         ┌────▼────┐    ┌────▼────┐
-         │  PART A │    │  PART B │  ← Network Partition!
-         │(receives│    │(doesn't│
-         │PreCommit)│    │receive) │
-         └─────────┘    └─────────┘
+Side {A}:     A is PRECOMMITTED, times out, runs termination alone:
+              "someone is PRECOMMITTED" → COMMIT
+Side {B, C}:  both UNCERTAIN, time out, run termination:
+              "all UNCERTAIN" → ABORT
 
-  Part A (receives PreCommit):
-    - Times out → asks others
-    - Can't reach Part B (partitioned!)
-    - Only itself in majority → can't reach consensus
-    - BLOCKED!
-
-  Part B (doesn't receive PreCommit):
-    - Times out waiting for PreCommit
-    - Knows CanCommit was sent (Phase 1)
-    - But unsure if PreCommit was sent to others
-    - Must ABORT to be safe (can't decide COMMIT without PreCommit knowledge)
-    - But PART A might COMMIT! → DIVERGENCE!
-
-Result: 3PC can still BLOCK during network partitions
-  - The non-blocking property requires a SYNCHRONOUS network
-  - In asynchronous networks (the real world), 3PC degrades to 2PC behavior
-  - This is WHY 3PC is rarely used in practice!
+Partition heals: A committed, B and C aborted. Atomicity violated.
 ```
 
-**Why 3PC Is Rarely Used (Production Reality):**
+So under asynchrony 3PC doesn't merely "degrade to blocking", it can be **unsafe**. Making it safe would require a quorum-based termination protocol (e.g. Skeen's quorum-based 3PC, or E3PC), which can block again in the minority, and at that point you're building consensus.
 
-```yaml
-Reasons 3PC isn't used:
+**Why 3PC Is Rarely Used:**
 
-1. Network Partitions Are Common:
-   - 3PC only works in synchronous networks
-   - Real-world networks are asynchronous (delays, drops)
-   - Under asynchrony, 3PC blocks just like 2PC
+1. **Its assumption is false in practice.** Bounded message delay and perfect failure detection don't exist on real networks; a GC pause looks like a crash.
+2. **Extra round trip** on every transaction (3 RTTs vs 2), with no benefit in the common no-failure case.
+3. **More states to get right** in recovery code that rarely runs.
+4. **Better alternatives:** 2PC with a consensus-replicated coordinator (Spanner, CockroachDB, YugabyteDB) is non-blocking as long as a majority of each group is up; sagas for cross-service workflows.
 
-2. Extra Round Trip:
-   - 3PC: 3 phases = CanCommit + PreCommit + DoCommit
-   - 2PC: 2 phases = Prepare + Commit
-   - 3PC adds 1 RTT (50% more latency)
-   - For cross-region: adds 50-100ms
+**3PC vs 2PC:**
 
-3. Complexity:
-   - Timeout-based recovery is hard to get right
-   - Participants must track state transitions carefully
-   - Majority voting during recovery adds complexity
-
-4. Better Alternatives Exist:
-   - For synchronous networks: 2PC is simpler and works fine
-   - For async networks: Saga patterns are the production choice
-   - Paxos/Raft give consensus with better properties
-
-Historical note: 3PC was proposed by Skeen & Stonebraker in 1983.
-It was influential as a theoretical contribution but never gained
-wide production adoption due to the network partition problem.
-```
-
-**3PC vs 2PC Comparison:**
-
-```yaml
-Property               2PC                 3PC
-─────────────────────────────────────────────────────
-Phases                 2 (Prepare, Commit) 3 (CanCommit, PreCommit, DoCommit)
-Network RTTs           2                    3
-Blocking on crash      YES                  YES (under partition)
-Blocking on partition  YES                  YES (degraded)
-Coordination overhead  Low                  Medium
-Implementation         Simple               Complex
-Production adoption    High (XA/JTA)        Very low
-Network assumption     None (any)           Synchronous required
-Timeout recovery       No                   Yes (majority vote)
-```
+| Property | 2PC | 3PC |
+|---|---|---|
+| Phases / RTTs | 2 | 3 |
+| Coordinator crash | Blocks YES-voters | Survivors can terminate |
+| Network partition | Blocks (safe) | May commit on one side and abort on the other (unsafe) |
+| Network assumption for its guarantees | None for safety | Synchronous (bounded delays, accurate failure detection) |
+| Production adoption | XA/JTA, `PREPARE TRANSACTION`, inside distributed DBs | Essentially none |
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Timeout recovery** | Explains how participants can commit/abort without coordinator in 3PC |
-| **Partition failure** | Shows why 3PC fails under async networks (the fundamental flaw) |
-| **RTT cost** | Quantifies the extra latency phase (50% more network trips) |
-| **Production reality** | Can articulate why theory (non-blocking) ≠ practice (still blocks) |
+| **PreCommit purpose** | Explains that it removes the state where some committed while others are uncertain |
+| **Termination rule** | States the actual rule (furthest state reached), not "majority vote" |
+| **Partition failure** | Shows the split where one side commits and the other aborts |
+| **Practical answer** | Points to consensus-replicated 2PC as the real non-blocking solution |
 
 ---
 
@@ -488,6 +301,9 @@ Timeout recovery       No                   Yes (majority vote)
 **Q:** "Design an order-to-shipment workflow that spans 5 microservices using the Saga pattern. Walk through both choreography and orchestration approaches. What happens when a compensating transaction fails? How do you handle the 'lost compensation' problem? How do you ensure idempotent compensations? Now make it resilient to production failures."
 
 **What They're Really Testing:** Whether you understand Sagas not just as a pattern, but as a distributed state machine with real failure modes: lost compensations, partial failures, timeout cascades, and zombie transactions.
+
+!!! tip "30-second answer"
+    A saga is a durable state machine: run local transactions in order, and on a business failure run the compensations of the completed steps in reverse. Order steps as **compensatable → pivot → retriable** (you can't "unsend" an email, so it goes last and is simply retried). **Choreography** (services react to each other's events) suits short flows; **orchestration** (one coordinator, persisted state) suits anything with more than a few steps, timeouts or compliance needs. Three rules make it production-safe: persist saga state before and after every step, make every step and compensation **idempotent** (a timeout means "unknown", so you will retry things that already happened), and treat a failing compensation as something to **retry until it succeeds** or escalate, never as "done".
 
 ### Answer
 
@@ -536,9 +352,10 @@ ORDER SERVICE        INVENTORY SVC       PAYMENT SVC       SHIPPING SVC       NO
 **Orchestration Saga — Central Coordinator:**
 
 ```python
+import asyncio
 import enum
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 class SagaStatus(enum.Enum):
@@ -555,9 +372,9 @@ class SagaState:
     status: SagaStatus
     current_step: int
     completed_steps: list[int]
-    compensating_steps: list[int]
+    compensating_steps: list[int]          # steps whose compensation succeeded
     error_message: Optional[str] = None
-    payload: dict = None  # Business data
+    payload: dict = field(default_factory=dict)  # Business data
 
 class OrchestrationSaga:
     """
@@ -565,11 +382,12 @@ class OrchestrationSaga:
     Each step is idempotent. Compensations are retriable.
     """
 
+    # compensatable → pivot → retriable
     STEPS = [
         ("reserve_stock", InventoryService.reserve, InventoryService.release),
-        ("charge_card", PaymentService.charge, PaymentService.refund),
+        ("charge_card", PaymentService.charge, PaymentService.refund),       # pivot
         ("create_label", ShippingService.create_label, ShippingService.void_label),
-        ("send_email", NotificationService.send, NotificationService.undo_send),
+        ("send_email", NotificationService.send, None),  # can't be undone: retry only
     ]
 
     def __init__(self, db, event_bus, max_retries=3):
@@ -596,11 +414,14 @@ class OrchestrationSaga:
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                # Send command to the service via event bus
-                # Service executes and publishes result
+                # Send command to the service via event bus; service replies
+                # with a result event. The command carries an idempotency key
+                # (saga_id + step) because a timeout does NOT mean "didn't happen":
+                # the retry may hit a step that already succeeded.
                 result = await self._send_command_with_timeout(
                     step_name,
                     state.payload,
+                    idempotency_key=f"{state.saga_id}:{step_name}",
                     timeout_seconds=30,
                 )
 
@@ -617,7 +438,8 @@ class OrchestrationSaga:
                     await self._notify_completion(state.saga_id)
                     return
 
-                # Execute next step
+                # Execute next step (a real engine would loop or enqueue
+                # the next command instead of recursing)
                 await self._execute_step(state)
                 return
 
@@ -625,6 +447,9 @@ class OrchestrationSaga:
                 if attempt < self.max_retries:
                     await asyncio.sleep(2 ** attempt)  # Exponential backoff
                     continue
+                # Outcome unknown. Before the pivot, compensating is safe
+                # (compensations are idempotent and tolerate "never happened").
+                # After the pivot, keep retrying forward instead.
                 await self._fail_saga(state, f"Step {step_name} failed after {self.max_retries} retries: {e}")
                 return
 
@@ -640,30 +465,32 @@ class OrchestrationSaga:
         await self._persist_state(state)
 
         # Execute compensations for completed steps, in reverse
+        all_ok = True
         for step_idx in reversed(state.completed_steps):
             step_name, _, comp_fn = self.STEPS[step_idx]
+            if comp_fn is None or step_idx in state.compensating_steps:
+                continue
             try:
                 await self._send_command_with_timeout(
                     f"compensate_{step_name}",
                     state.payload,
+                    idempotency_key=f"{state.saga_id}:{step_name}:undo",
                     timeout_seconds=30,
                 )
                 state.compensating_steps.append(step_idx)
+                await self._persist_state(state)
             except Exception as comp_error:
-                # Compensation failed! This is CRITICAL.
-                # We must NOT give up — compensations must eventually succeed.
-                # Publish to dead-letter queue for manual intervention.
-                await self._publish_to_dlq(
-                    saga_id=state.saga_id,
-                    step=step_name,
-                    error=str(comp_error),
-                )
-                # Continue with other compensations
-                continue
+                # Compensation failed. Do NOT mark the saga compensated:
+                # leave it COMPENSATING so the recovery worker retries it,
+                # and alert. Stop here so compensations stay in reverse order.
+                all_ok = False
+                await self._alert(state.saga_id, step_name, str(comp_error))
+                break
 
-        state.status = SagaStatus.COMPENSATED
-        await self._persist_state(state)
-        await self._notify_failure(state.saga_id, error)
+        if all_ok:
+            state.status = SagaStatus.COMPENSATED
+            await self._persist_state(state)
+            await self._notify_failure(state.saga_id, error)
 ```
 
 **The "Lost Compensation" Problem — And How to Solve It:**
@@ -696,76 +523,64 @@ class SagaRecoveryWorker:
             await self._retry_compensations(saga)
 
     async def _retry_compensations(self, saga: SagaState):
-        """Retry all compensations that haven't been acknowledged."""
-        for step_idx in saga.completed_steps:
-            if step_idx in saga.compensating_steps:
-                continue  # Already compensated
-
+        """Retry, in reverse order, all compensations not yet acknowledged."""
+        for step_idx in reversed(saga.completed_steps):
             step_name, _, comp_fn = self.STEPS[step_idx]
+            if comp_fn is None or step_idx in saga.compensating_steps:
+                continue  # Nothing to undo, or already compensated
+
             try:
-                await comp_fn(saga.payload)
+                await comp_fn(saga.payload,
+                              idempotency_key=f"{saga.saga_id}:{step_name}:undo")
                 saga.compensating_steps.append(step_idx)
+                await self._persist_state(saga)
             except Exception:
-                continue  # Will retry in next recovery cycle
+                return  # Will retry in next recovery cycle (keeps reverse order)
 
         # Check if all compensations done
-        if set(saga.compensating_steps) == set(saga.completed_steps):
+        needed = {i for i in saga.completed_steps if self.STEPS[i][2] is not None}
+        if needed <= set(saga.compensating_steps):
             saga.status = SagaStatus.COMPENSATED
             await self._persist_state(saga)
 
-# SOLUTION 2: Dead letter queue with manual intervention
-# When a compensation keeps failing, send it to DLQ:
-class DLQHandler:
-    """
-    Monitors dead letter queue for failed compensations.
-    Each DLQ message includes full context for manual or automated replay.
-    """
-
-    async def process_dlq(self):
-        messages = await self.kafka.consume("saga.dlq")
-        for msg in messages:
-            saga_id = msg["saga_id"]
-            step = msg["step"]
-            error = msg["error"]
-            retry_count = msg.get("retry_count", 0)
-
-            if retry_count < 10:
-                # Auto-retry with backoff
-                await asyncio.sleep(2 ** retry_count * 60)  # 1min, 2min, 4min, ...
-                try:
-                    await self._execute_compensation(saga_id, step)
-                except Exception:
-                    msg["retry_count"] = retry_count + 1
-                    await self.kafka.produce("saga.dlq", msg)
-            else:
-                # Escalate to human
-                await self._notify_ops(f"Saga {saga_id}: compensation {step} keeps failing")
+# SOLUTION 2: Escalation, not silent parking
+# Keep backoff state in the saga row (next_retry_at, retry_count) so the
+# recovery worker above does the waiting; never sleep inside a consumer
+# (it stalls the partition and triggers a rebalance).
+# After N attempts or a deadline: page a human, show the saga in an ops UI
+# with full context, and let them retry, force-complete or fix data.
+# Common causes: the downstream API changed, the resource was already
+# modified by a later business action (refund after chargeback), a bug.
 
 # SOLUTION 3: Idempotent compensations
 # Every compensation must be IDEMPOTENT — running it multiple times
 # must produce the same result as running it once.
 
 class IdempotentPaymentService:
-    def refund(self, order_id: str, amount: float) -> bool:
-        # Check if already refunded
-        existing = self.db.query(
-            "SELECT status FROM refunds WHERE order_id = %s",
-            (order_id,)
-        )
-        if existing and existing['status'] == 'COMPLETED':
-            return True  # Already done — idempotent NO-OP
-
-        # Process refund
-        result = self.payment_gateway.refund(order_id, amount)
-
-        # Record result
+    def refund(self, order_id: str, amount: float) -> None:
+        # 1. Record intent first (unique on order_id). A retry finds the row.
         self.db.execute(
             "INSERT INTO refunds (order_id, amount, status) "
-            "VALUES (%s, %s, 'COMPLETED') "
-            "ON CONFLICT (order_id) DO NOTHING",
-            (order_id, amount)
+            "VALUES (%s, %s, 'PENDING') ON CONFLICT (order_id) DO NOTHING",
+            (order_id, amount),
         )
-        return result
+        row = self.db.query_one(
+            "SELECT status FROM refunds WHERE order_id = %s", (order_id,))
+        if row["status"] == "COMPLETED":
+            return  # already done: idempotent no-op
+
+        # 2. Call the gateway with a deterministic idempotency key. If we
+        #    crashed after the gateway refunded but before step 3, the retry
+        #    gets the original result instead of a second refund.
+        self.payment_gateway.refund(order_id, amount,
+                                    idempotency_key=f"refund-{order_id}")
+
+        # 3. Mark complete.
+        self.db.execute(
+            "UPDATE refunds SET status = 'COMPLETED' WHERE order_id = %s",
+            (order_id,))
+        # Note: check-then-insert without the gateway key would double-refund
+        # if the process crashed between the gateway call and the INSERT.
 ```
 
 **Choreography vs Orchestration — Production Trade-offs:**
@@ -796,16 +611,17 @@ ORCHESTRATION SAGA:
     - Coordinator must be versioned and backward-compatible
   Use: Complex workflows, long-running sagas, compliance-heavy
 
-PRODUCTION CHOICE (for > 99% of cases):
+DEFAULT CHOICE for non-trivial workflows:
   ORCHESTRATION SAGA + OUTBOX PATTERN
+  (or a durable workflow engine: Temporal, AWS Step Functions, Camunda)
 ```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Failed compensation** | Articulates the "lost compensation" problem and designs a DLQ + recovery worker |
-| **Idempotent compensations** | Implements idempotency keys with ON CONFLICT DO NOTHING pattern |
+| **Failed compensation** | Articulates the "lost compensation" problem; saga stays COMPENSATING, recovery worker retries, humans get escalations |
+| **Idempotent compensations** | Records intent, then calls downstream with a deterministic idempotency key |
 | **Choreography vs orchestration** | Gives concrete trade-offs with examples, not just abstract benefits |
 | **Timeout management** | Uses exponential backoff, distinguishes retriable vs non-retriable errors |
 | **Recovery daemon** | Designs a background worker that rescues stuck sagas |
@@ -817,6 +633,9 @@ PRODUCTION CHOICE (for > 99% of cases):
 **Q:** "We have a microservice that needs to publish events to Kafka whenever a database row changes. The naive approach (write to DB then publish to Kafka) has a race condition: what if the DB write succeeds but Kafka publish fails? Or the Kafka publish succeeds but the DB transaction rolls back? Design a reliable solution. How do you scale it to 10K events/second? Compare polling vs CDC-based approaches."
 
 **What They're Really Testing:** Whether you understand the dual-write problem in depth and can design a production-grade outbox implementation with concrete trade-offs.
+
+!!! tip "30-second answer"
+    Write the business row **and** an event row into an `outbox` table in the **same local transaction**, so both exist or neither does. A separate relay publishes outbox rows to Kafka, either by **polling** (`SELECT ... FOR UPDATE SKIP LOCKED`, simple, 100s of ms latency) or by **CDC** (Debezium tailing the WAL/binlog, lower latency, no polling load, more infrastructure). Delivery is **at-least-once**: the relay can crash after publishing and before marking the row, so consumers must deduplicate by event ID. Key messages by **aggregate ID** to keep per-entity ordering, and keep the outbox small (delete or partition-drop published rows).
 
 ### Answer
 
@@ -842,9 +661,11 @@ def create_order(order_data):
 #   → Phantom event consumed by downstream services
 #   → Inventory reserved for nothing!
 
-# PROBLEM 3: Exactly-once delivery?
-#   → Kafka provides at-least-once delivery
-#   → If producer crashes before ack, message is re-sent
+# PROBLEM 3: Duplicates
+#   → The idempotent producer (default since Kafka 3.0) removes duplicates
+#     caused by the producer's own retries within one session...
+#   → ...but not an application that crashes and re-sends, or a consumer that
+#     processes and crashes before committing its offset
 #   → Downstream must handle duplicates anyway
 ```
 
@@ -860,13 +681,14 @@ CREATE TABLE outbox (
     payload JSONB NOT NULL,                  -- event data
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     published_at TIMESTAMPTZ,               -- NULL = not yet published
-    retry_count INT DEFAULT 0,
-    idempotency_key VARCHAR(255) UNIQUE     -- prevent duplicates
+    retry_count INT NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ,
+    idempotency_key VARCHAR(255) UNIQUE     -- prevent duplicate events from API retries
 );
 
-CREATE INDEX idx_outbox_unpublished ON outbox
-    WHERE published_at IS NULL
-    ORDER BY created_at ASC;
+-- Partial index: only unpublished rows, in publish order
+CREATE INDEX idx_outbox_unpublished ON outbox (created_at)
+    WHERE published_at IS NULL;
 ```
 
 ```python
@@ -926,7 +748,7 @@ class PollingOutboxPublisher:
     async def _fetch_unpublished(self) -> list[dict]:
         """Fetch unpublished messages, oldest first."""
         return await self.db.fetch("""
-            SELECT id, event_type, payload, idempotency_key
+            SELECT id, aggregate_type, aggregate_id, event_type, payload
             FROM outbox
             WHERE published_at IS NULL
               AND retry_count < 10             -- Max retries before DLQ
@@ -937,37 +759,35 @@ class PollingOutboxPublisher:
         """, self.batch_size)
 
     async def _publish_batch(self, messages: list[dict]):
-        """Publish messages to Kafka and mark as published."""
-        async with self.db.transaction():
-            for msg in messages:
-                try:
-                    # Publish with idempotency key (Kafka exactly-once)
-                    await self.kafka.produce(
-                        topic=msg['event_type'],
-                        value=msg['payload'],
-                        key=msg['idempotency_key'],  # For partitioning
-                        headers={'idempotency_key': msg['idempotency_key']},
-                    )
+        """Publish messages to Kafka and mark as published.
 
-                    # Mark as published
-                    await self.db.execute(
-                        "UPDATE outbox SET published_at = NOW() WHERE id = $1",
-                        msg['id'],
-                    )
+        (Simplified: in production, fetch + publish + mark run in one DB
+        transaction so the row locks from FOR UPDATE SKIP LOCKED are held
+        until the rows are marked.)"""
+        for msg in messages:
+            try:
+                await self.kafka.produce(
+                    topic=f"{msg['aggregate_type']}.events",
+                    key=msg['aggregate_id'],   # same aggregate → same partition → ordered
+                    value=msg['payload'],
+                    headers={'event_id': str(msg['id']),        # consumers dedupe on this
+                             'event_type': msg['event_type']},
+                )   # wait for the broker ack (acks=all) before marking
+            except Exception:
+                await self.db.execute("""
+                    UPDATE outbox
+                    SET retry_count = retry_count + 1,
+                        next_retry_at = NOW() + INTERVAL '1 second' * power(2, retry_count)
+                    WHERE id = $1
+                """, msg['id'])
+                break   # stop: publishing later rows now would reorder events
 
-                except Exception as e:
-                    # Increment retry count, set exponential backoff
-                    await self.db.execute("""
-                        UPDATE outbox
-                        SET retry_count = retry_count + 1,
-                            next_retry_at = NOW() + INTERVAL '1 second' * (2 ^ retry_count)
-                        WHERE id = $1
-                    """, msg['id'])
-
-                    if msg['retry_count'] >= 10:
-                        # Move to DLQ
-                        await self._move_to_dlq(msg)
+            await self.db.execute(
+                "UPDATE outbox SET published_at = NOW() WHERE id = $1", msg['id'])
+            # Crash here → row is re-published on restart → at-least-once.
 ```
+
+**Ordering caveat:** multiple relays with `SKIP LOCKED` can publish two events of the *same* aggregate out of order. If per-aggregate order matters, run one relay per outbox partition (hash of aggregate ID) or use CDC, which reads in commit order. Also, `created_at` order isn't commit order: a transaction that started earlier can commit later, so a poller can skip past it; poll with a small safety lag or use CDC.
 
 **Outbox Publisher — CDC-Based (Change Data Capture):**
 
@@ -978,20 +798,26 @@ class PollingOutboxPublisher:
 -- 1. Create a publication for the outbox table
 CREATE PUBLICATION outbox_pub FOR TABLE outbox;
 
--- 2. Debezium connector reads the WAL and publishes to Kafka
---    No polling needed! Sub-millisecond latency.
-
--- 3. Kafka Streams or ksqlDB to transform WAL events into domain events
+-- 2. Debezium's Postgres connector reads the WAL through a logical
+--    replication slot; its Outbox Event Router transform turns each outbox
+--    INSERT into a domain event on topic <aggregate_type>, keyed by aggregate_id.
+--    The relay can DELETE rows right after inserting (or in the same
+--    transaction): the INSERT is already in the WAL, so the table stays tiny.
 
 -- Benefits of CDC approach:
---   • Sub-millisecond latency vs 100ms polling
---   • No load on DB from polling queries
---   • Scales naturally with WAL throughput
---   • Debezium handles exactly-once semantics
+--   • Latency typically tens to a few hundred ms end to end (no poll interval)
+--   • No polling queries against the primary
+--   • Events emitted in commit order
+--   • At-least-once by default; Kafka Connect supports exactly-once source
+--     connectors since Kafka 3.3 (KIP-618), which recent Debezium versions
+--     support for some connectors.
+--     Consumers should still dedupe on event ID.
 
 -- Drawbacks:
 --   • Infrastructure complexity (Debezium, Kafka Connect)
---   • WAL must be retained until events are published
+--   • A stalled connector makes the replication slot retain WAL until the
+--     disk fills: cap it with max_slot_wal_keep_size (PG 13+) and alert on lag
+--   • Slot/failover handling (logical slot failover needs PG 17+ or tooling)
 --   • Schema changes require careful handling
 ```
 
@@ -1000,15 +826,17 @@ CREATE PUBLICATION outbox_pub FOR TABLE outbox;
 ```yaml
 Aspect               Polling-Based                  CDC-Based (Debezium)
 ────────────────────────────────────────────────────────────────────
-Latency              50-500ms (configurable)        <10ms (WAL streaming)
+Latency              poll interval + publish        tens to hundreds of ms
 DB Load              SELECT queries on outbox       Minimal (WAL reader)
                     table (can be optimized)
 Complexity           Simple SQL + background        Kafka Connect cluster,
                     worker                         Debezium config
 Scaling              Multiple publishers with       Partitions by table/row
                     FOR UPDATE SKIP LOCKED
-Exactly-once         At-least-once (dedup on        At-least-once
-                    consumer side)
+Delivery             At-least-once (dedup on        At-least-once by default
+                    consumer side)                  (EOS possible via KIP-618)
+Ordering             Per aggregate only with one    Commit order
+                    relay per partition
 Schema changes       Easy (add columns to           Must handle schema
                     outbox table)                   evolution carefully
 Dependency           Only the application DB        Requires Kafka + Connect
@@ -1018,32 +846,33 @@ Monitoring           Check outbox table size,       Check Debezium lag,
 
 **Scaling the Outbox to 10K Events/Second:**
 
+10K events/s is modest for Kafka; the bottlenecks are the outbox table and the relay.
+
+```sql
+-- STRATEGY 1: Hash-partition the outbox by aggregate, one relay per partition
+-- (keeps per-aggregate ordering while parallelising). The partition key must
+-- be part of the primary key in PostgreSQL.
+CREATE TABLE outbox (
+    id UUID NOT NULL,
+    aggregate_id VARCHAR(100) NOT NULL,
+    -- ... other columns as above ...
+    PRIMARY KEY (aggregate_id, id)
+) PARTITION BY HASH (aggregate_id);
+CREATE TABLE outbox_p0 PARTITION OF outbox FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE outbox_p1 PARTITION OF outbox FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+-- ... p2, p3
+
+-- STRATEGY 2: Keep the table small. Delete published rows in batches (or use
+-- time partitions and DROP old ones) so the unpublished-rows index stays hot and
+-- autovacuum keeps up. A huge outbox is the most common cause of relay lag.
+```
+
+- **Strategy 3, batch everything:** fetch 500–1000 rows per poll, produce asynchronously with `linger.ms`/compression, wait for all acks, then mark the batch with one `UPDATE ... WHERE id = ANY($1)`.
+- **Strategy 4, switch to CDC** when polling load or latency becomes a problem.
+- Don't move the outbox to a separate database: then writing business data and outbox row is itself a dual write.
+
 ```python
-# STRATEGY 1: Partition the outbox table
-# Instead of one outbox table, use multiple tables or partitions:
-
-CREATE TABLE outbox_shard_0 PARTITION OF outbox
-    FOR VALUES WITH (MODULUS 4, REMAINDER 0);
-CREATE TABLE outbox_shard_1 PARTITION OF outbox
-    FOR VALUES WITH (MODULUS 4, REMAINDER 1);
--- ... shard 2, shard 3
-
-# Each shard has its own publisher worker.
-# Idempotency key determines the shard:
-# shard = hash(idempotency_key) % NUM_SHARDS
-
-# STRATEGY 2: Dedicated outbox database
-# Separate PostgreSQL instance for the outbox table.
-# Application writes to both business DB and outbox DB in a
-# distributed transaction (or use 2PC between them).
-# This isolates the business DB from outbox load.
-
-# STRATEGY 3: Batch publishing
-# Instead of one Kafka message per outbox row, batch multiple
-# events into a single Kafka message (if ordering allows).
-# Reduces Kafka producer overhead at the cost of latency.
-
-# STRATEGY 4: Idempotency key dedup at DB level
+# Related: API-level idempotency in the same transaction
 # Since idempotency_key is UNIQUE, duplicate inserts fail silently.
 # This allows retrying the entire business transaction safely:
 def create_order_safe(order_data):
@@ -1076,8 +905,8 @@ def create_order_safe(order_data):
 | **Dual-write problem** | Explains both failure modes (DB succeeds/Kafka fails and vice versa) |
 | **Transactional outbox** | Implements outbox in same DB transaction with idempotency key |
 | **Polling vs CDC** | Compares both with concrete latency, load, and complexity numbers |
-| **Scaling** | Proposes partitioning, dedicated DB, batch publishing for throughput |
-| **Dead letter queue** | Handles failed publishes with retry count, backoff, and DLQ escalation |
+| **Scaling** | Partitions by aggregate, batches, keeps the table small, knows when to move to CDC |
+| **Ordering & duplicates** | Keys by aggregate ID; consumers dedupe on event ID; knows SKIP LOCKED can reorder |
 
 ---
 
@@ -1086,6 +915,9 @@ def create_order_safe(order_data):
 **Q:** "Explain the TCC pattern. How is it different from Saga? When would you use TCC instead of Saga? Walk through a concrete example of reserving a hotel room using TCC."
 
 **What They're Really Testing:** Whether you understand TCC as a reservation-based pattern that bridges the gap between 2PC (strong locks) and Saga (no locks).
+
+!!! tip "30-second answer"
+    TCC is 2PC moved into the business layer. **Try** reserves the resource with a business-level hold that expires (seat held 15 min, card *authorized* but not captured); **Confirm** turns holds into real effects once every Try succeeded; **Cancel** releases them. Unlike a saga, nothing irreversible happens until Confirm, so other users never see a "charged but not booked" state, only "held". Costs: every participant must implement three idempotent operations plus hold expiry, and the coordinator must handle the classic TCC anomalies: Cancel arriving for a Try that never ran (**empty cancel**), a delayed Try arriving after Cancel (**suspension**), and duplicates.
 
 ### Answer
 
@@ -1139,25 +971,40 @@ class TCCHotelBooking:
         Returns a hold_id for confirmation/cancellation.
         """
         with self.db.transaction():
-            # Check if room is available
+            # Suspension guard: if Cancel for this booking already ran
+            # (it arrived before this delayed Try), refuse to reserve.
+            if self.db.fetch("SELECT 1 FROM tcc_cancelled WHERE booking_id = $1",
+                             booking_id):
+                raise BookingAlreadyCancelled(booking_id)
+
+            # SELECT ... FOR UPDATE on overlapping rows can't stop a concurrent
+            # INSERT of a new overlapping row (phantom), so either lock the room
+            # row first or let an exclusion constraint enforce no-overlap:
+            #   ALTER TABLE reservations ADD CONSTRAINT no_double_booking
+            #     EXCLUDE USING gist (room_id WITH =,
+            #                         daterange(checkin, checkout) WITH &&)
+            #     WHERE (status IN ('HELD', 'CONFIRMED'));   -- needs btree_gist
+            self.db.execute("SELECT 1 FROM rooms WHERE id = $1 FOR UPDATE", room_id)
+
             existing = self.db.fetch("""
                 SELECT 1 FROM reservations
                 WHERE room_id = $1
                   AND status IN ('CONFIRMED', 'HELD')
                   AND checkin < $3 AND checkout > $2
-                FOR UPDATE  -- Lock the row for checking
             """, room_id, checkin, checkout)
 
             if existing:
                 raise RoomNotAvailable(room_id, checkin, checkout)
 
-            # Create a HOLD (not confirmed)
+            # Create a HOLD (not confirmed); booking_id is UNIQUE → a duplicate
+            # Try returns the existing hold instead of creating a second one
             hold = self.db.fetch("""
-                INSERT INTO reservations (room_id, guest, checkin, checkout,
-                                          status, hold_expires_at)
-                VALUES ($1, $2, $3, $4, 'HELD', NOW() + INTERVAL '15 minutes')
+                INSERT INTO reservations (booking_id, room_id, guest, checkin,
+                                          checkout, status, hold_expires_at)
+                VALUES ($1, $2, $3, $4, $5, 'HELD', NOW() + INTERVAL '15 minutes')
+                ON CONFLICT (booking_id) DO UPDATE SET booking_id = EXCLUDED.booking_id
                 RETURNING id
-            """, room_id, guest, checkin, checkout)
+            """, booking_id, room_id, guest, checkin, checkout)
 
             # Start a background timer to auto-cancel if not confirmed
             self._schedule_auto_cancel(hold['id'], timeout_minutes=15)
@@ -1172,7 +1019,8 @@ class TCCHotelBooking:
         """
         with self.db.transaction():
             hold = self.db.fetch("""
-                SELECT status FROM reservations WHERE id = $1 FOR UPDATE
+                SELECT status, hold_expires_at FROM reservations
+                WHERE id = $1 FOR UPDATE
             """, hold_id)
 
             if not hold:
@@ -1184,8 +1032,11 @@ class TCCHotelBooking:
             if hold['status'] == 'CANCELLED':
                 raise HoldExpired(hold_id)  # Auto-cancelled by timer
 
-            if hold['hold_expires_at'] < datetime.now():
+            if hold['hold_expires_at'] < datetime.now(timezone.utc):
                 raise HoldExpired(hold_id)  # Hold timed out
+            # If Confirm can fail like this, the coordinator must Cancel the
+            # other participants: holds must outlive the coordinator's
+            # Try→Confirm window by a safe margin.
 
             # Confirm the booking
             self.db.execute("""
@@ -1195,20 +1046,25 @@ class TCCHotelBooking:
             """, hold_id)
 
     # ── Phase 3: Cancel (release) ───────────────────────
-    def cancel_booking(self, hold_id: str):
+    def cancel_booking(self, booking_id: str):
         """
-        Cancel the booking and release the room.
+        Cancel the booking and release the room. Keyed by booking_id (not
+        hold_id) because Cancel may arrive when Try never ran or failed.
         Must be idempotent.
         """
         with self.db.transaction():
-            status = self.db.fetch("""
+            # Record the cancel first: makes an "empty cancel" succeed and lets
+            # a late Try detect it (suspension guard above).
+            self.db.execute("""
+                INSERT INTO tcc_cancelled (booking_id) VALUES ($1)
+                ON CONFLICT DO NOTHING
+            """, booking_id)
+            self.db.execute("""
                 UPDATE reservations
                 SET status = 'CANCELLED', hold_expires_at = NULL
-                WHERE id = $1 AND status = 'HELD'
-                RETURNING status
-            """, hold_id)
-
-            # If already cancelled or not found, it's fine (idempotent)
+                WHERE booking_id = $1 AND status = 'HELD'
+            """, booking_id)
+            # Already cancelled, or never held: still success (idempotent)
 ```
 
 **TCC vs Saga vs 2PC:**
@@ -1218,7 +1074,9 @@ Aspect              2PC                  TCC                   Saga
 ──────────────────────────────────────────────────────────────────────────
 Resource locking    Long (tx duration)  Short (hold timeout)  None (immediate
                                                                  release)
-Consistency         Strong              Strong (during hold)  Eventual
+Consistency         Atomic + isolated   Eventual, but no      Eventual; intermediate
+                                        irreversible effect   effects are visible
+                                        before Confirm
 Latency             High (locks held)   Medium (short hold)   Low (no hold)
 Compensation        Rollback (automatic) Cancel (explicit)     Compensating action
 Failure handling    Coordinator decides  Timeout auto-cancel   DLQ + recovery
@@ -1227,10 +1085,18 @@ Use case            Financial, short     Hotel booking,        Long-running
                     transactions         payment auth          workflows
 
 PRODUCTION RECOMMENDATION:
-  - Need strong consistency + short holds → TCC
-  - Need atomicity across heterogeneous systems → 2PC/XA
-  - Need long-running workflows → Saga
+  - Resources support cheap, expiring holds (inventory, seats, card auths) → TCC
+  - All participants are XA-capable databases in one DC → 2PC/XA
+  - Long-running workflows, third-party APIs without holds → Saga
 ```
+
+**The three TCC anomalies (frameworks like Apache Seata handle these for you):**
+
+| Anomaly | Cause | Handling |
+|---|---|---|
+| Empty cancel | Try timed out before reaching the participant; coordinator sends Cancel | Cancel succeeds with nothing to release, and records that it ran |
+| Suspension (hanging) | Delayed Try arrives *after* Cancel | Try checks the cancel record and refuses, otherwise the hold would never be released (until expiry) |
+| Duplicates | Retries of Try/Confirm/Cancel | All three idempotent, keyed by the global transaction / booking ID |
 
 ### 🔍 Staff-Level Evaluation
 
@@ -1240,6 +1106,7 @@ PRODUCTION RECOMMENDATION:
 | **Idempotent confirm/cancel** | Both confirm and cancel must be safe to retry |
 | **TCC vs Saga** | Explains TCC as the middle ground between 2PC and Saga |
 | **Auto-cancel** | Mentions background timer to clean up expired holds |
+| **Anomalies** | Handles empty cancel, suspension, and phantom double-booking (lock or exclusion constraint) |
 
 ---
 
@@ -1248,6 +1115,9 @@ PRODUCTION RECOMMENDATION:
 **Q:** "Define the dual-write problem in distributed systems. List all the known solutions and their trade-offs. How do you ensure atomicity when writing to a database AND publishing a message to a message queue?"
 
 **What They're Really Testing:** Whether you know the full landscape of dual-write solutions, not just the outbox pattern.
+
+!!! tip "30-second answer"
+    A dual write is any request that must change two systems that don't share a transaction (DB + Kafka, DB + cache, DB + search index). Ordering the two writes can't fix it: whichever goes second can fail. The fixes all reduce it to **one atomic write plus asynchronous propagation**: transactional outbox or CDC (DB is the source of truth), "listen to yourself" / event sourcing (the log is the source of truth), or true 2PC where both sides support it. For caches, prefer **delete** over set and let reads repopulate.
 
 ### Answer
 
@@ -1277,42 +1147,14 @@ The fundamental challenge:
 
 **Solutions Landscape:**
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                    DUAL-WRITE SOLUTIONS                             │
-├────────────────┬─────────────────┬────────────────┬─────────────────┤
-│  OUTBOX PATTERN │  CDC (Debezium) │  TRANSACTIONAL  │  TWO-PHASE     │
-│  (same DB tx)   │  (WAL reading)   │  DUAL-WRITE    │  COMMIT (XA)   │
-├────────────────┼─────────────────┼────────────────┼─────────────────┤
-│ Event written   │ DB writes WAL   │ Write to both  │ XA coordinator  │
-│ in same DB tx   │ Debezium reads  │ in same app    │ coordinates     │
-│ Background      │ WAL → Kafka     │ Best-effort    │ both systems    │
-│ publisher       │                  │ with retry     │                 │
-├────────────────┼─────────────────┼────────────────┼─────────────────┤
-│ Simplicity: ★★★★│ Latency: ★★★★★  │ Simplicity: ★★ │ Consistency:    │
-│ Reliability:    │ Complexity: ★★  │ Reliability: ★ │ ★★★★★          │
-│ ★★★★★           │                  │                │ Complexity: ★   │
-│ Latency: ★★★    │                  │                │ Performance: ★  │
-└────────────────┴─────────────────┴────────────────┴─────────────────┘
-
-┌────────────────┬─────────────────┬────────────────┬─────────────────┐
-│  EVENTUALLY    │  SAGA PATTERN    │ EVENT SOURCING │  KAFKA WITH     │
-│  CONSISTENT    │  (compensations) │ (events as     │  COMPACTED      │
-│  RETRY         │                  │  source of     │  TOPIC + LOG    │
-│                │                  │  truth)        │                  │
-├────────────────┼─────────────────┼────────────────┼─────────────────┤
-│ Accept data    │ Compensate if   │ Store events   │ Write to Kafka  │
-│ may diverge    │ secondary write  │ as primary DB  │ first, replay   │
-│ Fix later with │ fails           │ Rebuild other  │ to rebuild      │
-│ reconciliation │                  │ systems from   │ other systems   │
-│                │                  │ events         │                  │
-├────────────────┼─────────────────┼────────────────┼─────────────────┤
-│ Simplicity:    │ Complexity: ★★  │ Complexity:    │ Complexity: ★★ │
-│ ★★★★★           │ Consistency: ★★★ │ ★★★            │ Consistency:    │
-│ Consistency: ★ │                  │ Consistency:   │ ★★★★           │
-│                │                  │ ★★★★★          │                 │
-└────────────────┴─────────────────┴────────────────┴─────────────────┘
-```
+| Solution | How | Guarantee | Cost |
+|---|---|---|---|
+| Best-effort + reconciliation | Write DB, then the second system; a periodic job repairs drift | None in the moment; eventually repaired | Simplest; only for non-critical derived data (caches) |
+| Transactional outbox | Event row in the same DB transaction; relay publishes | Atomic intent, at-least-once delivery | Outbox table + relay; consumers dedupe |
+| CDC (Debezium) on business tables | Stream the WAL itself to Kafka | Every committed change, in commit order | Kafka Connect ops; events mirror table schema (leaks internals) unless you use an outbox table |
+| 2PC / XA | Both systems are XA resources | Atomic | Blocking, latency; most brokers/caches/search engines can't participate |
+| Listen to yourself | Write only to Kafka; your own service consumes it to update its DB | One write, ordered | Read-your-writes is lost: the API returns before the DB reflects the change |
+| Event sourcing | The event store *is* the database; projections are built from it | One write | Biggest modelling and operational change |
 
 **Pattern 1: Best-Effort Dual Write with Retry:**
 
@@ -1325,12 +1167,13 @@ def update_user_and_cache(user_id, name):
         # Write to DB
         db.execute("UPDATE users SET name = %s WHERE id = %s", (name, user_id))
 
-        # Write to cache (best-effort)
+        # Invalidate cache (best-effort). DELETE, not SET: two concurrent
+        # writers doing SET can leave the older value cached indefinitely.
         try:
-            redis.set(f"user:{user_id}", name)
+            redis.delete(f"user:{user_id}")
         except Exception:
-            logger.error(f"Cache update failed for user {user_id}")
-            # Cache will be populated on next read (lazy loading)
+            logger.error(f"Cache invalidation failed for user {user_id}")
+            # Stale until TTL expires: keep TTLs short, or invalidate via CDC
             pass
 
     except Exception:
@@ -1397,11 +1240,15 @@ class KafkaFirstOrderService:
 
         # 2. Kafka consumer updates the database
         # This is ASYNC — the DB eventually reflects Kafka
-        # But we told the client "order created" before DB writes!
+        # We told the client "order created" before the DB has it, so a
+        # read right after may 404. Validation that needs current state
+        # (e.g. "is there stock?") can't happen before the write either.
 
     def get_order(self, order_id):
         # Option A: Read from DB (eventually consistent)
-        # Option B: Read from Kafka Streams state store (stronger)
+        # Option B: Read from a Kafka Streams state store (also eventually
+        #           consistent: it lags the log too)
+        ...
 
 # The insight: Kafka log = source of truth.
 # Database = materialized view of the log.
@@ -1415,7 +1262,8 @@ class KafkaFirstOrderService:
 | **Full landscape** | Can list 5+ dual-write solutions with trade-offs |
 | **Outbox depth** | Explains the outbox pattern as the pragmatic choice for most systems |
 | **Kafka-first** | Mentions writing to Kafka first and rebuilding state from log |
-| **Event sourcing** | Suggests event sourcing as the most consistent but most complex approach |
+| **Event sourcing** | Knows it removes the dual write but changes the whole data model |
+| **Caches** | Invalidates rather than sets, and explains why |
 
 ---
 
@@ -1425,244 +1273,152 @@ class KafkaFirstOrderService:
 
 **What They're Really Testing:** Whether you understand that exactly-once means idempotent-at-least-once, and can design the full idempotency infrastructure: API → service → persistence → messaging.
 
+!!! tip "30-second answer"
+    A sender that times out can't know whether the request or the response was lost, so it must choose between maybe-never (at-most-once) and maybe-twice (at-least-once). Payments pick at-least-once and make every hop **idempotent**: the client sends an `Idempotency-Key`; the server atomically claims it, runs the side effect passing the same key downstream, and stores the response so retries get the identical answer. Consumers dedupe on an **event ID** in the same transaction as their state change. That's "effectively once". Kafka's exactly-once semantics only cover reading from and writing to Kafka.
+
 ### Answer
 
-**Why True Exactly-Once Is Impossible:**
+**Why "Exactly-Once Delivery" Is Impossible (and What We Build Instead):**
 
 ```
-FLP Impossibility Result:
-  In an asynchronous distributed system, no protocol can guarantee
-  both safety and liveness in the presence of failures.
+Client ── charge($100) ──► Server ── processes ──► response lost / timeout
 
-  → You can't know if a message was processed or not after a timeout.
-  → The sender MUST retry on timeout.
-  → Retries GUARANTEE at-least-once delivery.
+The client can't distinguish "request lost" from "response lost"
+(the Two Generals problem: no finite exchange over a lossy channel makes both
+sides certain). Its only options:
+  • don't retry  → at-most-once  (may lose the payment)
+  • retry        → at-least-once (may charge twice)
 
-So "exactly-once" in practice = idempotent at-least-once.
-
-  At-least-once: You may process the same message multiple times.
-  Idempotent: Processing it twice has the same effect as once.
-  Result: You observe "exactly-once" from the outside.
+"Exactly-once" in practice = at-least-once delivery + idempotent processing
+(or deduplication), so repeated deliveries have the effect of one.
 ```
 
-**Full Idempotency Architecture:**
+Where the term is used legitimately: **Kafka EOS** (idempotent producer + transactions + `read_committed` consumers) gives exactly-once *read-process-write within Kafka*. As soon as the processing has an external side effect (DB row, HTTP call, email), you're back to idempotency keys. Flink's exactly-once is the same idea: exactly-once *state*, with two-phase-commit sinks for supported outputs.
+
+**API-level idempotency (runnable, SQLite standing in for the real DB):**
 
 ```python
-# ── LAYER 1: API-level idempotency key ──────────────────
-# Client sends idempotency-key header. Server deduplicates.
+import hashlib
+import json
+import sqlite3
 
-from flask import Flask, request, jsonify
-import uuid
-
-app = Flask(__name__)
-
-class PaymentAPI:
-    def __init__(self, db, kafka_producer):
-        self.db = db
-        self.kafka = kafka_producer
-
-    def charge(self, amount: float, currency: str,
-               source: str, idempotency_key: str = None) -> dict:
-        """
-        Charge a payment source. Idempotent by design.
-
-        Idempotency key:
-          - Generated by client (e.g., uuid4)
-          - Sent as 'Idempotency-Key' header
-          - Stored for at least 24 hours
-          - If same key arrives again, return cached result
-
-        Guarantees:
-          - Client can retry ANY failed request safely
-          - Charge is processed exactly-once (effectively)
-          - Response is identical for retries
-        """
-
-        if not idempotency_key:
-            idempotency_key = str(uuid.uuid4())
-
-        # Check if we've seen this key before
-        existing = self.db.fetch("""
-            SELECT response_body, status_code, created_at
-            FROM idempotency_keys
-            WHERE idempotency_key = %s
-        """, (idempotency_key,))
-
-        if existing:
-            # Return the CACHED response — retry of a completed request
-            return {
-                'status': existing['status_code'],
-                'body': existing['response_body'],
-                'cached': True,
-            }
-
-        # NEW request — process it
-        # Use a DB-level lock to prevent double processing
-        lock_acquired = self.db.execute("""
-            INSERT INTO idempotency_locks (idempotency_key, created_at)
-            VALUES (%s, NOW())
-            ON CONFLICT (idempotency_key) DO NOTHING
-            RETURNING id
-        """, (idempotency_key,))
-
-        if not lock_acquired:
-            # Another request is processing this key — wait or retry
-            raise RetryLater("Another request is processing this idempotency key")
-
-        try:
-            # Process the payment
-            result = self._process_charge(amount, currency, source)
-
-            # Cache the response
-            response_body = json.dumps({'charge_id': result['id'], 'status': 'succeeded'})
-            self.db.execute("""
-                INSERT INTO idempotency_keys (idempotency_key, response_body,
-                                              status_code, created_at)
-                VALUES (%s, %s, 200, NOW())
-            """, (idempotency_key, response_body))
-
-            # Remove the lock
-            self.db.execute("""
-                DELETE FROM idempotency_locks WHERE idempotency_key = %s
-            """, (idempotency_key,))
-
-            return json.loads(response_body)
-
-        except Exception as e:
-            # For certain errors, we can retry
-            if self._is_retriable(e):
-                # Don't cache the error — client will retry
-                self.db.execute("""
-                    DELETE FROM idempotency_locks WHERE idempotency_key = %s
-                """, (idempotency_key,))
-                raise
-
-            # Permanent failure — cache the error too
-            error_body = json.dumps({'error': str(e)})
-            self.db.execute("""
-                INSERT INTO idempotency_keys (idempotency_key, response_body,
-                                              status_code, created_at)
-                VALUES (%s, %s, 400, NOW())
-            """, (idempotency_key, error_body))
-
-            self.db.execute("""
-                DELETE FROM idempotency_locks WHERE idempotency_key = %s
-            """, (idempotency_key,))
-
-            raise
-
-    def _process_charge(self, amount, currency, source):
-        # Process with payment gateway
-        # Must generate unique charge_id (e.g., from payment gateway)
-        return self.payment_gateway.charge(amount, currency, source)
-
-    def _is_retriable(self, error):
-        return isinstance(error, (TimeoutError, ConnectionError, ServiceUnavailable))
-```
-
-```sql
--- ── LAYER 2: Database schema for idempotency ────────────
-
--- Idempotency key table (for API-level dedup)
+db = sqlite3.connect(":memory:", isolation_level=None)
+db.executescript("""
 CREATE TABLE idempotency_keys (
-    idempotency_key VARCHAR(255) PRIMARY KEY,
-    response_body JSONB NOT NULL,
-    status_code INT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- TTL: delete after 24 hours
-    -- (or use partitioned table by created_at)
+    key           TEXT PRIMARY KEY,           -- client-supplied Idempotency-Key
+    request_hash  TEXT NOT NULL,              -- detect the same key reused for a different request
+    status        TEXT NOT NULL,              -- STARTED | COMPLETED
+    response      TEXT,                       -- cached response once COMPLETED
+    locked_until  TEXT                        -- lease so a crashed worker's key can be resumed
 );
+""")
 
--- Idempotency lock table (to prevent concurrent processing)
-CREATE TABLE idempotency_locks (
-    idempotency_key VARCHAR(255) PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- TTL: auto-release after 60 seconds
-    -- (lock can be stale if worker crashes)
-);
 
--- Index for fast cleanup
-CREATE INDEX idx_idempotency_created ON idempotency_keys(created_at);
+class Conflict(Exception): ...
+class InProgress(Exception): ...
+
+
+def charge(key: str, request: dict, gateway) -> dict:
+    req_hash = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+
+    # 1. Claim the key atomically (INSERT ... ON CONFLICT DO NOTHING).
+    db.execute("BEGIN IMMEDIATE")
+    claimed = db.execute(
+        "INSERT INTO idempotency_keys (key, request_hash, status, locked_until) "
+        "VALUES (?, ?, 'STARTED', datetime('now', '+60 seconds')) "
+        "ON CONFLICT (key) DO NOTHING", (key, req_hash)).rowcount == 1
+    row = db.execute("SELECT request_hash, status, response, locked_until > datetime('now') "
+                     "FROM idempotency_keys WHERE key = ?", (key,)).fetchone()
+    if not claimed:
+        if row[0] != req_hash:
+            db.execute("ROLLBACK")
+            raise Conflict("Idempotency-Key reused with a different request body")
+        if row[1] == "COMPLETED":
+            db.execute("ROLLBACK")
+            return json.loads(row[2])                  # replay the original response
+        if row[3]:
+            db.execute("ROLLBACK")
+            raise InProgress("retry later")            # another worker holds the lease
+        # STARTED but lease expired: previous worker crashed; take over.
+        db.execute("UPDATE idempotency_keys SET locked_until = datetime('now', '+60 seconds') "
+                   "WHERE key = ?", (key,))
+    db.execute("COMMIT")
+
+    # 2. Side effect, passing the SAME key downstream. If we crashed after the
+    #    gateway charged but before step 3, the takeover above re-calls the
+    #    gateway, which returns the original charge instead of charging twice.
+    result = gateway.charge(request["amount"], request["source"], idempotency_key=key)
+
+    # 3. Store the response.
+    response = {"charge_id": result, "status": "succeeded"}
+    db.execute("UPDATE idempotency_keys SET status = 'COMPLETED', response = ?, "
+               "locked_until = NULL WHERE key = ?", (json.dumps(response), key))
+    return response
+
+
+class FakeGateway:
+    def __init__(self): self.charges = {}
+    def charge(self, amount, source, idempotency_key):
+        return self.charges.setdefault(idempotency_key, f"ch_{len(self.charges) + 1}")
+
+
+gw = FakeGateway()
+req = {"amount": 1000, "currency": "usd", "source": "tok_visa"}
+first = charge("key-1", req, gw)
+again = charge("key-1", req, gw)                       # client retry
+assert first == again and len(gw.charges) == 1
+try:
+    charge("key-1", {**req, "amount": 5}, gw)
+except Conflict as e:
+    print("conflict:", e)
+print(first, "charges:", len(gw.charges))
 ```
+
+Design points:
+
+- **The client generates the key** (UUID per logical operation, reused across retries). A server-generated key can't dedupe anything.
+- **Store a hash of the request**: same key with a different body is a client bug; return an error rather than the old response (Stripe does this).
+- **A lease, not a permanent lock:** if the worker dies mid-request, the key is resumable after the lease expires instead of stuck forever.
+- **Pass the key downstream.** The local table alone can't protect the gap between "gateway charged" and "we recorded it"; the gateway's own idempotency closes it. If a downstream has no idempotency support, query it for the outcome before retrying.
+- **Retention:** keep keys at least as long as clients may retry (Stripe: 24 hours), then purge by time partition.
+- **What to cache:** final results (success *and* deterministic failures such as "card declined"). Don't cache transient errors (timeouts, 503s); let the client retry.
+
+**Consumer-side idempotency (messaging):**
 
 ```python
-# ── LAYER 3: Messaging idempotency (consumer side) ──────
+async def process_message(self, message):
+    event_id = message.headers["event_id"]       # unique per event, set by the producer/outbox
 
-class IdempotentMessageConsumer:
-    """
-    Consumes Kafka messages idempotently.
-    Uses a dedup table to prevent double-processing.
-    """
+    async with self.db.transaction():
+        # Dedup record and business effect commit TOGETHER.
+        claimed = await self.db.fetchval("""
+            INSERT INTO processed_events (event_id, processed_at)
+            VALUES ($1, NOW())
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id
+        """, event_id)
+        if claimed is None:
+            return                               # duplicate: already applied
 
-    def __init__(self, db, kafka_consumer):
-        self.db = db
-        self.consumer = kafka_consumer
+        await self._apply_business_change(message)   # same DB, same transaction
 
-    async def process_message(self, message):
-        """
-        Process a Kafka message idempotently.
-
-        The idempotency key comes from:
-          - message.key (if producer set it)
-          - message.headers['idempotency_key']
-          - Or a deterministic function of message content
-        """
-        idempotency_key = self._extract_idempotency_key(message)
-
-        # Try to claim this message
-        claimed = await self.db.execute("""
-            INSERT INTO processed_messages (message_id, idempotency_key,
-                                           topic, partition, offset,
-                                           processed_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
-            ON CONFLICT (idempotency_key) DO NOTHING
-            RETURNING id
-        """, (
-            message.id,
-            idempotency_key,
-            message.topic,
-            message.partition,
-            message.offset,
-        ))
-
-        if not claimed:
-            # Already processed — skip
-            logger.info(f"Skipping duplicate message {message.id}")
-            return
-
-        # Process the message
-        try:
-            await self._handle_message(message)
-        except Exception as e:
-            # Remove the claim so we can retry
-            await self.db.execute("""
-                DELETE FROM processed_messages
-                WHERE idempotency_key = $1
-            """, idempotency_key)
-            raise
-
-    def _extract_idempotency_key(self, message) -> str:
-        """Extract or generate idempotency key from message."""
-        # First choice: explicit key from headers
-        if 'idempotency_key' in (message.headers or {}):
-            return message.headers['idempotency_key']
-
-        # Second choice: Kafka message key
-        if message.key:
-            return f"{message.topic}:{message.partition}:{message.key}"
-
-        # Fallback: offset-based (less ideal)
-        return f"{message.topic}:{message.partition}:{message.offset}"
+    await self.consumer.commit(message)          # offset commit AFTER the DB commit
 ```
+
+- If the process crashes before the DB commit, nothing was recorded and the redelivered message is processed normally. If it crashes after the DB commit but before the offset commit, the redelivery hits the dedup row and is skipped. Committing the claim in a separate transaction from the effect would turn a crash into a **lost** message.
+- Dedup on a unique **event ID**, never on the Kafka message key: many different events share a key (all events of one order).
+- Alternative without a dedup table: make the effect naturally idempotent (`UPSERT` with a version check, `SET status = 'PAID' WHERE status = 'PENDING'`), or store the consumed offset in the same DB transaction and seek to it on startup.
+- If the side effect is in *another* system (an HTTP call), pass the event ID as that system's idempotency key.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **FLP justification** | Explains WHY exactly-once is impossible (FLP theorem) |
-| **Idempotency key flow** | Designs API → DB → messaging idempotency end-to-end |
-| **Concurrent requests** | Uses INSERT ON CONFLICT + lock table to prevent double processing |
-| **Retriable vs permanent** | Distinguishes errors that can be retried vs those that should be cached as failures |
+| **Why not exactly-once** | Lost request vs lost response (Two Generals), not FLP; knows what Kafka EOS does and doesn't cover |
+| **Idempotency key flow** | Client-generated key, request hash, lease, key passed downstream |
+| **Concurrent requests** | Atomic claim (`INSERT ... ON CONFLICT`) so only one worker runs the side effect |
+| **Crash windows** | Can point to each crash point and say why it's safe |
+| **Consumer dedup** | Dedup row and business change in one transaction; offset committed after |
 
 ---
 
@@ -1671,6 +1427,9 @@ class IdempotentMessageConsumer:
 **Q:** "Design a compensating transaction framework for a flight booking system. What makes a good compensating transaction? How do you handle compensations that fail? How do you prevent compensations from being lost?"
 
 **What They're Really Testing:** Whether you understand that compensations are business actions, not technical rollbacks, and can design them with the same care as forward transactions.
+
+!!! tip "30-second answer"
+    A compensation is a new business transaction that semantically cancels an earlier one (refund, release seats, void ticket); it doesn't restore the old bytes, and the world may have moved on (the customer got an email, a loyalty point was spent). Good compensations are **idempotent**, **retriable until they succeed** (so they must not fail for business reasons), tolerant of the forward step **never having happened**, and recorded durably so a crash can't lose them. Steps that can't be compensated (emails, irreversible captures) go after the pivot and are retried forward instead. When retries are exhausted, a human gets a ticket with full context.
 
 ### Answer
 
@@ -1695,11 +1454,13 @@ BAD compensation: Trying to "rollback" a side effect.
 PRINCIPLES:
   1. Compensations are SEMANTIC — they mirror business actions, not DB changes
   2. Compensations must be IDEMPOTENT — retrying is safe
-  3. Compensations must be REVERSIBLE — if compensation fails, system must
-     remain in a known state
-  4. Compensations should be COMMUTATIVE — order of compensations shouldn't
-     (usually) matter
-  5. Compensations should have a DEADLINE — eventually they must succeed or
+  3. Compensations must not fail for BUSINESS reasons — only transiently,
+     so retrying eventually succeeds (design the forward step so that's true,
+     e.g. refunds are always allowed for N days)
+  4. Compensations must tolerate "forward step never happened" (timeout on
+     the forward call) and "compensation already ran"
+  5. Each compensation is a durable, persisted intent — a crash must not lose it
+  6. Compensations should have a DEADLINE — eventually they must succeed or
      escalate to manual intervention
 ```
 
@@ -1798,9 +1559,9 @@ class FlightBookingSaga:
         """
         Refund the charged amount.
 
-        IMPORTANT: Different from void! A void happens before settlement
-        (within 24h), a refund happens after settlement.
-        Both are idempotent.
+        IMPORTANT: Different from void! A void cancels an authorization or an
+        unsettled charge (typically same day); a refund returns money after
+        settlement. Both should be called with an idempotency key.
         """
         charge_id = step_data['charge_id']
         amount = step_data['amount']
@@ -1850,9 +1611,11 @@ CREATE TABLE unresolved_compensations (
     step_name VARCHAR(100) NOT NULL,
     payload JSONB NOT NULL,
     error_message TEXT NOT NULL,
-    retry_count INT DEFAULT 0,
-    status VARCHAR(20) DEFAULT 'PENDING',  -- PENDING, RESOLVED, ESCALATED
+    retry_count INT NOT NULL DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',  -- PENDING, RESOLVED, ESCALATED
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_retry_at TIMESTAMPTZ,
     escalated_at TIMESTAMPTZ
 );
 ```
@@ -1900,15 +1663,16 @@ class SagaCompensationMonitor:
             """, comp['id'])
 
         except Exception as e:
-            await self.db.execute("""
+            retry_count = await self.db.fetchval("""
                 UPDATE unresolved_compensations
                 SET retry_count = retry_count + 1,
-                    last_retry_at = NOW()
+                    last_retry_at = NOW(), updated_at = NOW()
                 WHERE id = $1
+                RETURNING retry_count
             """, comp['id'])
 
-            if comp['retry_count'] >= 10:
-                await self._escalate_to_human(comp)
+            if retry_count >= 10:
+                await self._escalate_to_human(comp)   # sets status = 'ESCALATED'
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -1935,16 +1699,20 @@ class SagaCompensationMonitor:
 ```yaml
 SCENARIO 1: Payment transfer between two accounts in the same bank
 Constraints: Strong consistency required, short duration, < 100ms
-Pattern: 2PC (or local ACID if same DB)
-Rationale: Same database, short transaction, strong consistency needed.
+Pattern: Local ACID transaction (same ledger DB); 2PC only if the two
+         accounts genuinely live in different XA-capable databases
+Rationale: Short transaction, strong consistency needed, one ledger.
            No compensations needed (just ROLLBACK on failure).
+           Cross-bank transfers are the opposite: async messages + reconciliation.
 
 SCENARIO 2: Order processing across 5 microservices (inventory, payment, shipping, notification, analytics)
 Constraints: 1000 orders/second, < 2s total, compensations possible
 Pattern: Orchestration Saga + Transactional Outbox
-Rationale: High throughput rules out 2PC. Compensations are business
+Rationale: Independent services and databases (and a card network that
+           can't take part in 2PC). Compensations are business
            actions (refund, restock). Orchestrator provides visibility.
-           Outbox ensures reliable event publishing.
+           Outbox ensures reliable event publishing. Analytics is not a saga
+           step at all: it just consumes events.
 
 SCENARIO 3: Hotel reservation system with 15-minute hold
 Constraints: Must guarantee room isn't double-booked, temporary hold
@@ -1956,22 +1724,28 @@ Rationale: Short-term hold prevents double-booking without long locks.
 SCENARIO 4: Cross-cloud data replication (AWS → GCP)
 Constraints: 50ms RTT, 10K events/second
 Pattern: CDC-based Outbox (Debezium)
-Rationale: High latency makes 2PC/3PC unusable (adds 200ms+).
-           Debezium reads WAL with <10ms latency.
-           No application-level code needed.
+Rationale: 2PC across clouds would hold locks for multiple 50ms round
+           trips. CDC streams committed changes asynchronously, in commit
+           order, typically within a second, with no application changes.
+           Replicate via Kafka (MirrorMaker 2 / Confluent replication) and
+           make the target apply idempotent upserts.
 
 SCENARIO 5: Legacy monolith migration to microservices
 Constraints: 200K LOC, 30 tables, 2-month migration timeline
-Pattern: Strangler Fig + Outbox for events
-Rationale: Outbox events are the "strangler" interface — new microservices
-           consume events from the monolith's outbox without direct DB access.
+Pattern: Strangler Fig + Outbox (or CDC on the monolith's tables) for events
+Rationale: Events are the "strangler" interface — new microservices
+           consume events from the monolith without reading its DB directly.
+           Route traffic piece by piece; avoid two-way sync where possible.
 
 SCENARIO 6: Audit log that must NEVER lose events
 Constraints: Zero data loss, 100 events/second, multi-cloud
-Pattern: Outbox (with synchronous fsync) + CDC replication
-Rationale: Events written in same DB transaction as business data.
-           CDC replicates to Kafka with exactly-once semantics.
-           Dual path: primary (CDC) and fallback (polling).
+Pattern: Outbox in the business transaction + CDC to Kafka
+Rationale: Audit event commits atomically with the business change, so it
+           can't be lost if the DB's commit is durable (synchronous replica).
+           CDC delivers at-least-once; the audit store dedupes on event ID.
+           Kafka with replication.factor=3, min.insync.replicas=2, acks=all.
+           Reconcile periodically (counts/hashes per hour) to prove nothing
+           went missing.
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -2128,21 +1902,32 @@ def refund_payment(order_id):
     # What if this is called TWICE?
     payment_gateway.refund(order_id)  # ⚠️ Refunds the customer TWICE!
 
-# ✅ FIX: Check before acting
+# ✅ FIX: Record intent, call with a deterministic idempotency key, then mark done
 def refund_payment(order_id):
-    # Atomic check-and-act
-    result = db.execute("""
+    db.execute("""
         UPDATE payment_transactions
-        SET refund_status = 'REFUNDED',
-            refunded_at = NOW()
-        WHERE order_id = $1
-          AND refund_status IS NULL
-        RETURNING id
+        SET refund_status = 'PENDING'
+        WHERE order_id = $1 AND refund_status IS NULL
     """, order_id)
 
-    if result:
-        # Only first call processes the refund
-        payment_gateway.refund(order_id, idempotency_key=f"refund-{order_id}")
+    status = db.fetchval(
+        "SELECT refund_status FROM payment_transactions WHERE order_id = $1", order_id)
+    if status == 'REFUNDED':
+        return                                   # already done
+
+    # Safe to repeat: the gateway dedupes on the key, so a retry after a
+    # crash (status still PENDING) can't refund twice.
+    payment_gateway.refund(order_id, idempotency_key=f"refund-{order_id}")
+
+    db.execute("""
+        UPDATE payment_transactions
+        SET refund_status = 'REFUNDED', refunded_at = NOW()
+        WHERE order_id = $1
+    """, order_id)
+
+# Marking REFUNDED *before* calling the gateway (and skipping the call when
+# the row is already marked) loses the refund if the process crashes between
+# the UPDATE and the gateway call.
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -2204,62 +1989,49 @@ def refund_payment(order_id):
 └────────────────────────────────────────────────────────────────┘
 ```
 
-**Seat Reservation (TCC with Optimistic Locking):**
+**Seat Reservation (TCC Try as a conditional update):**
 
 ```sql
--- Seat reservation with optimistic locking and hold timeout:
-
--- Schema:
 CREATE TABLE seats (
-    id INT PRIMARY KEY,
-    event_id INT NOT NULL,
+    id BIGINT PRIMARY KEY,
+    event_id BIGINT NOT NULL,
     section VARCHAR(10),
     row_num INT,
     seat_num INT,
-    version INT NOT NULL DEFAULT 0,  -- Optimistic lock
-    status VARCHAR(20) DEFAULT 'AVAILABLE',  -- AVAILABLE, HELD, BOOKED
+    status VARCHAR(20) NOT NULL DEFAULT 'AVAILABLE',  -- AVAILABLE, HELD, BOOKED
     hold_expires_at TIMESTAMPTZ,
     booking_id UUID,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX idx_seats_event ON seats (event_id, status);
+```
 
-CREATE INDEX idx_seats_event ON seats(event_id, status);
-
--- TCC Phase 1: Try (reserve seat with 10-minute hold)
--- Using optimistic locking to prevent contention:
+```python
+# TCC Try: hold all requested seats or none, in one local transaction.
 def reserve_seats(event_id, seat_ids, booking_id):
     with db.transaction():
-        for seat_id in seat_ids:
-            updated = db.execute("""
-                UPDATE seats
-                SET status = 'HELD',
-                    hold_expires_at = NOW() + INTERVAL '10 minutes',
-                    booking_id = $1,
-                    version = version + 1,
-                    updated_at = NOW()
-                WHERE id = $2
-                  AND event_id = $3
-                  AND status = 'AVAILABLE'
-                  AND version = (
-                      SELECT version FROM seats WHERE id = $2
-                  )
-                RETURNING version
-            """, booking_id, seat_id, event_id)
+        held = db.fetch("""
+            UPDATE seats
+            SET status = 'HELD',
+                hold_expires_at = NOW() + INTERVAL '10 minutes',
+                booking_id = $1,
+                updated_at = NOW()
+            WHERE event_id = $2
+              AND id = ANY($3)
+              AND (status = 'AVAILABLE'
+                   OR (status = 'HELD' AND hold_expires_at < NOW()))  -- reclaim expired holds
+            RETURNING id
+        """, booking_id, event_id, seat_ids)
 
-            if not updated:
-                # Seat already taken or held — rollback entire reservation
-                self._release_all(event_id, seat_ids, booking_id)
-                raise SeatNotAvailable(seat_id)
-
-    return True  # All seats reserved
-
-# Handle contention for popular events:
-# 10000 users trying to book the same event:
-# → Each user's transaction checks seats individually
-# → First user to UPDATE wins (optimistic locking)
-# → Other users get SeatNotAvailable (they see "sold out" instantly)
-# → No queueing needed! Optimistic concurrency handles it.
+        if len(held) != len(seat_ids):
+            raise SeatNotAvailable(set(seat_ids) - {r['id'] for r in held})
+            # exception → transaction rolls back → no partial hold
+    return True
 ```
+
+Why this can't oversell: the `WHERE status = 'AVAILABLE'` condition is re-checked on the latest row version under a row lock, so of two concurrent updates on the same seat exactly one matches; the other updates zero rows. That's a compare-and-set, so no separate version column is needed. Taking all seats in one statement (and in a consistent order) avoids deadlocks between bookings that want overlapping seats.
+
+Contention is the real limit: thousands of users hammering the same few rows serialize on row locks. That's why the waiting room below exists, and why general-admission inventory is often modelled as a counter decremented with `UPDATE ... SET remaining = remaining - $n WHERE remaining >= $n`, or split into several counter rows (buckets) to spread the hotspot.
 
 **Payment Processing (Idempotent + Outbox):**
 
@@ -2294,60 +2066,64 @@ def process_payment(booking_id, amount, payment_token):
 **Exactly-Once Webhook Handling:**
 
 ```python
-# Payment gateway sends webhooks. We handle them idempotently:
+# Payment gateway sends webhooks at-least-once, possibly out of order.
 @app.route('/webhook/payment', methods=['POST'])
 async def payment_webhook():
+    verify_signature(request)          # reject forged webhooks (HMAC header)
     payload = request.json
-    event_id = payload['event_id']  # Unique event from payment gateway
+    event_id = payload['event_id']     # unique event ID from the gateway
 
-    # Dedup: check if we already processed this webhook
-    processed = await db.fetch("""
-        INSERT INTO webhook_events (event_id, event_type, payload,
-                                    processed_at)
-        VALUES ($1, 'payment.update', $2, NOW())
-        ON CONFLICT (event_id) DO NOTHING
-        RETURNING id
-    """, event_id, json.dumps(payload))
+    async with db.transaction():
+        # Dedup row and state change commit together: a crash can't leave
+        # "marked processed" without the effect.
+        processed = await db.fetchval("""
+            INSERT INTO webhook_events (event_id, payload, processed_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id
+        """, event_id, json.dumps(payload))
+        if processed is None:
+            return jsonify({'status': 'duplicate'}), 200
 
-    if not processed:
-        return jsonify({'status': 'duplicate'}), 200
+        # Out-of-order safe: only move forward from PROCESSING
+        new_status = 'SUCCEEDED' if payload['status'] == 'succeeded' else 'FAILED'
+        await db.execute("""
+            UPDATE payments SET status = $1
+            WHERE booking_id = $2 AND status = 'PROCESSING'
+        """, new_status, payload['booking_id'])
 
-    # Process the webhook
-    booking_id = payload['booking_id']
-    payment_status = payload['status']
+        # Tell the orchestrator via the outbox (same transaction), not a direct call
+        await db.execute("""
+            INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+            VALUES ('booking', $1, $2, $3)
+        """, payload['booking_id'], f"payment.{new_status.lower()}", json.dumps(payload))
 
-    if payment_status == 'succeeded':
-        # Move to next saga step (issue tickets)
-        await booking_orchestrator.complete_step(
-            booking_id, 'payment', {'status': 'succeeded'}
-        )
-    elif payment_status == 'failed':
-        # Start compensation flow
-        await booking_orchestrator.fail_step(
-            booking_id, 'payment', 'Payment failed'
-        )
+    return jsonify({'status': 'processed'}), 200   # 2xx quickly; gateway retries otherwise
 
-    return jsonify({'status': 'processed'}), 200
+# Also: if the webhook never arrives, a reconciliation job polls the gateway
+# for payments stuck in PROCESSING longer than a few minutes.
 ```
 
 **Scaling for Popular Events (The Taylor Swift Problem):**
 
 ```yaml
-PROBLEM: 10,000 concurrent users trying to book 20,000 seats
-SOLUTION: Tiered booking queue + optimistic locking
+PROBLEM: hundreds of thousands of users arrive at on-sale time for ≤10,000 seats
+SOLUTION: Virtual waiting room (admission control) + conditional-update holds
 
 1. Pre-booking queue:
-   - Users join a virtual waiting room (Cloudflare Queue or custom)
-   - Queue position assigned randomly (not FIFO — prevents scalpers)
-   - User gets a session with a TTL when their turn arrives
+   - Users join a virtual waiting room (e.g. Cloudflare Waiting Room, or custom)
+   - Users who arrive before the on-sale time get a random position (so
+     refreshing early buys nothing); later arrivals queue FIFO
+   - Admission rate is set to what the booking path can sustain
+   - Admitted users get a signed, short-lived token checked by the API
 
 2. Booking session:
    - User has 5 minutes to select and book seats
    - During this time, selected seats are HELD (TCC Phase 1)
    - If session expires, seats are released
 
-3. Optimistic locking handles conflicts:
-   - If two users select the same seat, the second gets an error
+3. The conditional UPDATE handles conflicts:
+   - If two users select the same seat, the second updates 0 rows
    - "Seat A12 is no longer available. Please select another seat."
    - User can immediately select a different seat (cache refreshes)
 
@@ -2355,18 +2131,12 @@ SOLUTION: Tiered booking queue + optimistic locking
    - 10-minute window to complete payment
    - After 10 minutes, held seats are released (auto cancellation)
 
-5. Monitoring:
-   ┌────────────────────────────────────────────────────┐
-   │ Dashboard: Taylor Swift Booking                     │
-   │                                                     │
-   │ Total users in queue: 15,342                       │
-   │ Active booking sessions: 2,150                     │
-   │ Seats held: 8,341 / 20,000                         │
-   │ Seats booked: 3,207                                │
-   │ Seats released (expired): 1,234                    │
-   │ Payment success rate: 94.2%                        │
-   │ Average booking time: 3 min 42 sec                 │
-   └────────────────────────────────────────────────────┘
+5. Monitoring (what to put on the dashboard):
+   - users waiting / admitted per minute
+   - seats available / held / booked, holds expired
+   - payment success rate and latency, sagas stuck in PROCESSING
+   - outbox lag, webhook dedup hits
+   - invariant check: booked seats ≤ capacity (alert on any violation)
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -2374,11 +2144,9 @@ SOLUTION: Tiered booking queue + optimistic locking
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Pattern composition** | Combines TCC (seat hold), Saga (booking flow), Outbox (reliable events) |
-| **Contention handling** | Uses optimistic locking, not pessimistic locking, for high-concurrency hotspots |
+| **Contention handling** | Conditional updates (compare-and-set) for seats; admission control so the hotspot isn't the database |
 | **Scalability** | Designs virtual waiting room, TTL-based holds, auto-expiry |
 | **End-to-end flow** | Walks through the complete flow from seat selection to ticket issuance |
 
 ---
-
-> *Master these patterns and you'll be prepared for the most rigorous distributed transaction questions at Staff/Principal Engineer interviews.*
 

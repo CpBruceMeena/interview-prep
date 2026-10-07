@@ -1,7 +1,7 @@
 # 🖥️ Computer Science — Staff-Level Interview Questions
 
 > **8 deep-dive CS topics** for Staff/Principal Engineer backend interviews  \
-> *Each topic contains 10–15 questions with production-grade code examples, whiteboard-ready diagrams, and principal engineer–level analysis*
+> *Each topic contains 9–15 questions, plus deep-dive companion pages, with code examples, diagrams, and staff-level analysis*
 
 ---
 
@@ -19,21 +19,23 @@ cs-interview/
 │
 ├── database-systems/                   ← B-Trees vs LSM, MVCC, replication, sharding
 │   ├── INTERVIEW_QUESTIONS.md          (14 questions)
-│   ├── POSTGRESQL_DEEP_DIVE.md         (internals, tuning, operations)
-│   └── DYNAMODB_DEEP_DIVE.md           (keys, indexes, single-table design, bulk scenarios)
+│   ├── POSTGRESQL_DEEP_DIVE.md         (13 sections: internals, tuning, operations, 12 interview questions, PG 17–18 changes)
+│   └── DYNAMODB_DEEP_DIVE.md           (13 sections: keys, indexes, single-table design, bulk scenarios)
 │
 ├── distributed-systems/                ← CAP, Raft, gossip, distributed transactions
-│   └── INTERVIEW_QUESTIONS.md          (12 questions)
+│   ├── INTERVIEW_QUESTIONS.md          (12 questions)
+│   └── DISTRIBUTED_TRANSACTION_PATTERNS.md (12 sections: 2PC, saga, outbox, TCC, idempotency)
 │
 ├── concurrency-parallelism/            ← Lock-free, memory models, schedulers
-│   └── INTERVIEW_QUESTIONS.md          (10 questions)
+│   └── INTERVIEW_QUESTIONS.md          (9 questions)
 │
 ├── data-structures-algorithms/         ← Bloom filters, sketches, Merkle trees
 │   ├── INTERVIEW_QUESTIONS.md          (10 questions)
-│   └── DATA_STRUCTURES_FOR_SCALE.md   (12 structures, 700+ lines)
+│   └── DATA_STRUCTURES_FOR_SCALE.md    (12 structures)
 │
-├── software-architecture/              ← Microservices → Strangler Fig (all 12 topics)
-│   └── INTERVIEW_QUESTIONS.md          (fully expanded with code examples & evaluation rubrics)
+├── software-architecture/              ← DDD, modular monolith, event-driven, CQRS/ES, migrations, API compatibility, ADRs
+│   ├── INTERVIEW_QUESTIONS.md          (15 questions)
+│   └── DESIGN_PATTERNS.md              (12 GoF patterns in 11 sections + selection framework)
 │
 └── security/                           ← OWASP, JWT, OAuth2, secrets management
     └── INTERVIEW_QUESTIONS.md          (10 questions)

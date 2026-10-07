@@ -1,6 +1,6 @@
 # 📐 Data Structures for Scale — Staff/Principal-Level Interview Q&A
 
-> *12 deep-dive topics covering probabilistic data structures, spatial indexes, and ordered structures used at scale in production systems — every question expects principal engineer-level depth with mathematical rigor, production trade-offs, and real-world war stories.*
+> *12 deep-dive topics covering probabilistic data structures, spatial indexes, and ordered structures used at scale in production systems. Every code block below runs as-is (Python 3.10+, standard library only, except the H3 section which needs `pip install h3`, v4 API).*
 
 ---
 
@@ -27,130 +27,122 @@
 
 **What They're Really Testing:** Whether you can reason about the trade-off space between memory, false-positive rate, and capacity — and whether you know which variant to use when.
 
+!!! tip "30-second answer"
+    With m bits, n items and k hashes, FP ≈ (1 − e^(−kn/m))^k, minimised at k = (m/n)·ln 2. 1 GB = 8×10⁹ bits for 5×10⁸ URLs is 16 bits per URL → k = 11 → **FP ≈ 0.046%**: about 1 in 2,200 new URLs is wrongly skipped. Bloom filters never give false negatives, so no URL is crawled twice, but a false positive means a page is *never* crawled, which is the real product cost. "500M per day" also means the set keeps growing: plan for **time-partitioned filters** (one per day, query the last N) or a scalable Bloom filter, and shard by host so each crawler node owns its filter.
+
 ### Answer
 
 **Classic Bloom Filter Math:**
 
-```python
-# Given: n = 500M URLs, m = 1GB = 8e9 bits
-# Solve for achievable false-positive rate (p):
+```text
+n = 5×10⁸ URLs, m = 1 GB = 8×10⁹ bits → m/n = 16 bits per URL
 
-n = 500_000_000
-m = 8_000_000_000
-k = optimal_k(m, n)
+Optimal k = (m/n)·ln 2 = 16 × 0.693 = 11.1 → 11 hash functions
 
-# Optimal k = (m/n) * ln(2)
-k = (8e9 / 5e8) * 0.693 = 16 * 0.693 ≈ 11 hash functions
+p = (1 − e^(−k·n/m))^k
+  = (1 − e^(−11/16))^11
+  = (1 − 0.503)^11
+  ≈ 0.00046  → 0.046% false positives
 
-# Expected false-positive rate:
-p = (1 - e^(-k * n / m))^k
-p = (1 - e^(-11 * 5e8 / 8e9))^11
-p = (1 - e^(-0.6875))^11
-p = (1 - 0.502)^11
-p = (0.498)^11 ≈ 0.00048 → 0.048% FPR
+Rule of thumb: bits per key = 1.44·log₂(1/p)
+  1%    → 9.6 bits/key        0.1%  → 14.4 bits/key
+  0.01% → 19.2 bits/key       each 10× lower p costs ~4.8 more bits/key
 
-# So with 1GB, we achieve 99.95% accuracy at 500M unique URLs.
+What would 1.8 GB buy? 28.8 bits/URL, k = 20 → p ≈ 0.0001% (1 in a million).
+Whether that's worth 800 MB depends on how much a never-crawled page costs.
 ```
 
-**But here's where the staff-level answer begins — the production deployment:**
+**Production version: a scalable Bloom filter for an unbounded stream:**
 
 ```python
-# ==============================
-# PRODUCTION BLOOM FILTER
-# ==============================
-import mmh3
+import hashlib
 import math
-from bitarray import bitarray
-from typing import List, Optional
-
-class ScalableBloomFilter:
-    """Gracefully grows when capacity is exceeded."""
-    
-    def __init__(self, initial_capacity: int, fp_rate: float = 0.01,
-                 scaling_factor: float = 2.0):
-        self.filters: List[BloomFilter] = []
-        self.fp_rate = fp_rate
-        self.scaling_factor = scaling_factor
-        self.current = BloomFilter(initial_capacity, fp_rate)
-        self.filters.append(self.current)
-
-    def add(self, item: str):
-        if self.current.is_full():
-            # Create a new filter with tighter FPR
-            new_fp = self.fp_rate * (1 - self.scaling_factor ** -1)
-            new_capacity = int(self.current.capacity * self.scaling_factor)
-            self.current = BloomFilter(new_capacity, new_fp)
-            self.filters.append(self.current)
-        self.current.add(item)
-
-    def might_contain(self, item: str) -> bool:
-        # Check newest filter first (most likely to match)
-        for bf in reversed(self.filters):
-            if bf.might_contain(item):
-                return True
-        return False
-
-    def size_bytes(self) -> int:
-        return sum(bf.size_bytes() for bf in self.filters)
 
 
 class BloomFilter:
     def __init__(self, capacity: int, fp_rate: float = 0.01):
         self.capacity = capacity
-        # Size in bits
-        self.m = int(-capacity * math.log(fp_rate) / (math.log(2) ** 2))
-        # Number of hash functions
-        self.k = int((self.m / capacity) * math.log(2))
-        self.bits = bitarray(self.m)
-        self.bits.setall(0)
+        self.m = math.ceil(-capacity * math.log(fp_rate) / math.log(2) ** 2)   # bits
+        self.k = max(1, round(self.m / capacity * math.log(2)))                # hashes
+        self.bits = bytearray((self.m + 7) // 8)
         self.count = 0
 
-    def _hashes(self, item: str):
-        """Kirsch-Mitzenmacher double hashing for k independent hashes."""
-        h1 = mmh3.hash64(item, seed=0)[0] & 0xFFFFFFFFFFFFFFFF
-        h2 = mmh3.hash64(item, seed=1)[0] & 0xFFFFFFFFFFFFFFFF
-        for i in range(self.k):
-            yield (h1 + i * h2 + (i ** 2)) % self.m
+    def _positions(self, item: str):
+        d = hashlib.blake2b(item.encode(), digest_size=16).digest()
+        h1 = int.from_bytes(d[:8], "little")
+        h2 = int.from_bytes(d[8:], "little") | 1
+        for i in range(self.k):                  # Kirsch–Mitzenmacher double hashing
+            yield (h1 + i * h2) % self.m
 
-    def add(self, item: str):
-        for pos in self._hashes(item):
-            self.bits[pos] = 1
+    def add(self, item: str) -> None:
+        for p in self._positions(item):
+            self.bits[p >> 3] |= 1 << (p & 7)
         self.count += 1
 
     def might_contain(self, item: str) -> bool:
-        return all(self.bits[pos] for pos in self._hashes(item))
+        return all(self.bits[p >> 3] & (1 << (p & 7)) for p in self._positions(item))
 
     def is_full(self) -> bool:
         return self.count >= self.capacity
 
-    def size_bytes(self) -> int:
-        return len(self.bits) // 8
+
+class ScalableBloomFilter:
+    """Almeida et al. (2007): when the current filter reaches capacity, add a
+    filter `growth`× larger whose FP target is tightened by `ratio`. The
+    overall FP rate stays below p0 / (1 - ratio), so start at p0 = p·(1 - ratio)."""
+
+    def __init__(self, initial_capacity: int, fp_rate: float = 0.01,
+                 growth: int = 2, ratio: float = 0.9):
+        self.growth, self.ratio = growth, ratio
+        self.next_fp = fp_rate * (1 - ratio)
+        self.filters = [BloomFilter(initial_capacity, self.next_fp)]
+
+    def add(self, item: str) -> None:
+        if self.filters[-1].is_full():
+            self.next_fp *= self.ratio
+            self.filters.append(BloomFilter(self.filters[-1].capacity * self.growth,
+                                            self.next_fp))
+        self.filters[-1].add(item)
+
+    def might_contain(self, item: str) -> bool:
+        return any(f.might_contain(item) for f in reversed(self.filters))
+
+
+sbf = ScalableBloomFilter(initial_capacity=10_000, fp_rate=0.01)
+for i in range(200_000):
+    sbf.add(f"https://example.com/{i}")
+assert all(sbf.might_contain(f"https://example.com/{i}") for i in range(0, 200_000, 7))
+fp = sum(sbf.might_contain(f"https://other.org/{i}") for i in range(100_000)) / 100_000
+print(f"filters={len(sbf.filters)} observed FP={fp:.4f} (target ≤ 0.01)")
 ```
+
+Sample output: 5 filters, observed FP ≈ 0.3% against a 1% bound (the bound is conservative).
 
 **Production Variants and When to Use Them:**
 
 | Variant | Key Feature | Use Case |
 |---------|-------------|----------|
-| **Classic Bloom** | Simple, fastest | Cache dedup (Cassandra, HBase) |
-| **Scalable Bloom** | Grows dynamically | URL crawlers, unknown cardinality |
-| **Counting Bloom** | Supports deletion | Caching with TTL / eviction |
-| **Blocked Bloom** | CPU cache-line sized | SIMD-friendly, ~2x faster lookups |
-| **Cuckoo Filter** | Supports deletion, lower FPR | See next section |
+| **Classic Bloom** | Simple, smallest for p ≳ 3% | Per-SSTable "is the key in this file?" checks (Cassandra, HBase, RocksDB) |
+| **Scalable Bloom** | Grows by adding tighter filters | Unknown cardinality: crawlers, dedup streams |
+| **Counting Bloom** | 4-bit counters allow deletion | Rarely worth 4× memory; prefer a cuckoo filter |
+| **Blocked Bloom** | All k bits in one 64-byte cache line | One cache miss per lookup instead of k; slightly higher FP for the same memory. RocksDB's format |
+| **Cuckoo / xor / Ribbon** | Fingerprint-based | Deletion (cuckoo), static sets 15–30% smaller (xor, Ribbon) |
 
 **Staff-Level Trade-Offs:**
-- **False positives are acceptable** (re-crawl 0.05% of URLs) — but false negatives are NOT (you never miss a new URL)
-- **Counting BF uses 4× more memory** (4-bit counters) — only use if you need deletion
-- **Blocked Bloom** gives 2× lookup speed by fitting in L1 cache (512-bit blocks) at the cost of slightly higher FPR
-- **~1.8GB** would get you 0.001% FPR — is that worth the extra 800MB?
+
+- **Which error is acceptable?** A false positive here means "skip a new URL", so you lose content, not CPU. If that's unacceptable, use the filter only as a fast path and confirm positives against an exact store (a key-value lookup) for important domains.
+- **Rotate, don't grow forever:** one filter per day (500M URLs → ~1 GB each at 0.05%) and check the last 30 days, or recrawl policy will want "seen in the last N days" anyway.
+- **Shard by host:** crawler nodes partitioned by hostname each keep a small local filter; no cross-node lookups on the hot path.
+- **Hashing:** one 128-bit hash split into h1/h2 (Kirsch–Mitzenmacher) instead of k hashes; keyed if adversaries choose the input.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Math** | Calculates m, k, p correctly from scratch |
+| **Math** | Calculates m, k, p correctly from scratch; knows 1.44·log₂(1/p) bits/key |
 | **Hash independence** | Names Kirsch-Mitzenmacher double hashing |
-| **Scaling** | Mentions Scalable Bloom Filter for unknown cardinality |
-| **Production** | Discusses blocked variant, cache-line alignment |
+| **Scaling** | Scalable or time-partitioned filters for an unbounded stream |
+| **Product impact** | Explains what a false positive costs in *this* system |
 
 ---
 
@@ -160,305 +152,262 @@ class BloomFilter:
 
 **What They're Really Testing:** Whether you understand the fundamental trade-off between Bloom filters (bit array + hashes) and Cuckoo filters (hash table + fingerprints). Most engineers know Bloom filters; staff engineers know when Bloom isn't enough.
 
+!!! tip "30-second answer"
+    A cuckoo filter (Fan et al., 2014) stores a short **fingerprint** of each item in one of two buckets (4 slots each); the alternate bucket is `i ⊕ hash(fingerprint)`, so entries can be moved without the original key. Lookup checks 2 buckets (≤ 2 cache misses); **delete** just removes the fingerprint. FP ≈ 2b/2^f, so 12-bit fingerprints give ~0.2%, and below ~3% FP it uses **less** space than a Bloom filter. Its weaknesses: inserts can **fail** once the table is ~95% full (so you must size it or resize/rebuild), deleting an item that was never inserted can remove another item's fingerprint, and the same item can only be inserted 2b times.
+
 ### Answer
 
-**Cuckoo Filter — Core Idea:**
-
-Instead of setting bits in a bit array, a Cuckoo filter stores a *fingerprint* (small hash, e.g., 7 bits) of each item in a hash table using **partial-key cuckoo hashing**.
+**Cuckoo Filter — Core Idea (runnable):**
 
 ```python
+import hashlib
+import random
+
+
 class CuckooFilter:
-    def __init__(self, capacity: int, fingerprint_bits: int = 7,
-                 bucket_size: int = 4):
-        """
-        capacity: max number of items
-        fingerprint_bits: bits per fingerprint (7-8 bits typical)
-        bucket_size: slots per bucket (4 is standard)
-        """
-        self.bucket_size = bucket_size
-        self.fingerprint_bits = fingerprint_bits
-        self.fingerprint_mask = (1 << fingerprint_bits) - 1
-        
-        # Number of buckets = ceil(capacity / bucket_size) * load_factor
-        # Cuckoo filters target ~95% load factor
-        num_buckets = self._next_pow2(capacity // bucket_size * 2)
-        self.buckets = [[] for _ in range(num_buckets)]
-        self.size = 0
-        self.max_kicks = 500  # threshold for considering table full
+    """Fan et al. (2014). Stores an f-bit fingerprint of each item in one of two
+    candidate buckets of b slots. The second bucket is i1 XOR hash(fp), so it can
+    be computed from (bucket, fingerprint) alone during relocation.
+    False-positive rate ≈ 2b / 2^f  (b = 4, f = 12 → ~0.2%)."""
 
-    def _fingerprint(self, item: str) -> int:
-        hash_val = mmh3.hash64(item, seed=42)[0]
-        return hash_val & self.fingerprint_mask
+    def __init__(self, capacity: int, fp_bits: int = 12, bucket_size: int = 4,
+                 max_kicks: int = 500):
+        self.b, self.f, self.max_kicks = bucket_size, fp_bits, max_kicks
+        n = 1
+        while n * bucket_size * 0.95 < capacity:   # ~95% load is achievable with b = 4
+            n <<= 1                                # power of two so XOR stays in range
+        self.n = n
+        self.buckets: list[list[int]] = [[] for _ in range(n)]
+        self.victim: int | None = None             # stashed fingerprint after a failed insert
 
-    def _hash(self, item: str) -> int:
-        return mmh3.hash64(item, seed=0)[0] % len(self.buckets)
+    def _h(self, data: bytes) -> int:
+        return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
 
-    def _alt_bucket(self, i1: int, fp: int) -> int:
-        """Alternative bucket: XOR with hash(fingerprint).
-        This allows computing the other bucket without storing the original key.
-        """
-        return (i1 ^ (mmh3.hash64(bytes([fp]), seed=0)[0] % len(self.buckets))) % len(self.buckets)
+    def _fp_and_index(self, item: str) -> tuple[int, int]:
+        h = self._h(item.encode())
+        fp = (h >> 32) % ((1 << self.f) - 1) + 1   # never 0 (0 often marks an empty slot)
+        return fp, h % self.n
+
+    def _alt(self, i: int, fp: int) -> int:
+        return (i ^ self._h(fp.to_bytes(4, "little"))) % self.n
 
     def insert(self, item: str) -> bool:
-        fp = self._fingerprint(item)
-        i1 = self._hash(item)
-        i2 = self._alt_bucket(i1, fp)
-
-        # Try primary bucket first
-        if len(self.buckets[i1]) < self.bucket_size:
-            self.buckets[i1].append(fp)
-            self.size += 1
-            return True
-
-        # Try alternate bucket
-        if len(self.buckets[i2]) < self.bucket_size:
-            self.buckets[i2].append(fp)
-            self.size += 1
-            return True
-
-        # Cuckoo displacement: kick out existing fingerprint
-        cur_bucket = i1 if (hash(item) % 2 == 0) else i2
-        for _ in range(self.max_kicks):
-            # Pick a random slot in the bucket to evict
-            slot = hash(fp) % self.bucket_size
-            fp, self.buckets[cur_bucket][slot] = self.buckets[cur_bucket][slot], fp
-            cur_bucket = self._alt_bucket(cur_bucket, fp)
-
-            if len(self.buckets[cur_bucket]) < self.bucket_size:
-                self.buckets[cur_bucket].append(fp)
-                self.size += 1
+        if self.victim is not None:
+            return False                           # full: resize/rebuild before inserting more
+        fp, i1 = self._fp_and_index(item)
+        i2 = self._alt(i1, fp)
+        for i in (i1, i2):
+            if len(self.buckets[i]) < self.b:
+                self.buckets[i].append(fp)
                 return True
-
-        # Table is too full — need to rehash (or grow)
+        i = random.choice((i1, i2))
+        for _ in range(self.max_kicks):            # relocate ("kick") existing fingerprints
+            slot = random.randrange(self.b)
+            fp, self.buckets[i][slot] = self.buckets[i][slot], fp
+            i = self._alt(i, fp)
+            if len(self.buckets[i]) < self.b:
+                self.buckets[i].append(fp)
+                return True
+        self.victim = fp    # keep the evicted fingerprint, or that item gets a false negative
         return False
 
     def contains(self, item: str) -> bool:
-        fp = self._fingerprint(item)
-        i1 = self._hash(item)
-        i2 = self._alt_bucket(i1, fp)
-        return fp in self.buckets[i1] or fp in self.buckets[i2]
+        fp, i1 = self._fp_and_index(item)
+        return fp in self.buckets[i1] or fp in self.buckets[self._alt(i1, fp)] or fp == self.victim
 
     def delete(self, item: str) -> bool:
-        fp = self._fingerprint(item)
-        i1 = self._hash(item)
-        i2 = self._alt_bucket(i1, fp)
-        for bucket in (self.buckets[i1], self.buckets[i2]):
-            if fp in bucket:
-                bucket.remove(fp)
-                self.size -= 1
+        """Only delete items you inserted: deleting a never-inserted item that
+        shares a fingerprint removes someone else's entry (false negative)."""
+        fp, i1 = self._fp_and_index(item)
+        for i in (i1, self._alt(i1, fp)):
+            if fp in self.buckets[i]:
+                self.buckets[i].remove(fp)
                 return True
         return False
+
+
+random.seed(3)
+cf = CuckooFilter(capacity=100_000)
+ok = sum(cf.insert(f"k{i}") for i in range(100_000))
+assert ok == 100_000 and all(cf.contains(f"k{i}") for i in range(100_000))
+fp = sum(cf.contains(f"x{i}") for i in range(100_000)) / 100_000
+load = sum(map(len, cf.buckets)) / (cf.n * cf.b)
+for i in range(50_000):
+    cf.delete(f"k{i}")
+assert all(cf.contains(f"k{i}") for i in range(50_000, 100_000))
+print(f"buckets={cf.n} load={load:.2f} fp={fp:.4f} (2b/2^f = {8 / 4096:.4f})")
 ```
 
-**The Achilles' Heel — Fingerprint Collisions:**
+Sample output: FP ≈ 0.18% (formula 0.20%), all 100,000 inserts succeed at 76% load, and deletions leave the other items intact.
 
-```python
-# Problem: Two different items may have the same 7-bit fingerprint.
-# If they hash to the same bucket pair, one insertion can fail.
-#
-# Probability of fingerprint collision:
-#   With 7-bit fingerprints: 1/128 ≈ 0.78% per pair
-#   With 10M items: ~39K collisions → could cause insert failures
-#
-# Mitigation:
-#   1. Use adaptive bucket sizes (4 → 8 when collision rate high)
-#   2. Use larger fingerprints (8 bits → lower collision, +12.5% memory)
-#   3. Use Cuckoo+ variant: fall back to Bloom filter for overflow entries
+**The Achilles' Heels:**
 
-# The real limitation: Cuckoo filter can fail (insert returns False).
-# Bloom filter never fails — it just increases FPR.
-# In systems that MUST accept all inserts, this matters.
-```
+| Problem | Why | Mitigation |
+|---|---|---|
+| Insert failure | When both buckets are full, relocation chains grow; past ~95% load (b = 4) the kick limit is hit | Size for known capacity; on failure, rebuild into a 2× table (needs the original keys, or grow by stacking filters) |
+| Unsafe delete | Delete matches on fingerprint, not key | Only delete keys you know were inserted (e.g. tracked in the source of truth) |
+| Duplicate inserts | Each insert of the same item takes a slot in one of the same 2 buckets | Check `contains` first, or accept the 2b limit |
+| Fingerprints vs FP rate | FP grows with bucket size: ≈ 2b/2^f | Larger f for lower FP; semi-sorting saves ~1 bit per item |
 
 **Bloom vs Cuckoo Comparison:**
 
 | Property | Bloom Filter | Cuckoo Filter |
 |----------|-------------|---------------|
-| **Lookup** | O(k), k = hash count | O(1) — two buckets × bucket_size |
-| **Insert** | O(k) | O(1) amortized, may fail |
-| **Delete** | Not supported (Counting BF: O(k), 4× memory) | O(1) native |
-| **False positive rate** | ~0.1% at optimal params | ~0.1% at 7-bit fp |
-| **Memory** | Lower (1 bit per entry + overhead) | ~1.2× Bloom for same FPR |
-| **Load factor** | Always works | ~95% max (cycles at ~98%) |
-| **Space** | ~1.44 × log₂(1/p) bits per key | ~(log₂(1/p) + 2) bits per key |
+| **Lookup** | k probes, up to k cache misses (1 if blocked) | 2 buckets, ≤ 2 cache misses |
+| **Insert** | Always succeeds; FP rises as it overfills | O(1) amortized, can fail near capacity |
+| **Delete** | No (counting variant: 4× memory) | Yes |
+| **Space per item** | 1.44·log₂(1/p) | ≈ (log₂(1/p) + 3)/α with load α ≈ 0.95 (≈ +2 with semi-sorting) |
+| **Example, p = 0.1%** | 14.4 bits | ≈ 13.6 bits |
+| **Example, p = 5%** | 6.2 bits | ≈ 7.7 bits (Bloom smaller) |
 
-**When would you pick Cuckoo over Bloom?**
-
-- **You need deletion** (Counting BF uses 4× memory for the same FPR)
-- **You need fast lookups** (Cuckoo is O(1) average, Bloom is O(k))
-- **Your dataset has known cardinality** (Cuckoo benefits from tight sizing)
+**When would you pick Cuckoo over Bloom?** You need deletion; you want lower space at FP ≲ 3%; you want predictable lookups (2 cache lines). Pick Bloom when inserts must never fail, when the set size is unknown, or when FP can be a few percent. RedisBloom offers both (`BF.*`, `CF.*`).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Fingerprint concept** | Explains partial-key cuckoo hashing — alternative bucket via XOR |
-| **Insert failure** | Understands the cycle condition and max-kick threshold |
-| **Comparison to Bloom** | Knows exact memory trade-offs (not just "better") |
-| **Production** | Mentions adaptive bucket sizing or Cuckoo+ hybrid |
+| **FP formula** | ≈ 2b/2^f; sizes f for a target FP |
+| **Insert failure** | Understands the load-factor limit, kick threshold, and keeping the evicted victim |
+| **Comparison to Bloom** | Knows the ~3% crossover and the unsafe-delete caveat |
 
 ---
 
 ## 3. HyperLogLog: Cardinality Estimation
 
-**Q:** "We need to count distinct users visiting our site every hour — 10M DAU, 1B events/hour. Naive exact counting (HashSet) would take 8GB/hour. Design a system that uses < 2KB per time window and gives < 2% error. Walk me through the stochastic averaging math."
+**Q:** "We need to count distinct users visiting our site every hour — 10M DAU, 1B events/hour. Exact counting needs one entry per distinct user per window (80 MB of raw 64-bit IDs, several times that in a hash set). Design a system that uses < 2KB per time window and gives < 2% error. Walk me through the stochastic averaging math."
 
 **What They're Really Testing:** Whether you understand the algorithm's internal mechanics — not just how to use a library.
+
+!!! tip "30-second answer"
+    Hash each user; the number of leading zeros in a hash is ≥ k with probability 2^−k, so the maximum seen estimates log₂(n). HLL splits users into m = 2^b buckets by the first b bits, keeps the max rank per bucket, and combines them with a bias-corrected harmonic mean; error ≈ **1.04/√m**. The two constraints conflict slightly: < 2% needs m ≥ 2,704 → 4,096 registers, which is 3 KB at 6 bits (2.5 KB at 5 bits); fitting under 2 KB means m = 2,048 at ~2.3%. Say so, then offer options: 4-bit registers with an exception table (Apache DataSketches' HLL_4 ≈ 2 KB for m = 4,096), or accept 2.3%. Hourly sketches **merge** into daily/weekly uniques by taking register-wise max.
 
 ### Answer
 
 **The Core Insight:**
 
-HyperLogLog exploits a simple probabilistic fact: if you hash each element uniformly, the probability of seeing a hash value with exactly `ρ` leading zeros is `1/2^ρ`. The maximum number of leading zeros observed across all elements gives a rough estimate of `log₂(n)`.
+HyperLogLog exploits a simple probabilistic fact: if you hash each element uniformly, the probability that a hash has at least `ρ−1` leading zeros is `2^−(ρ−1)`. The maximum rank observed gives a rough estimate of `log₂(n)`.
 
-The problem with a single register is high variance (±1 bit = 2× error). **Stochastic averaging** solves this by splitting into `m = 2^b` registers using the first `b` bits of the hash, then taking the harmonic mean.
+The problem with a single register is high variance (±1 = 2× error). **Stochastic averaging** splits the stream into `m = 2^b` registers using the first `b` bits of the hash and combines them with a harmonic mean.
 
 ```python
+import hashlib
+import math
+
+
 class HyperLogLog:
-    """
-    HLL with bias correction for small and large ranges.
-    Memory: m × 6 bits (~12KB for m=16384, which gives ~1% error)
-    """
+    """Dense HLL, leading-zero form: top b bits pick the register, rank = leading
+    zeros of the remaining 64-b bits + 1. 6-bit registers (rank ≤ 65 - b)."""
+
     def __init__(self, b: int = 12):
-        # b = number of bits for register selection
-        # m = 2^b = number of registers
-        self.b = b
-        self.m = 1 << b  # e.g., b=12 → 4096 registers → ~1.6% error
-        # 5 bits per register (enough to count up to 2^32 distinct items)
-        self.registers = [0] * self.m
+        self.b, self.m = b, 1 << b
+        self.registers = bytearray(self.m)
+
+    def _rank(self, x: int) -> tuple[int, int]:
+        j = x >> (64 - self.b)
+        rest = x & ((1 << (64 - self.b)) - 1)
+        return j, (64 - self.b) - rest.bit_length() + 1
 
     def add(self, value: str) -> None:
-        # 64-bit hash — use strong hash for uniformity
-        x = mmh3.hash64(value, seed=42)[0] & 0xFFFFFFFFFFFFFFFF
-        # First b bits: register index
-        j = x >> (64 - self.b)
-        # Remaining 64-b bits: count leading zeros + 1
-        w = x << self.b  # Remove the first b bits
-        leading_zeros = w.bit_length() if w > 0 else 0
-        rho = 65 - self.b - leading_zeros  # +1 for rank
-        self.registers[j] = max(self.registers[j], rho)
+        x = int.from_bytes(hashlib.blake2b(value.encode(), digest_size=8).digest(), "big")
+        j, rho = self._rank(x)
+        if rho > self.registers[j]:
+            self.registers[j] = rho
 
     def count(self) -> float:
-        # Harmonic mean of 2^{register}
-        Z = sum(1.0 / (1 << r) for r in self.registers)
+        m = self.m
+        alpha = 0.7213 / (1 + 1.079 / m)            # m ≥ 128
+        e = alpha * m * m / sum(2.0 ** -r for r in self.registers)
+        zeros = self.registers.count(0)
+        if e <= 2.5 * m and zeros:
+            e = m * math.log(m / zeros)            # linear counting for small n
+        return e                                    # no large-range fix needed with 64-bit hashes
 
-        # Bias correction constant
-        alpha = {
-            16: 0.673,
-            32: 0.697,
-            64: 0.709,
-        }.get(self.m, 0.7213 / (1 + 1.079 / self.m))
-
-        E = alpha * self.m * self.m / Z
-
-        # === BIAS CORRECTION ===
-
-        # Small range: linear counting (when most registers are empty)
-        if E <= 2.5 * self.m:
-            V = self.registers.count(0)  # Number of zero registers
-            if V > 0:
-                E = self.m * math.log(self.m / V)
-
-        # Medium range: use raw HLL estimate
-        # (E is already correct for 2.5*m < E <= 2^32)
-
-        # Large range: 64-bit correction
-        if E > 1 << 32:  # 2^32
-            E = -(1 << 64) * math.log(1 - E / (1 << 64))
-
-        return E
-
-    def merge(self, other: 'HyperLogLog') -> None:
-        """Merge another HLL into this one (for distributed counting)."""
-        if self.b != other.b:
-            raise ValueError("Cannot merge HLLs with different precision")
-        for i in range(self.m):
-            self.registers[i] = max(self.registers[i], other.registers[i])
+    def merge(self, other: "HyperLogLog") -> None:
+        assert self.b == other.b, "precision must match"
+        self.registers = bytearray(map(max, self.registers, other.registers))
 
 
-# ==============================
-# PRODUCTION: HyperLogLog++
-# ==============================
-#
-# Google's HyperLogLog++ (used in BigQuery) adds:
-# 1. 64-bit hash (vs original 32-bit) — handles > 4B cardinality
-# 2. Sparse representation — when cardinality << m, store (index, value)
-#    pairs instead of full register array (saves memory by 10-100×)
-# 3. Improved bias correction using empirical curves
-#
-# Sparse representation:
-class SparseHLL(HyperLogLog):
-    """When n << m, use a map instead of full register array."""
-    def __init__(self, b: int = 12, sparse_threshold: int = None):
+class SparseFirstHLL(HyperLogLog):
+    """HLL++ idea: while few registers are set, keep {index: rank} instead of
+    the full array; convert to dense once the map would cost more than it saves."""
+
+    def __init__(self, b: int = 12):
         super().__init__(b)
-        self._use_sparse = True
-        self._sparse_map = {}  # index → max_rho
-        self.sparse_threshold = sparse_threshold or (self.m // 4)
-        self._sparse_count = 0
+        self.sparse: dict[int, int] | None = {}
+        self.registers = None                       # allocated on conversion
 
-    def add(self, value: str):
-        if not self._use_sparse:
+    def add(self, value: str) -> None:
+        if self.sparse is None:
             return super().add(value)
+        x = int.from_bytes(hashlib.blake2b(value.encode(), digest_size=8).digest(), "big")
+        j, rho = self._rank(x)
+        if rho > self.sparse.get(j, 0):
+            self.sparse[j] = rho
+        if len(self.sparse) > self.m // 8:          # threshold is a tuning knob
+            self.registers = bytearray(self.m)
+            for j, r in self.sparse.items():
+                self.registers[j] = r
+            self.sparse = None
 
-        x = mmh3.hash64(value, seed=42)[0] & 0xFFFFFFFFFFFFFFFF
-        j = x >> (64 - self.b)
-        w = x << self.b
-        leading_zeros = w.bit_length() if w > 0 else 0
-        rho = 65 - self.b - leading_zeros
+    def count(self) -> float:
+        if self.sparse is not None:                 # few registers set → linear counting is exact-ish
+            return self.m * math.log(self.m / (self.m - len(self.sparse)))
+        return super().count()
 
-        # In sparse mode, only store non-zero entries
-        prev = self._sparse_map.get(j, 0)
-        if rho > prev:
-            self._sparse_map[j] = rho
-            if prev == 0:
-                self._sparse_count += 1
 
-        # Switch to dense mode if too many registers are populated
-        if self._sparse_count > self.sparse_threshold:
-            self._to_dense()
-
-    def _to_dense(self):
-        for idx, rho in self._sparse_map.items():
-            self.registers[idx] = rho
-        self._use_sparse = False
-        self._sparse_map = None
+for cls in (HyperLogLog, SparseFirstHLL):
+    for n in (100, 10_000, 1_000_000):
+        h = cls(12)
+        for i in range(n):
+            h.add(f"u{i}")
+        print(cls.__name__, n, f"{(h.count() - n) / n:+.2%}")
 ```
 
-**Error Bounds:**
+Sample output: errors of +0.2%, +3.8% and +0.4% for 100, 10,000 and 1,000,000 users with m = 4,096. The 10,000 case sits right where the estimator switches from linear counting to raw HLL (≈ 2.5m), a region where raw HLL is biased. That's exactly what **HLL++**'s empirical bias correction fixes. The full trailing-zero implementation with merge is in [Interview Questions Q3](./INTERVIEW_QUESTIONS.md#3-hyperloglog-cardinality-estimation).
+
+**HyperLogLog++ (Heule, Nunkesser & Hall, Google, 2013)** adds:
+
+1. 64-bit hashes, so no large-range correction is needed.
+2. A **sparse representation** for small cardinalities (as above, but with compressed sorted lists and higher internal precision), which matters when you keep millions of hourly sketches that mostly see few users.
+3. Empirically measured **bias correction** around the 2.5m transition.
+
+**Error Bounds (6-bit registers):**
 
 ```
-Standard error of HLL with m registers:
-    σ ≈ 1.04 / √m
+σ ≈ 1.04 / √m
 
-    b = 8,  m = 256:   σ ≈ 6.5%   (uses 160 bytes)
-    b = 10, m = 1024:  σ ≈ 3.3%   (uses 640 bytes)
-    b = 12, m = 4096:  σ ≈ 1.6%   (uses 2.5 KB)
-    b = 14, m = 16384: σ ≈ 0.8%   (uses 10 KB)
-    b = 16, m = 65536: σ ≈ 0.4%   (uses 40 KB)
+b = 8,  m = 256:    σ ≈ 6.5%    192 bytes
+b = 10, m = 1024:   σ ≈ 3.25%   768 bytes
+b = 11, m = 2048:   σ ≈ 2.3%    1.5 KB   ← fits < 2 KB
+b = 12, m = 4096:   σ ≈ 1.6%    3 KB     ← meets < 2% error
+b = 14, m = 16384:  σ ≈ 0.81%   12 KB    (Redis)
+b = 16, m = 65536:  σ ≈ 0.41%   48 KB
 ```
 
 **Real-World Use:**
 
-| System | What they count | Precision | Memory |
-|--------|----------------|-----------|--------|
-| Redis | Distinct visitors per page | ~1% | 12KB per key |
-| BigQuery | Approximate COUNT(DISTINCT) | ~1% | Configurable |
-| Presto | Approximate cardinality | ~2% | Default b=12 |
-| Elasticsearch | Cardinality aggregation | ~5% | Configurable |
+| System | API | Configuration |
+|--------|-----|---------------|
+| Redis | `PFADD` / `PFCOUNT` / `PFMERGE` | m = 16,384, 0.81% std error, ≤ 12 KB (sparse encoding when small) |
+| BigQuery | `APPROX_COUNT_DISTINCT`, `HLL_COUNT.INIT/MERGE/EXTRACT` | HLL++; precision configurable (10–24) for `HLL_COUNT` |
+| Presto / Trino | `approx_distinct(x, e)` | Default max standard error 2.3% |
+| Elasticsearch / OpenSearch | `cardinality` aggregation | HLL++; near-exact below `precision_threshold` (default 3,000) |
 
 **Staff-Level Trade-Offs:**
-- **HLL vs Bitmap**: For `n < 10M`, a compressed bitmap (RoaringBitmap) is often *better* — exact with ~2 bits per unique
-- **HLL vs Bloom**: Bloom can estimate set *size* by using linear counting (counting empty bits), but error is higher than HLL
-- **HLL++ sparse mode** is critical for hourly windows where actual cardinality << m
+
+- **HLL vs exact bitmaps:** if user IDs are dense integers, a compressed bitmap (Roaring) is exact, supports intersections, and is often only a few bits per user. HLL wins when IDs are arbitrary strings or you need fixed tiny memory per window.
+- **Intersections** ("users active both today and yesterday") aren't native to HLL; inclusion–exclusion on unions is very noisy for small overlaps. Use Theta sketches (DataSketches) when set operations matter.
+- **Mergeability is the killer feature:** per-server, per-hour sketches roll up into any time range without re-reading events.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Stochastic averaging** | Explains harmonic mean over registers, not arithmetic |
-| **Bias correction** | Knows small-range (linear counting) and large-range (64-bit) corrections |
-| **HLL++ enhancements** | Mentions sparse representation and improved bias curves |
-| **When not to use** | Knows RoaringBitmap beats HLL for low cardinality |
+| **Sizing honesty** | Computes m from the error target and notices the 2 KB / 2% tension |
+| **Bias correction** | Knows linear counting for small n and HLL++'s bias table; no large-range fix with 64-bit hashes |
+| **When not to use** | Roaring bitmaps for dense integer IDs; Theta sketches for intersections |
 
 ---
 
@@ -468,149 +417,80 @@ Standard error of HLL with m registers:
 
 **What They're Really Testing:** Understanding of the sketch's asymmetric error guarantee — it only overcounts, never undercounts — and how d, w parameters control that.
 
+!!! tip "30-second answer"
+    d rows of w counters, one hash per row; add increments one counter per row, estimate takes the **minimum**. Never undercounts (insert-only); overcount ≤ **ε·N** with probability ≥ 1 − δ when **w = ⌈e/ε⌉, d = ⌈ln(1/δ)⌉**, N = total events. ε = 0.001, δ = 0.001 → 2,719 × 7 counters ≈ 76 KB. Keep a heap of the K best candidates for top-K, use **conservative update** to cut overcounting, a keyed hash against adversarial queries, and one sketch per time window (merged by addition) for "trending in the last 5 minutes".
+
 ### Answer
 
-**Count-Min Sketch Properties:**
-- **Never underestimates** — the count is always ≥ true count
-- **Width** w: controls error magnitude (error ≤ `ε × N` with `ε = e/w`)
-- **Depth** d: controls confidence (probability `1 - δ` where `δ = e^{-d}`)
+**Sizing:**
 
-```python
-class CountMinSketch:
-    """
-    Probabilistic frequency table.
-    
-    Parameters:
-        epsilon: error factor (as fraction of total count)
-        delta: confidence (probability the error bound holds)
-        
-    Given epsilon, delta:
-        width  = ceil(e / epsilon)
-        depth  = ceil(-ln(1 - delta))
-    """
-    def __init__(self, epsilon: float = 0.001, delta: float = 0.999):
-        # e = 2.71828...
-        self.width = int(math.ceil(math.e / epsilon))   # e.g., 2718
-        self.depth = int(math.ceil(-math.log(1 - delta)))  # e.g., 7
-        self.table = [[0] * self.width for _ in range(self.depth)]
-        self.total = 0  # Track total count for relative error
+```text
+ε (error as a fraction of N) and δ (probability the bound fails):
+    width  w = ⌈e / ε⌉
+    depth  d = ⌈ln(1 / δ)⌉
 
-    def _hash(self, item: str, row: int) -> int:
-        """Row-independent hash."""
-        return mmh3.hash64(item, seed=row)[0] % self.width
-
-    def increment(self, item: str, count: int = 1) -> None:
-        self.total += count
-        for row in range(self.depth):
-            col = self._hash(item, row)
-            self.table[row][col] += count
-
-    def estimate(self, item: str) -> int:
-        """Returns minimum across all rows (guarantees no undercount)."""
-        return min(
-            self.table[row][self._hash(item, row)]
-            for row in range(self.depth)
-        )
-
-    def error_bound(self) -> float:
-        """ε × N: the maximum likely overcount."""
-        return math.e / self.width * self.total
+ε = 0.001, δ = 0.001:  w = 2,719,  d = 7  → 19,033 counters × 4 B ≈ 76 KB
+100K queries/s → N = 6M per minute → overcount ≤ 6,000 per query per minute
+(with 99.9% probability). Heavy hitters are far above that; rare queries are noise.
 ```
 
-**The Heavy Hitters (Top-K) Extension:**
+The full runnable implementation (keyed hashing, conservative update, top-K tracker) is in [Interview Questions Q5](./INTERVIEW_QUESTIONS.md#5-count-min-sketch-frequency-estimation). Key pieces:
 
 ```python
-class HeavyHittersTracker:
-    """
-    Track top-K frequent items using Count-Min Sketch + a min-heap.
-    
-    The trick: sketch tracks approximate frequency, heap tracks current top-K.
-    When a new item comes in, check if its sketch estimate > heap min.
-    If so, pop the min and push the new item.
-    
-    False positives: items may appear in top-K when they shouldn't
-    False negatives: NEVER — true top-K items will always have high
-                     sketch estimates (no undercount guarantee)
-    """
-    def __init__(self, k: int, epsilon: float = 0.001, delta: float = 0.999):
-        self.k = k
-        self.sketch = CountMinSketch(epsilon, delta)
-        self.heap = []  # Min-heap of (estimated_count, item)
-        self.blacklist = set()
+import math
 
-    def add(self, item: str) -> None:
-        prev_estimate = self.sketch.estimate(item)
-        self.sketch.increment(item)
-        new_estimate = self.sketch.estimate(item)
+def cms_dimensions(epsilon: float, delta: float) -> tuple[int, int]:
+    return math.ceil(math.e / epsilon), math.ceil(math.log(1 / delta))
 
-        if item not in self.blacklist:
-            if len(self.heap) < self.k:
-                heapq.heappush(self.heap, (new_estimate, item))
-            else:
-                min_est, min_item = self.heap[0]
-                if new_estimate > min_est:
-                    heapq.heappop(self.heap)
-                    heapq.heappush(self.heap, (new_estimate, item))
-                    self.blacklist.add(min_item)
+def conservative_add(table, cols, count=1):
+    """cols = [(row, col), ...] for the item. Raise each counter only to
+    (current estimate + count): counters already above that are left alone."""
+    target = min(table[r][c] for r, c in cols) + count
+    for r, c in cols:
+        table[r][c] = max(table[r][c], target)
 
-    def top_k(self) -> List[Tuple[str, int]]:
-        return [(item, -est) for est, item in
-                sorted(self.heap, reverse=True)]
+def count_mean_min(table, cols, total, width):
+    """Subtract each row's expected collision noise (total − c)/(w − 1) and take
+    the median. Less biased for rare items, but it CAN undercount."""
+    ests = sorted(c - (total - c) / (width - 1) for c in (table[r][k] for r, k in cols))
+    return ests[len(ests) // 2]
+
+print(cms_dimensions(0.001, 0.001))   # (2719, 7)
 ```
 
-**Conservative Update — Better Accuracy at No Cost:**
+**The Heavy Hitters (Top-K) Pipeline at 100K QPS:**
 
-```python
-class ConservativeCMS(CountMinSketch):
-    """
-    Conservative update: only increment cells that contain the *minimum*
-    value across the row hashes. This significantly reduces overcounting
-    when collisions would otherwise inflate counts.
-    
-    Trade-off: slightly slower updates (need to read before write),
-               but same memory, same error bound.
-    """
-    def increment(self, item: str, count: int = 1) -> None:
-        # First pass: find current minimum
-        cols = [self._hash(item, row) for row in range(self.depth)]
-        min_val = min(self.table[row][col] for row, col in zip(range(self.depth), cols))
-
-        # Second pass: only increment cells at the minimum
-        for row, col in enumerate(cols):
-            if self.table[row][col] == min_val:
-                self.table[row][col] += count
-
-        self.total += count
 ```
+API nodes ──(sample or full stream)──► per-node CMS + top-K candidates (1 s windows)
+         └── every few seconds ship sketch (76 KB) + candidates ─► aggregator
+aggregator: sum sketches (same seed & dims) → re-estimate candidates → global top-K
+"last 5 minutes" = sum of the last 300 one-second sketches (ring buffer),
+or exponential decay (halve all counters periodically).
+```
+
+- **No false negatives for top-K?** Only if every true heavy hitter gets a chance to enter the candidate set. With per-node candidate lists that's usually fine because heavy items are heavy everywhere; to be safe, track more candidates (e.g. 10K) than K and re-rank at the aggregator.
+- **Alternatives:** Space-Saving (k counters, deterministic, error ≤ N/k) is often simpler when you *only* need top-K. Misra–Gries is similar and mergeable. CMS earns its place when you also need point queries for arbitrary keys ("how often was X searched?").
 
 **Error Analysis:**
 
 ```text
-Count-Min Sketch guarantees:
-    est ≤ true_count + ε × total_count
-    with probability ≥ 1 - δ
-    
-    where ε = e/w, δ = e^{-d}
-    
-    Example: w=2718, d=7 gives:
-        ε = e/2718 ≈ 0.001 (error < 0.1% of total count)
-        δ = e^{-7} ≈ 0.0009 (99.91% confidence the bound holds)
-    
-    For 10M search queries: max error ≈ 10K per item
-```
+estimate(x) ≤ true(x) + ε·N   with probability ≥ 1 − δ
+  w = 2,719 → ε = e/w ≈ 0.001
+  d = 7     → δ = e^−7 ≈ 0.0009   (bound holds 99.9% of the time)
 
-**Count-Min vs Count-Mean-Min:**
-- **Count-Min**: Overcounts due to hash collisions (never undercounts)
-- **Count-Mean-Min**: Subtracts expected noise (d/width × total), centers estimates at true count — but can now undercount
+For N = 10M queries: overcount ≤ ~10K per item.
+Conservative update keeps the same guarantee and is much tighter on skewed
+(Zipfian) traffic, but you can no longer decrement or subtract sketches.
+```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Error guarantee** | Explains asymmetry: never undercounts, may overcount |
+| **Error guarantee** | Explains asymmetry: never undercounts, may overcount, relative to N |
 | **Parameter sizing** | Calculates w, d from ε, δ mathematically |
-| **Conservative update** | Mentions the optimization for less overcounting |
-| **Heavy hitters** | Describes heap + sketch combo for top-K |
+| **Conservative update** | Knows the rule (raise to min + count) and its no-deletion cost |
+| **Heavy hitters** | Candidate set + sketch, windowing, merge across nodes; knows Space-Saving |
 
 ---
 
@@ -620,161 +500,136 @@ Count-Min Sketch guarantees:
 
 **What They're Really Testing:** Whether you understand the connection between MinHash and Jaccard similarity — and can design the LSH indexing layer for sub-linear retrieval.
 
+!!! tip "30-second answer"
+    For a random hash h, P(min h(A) = min h(B)) = |A∩B| / |A∪B| = Jaccard(A, B). A signature of k such minimums estimates J as the fraction of matching positions, with standard error √(J(1−J)/k) ≤ 0.5/√k (k = 128 → ≤ 4.4%), and shrinks every document to k integers. To avoid comparing against all 10M signatures, **LSH banding** splits the signature into b bands of r rows and indexes each band; documents sharing any band become candidates. P(candidate) = 1 − (1 − J^r)^b, an S-curve with threshold ≈ (1/b)^(1/r). Then rank candidates by estimated (or exact) Jaccard.
+
 ### Answer
 
 **The Core Insight:**
 
-MinHash exploits the property that the probability that the minimum hash value of two sets is the same equals their Jaccard similarity:
-
-```python
-# For sets A, B:
-#   P(min(h(A)) == min(h(B))) = |A ∩ B| / |A ∪ B| = J(A, B)
-#
-# With k independent hash functions:
-#   Signature: [min(h_1(A)), min(h_2(A)), ..., min(h_k(A))]
-#   J(A, B) ≈ (matches in signature) / k
+```text
+Pick a random permutation (hash) of all shingles. The first shingle of A ∪ B
+under that order is equally likely to be any element of A ∪ B; it is the
+minimum of BOTH sets exactly when it lies in A ∩ B. Hence
+    P(min h(A) == min h(B)) = |A ∩ B| / |A ∪ B| = J(A, B)
+With k independent hashes, the match rate is an unbiased estimate of J.
 ```
 
+**MinHash + LSH (runnable):**
+
 ```python
-import numpy as np
-from typing import Set, List, Tuple
-import mmh3
+import hashlib
+import random
+from collections import defaultdict
+
+PRIME = (1 << 61) - 1          # Mersenne prime for universal hashing
+
 
 class MinHasher:
-    """
-    Generate MinHash signatures for documents.
-    
-    k = 200 gives standard error ~1/√200 ≈ 7%
-    """
-    def __init__(self, k: int = 200):
-        self.k = k
-        # Generate k random hash seeds (reused across all documents)
-        self.seeds = [np.random.randint(0, 2**31) for _ in range(k)]
+    """k-permutation MinHash. P(minhash_i(A) == minhash_i(B)) = Jaccard(A, B),
+    so the fraction of matching positions estimates J with standard error
+    sqrt(J(1-J)/k) ≤ 0.5/√k (k = 128 → at most ±4.4%)."""
 
-    def signature(self, shingles: Set[str]) -> List[int]:
-        """Generate k-length signature."""
-        sig = [float('inf')] * self.k
-        for shingle in shingles:
-            for i, seed in enumerate(self.seeds):
-                # MurmurHash is fast and uniform
-                h = mmh3.hash64(shingle, seed=seed)[0]
-                if h < sig[i]:
-                    sig[i] = h
-        return sig
+    def __init__(self, k: int = 128, seed: int = 1):
+        rnd = random.Random(seed)
+        self.k = k
+        self.coeffs = [(rnd.randrange(1, PRIME), rnd.randrange(PRIME)) for _ in range(k)]
+
+    def signature(self, shingles: set[str]) -> list[int]:
+        base = [int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8).digest(), "little")
+                for s in shingles]                       # hash each shingle once
+        return [min((a * x + b) % PRIME for x in base) for a, b in self.coeffs]
 
     @staticmethod
-    def similarity(sig_a: List[int], sig_b: List[int]) -> float:
-        """Estimated Jaccard similarity."""
-        matches = sum(1 for a, b in zip(sig_a, sig_b) if a == b)
-        return matches / len(sig_a)
-```
+    def similarity(s1: list[int], s2: list[int]) -> float:
+        return sum(x == y for x, y in zip(s1, s2)) / len(s1)
 
-**LSH for Sub-Linear Retrieval:**
 
-The real power of MinHash is not just computing pairwise similarity — it's **Locality-Sensitive Hashing** (LSH) that finds similar pairs in O(N) instead of O(N²).
-
-```python
 class MinHashLSH:
-    """
-    Banded LSH for MinHash signatures.
-    
-    Split k-length signature into b bands of r rows each.
-    Two items collide in a band if all r hashes match.
-    Tune b and r for desired sensitivity.
-    
-    Probability of collision for Jaccard = J:
-        P = 1 - (1 - J^r)^b
-    
-    For k=200, desired threshold ~0.7:
-        b = 50 bands, r = 4 rows/band
-        P(0.7) = 1 - (1 - 0.7^4)^50 ≈ 0.94
-        P(0.3) = 1 - (1 - 0.3^4)^50 ≈ 0.04
-    """
-    def __init__(self, k: int = 200, bands: int = 50):
-        self.k = k
-        self.bands = bands
-        self.rows = k // bands  # Should be exact division
-        self.hash_tables = [{} for _ in range(bands)]
+    """Banding: split the k-length signature into b bands of r rows. Two docs
+    become candidates if ANY band matches exactly:
+        P(candidate | J) = 1 - (1 - J^r)^b,   threshold ≈ (1/b)^(1/r)."""
 
-    def _band_hash(self, signature: List[int], band: int) -> int:
-        """Hash a band of the signature into a bucket."""
-        start = band * self.rows
-        band_sig = signature[start:start + self.rows]
-        return hash(tuple(band_sig))
+    def __init__(self, k: int = 128, bands: int = 16):
+        assert k % bands == 0
+        self.bands, self.rows = bands, k // bands
+        self.tables = [defaultdict(list) for _ in range(bands)]
+        self.signatures: dict[str, list[int]] = {}
 
-    def insert(self, doc_id: str, signature: List[int]) -> None:
+    def _keys(self, sig):
         for band in range(self.bands):
-            bucket = self._band_hash(signature, band)
-            if bucket not in self.hash_tables[band]:
-                self.hash_tables[band][bucket] = []
-            self.hash_tables[band][bucket].append(doc_id)
+            yield band, tuple(sig[band * self.rows:(band + 1) * self.rows])
 
-    def candidates(self, signature: List[int]) -> Set[str]:
-        """Return candidate similar documents (not deduplicated)."""
-        candidates = set()
-        for band in range(self.bands):
-            bucket = self._band_hash(signature, band)
-            if bucket in self.hash_tables[band]:
-                candidates.update(self.hash_tables[band][bucket])
-        return candidates
+    def insert(self, doc_id: str, sig: list[int]) -> None:
+        self.signatures[doc_id] = sig
+        for band, key in self._keys(sig):
+            self.tables[band][key].append(doc_id)
 
-    def query(self, doc_id: str, signature: List[int],
-              min_similarity: float = 0.7) -> List[Tuple[str, float]]:
-        """Find documents similar to the query signature."""
-        candidates = self.candidates(signature)
-        candidates.discard(doc_id)
+    def query(self, sig: list[int], min_similarity: float = 0.5) -> list[tuple[str, float]]:
+        candidates = {d for band, key in self._keys(sig) for d in self.tables[band].get(key, [])}
+        scored = [(d, MinHasher.similarity(sig, self.signatures[d])) for d in candidates]
+        return sorted([x for x in scored if x[1] >= min_similarity], key=lambda x: -x[1])
 
-        results = []
-        for cid in candidates:
-            # Retrieve stored signature and compute similarity
-            csig = self.stored_signatures.get(cid)
-            if csig:
-                sim = MinHasher.similarity(signature, csig)
-                if sim >= min_similarity:
-                    results.append((cid, sim))
 
-        return sorted(results, key=lambda x: -x[1])
+def shingles(text: str, w: int = 3) -> set[str]:
+    words = text.lower().split()
+    return {" ".join(words[i:i + w]) for i in range(len(words) - w + 1)}
+
+
+mh, lsh = MinHasher(k=128), MinHashLSH(k=128, bands=16)        # 16 bands × 8 rows, threshold ≈ 0.71
+base = " ".join(f"w{i}" for i in range(300))
+docs = {
+    "original": base,
+    "near_copy": base.replace("w150", "x150").replace("w151", "x151"),
+    "unrelated": " ".join(f"z{i}" for i in range(300)),
+}
+for d, text in docs.items():
+    lsh.insert(d, mh.signature(shingles(text)))
+q = mh.signature(shingles(docs["near_copy"]))
+true_j = len(shingles(docs["original"]) & shingles(docs["near_copy"])) / len(shingles(docs["original"]) | shingles(docs["near_copy"]))
+print("true J(original, near_copy) =", round(true_j, 3))
+print(lsh.query(q))
 ```
 
-**How to Tune b and r:**
+Sample output: true J = 0.974 between the original and the near-copy (2 of 300 words changed); the LSH query finds both near-identical documents and not the unrelated one.
 
-```
-k = 200 (total signature length)
+**How to Tune b and r (k = b × r):**
 
-bands=50, rows=4: threshold ≈ (1/50)^{1/4} ≈ 0.37
-bands=40, rows=5: threshold ≈ (1/40)^{1/5} ≈ 0.42
-bands=25, rows=8: threshold ≈ (1/25)^{1/8} ≈ 0.67
-bands=20, rows=10: threshold ≈ (1/20)^{1/10} ≈ 0.74
+| Bands × rows | Threshold ≈ (1/b)^(1/r) | P(candidate) at J = 0.9 / 0.7 / 0.5 / 0.3 |
+|---|---|---|
+| 50 × 4 | 0.38 | 1.00 / 1.00 / 0.96 / 0.33 |
+| 40 × 5 | 0.48 | 1.00 / 1.00 / 0.72 / 0.09 |
+| 25 × 8 | 0.67 | 1.00 / 0.77 / 0.09 / 0.002 |
+| 20 × 10 | 0.74 | 1.00 / 0.44 / 0.02 / 0.0001 |
 
-The probability curve:
-    J=0.9: P(collision in any band) ≈ 1.0
-    J=0.7: P ≈ 0.94
-    J=0.5: P ≈ 0.32
-    J=0.3: P ≈ 0.04
-    J=0.1: P ≈ 0.0003
-```
+More bands → more recall (fewer missed near-duplicates) but more false candidates to verify; more rows per band → sharper cut-off. Pick the threshold slightly *below* the similarity you care about, then verify candidates.
 
-**Weighted MinHash — Handling Non-Binary Data:**
+**System design for 10M documents:**
 
-When sets have weights (e.g., TF-IDF vectors, n-gram frequencies), use **Weighted MinHash** which extends the algorithm to handle integer weights. Used at Google for duplicate detection in Search.
+- Signatures: 10M × 128 × 4–8 bytes ≈ 5–10 GB; store them in a KV store or columnar file.
+- LSH index: b hash tables keyed by band hash → doc IDs. Shard by band (each shard owns some bands) or by band-hash range.
+- Query: compute the new doc's signature (500 shingles × 128 hashes), probe b buckets, verify a few hundred candidates, return top-10.
+- Cost tricks: hash each shingle once and derive k values with universal hashing (as above) or **one-permutation hashing** with densification; drop over-full buckets (boilerplate shingles shared by everything).
+
+**Weighted and alternative schemes:** Weighted MinHash / consistent weighted sampling (Ioffe, 2010) handles TF-IDF-style weights; **SimHash** (Charikar, 2002) estimates cosine similarity with 64-bit fingerprints and was used by Google for near-duplicate web pages (Manku et al., 2007).
 
 **Real-World Use:**
 
-| System | Application | Signature Size |
-|--------|-------------|----------------|
-| Google Alog | Near-duplicate web pages | k=84 |
-| AltaVista | Duplicate URL detection | k=200 |
-| Apache Spark MLlib | Document similarity | Configurable |
-| LinkedIn | Job/skill matching | k=100 |
+| System | Application |
+|--------|-------------|
+| AltaVista (Broder et al., 1997) | Original shingling + min-wise hashing for near-duplicate web pages |
+| Apache Spark MLlib | `MinHashLSH` for approximate similarity joins |
+| LLM pre-training pipelines | Fuzzy deduplication of web text (e.g. GPT-3 used Spark's `MinHashLSH`) |
+| `datasketch` (Python) | MinHash, LSH, LSH Forest for practitioners |
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Core probability** | Explains P(min-hash match) = Jaccard |
-| **Signature accuracy** | Relates k to standard error (1/√k) |
-| **LSH bands** | Tunes b, r for a similarity threshold |
-| **Weighted variant** | Mentions Weighted MinHash for non-uniform sets |
+| **Signature accuracy** | Relates k to standard error √(J(1−J)/k) |
+| **LSH bands** | Tunes b, r for a similarity threshold and explains the S-curve |
+| **System design** | Sizes signatures and index, verifies candidates, handles boilerplate buckets |
 
 ---
 
@@ -784,192 +639,137 @@ When sets have weights (e.g., TF-IDF vectors, n-gram frequencies), use **Weighte
 
 **What They're Really Testing:** Whether you understand spatial indexing fundamentals — the precision/length trade-off, edge cases at cell boundaries, and when to use Geohash vs alternatives.
 
+!!! tip "30-second answer"
+    Geohash bisects longitude and latitude alternately and interleaves the bits (a Z-order curve), then writes 5 bits per base-32 character; a longer string is a smaller cell nested inside its prefix. For a 500 m search pick the longest precision whose cells are **at least 500 m** on each side (precision 6, ~1.2 × 0.6 km at the equator), query the user's cell **plus its 8 neighbours**, then filter by exact distance. Failure modes: points a few metres apart across a cell edge can share no prefix at all (Z-order jumps), cell width shrinks with cos(latitude), and cells are rectangles, not circles, so you always over-fetch and post-filter.
+
 ### Answer
 
-**Geohash Encoding — Interleaving Bits:**
+**Geohash Encoding — Interleaving Bits (runnable):**
 
 ```python
-class Geohash:
-    BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
-    
-    @staticmethod
-    def encode(lat: float, lng: float, precision: int = 12) -> str:
-        """
-        Encode (lat, lng) into a base32 Geohash string.
-        
-        Precision → cell size:
-            p=1: ~5000km × 5000km
-            p=2: ~1250km × 625km
-            p=3: ~156km × 156km
-            p=4: ~39km × 19.5km
-            p=5: ~4.9km × 4.9km
-            p=6: ~1.2km × 0.61km
-            p=7: ~152m × 152m   ← Good for "nearby" queries
-            p=8: ~38m × 19m
-            p=9: ~4.8m × 4.8m
-        """
-        lat, lng = Geohash._normalize(lat, lng)
-        lat_range = [-90.0, 90.0]
-        lng_range = [-180.0, 180.0]
-        
-        bits = []
-        for i in range(precision * 5):  # 5 bits per character
-            if i % 2 == 0:  # Even bits: longitude
-                mid = (lng_range[0] + lng_range[1]) / 2
-                if lng >= mid:
-                    bits.append('1')
-                    lng_range[0] = mid
-                else:
-                    bits.append('0')
-                    lng_range[1] = mid
-            else:  # Odd bits: latitude
-                mid = (lat_range[0] + lat_range[1]) / 2
-                if lat >= mid:
-                    bits.append('1')
-                    lat_range[0] = mid
-                else:
-                    bits.append('0')
-                    lat_range[1] = mid
+import math
 
-        # Group into 5-bit chunks and encode as base32
-        result = []
-        for i in range(0, len(bits), 5):
-            chunk = bits[i:i+5]
-            val = int(''.join(chunk), 2)
-            result.append(Geohash.BASE32[val])
-        return ''.join(result)
+BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 
-    @staticmethod
-    def neighbors(geohash: str) -> List[str]:
-        """
-        Get all 8 neighboring geohash cells.
-        CRITICAL for boundary queries — a point at the edge of a cell
-        may have nearby points in adjacent cells.
-        """
-        lat, lng = Geohash.decode(geohash)
-        precision = len(geohash)
-        neighbors = []
-        for dlat in (-1, 0, 1):
-            for dlng in (-1, 0, 1):
-                if dlat == 0 and dlng == 0:
-                    continue
-                # Move by one cell in the geohash grid
-                nlat = lat + dlat * Geohash._cell_lat(precision)
-                nlng = lng + dlng * Geohash._cell_lng(precision)
-                if -90 <= nlat <= 90 and -180 <= nlng <= 180:
-                    neighbors.append(Geohash.encode(nlat, nlng, precision))
-        return neighbors
+
+def encode(lat: float, lng: float, precision: int = 9) -> str:
+    """Interleave longitude/latitude bisection bits (lng first), 5 bits per char."""
+    lat_rng, lng_rng = [-90.0, 90.0], [-180.0, 180.0]
+    out, bits, ch, even = [], 0, 0, True
+    while len(out) < precision:
+        rng, val = (lng_rng, lng) if even else (lat_rng, lat)
+        mid = (rng[0] + rng[1]) / 2
+        ch <<= 1
+        if val >= mid:
+            ch |= 1
+            rng[0] = mid
+        else:
+            rng[1] = mid
+        even, bits = not even, bits + 1
+        if bits == 5:
+            out.append(BASE32[ch])
+            bits, ch = 0, 0
+    return "".join(out)
+
+
+def bounds(gh: str) -> tuple[float, float, float, float]:
+    lat_rng, lng_rng, even = [-90.0, 90.0], [-180.0, 180.0], True
+    for c in gh:
+        v = BASE32.index(c)
+        for shift in range(4, -1, -1):
+            rng = lng_rng if even else lat_rng
+            mid = (rng[0] + rng[1]) / 2
+            if (v >> shift) & 1:
+                rng[0] = mid
+            else:
+                rng[1] = mid
+            even = not even
+    return lat_rng[0], lat_rng[1], lng_rng[0], lng_rng[1]
+
+
+def neighbors(gh: str) -> list[str]:
+    """The 8 surrounding cells: step one cell-size from the centre and re-encode."""
+    s, n, w, e = bounds(gh)
+    clat, clng, dlat, dlng = (s + n) / 2, (w + e) / 2, n - s, e - w
+    out = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx or dy:
+                lat = clat + dy * dlat
+                if -90 <= lat <= 90:
+                    lng = (clng + dx * dlng + 180) % 360 - 180   # wrap the antimeridian
+                    out.append(encode(lat, lng, len(gh)))
+    return out
+
+
+def cell_size_m(precision: int, lat: float) -> tuple[float, float]:
+    """(height, width) of a cell in metres at a given latitude."""
+    lng_bits = (5 * precision + 1) // 2
+    lat_bits = 5 * precision // 2
+    height = 180 / 2 ** lat_bits * 111_320
+    width = 360 / 2 ** lng_bits * 111_320 * math.cos(math.radians(lat))
+    return height, width
+
+
+def precision_for_radius(radius_m: float, lat: float) -> int:
+    """Longest geohash whose cells are at least `radius_m` in both directions,
+    so the 3×3 block around the user is guaranteed to contain the whole circle."""
+    p = 1
+    while p < 12 and min(cell_size_m(p + 1, lat)) >= radius_m:
+        p += 1
+    return p
+
+
+gh = encode(37.7749, -122.4194, 7)
+print(gh, len(neighbors(gh)), [round(x) for x in cell_size_m(7, 0)], [round(x) for x in cell_size_m(7, 60)])
+print("500 m at the equator → precision", precision_for_radius(500, 0),
+      "| at 60°N →", precision_for_radius(500, 60))
+print("boundary:", encode(0.0001, -0.0001, 5), "vs", encode(-0.0001, 0.0001, 5))
 ```
+
+Sample output: `9q8yyk8` (San Francisco) has 8 neighbours; a precision-7 cell is 153 × 153 m at the equator but 153 × 76 m at 60°N; a 500 m radius needs precision 6; and two points 30 m apart straddling the equator and the prime meridian (`ebpbp` vs `kpbpb`) share no prefix.
+
+**Cell sizes at the equator (height × width):**
+
+| Precision | Cell size | Precision | Cell size |
+|---|---|---|---|
+| 1 | 5,000 km × 5,000 km | 6 | 1.2 km × 0.61 km |
+| 2 | 1,250 km × 625 km | 7 | 153 m × 153 m |
+| 3 | 156 km × 156 km | 8 | 38 m × 19 m |
+| 4 | 39 km × 19.5 km | 9 | 4.8 m × 4.8 m |
+| 5 | 4.9 km × 4.9 km | 12 | ~3.7 cm × 1.9 cm |
+
+(Odd precisions give square-ish cells; even ones are 2:1. Width in metres scales with cos(latitude).)
 
 **The Failure Modes:**
 
-```python
-# ==============================
-# PROBLEM 1: The Edge Case
-# ==============================
-# User is at a cell boundary. Nearby restaurants are in the NEXT cell.
-#
-# Example: user at geohash "u4pruydqqvj"
-# Restaurant 500m away → geohash "u4pruydqqvk" (different cell!)
-# 
-# Solution: ALWAYS query the 9-cell grid (cell + 8 neighbors).
-# This is non-negotiable for any Geohash-based proximity system.
+1. **Boundary effect.** A user near a cell edge has neighbours in the adjacent cell, so always query the 3×3 block. And that block only covers the circle if cell size ≥ radius: querying precision 7 (153 m cells) for a 500 m radius silently misses most of the circle.
+2. **Z-order discontinuities.** Adjacent cells across the equator, the prime meridian, or any high-level split boundary have completely different prefixes, so "shared prefix ⇒ close" holds but "close ⇒ shared prefix" doesn't. Never use a single `LIKE 'prefix%'` for proximity.
+3. **Latitude distortion.** Cells narrow towards the poles (precision 7 at 89° is ~153 m × 2.7 m), so choose precision per latitude and expect odd cell shapes at high latitudes.
+4. **Rectangles vs circles.** The 3×3 block covers up to 9 cells of area for a circle that needs far less, so expect to discard most candidates in the distance filter.
 
-def nearby_restaurants(user_geohash: str, db_cursor) -> List[Restaurant]:
-    cells = [user_geohash] + Geohash.neighbors(user_geohash)
-    candidates = db_cursor.execute("""
-        SELECT * FROM restaurants 
-        WHERE geohash_prefix IN %s
-        AND abs(lat - %s) < 0.005
-        AND abs(lng - %s) < 0.005
-    """, (tuple(cells), user_lat, user_lng))
-    
-    # Still need Haversine to filter (9 cells is imprecise at edges)
-    return [r for r in candidates if haversine(user, r) < 500]
+**Query Pattern:**
 
-# ==============================
-# PROBLEM 2: The Pole Problem
-# ==============================
-# Near the poles, longitude lines converge. A geohash cell that's
-# ~152m wide at the equator narrows to 0 at the poles.
-# 
-# Consequence: precision 7 gives ~152m × 152m at equator
-#              but ~152m × 0.15m at latitude 89°
-# 
-# Mitigation: Use Geohash only between ±80° latitude.
-# Outside that range, fall back to UTM or S2.
-
-# ==============================
-# PROBLEM 3: Variable Precision
-# ==============================
-# Not all characters in the same position encode the same area.
-# The first character encodes 5000km × 5000km at equator,
-# but only 5000km × 2500km near the pole.
-# This makes uniform KNN queries (within 500m regardless of location)
-# harder — you need to dynamically choose precision based on latitude.
+```sql
+-- restaurants(geohash6 CHAR(6), lat, lng, ...) with a B-tree index on geohash6.
+-- :cells = the user's precision-6 cell + 8 neighbours (computed in the app)
+SELECT id, name, lat, lng
+FROM restaurants
+WHERE geohash6 = ANY(:cells)
+-- then compute haversine(user, restaurant) in the app (or SQL) and keep < 500 m,
+-- order by distance, LIMIT 50.
 ```
 
-**Geohash for Range Queries — Prefix Property:**
-
-```python
-# KEY PROPERTY: Longer hashes are nested inside shorter ones.
-# 
-# "u4pruydqqvj" starts with "u4pru" → "u4pru" is a LARGER cell
-# containing the smaller cell.
-#
-# This enables:
-#   1. Prefix query: WHERE geohash LIKE 'u4pru%' → all items in that region
-#   2. Zoom-dependent: shorter prefix = larger area = faster query
-#
-# For the "find nearby" problem:
-#   precision 5 (~4.9km): get all restaurants in ~25km² area
-#   precision 7 (~152m): get all restaurants in ~0.023km² area
-#
-# Start with shorter prefix for a quick broad query,
-# then refine with Haversine on the filtered results.
-
-def adaptive_proximity_query(lat: float, lng: float,
-                              radius_m: float, db_cursor):
-    # Choose precision based on desired radius
-    if radius_m > 10000:    # 10km
-        precision = 4       # ~39km cells
-    elif radius_m > 1000:   # 1km
-        precision = 6       # ~1.2km cells
-    elif radius_m > 200:    # 200m
-        precision = 7       # ~152m cells
-    else:
-        precision = 8       # ~38m cells
-
-    center = Geohash.encode(lat, lng, precision)
-    cells = [center] + Geohash.neighbors(center)
-    
-    # SQL query with prefix match and Haversine filter
-    results = db_cursor.execute("""
-        SELECT *, (
-            6371 * acos(
-                cos(radians(%s)) * cos(radians(lat)) *
-                cos(radians(lng) - radians(%s)) +
-                sin(radians(%s)) * sin(radians(lat))
-            )
-        ) AS distance
-        FROM restaurants
-        WHERE geohash_prefix IN %s
-        HAVING distance < %s
-        ORDER BY distance
-        LIMIT 50
-    """, (lat, lng, lat, tuple(cells), radius_m / 1000))
-    
-    return results
-```
+**What production systems use:** Redis `GEOADD`/`GEOSEARCH` stores a 52-bit geohash as the score of a sorted set and does the neighbour-cell search for you; Elasticsearch/OpenSearch index `geo_point` in BKD trees (geohash is used for aggregations/grids); PostGIS uses an R-tree (GiST) and `ST_DWithin`. For 1M restaurants, any of these on a single node answers a 500 m query in milliseconds; geohash in your own table is mainly useful when your store only offers B-tree indexes.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Encoding** | Explains bit-interleaving of lat/lng → base32 |
-| **Edge cells** | Mandatory 9-cell neighbor query |
-| **Pole distortion** | Knows Geohash breaks at high latitudes |
-| **Precision trade-off** | Chooses precision based on query radius |
+| **Edge cells** | 9-cell query *and* cell size ≥ radius |
+| **Discontinuities** | Knows nearby points can share no prefix (Z-order) |
+| **Distortion** | Knows width shrinks with cos(latitude) |
 
 ---
 
@@ -979,198 +779,105 @@ def adaptive_proximity_query(lat: float, lng: float,
 
 **What They're Really Testing:** Whether you understand the fundamental problems with lat/lng indexing on a sphere and how S2's design choices (cube projection + space-filling curve) fix them.
 
+!!! tip "30-second answer"
+    S2 projects the sphere onto the 6 faces of a cube, warps each face with a cheap quadratic transform so cells have similar areas (max/min area ratio ≈ 2.1 instead of 5.2 for a plain projection), and orders the cells on each face along a **Hilbert curve**. A cell at level L (0–30) is a 64-bit ID: 3 face bits, 2 bits per level, and a trailing 1 bit. Hilbert order has no jumps (consecutive IDs are adjacent cells), parent/child relationships are bit operations, and **S2RegionCoverer** approximates any circle or polygon as a handful of cell-ID ranges, so "drivers near me" becomes a few B-tree range scans on an integer column. It still has cell edges, so you still post-filter by distance.
+
 ### Answer
 
 **S2's Three-Step Pipeline:**
 
-```python
-# S2 converts lat/lng → cell ID via three transforms:
-#
-# Step 1: lat/lng → unit vector (x, y, z) on the sphere
-# Step 2: unit vector → face + (u, v) on cube face
-# Step 3: (u, v) → (i, j) → cell ID on Hilbert curve
-#
-# Result: a 64-bit cell ID that preserves spatial proximity.
+```text
+1. (lat, lng) → unit vector (x, y, z) on the sphere
+2. (x, y, z) → cube face (largest |coordinate|) + (u, v) ∈ [-1, 1]²
+3. (u, v) → (s, t) ∈ [0, 1]² via the quadratic transform
+          → integer (i, j) on a 2^30 × 2^30 grid → position on that face's Hilbert curve
 
+Cell ID (64 bits):  [face: 3 bits][Hilbert position: 2 bits × level][1][zeros]
+The trailing 1 marks the level, so a parent ID is the child ID with its low bits
+reset, and "all descendants of cell C" is the contiguous range
+[C.range_min, C.range_max]: one B-tree range scan.
+```
+
+```python
 import math
 
-class S2CellId:
-    """
-    64-bit cell identifier.
-    
-    Bit layout:
-    [0..2]: face (0-5, 3 bits)
-    [3..60]: position on Hilbert curve (58 bits)
-    [61..63]: level (0-30, 4 bits encoded in trailing bits + lsb)
-    
-    Maximum level 30 gives cells ~1cm² at the equator.
-    """
+def lat_lng_to_face_uv(lat_deg: float, lng_deg: float) -> tuple[int, float, float]:
+    """Steps 1–2 (simplified: real S2 also permutes axes per face so the
+    Hilbert curve stays continuous across face edges)."""
+    lat, lng = math.radians(lat_deg), math.radians(lng_deg)
+    x, y, z = math.cos(lat) * math.cos(lng), math.cos(lat) * math.sin(lng), math.sin(lat)
+    ax, ay, az = abs(x), abs(y), abs(z)
+    if ax >= ay and ax >= az:
+        return (0 if x > 0 else 3), y / ax, z / ax
+    if ay >= az:
+        return (1 if y > 0 else 4), x / ay, z / ay
+    return (2 if z > 0 else 5), x / az, y / az
 
-    FACE_SHIFT = 61  # Face occupies top 3 bits
-    MAX_LEVEL = 30
-    POS_BITS = 2 * MAX_LEVEL + 1  # 61 bits for position
+def uv_to_st(u: float) -> float:
+    """S2's quadratic transform: maps u ∈ [-1, 1] to s ∈ [0, 1], stretching the
+    face centre and compressing the edges so cell areas even out."""
+    return 0.5 * math.sqrt(1 + 3 * u) if u >= 0 else 1 - 0.5 * math.sqrt(1 - 3 * u)
 
-    def __init__(self, cell_id: int):
-        self.id = cell_id
-
-    @staticmethod
-    def from_lat_lng(lat_deg: float, lng_deg: float, level: int) -> 'S2CellId':
-        lat = math.radians(lat_deg)
-        lng = math.radians(lng_deg)
-
-        # Step 1: lat/lng → unit vector on sphere
-        x = math.cos(lat) * math.cos(lng)
-        y = math.cos(lat) * math.sin(lng)  
-        z = math.sin(lat)
-
-        # Step 2: unit vector → cube face + (u, v)
-        face, u, v = S2CellId._xyz_to_face_uv(x, y, z)
-
-        # Step 3: (u, v) → (s, t) via quadratic transform → (i, j) → cell ID
-        cell_id = S2CellId._face_uv_to_cell_id(face, u, v, level)
-        return S2CellId(cell_id)
-
-    @staticmethod
-    def _xyz_to_face_uv(x: float, y: float, z: float) -> tuple:
-        # Find the dominant axis (face)
-        abs_x, abs_y, abs_z = abs(x), abs(y), abs(z)
-        
-        if abs_x >= abs_y and abs_x >= abs_z:
-            face = 0 if x > 0 else 3
-            u = y / x if x > 0 else y / x  # same but sign
-            v = z / x if x > 0 else z / x
-        elif abs_y >= abs_z:
-            face = 1 if y > 0 else 4
-            u = x / y if y > 0 else x / y
-            v = z / y if y > 0 else z / y
-        else:
-            face = 2 if z > 0 else 5
-            u = x / z if z > 0 else x / z
-            v = y / z if z > 0 else y / z
-
-        # u, v are in [-1, 1] on the cube face
-        return face, u, v
+face, u, v = lat_lng_to_face_uv(37.7749, -122.4194)
+print(face, round(uv_to_st(u), 4), round(uv_to_st(v), 4))
+assert uv_to_st(-1) == 0 and uv_to_st(0) == 0.5 and uv_to_st(1) == 1
 ```
 
-**Why Quadratic Transform (Not Linear)?**
+**Why a Quadratic Transform?** Equal steps in u near a face's edge cover less of the sphere than near its centre. S2's documentation compares the ratio of largest to smallest cell area at a given level: linear 5.2×, quadratic 2.08×, tangent 1.41×. The tangent projection is most uniform but needs `tan`/`atan`; quadratic costs one square root and is close enough.
 
-```python
-# S2 uses a quadratic projection (not linear) from cube face → grid:
-#
-# Linear:   s = 0.5 * (u + 1)  -- uniform sampling, waste at edges
-# Tangent:  s = ...             -- non-uniform, expensive
-# Quadratic: s = 0.5 * (sign(u) * (sqrt(1 + 3*u²) - 1) + 1)
-#
-# The quadratic transform is chosen because:
-# 1. It's cheap to compute (one sqrt)
-# 2. It makes cells more uniform in area (within 2× of each other)
-# 3. At the equator (most used), cells are ~square
+**Hilbert Curve vs Z-order:** both map 2D cells to 1D. In Z-order (geohash) consecutive positions can jump across the map; on a Hilbert curve consecutive positions are always adjacent cells, so a region maps to fewer, longer ID ranges. No curve keeps *every* pair of neighbours close (cells across a curve "fold" can be far apart in ID), which is why queries use coverings rather than a single range.
 
-def _quadratic_transform(u: float) -> float:
-    """Maps [-1, 1] to [0, 1] with area-preserving properties."""
-    if u >= 0:
-        return 0.5 * (math.sqrt(1 + 3 * u) - 1)
-    else:
-        return 0.5 * (1 - math.sqrt(1 - 3 * u))
+**Cell sizes (average):**
 
-# Without this transform, cells near cube face corners would be
-# ~5.7× more area than cells at face centers.
-# With quadratic transform: max area ratio ≈ 2.0 (much better).
-```
+| Level | Area | ~Edge | Typical use |
+|---|---|---|---|
+| 7 | 5,200 km² | 72 km | Metro area sharding |
+| 10 | 81 km² | 9 km | City districts |
+| 12 | 5.1 km² | 2.3 km | Dispatch regions |
+| 13 | 1.3 km² | 1.1 km | Neighbourhoods |
+| 15 | 0.08 km² | 280 m | "Nearby" searches |
+| 20 | 77 m² | 9 m | Buildings |
+| 30 | 0.74 cm² | 9 mm | Leaf cells |
 
-**Hilbert Curve — The Key to Locality:**
-
-```python
-# S2 encodes (face, level, i, j) → 64-bit cell ID using a
-# Hilbert space-filling curve.
-# 
-# Why Hilbert and not Z-order (Morton)?
-#   Z-order:   Leaps between quadrants, poor locality
-#   Hilbert:   Max 2 steps between adjacent cells (optimal)
-#              Preserves 2D adjacency in 1D ordering
-#
-# Property: if two points are close in 2D space,
-# they are close on the Hilbert curve.
-#
-# This means: cell IDs that are numerically close
-# correspond to spatially close regions.
-# 
-# Consequence: B-tree indexing on cell ID naturally
-# groups spatial neighbors!
-
-# Cell level → approximate size:
-level_7  = 2 * (7 * 2 + 1)  # ~15 bits → ~1km
-level_15 = 2 * (15 * 2 + 1)  # ~31 bits → ~2m
-level_30 = 2 * (30 * 2 + 1)  # ~61 bits → ~1cm
-```
-
-**S2 vs Geohash — The Decisive Comparison:**
-
-| Property | Geohash | S2 |
-|----------|---------|----|
-| **Projection** | Flat lat/lng grid | Cube + quadratic transform |
-| **Cell shape** | Rectangular (distorted at poles) | Nearly uniform globally |
-| **Locality** | Prefix-based (OK) | Hilbert curve (excellent) |
-| **Covering** | Rectangles only | Arbitrary polygons via S2RegionCoverer |
-| **Levels** | 12 (by string length) | 31 (0-30, by bit position) |
-| **Cell ID** | Variable-length string | 64-bit integer |
-| **Worst case** | Poles break | ~2× area variance globally |
-| **Ecosystem** | Simple, widely supported | Richer (polygon cover, KNN, S2LatLngRect) |
+Areas vary by up to ~2× around these averages depending on position on the face.
 
 **S2RegionCoverer — The Killer Feature:**
 
-```python
-# S2's most powerful feature: approximate ANY region as a
-# union of cell IDs at multiple levels.
-#
-# Given a polygon (e.g., delivery zone for a restaurant):
-# 1. Start with largest cells fully inside the polygon
-# 2. Recursively split cells that cross the boundary
-# 3. Cap at max_cells (e.g., 20 cells)
-# 4. Result: ~20 cells covering the polygon with O(1) lookup
+```text
+Given a region (a 500 m cap around the rider, or a delivery polygon) and
+limits (min_level, max_level, max_cells), the coverer returns a small set of
+cells of mixed levels whose union contains the region:
+    big cells fully inside, small cells along the boundary, ≤ max_cells total.
 
-def cover_polygon(polygon_coords, max_cells=20):
-    """
-    Returns a set of S2 cell IDs covering the polygon.
-    
-    Query: "Find all restaurants in this delivery zone"
-    
-    SELECT * FROM restaurants
-    WHERE s2_cell_id IN <covering_set>
-    
-    Instead of expensive polygon intersection,
-    we get O(1) equality/in-list lookup.
-    
-    Typical result: a 5km² zone → 10-50 cells at level 13-15
-    """
-    # (Python bindings via s2sphere or s2)
-    region = S2Polygon(polygon_coords)
-    coverer = S2RegionCoverer()
-    coverer.set_max_cells(max_cells)
-    coverer.set_min_level(12)  # ~3km
-    coverer.set_max_level(15)  # ~1km
-    covering = coverer.get_covering(region)
-    return [cell.id() for cell in covering]
+Indexing: store each driver's leaf (or level-15) cell ID in an integer column.
+Query:    for each covering cell C:  WHERE cell_id BETWEEN C.range_min AND C.range_max
+          then post-filter by exact distance.
+Fewer cells = fewer range scans but more over-coverage; ~8–20 cells is typical.
 ```
 
-**Real-World Use:**
+**For Uber-style matching:** drivers' locations change every few seconds, so instead of a persistent index, bucket drivers in memory by cell at a fixed level (e.g. level 12–13), shard servers by cell, and on a request scan the covering cells of the search radius, rank by ETA (road network), not straight-line distance. Uber evaluated S2 and built H3 (next section) for this kind of analysis.
 
-| System | Application |
-|--------|-------------|
-| Google Maps | All spatial indexing |
-| Uber | H3 (predecessor was S2-like) |
-| Foursquare | Venue search |
-| MongoDB | 2dsphere index (uses S2) |
-| BigQuery | GEOGRAPHY type (S2-based) |
+**S2 vs Geohash:**
+
+| Property | Geohash | S2 |
+|----------|---------|----|
+| **Projection** | Lat/lng rectangle | Cube + quadratic transform |
+| **Cell shape** | Rectangles, narrowing towards poles | Quadrilaterals, ≤ ~2× area variation |
+| **Curve** | Z-order (jumps) | Hilbert (no jumps) |
+| **Covering** | 3×3 cells at one precision | Multi-level covering of any region |
+| **Levels** | 12 characters (60 bits) | 31 levels (0–30) |
+| **Cell ID** | String (or integer) | 64-bit integer |
+
+**Real-World Use:** MongoDB `2dsphere` indexes, Google BigQuery `GEOGRAPHY`, CockroachDB spatial indexes, Google Maps/Earth, Pokémon Go's map cells.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Three transforms** | Explains sphere → cube → Hilbert pipeline |
-| **Quadratic justification** | Knows why linear fails (area distortion) |
-| **Hilbert vs Z-order** | Argues Hilbert's better locality for B-tree |
-| **RegionCoverer** | Describes multi-level covering for arbitrary polygons |
+| **Three transforms** | Explains sphere → cube → quadratic → Hilbert pipeline |
+| **Quadratic justification** | Knows it evens out cell areas cheaply |
+| **Hilbert vs Z-order** | Explains fewer, longer ID ranges for the same region |
+| **RegionCoverer** | Describes multi-level covering → B-tree range scans + post-filter |
 
 ---
 
@@ -1180,369 +887,200 @@ def cover_polygon(polygon_coords, max_cells=20):
 
 **What They're Really Testing:** Whether you understand the constraints of using square grids for spatial problems that need uniform distance metrics — and the unique design of the hexagon-based H3 system.
 
+!!! tip "30-second answer"
+    H3 (Uber, open-sourced 2018) tiles the globe with hexagons at 16 resolutions by projecting onto an **icosahedron**. Every hexagon has 6 neighbours, all at the same centre-to-centre distance, so "k rings around this cell" is a natural, roughly circular neighbourhood: ideal for smoothing supply/demand, surge zones and movement analysis. Costs: 12 **pentagons** per resolution (placed in the oceans), and hexagons can't be split exactly into smaller hexagons, so parent/child containment is approximate (aperture 7). Use H3 for analytics and aggregation over areas; S2 for exact hierarchical containment and indexing.
+
 ### Answer
 
 **Why Hexagons?**
 
-```python
-# Square grid neighbor distances:
-#    2 3 4
-#    1 C 5   (C = center cell)
-#    8 7 6
-#
-# Distance to cells 3, 4, 5, 7: d
-# Distance to cells 2, 1, 8, 6: d * √2
-#
-# This inconsistency causes problems for:
-# - Surge pricing (which 8 cells should be included?)
-# - Pathfinding (A* with weights depends on direction)
-# - Distance queries (KNN with cell expansion is asymmetric)
-#
-# Hexagonal grid neighbor distances:
-#   2   3
-# 1   C   4
-#   6   5
-#
-# ALL 6 neighbors are equidistant → perfect for k-ring queries
+```text
+Square grid:   edge neighbours at distance d, corner neighbours at d·√2
+               → "neighbourhood" depends on direction; diffusion and smoothing look boxy
+Hexagon grid:  6 neighbours, all at the same distance, no corner-only neighbours
+               → k-ring ≈ a circle of radius k; gradients and flows look natural
 ```
 
 **H3's Hierarchical Structure:**
 
-```python
-# H3 uses a planar projection (not cube like S2, not flat like Geohash):
-#   1. lat/lng → vertices of an icosahedron (20 triangular faces)
-#   2. Each triangle is subdivided into hexagons
-#   3. Resolution 0-15 (16 levels)
-#   4. Pentagon cells at exactly 12 icosahedron vertices
-#
-# Resolution → average cell area:
-#   res 0:  4,250,000 km²  (macro region)
-#   res 5:     253 km²     (city)
-#   res 8:       0.74 km²  (neighborhood)
-#   res 10:      0.015 km²  (block)
-#   res 12:      0.0003 km² (street)
-#   res 15:      0.0000009 km² (building)
-```
+- Project the sphere onto an **icosahedron** (20 triangular faces) with a gnomonic projection, oriented so all 12 vertices fall in the ocean.
+- Lay a hexagonal grid on each face; 122 base cells at resolution 0 (110 hexagons + 12 pentagons).
+- Each finer resolution has ~7× more cells (aperture 7); cells are rotated relative to the parent, so a parent's 7 children only approximately cover it.
+- 64-bit index: mode, resolution, base cell, then 3 bits per resolution digit.
 
-**H3's Key Operations:**
+Average hexagon area by resolution (from `h3.average_hexagon_area`):
+
+| Res | Avg area | Res | Avg area |
+|---|---|---|---|
+| 0 | 4,357,449 km² | 9 | 0.105 km² |
+| 5 | 252.9 km² | 10 | 0.015 km² |
+| 7 | 5.16 km² | 12 | 307 m² |
+| 8 | 0.737 km² | 15 | 0.9 m² |
+
+**H3's Key Operations (h3-py v4 API):**
 
 ```python
-from h3 import h3  # pip install h3
+import h3   # pip install h3   (v4 renamed most functions from v3)
 
-# ==============================
-# 1. k-Ring: All cells within k steps
-# ==============================
-# For surge pricing, we want all hexagons within 3 steps of center:
-center = h3.geo_to_h3(37.7749, -122.4194, resolution=9)
-surge_zone = h3.k_ring(center, k=3)
-# Returns exactly 1 + 6*3 = 37 cells (if no pentagons)
-# Every cell is exactly distance k from center → fair pricing
+center = h3.latlng_to_cell(37.7749, -122.4194, 9)          # was geo_to_h3
 
-# ==============================
-# 2. k-Ring Distances: concentric rings
-# ==============================
-rings = h3.k_ring_distances(center, k=3)
-# rings[0] = [center] (1 cell)
-# rings[1] = ring 1 (6 cells)
-# rings[2] = ring 2 (12 cells)
-# rings[3] = ring 3 (18 cells)
-# Total: 1 + 6 + 12 + 18 = 37 cells
-# 
-# For tiered surge pricing:
-#   ring 1: 1.5× multiplier
-#   ring 2: 1.2× multiplier
-#   ring 3: 1.0× multiplier
+disk = h3.grid_disk(center, 3)                               # was k_ring
+print(len(disk))                                             # 37 = 1 + 6 + 12 + 18 (no pentagon nearby)
 
-# ==============================
-# 3. Polyfill: Convert region → hex set
-# ==============================
-# Given a delivery zone polygon, get all hexagons that cover it:
-polygon = [
-    [37.7749, -122.4194],
-    [37.7849, -122.4194],
-    [37.7849, -122.4094],
-    [37.7749, -122.4094],
-]
-hexagons = h3.polyfill(polygon, res=9)
-# Returns set of hex IDs → O(1) lookup table for "is this in zone?"
+rings = [h3.grid_ring(center, k) for k in range(4)]          # was hex_ring / k_ring_distances
+print([len(r) for r in rings])                               # [1, 6, 12, 18]
+# Tiered surge: ring 0–1 → 1.5×, ring 2 → 1.2×, ring 3 → 1.0×
 
-# ==============================
-# 4. Compact: Reduce resolution for storage
-# ==============================
-# Store a zone as the MINIMAL set of parent cells:
-compact = h3.compact(hexagons)
-# e.g., 50 children at res 9 → 5 parents at res 7
-# Reduces storage by 10× while preserving spatial coverage
+other = h3.latlng_to_cell(37.7849, -122.4094, 9)
+print(h3.grid_distance(center, other))                       # was h3_distance; in grid steps
 
-# ==============================
-# 5. H3 Distance: Uniform metric
-# ==============================
-a = h3.geo_to_h3(37.7749, -122.4194, 9)
-b = h3.geo_to_h3(37.7849, -122.4094, 9)
-steps = h3.h3_distance(a, b)
-# Distance in hex steps (not meters, not degrees)
-# Multiply by avg hex radius at this resolution for meters
+zone = h3.LatLngPoly([(37.7749, -122.4194), (37.7849, -122.4194),
+                      (37.7849, -122.4094), (37.7749, -122.4094)])
+cells = h3.polygon_to_cells(zone, 9)                         # was polyfill (cell centres inside)
+print(len(cells), len(h3.compact_cells(cells)))              # was compact
+
+print(h3.is_pentagon(center), len(h3.get_pentagons(9)))     # False, 12 per resolution
 ```
 
-**The Pentagon Problem:**
+Output (h3 4.x): `37`, `[1, 6, 12, 18]`, `5`, `9 9`, `False 12`. Note `grid_disk` returns O(k²) cells (3k² + 3k + 1).
 
-```python
-# H3's "Achilles' Heel": each icosahedron face is triangular,
-# and hexagons don't tile a triangle perfectly.
-# → Exactly 12 pentagons at the icosahedron vertices.
-#
-# Pentagon has 5 neighbors (not 6), breaking the uniform property.
-#
-# Mitigation:
-# 1. PENTAGONS are placed over oceans (H3 team chose icosahedron
-#    orientation to land on water at 12 specific points)
-# 2. k_ring on pentagon = 1 + 5×k cells instead of 1 + 6×k
-# 3. In practice, it rarely matters (99.99% of queries don't
-#    involve pentagons)
-#
-# Check for pentagon:
-def is_pentagon(cell: str) -> bool:
-    return h3.h3_is_pentagon(cell)
+**Surge pricing design:** aggregate ride requests and available drivers per res-8/9 cell every few seconds (stream processor keyed by cell ID), compute the demand/supply ratio, smooth it over `grid_disk(cell, 1–2)` so neighbouring cells don't flip-flop, and publish multipliers per cell. Riders look up their cell; drivers see a heatmap of the same cells.
 
-# If you need to avoid pentagons:
-def safe_k_ring(center: str, k: int) -> set:
-    result = h3.k_ring(center, k)
-    pentagons = {c for c in result if h3.h3_is_pentagon(c)}
-    if pentagons:
-        # Handle pentagon case: use parent resolution or custom logic
-        pass
-    return result
-```
+**The Pentagon Problem and Other Caveats:**
+
+- 12 pentagons at every resolution, all in the ocean; they have 5 neighbours, and some grid functions (e.g. ring traversal across them) return errors or different counts. Production code should handle `H3 error` cases rather than assume 6 neighbours.
+- **Approximate hierarchy:** a parent cell's children don't exactly tile it, so rolling res-9 counts up to res-7 via `cell_to_parent` slightly misassigns area at the borders. Fine for analytics, not for legal boundaries.
+- `polygon_to_cells` includes a cell if its *centre* is inside the polygon, so small polygons can return few or zero cells: use a finer resolution or a containment mode that fits the use case.
 
 **H3 vs S2 — When to Use Which:**
 
 | Criterion | H3 | S2 |
 |-----------|----|----|
-| **Neighbor uniformity** | ✅ All neighbors equidistant | ❌ Edge vs corner neighbors |
-| **k-ring** | ✅ O(k), exact k-ring | ❌ Approximate expansion |
-| **Polygon covering** | ✅ polyfill | ✅ RegionCoverer |
-| **Pathfinding** | ✅ Hex grids = natural | ❌ Square grids need weights |
-| **Distortion** | ❌ 12 pentagons | ❌ ~2× area variance |
-| **Precision** | 16 levels | 31 levels |
-| **Maturity** | Uber standard | Google standard |
-| **Use case** | Movement/geofencing | General spatial (maps, storage) |
+| **Neighbour uniformity** | ✅ 6 equidistant neighbours | ❌ edge vs corner neighbours |
+| **Neighbourhood queries** | ✅ `grid_disk` / `grid_ring` | Coverings of a cap |
+| **Hierarchy** | ❌ Approximate (aperture 7) | ✅ Exact (each cell = 4 children) |
+| **Distortion** | 12 pentagons; areas vary by ~2× | ~2× area variation |
+| **Levels** | 16 resolutions | 31 levels |
+| **Typical use** | Movement analytics, surge, aggregation, ML features | Indexing, exact containment, coverings |
 
-**Real-World Use:**
-
-| System | Application |
-|--------|-------------|
-| Uber | Surge pricing, ETA, geofencing |
-| Snapchat | Geofilters (polygon → hex set) |
-| Foursquare | Venue clustering |
-| Descartes Labs | Satellite image tiling |
-| Tesla | Navigation routing |
+**Real-World Use:** Uber (surge, dispatch analytics, forecasting); native H3 functions in Snowflake, Databricks and ClickHouse; DuckDB and PostGIS extensions (`h3`, `h3-pg`).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Hex uniformity** | Explains 6 equidistant neighbors vs 4+4 in squares |
-| **Icosahedron projection** | Knows the 12 pentagon artifact |
-| **k-ring for surge** | Uses k_ring_distances for tiered pricing |
-| **H3 vs S2** | Gives principled trade-off (movement vs storage) |
+| **Hex uniformity** | Explains 6 equidistant neighbours vs 4+4 in squares |
+| **Icosahedron projection** | Knows the 12 pentagons and why they're in the ocean |
+| **Approximate hierarchy** | Knows children don't exactly tile parents |
+| **H3 vs S2** | Gives a principled trade-off (analytics/neighbourhoods vs exact indexing) |
 
 ---
 
 ## 9. Quad Tree: 2D Spatial Partitioning
 
-**Q:** "Design a real-time collision detection system for a multiplayer game with 10K entities moving simultaneously on a 2D map. Brute-force pairwise comparison is O(N²) = 100M checks per frame. Design a spatial partitioning structure. How does a Quad Tree compare to a uniform grid? Walk me through insertion, query, and rebalancing."
+**Q:** "Design a real-time collision detection system for a multiplayer game with 10K entities moving simultaneously on a 2D map. Brute-force pairwise comparison is O(N²) ≈ 50M pair checks per frame. Design a spatial partitioning structure. How does a Quad Tree compare to a uniform grid? Walk me through insertion, query, and rebalancing."
 
 **What They're Really Testing:** Whether you can reason about the adaptability of Quad Trees vs fixed-grid approaches for non-uniform distributions.
 
+!!! tip "30-second answer"
+    A point quadtree recursively splits a square into 4 quadrants once a node holds more than a few points, so dense areas get small cells and empty areas stay coarse. For collisions you query each entity's neighbourhood and prune whole subtrees whose box can't intersect the query circle. For 10K moving entities the simplest robust approach is to **rebuild the structure every frame** (10K inserts take well under a millisecond in C++/Rust); for roughly uniform density a **uniform grid / spatial hash** with cell size ≈ interaction radius is even simpler and faster. Use a quadtree when density is very uneven (crowds in a few towns); use loose quadtrees or BVHs when objects have extents.
+
 ### Answer
 
-**Core Concept:**
-
-```python
-class QuadTreeNode:
-    """
-    Each node represents a rectangular region.
-    If the region contains more than capacity items,
-    split into 4 children: NW, NE, SW, SE.
-    """
-    def __init__(self, x: float, y: float, w: float, h: float,
-                 capacity: int = 4, max_depth: int = 10):
-        self.bounds = (x, y, w, h)  # (center_x, center_y, width, height)
-        self.capacity = capacity
-        self.max_depth = max_depth
-        self.items = []      # Points in this node
-        self.children = None  # None until first split
-        self.depth = 0
-
-    def insert(self, point: tuple) -> bool:
-        """Insert a (x, y) point. Returns True if inserted in this subtree."""
-        if not self._contains(point):
-            return False
-        if len(self.items) < self.capacity or self.depth >= self.max_depth:
-            self.items.append(point)
-            return True
-        if self.children is None:
-            self._split()
-        for child in self.children:
-            if child.insert(point):
-                return True
-        return False
-
-    def _split(self):
-        x, y, w, h = self.bounds
-        hw, hh = w / 2, h / 2
-        self.children = [
-            QuadTreeNode(x - hw/2, y + hh/2, hw, hh, self.capacity, self.max_depth),  # NW
-            QuadTreeNode(x + hw/2, y + hh/2, hw, hh, self.capacity, self.max_depth),  # NE
-            QuadTreeNode(x + hw/2, y - hh/2, hw, hh, self.capacity, self.max_depth),  # SE
-            QuadTreeNode(x - hw/2, y - hh/2, hw, hh, self.capacity, self.max_depth),  # SW
-        ]
-        for child in self.children:
-            child.depth = self.depth + 1
-        # Redistribute items to children
-        items, self.items = self.items, []
-        for point in items:
-            for child in self.children:
-                if child.insert(point):
-                    break
-```
-
-**Collision Detection — Range Query:**
+**Point Quadtree with Circle Queries (runnable):**
 
 ```python
 class QuadTree:
-    def __init__(self, width: float, height: float,
-                 capacity: int = 4, max_depth: int = 12):
-        self.root = QuadTreeNode(width/2, height/2, width, height,
-                                  capacity, max_depth)
-        self.all_items = {}  # id → position for fast lookup
+    """Point quadtree over the rectangle [x0, x1) × [y0, y1).
+    A node holds up to `capacity` points, then splits into 4 quadrants."""
 
-    def update(self, entity_id: int, new_pos: tuple):
-        """Move entity to new position (reinsert)."""
-        self.remove(entity_id)
-        self.insert(entity_id, new_pos)
+    def __init__(self, x0, y0, x1, y1, capacity: int = 8, depth: int = 0, max_depth: int = 12):
+        self.box = (x0, y0, x1, y1)
+        self.capacity, self.depth, self.max_depth = capacity, depth, max_depth
+        self.points: list[tuple[float, float, int]] = []    # (x, y, entity_id)
+        self.children: list["QuadTree"] | None = None
 
-    def insert(self, entity_id: int, pos: tuple):
-        self.root.insert(pos)
-        self.all_items[entity_id] = pos
+    def _contains(self, x, y) -> bool:
+        x0, y0, x1, y1 = self.box
+        return x0 <= x < x1 and y0 <= y < y1
 
-    def query_range(self, x: float, y: float,
-                    radius: float) -> List[tuple]:
-        """Find all points within radius of (x, y)."""
-        return self._query_range(self.root, x, y, radius, [])
+    def insert(self, x: float, y: float, eid: int) -> bool:
+        if not self._contains(x, y):
+            return False
+        if self.children is None:
+            if len(self.points) < self.capacity or self.depth == self.max_depth:
+                self.points.append((x, y, eid))
+                return True
+            self._split()
+        return any(c.insert(x, y, eid) for c in self.children)
 
-    def _query_range(self, node, x, y, radius, results):
-        if not self._rect_intersects_circle(node.bounds, x, y, radius):
-            return results
-        for px, py in node.items:
-            if ((px - x) ** 2 + (py - y) ** 2) <= radius ** 2:
-                results.append((px, py))
-        if node.children:
-            for child in node.children:
-                self._query_range(child, x, y, radius, results)
-        return results
+    def _split(self) -> None:
+        x0, y0, x1, y1 = self.box
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        args = (self.capacity, self.depth + 1, self.max_depth)
+        self.children = [QuadTree(x0, y0, mx, my, *args), QuadTree(mx, y0, x1, my, *args),
+                         QuadTree(x0, my, mx, y1, *args), QuadTree(mx, my, x1, y1, *args)]
+        pts, self.points = self.points, []
+        for p in pts:
+            any(c.insert(*p) for c in self.children)
+
+    def query_circle(self, cx, cy, r, out=None) -> list[int]:
+        out = [] if out is None else out
+        x0, y0, x1, y1 = self.box
+        # closest point of this box to the circle centre; prune if it's outside the circle
+        nx, ny = min(max(cx, x0), x1), min(max(cy, y0), y1)
+        if (nx - cx) ** 2 + (ny - cy) ** 2 > r * r:
+            return out
+        for x, y, eid in self.points:
+            if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                out.append(eid)
+        for c in self.children or ():
+            c.query_circle(cx, cy, r, out)
+        return out
+
+
+import random
+random.seed(0)
+ents = {i: (random.uniform(0, 1000), random.uniform(0, 1000)) for i in range(10_000)}
+qt = QuadTree(0, 0, 1000, 1000)
+for i, (x, y) in ents.items():          # rebuild every frame: 10K inserts is cheap
+    qt.insert(x, y, i)
+hits = qt.query_circle(500, 500, 20)
+brute = [i for i, (x, y) in ents.items() if (x - 500) ** 2 + (y - 500) ** 2 <= 400]
+assert sorted(hits) == sorted(brute)
+print("neighbours within 20 units:", len(hits))
 ```
 
-**Quad Tree vs Uniform Grid — The Trade-Off:**
+**Uniform Grid vs Quad Tree:**
 
-```python
-# ==============================
-# UNIFORM GRID: Fixed cell size
-# ==============================
-#
-#   Game map divided into 100×100 cells (10K cells total).
-#   Each cell stores entities within its bounds.
-#
-#   Query: "find entities near (x, y)" = check 9 cells (center + neighbors)
-#   Each cell: entities = hashmap lookup → O(1)
-#
-#   Problem: Players cluster in one area → 1000 entities in one cell
-#   → neighbor check still tests 1000 entities → O(N) again
-#
-#   Solution: Adapt cell size to entity density → QUAD TREE
+| | Uniform grid / spatial hash | Quadtree |
+|---|---|---|
+| Build per frame | O(N), one hash insert per entity | O(N log N) typical |
+| Neighbour query | Check the 3×3 cells around the entity | Descend, pruning by box |
+| Uneven density | Degrades: a crowded cell holds hundreds | Adapts: crowded areas split deeper |
+| Memory | Cells × bucket overhead (or a hash map of non-empty cells) | Nodes proportional to points |
+| Moving objects | Trivial (rebuild or move between buckets) | Rebuild each frame, or remove/reinsert |
+| Depth bound | n/a | `max_depth` stops infinite splitting when points coincide |
 
-# ==============================
-# QUAD TREE: Adaptive partitioning
-# ==============================
-#
-#   Sparse areas: large cells (few subdivisions)
-#   Dense areas: small cells (deep subdivisions)
-#
-#   Worst-case query: O(log N + k) where k = results
-#   Adapts automatically to any distribution
-#
-#   Problem: Rebalancing cost
-#   If entities shift (e.g., all players move from left to right),
-#   the tree structure becomes unbalanced.
-#
-#   Solution: Rebuild every ~60 frames (for games) or
-#   use a lazy deletion approach.
+Rule of thumb: start with a grid whose cell size is about the interaction radius. Switch to a quadtree only if profiling shows crowded cells dominate.
 
-# ==============================
-# HYBRID: Grid-of-QuadTrees
-# ==============================
-#
-#   Partition world into coarse grid (e.g., 8×8 sectors).
-#   Each sector has its own Quad Tree.
-#   Sector selection: O(1), Quad Tree query: O(log N)
-#   Best of both worlds for large maps.
-```
+**Handling movement:**
 
-**Lazy Deletion + Bulk Rebuild:**
+- **Rebuild each frame** (shown above): no stale positions, no deletion code, predictable cost. 10K inserts × 60 fps = 600K inserts/s, fine in a compiled language.
+- **Incremental update**: remove + reinsert only entities that crossed a cell boundary; needs parent pointers and node merging when cells empty out.
+- **Loose quadtree**: each node's bounds are enlarged (e.g. 2×) so objects with extents rarely need to move between nodes.
+- Broad phase only: after finding candidate pairs, run exact narrow-phase collision tests on the shapes.
 
-```python
-class LazyQuadTree(QuadTree):
-    """
-    Instead of removing/reinserting every frame, mark items as stale
-    and rebuild the entire tree periodically.
-    
-    For 10K entities: full rebuild = O(N log N) ≈ 10K × ~14 = 140K ops
-    At 60 FPS: that's 8.4M ops/sec — trivial for modern CPUs.
-    
-    Strategy:
-    - Every frame: insert current positions with timestamps
-    - Every 60 frames: rebuild from scratch
-    - Queries: check both the stale tree and the new positions
-    """
-    def __init__(self, ...):
-        super().__init__(...)
-        self.frame_count = 0
-        self.rebuild_interval = 60
-        self.entity_positions = {}  # Current ground truth
-
-    def update(self, entity_id: int, pos: tuple):
-        self.entity_positions[entity_id] = pos
-
-    def rebuild(self):
-        self.root = QuadTreeNode(...)
-        for eid, pos in self.entity_positions.items():
-            self.root.insert(pos)
-
-    def on_frame_end(self):
-        self.frame_count += 1
-        if self.frame_count % self.rebuild_interval == 0:
-            self.rebuild()
-```
-
-**Production Lessons:**
-
-```
-War Story: "Quad Tree vs R-Tree for Game Server"
-- Client: MMORPG with 50K NPCs on a 100km² map
-- Quad Tree depth: max 12 (2^12 ≈ 4096 cells — too coarse for dense zones)
-- Fix: dynamic capacity based on density (not fixed 4)
-- Result: O(log N) queries, 2ms per frame for collision detection
-- Lesson: Use capacity = 8-16 for game servers (fewer splits, faster queries)
-```
+**Worst cases:** a quadtree query is typically O(log N + k), but depth depends on the data: many points at nearly the same spot force deep chains (hence `max_depth`), and a large query circle can visit many nodes. Grids have the analogous problem in crowded cells.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Adaptive partitioning** | Explains why fixed grids fail under non-uniform distribution |
-| **Range query** | Implements recursive query with bounds checking |
-| **Rebalancing** | Proposes lazy deletion + periodic rebuild for moving entities |
-| **Hybrid** | Suggests grid-of-QuadTrees for very large worlds |
+| **Adaptive partitioning** | Explains why fixed grids struggle with uneven density, and when a grid is still the better answer |
+| **Range query** | Prunes subtrees by box–circle distance |
+| **Movement** | Rebuild per frame or incremental; knows loose quadtrees |
+| **Broad vs narrow phase** | Spatial structure finds candidates; exact tests confirm |
 
 ---
 
@@ -1552,202 +1090,135 @@ War Story: "Quad Tree vs R-Tree for Game Server"
 
 **What They're Really Testing:** Understanding of R-Trees as dynamic, balanced spatial structures optimized for rectangle (not point) storage — and the trade-off between area overlap and query speed.
 
+!!! tip "30-second answer"
+    An R-tree is a balanced, B-tree-like tree in which every entry is a **minimum bounding rectangle (MBR)**: leaves hold object MBRs, internal nodes hold the MBR of each child. A query descends only into children whose MBR overlaps the query rectangle. Unlike a quadtree, it partitions the *data* rather than space, stores rectangles (roads, polygons) as well as points, stays balanced, and maps to disk pages, which is why databases use it (PostGIS via GiST, SQLite, MySQL InnoDB). Its weakness is MBR **overlap**, which forces multi-path searches; R*-tree insertion heuristics and **STR bulk loading** minimise it. For 1M drivers whose positions change every few seconds, an in-memory grid/geohash bucket per region usually beats maintaining an R-tree.
+
 ### Answer
 
-**R-Tree — The Spatial B-Tree:**
+**Structure and Invariants:**
 
-```python
-class RTreeNode:
-    """
-    An R-Tree node stores a bounding box + either:
-    - Child pointers (if internal node)
-    - Data entries (if leaf node)
-    
-    Key invariants:
-    - Root has ≥ 2 children (unless leaf)
-    - Internal nodes have M/2 to M children
-    - Leaf entries are (MBR, object_id)
-    - All leaves at same depth
-    
-    M = max entries per node (typically 4-20)
-    m = M/2 = min entries per node
-    """
-    def __init__(self, is_leaf: bool = True):
-        self.is_leaf = is_leaf
-        self.mbr = None  # (min_x, min_y, max_x, max_y)
-        self.entries = []  # [(mbr, pointer_or_id), ...]
-    
-    def update_mbr(self):
-        if not self.entries:
-            self.mbr = None
-            return
-        min_x = min(e[0][0] for e in self.entries)
-        min_y = min(e[0][1] for e in self.entries)
-        max_x = max(e[0][2] for e in self.entries)
-        max_y = max(e[0][3] for e in self.entries)
-        self.mbr = (min_x, min_y, max_x, max_y)
+```text
+Node capacity M (fan-out, e.g. 16–200 so a node fills a disk page), minimum m ≤ M/2
+(R*-trees use m ≈ 0.4·M). All leaves at the same depth; root has ≥ 2 children unless it's a leaf.
+Leaf entry:     (MBR of object, object id)
+Internal entry: (MBR covering the child's entries, child pointer)
+
+Insert (Guttman, 1984): descend choosing the child whose MBR needs the LEAST
+area enlargement; on overflow split the node and propagate the split and the
+updated MBRs up to the root. Delete: remove, condense under-full nodes, reinsert
+their orphaned entries.
 ```
 
-**R-Tree Operations:**
+**STR Bulk Loading + Search (runnable):**
 
 ```python
-class RTree:
-    """
-    R-Tree implementation using the R*-Tree heuristics
-    (improved split policy, forced reinsert).
-    """
-    def __init__(self, max_entries: int = 8):
-        self.M = max_entries
-        self.m = max_entries // 2
-        self.root = RTreeNode(is_leaf=True)
+import math
 
-    def insert(self, mbr: tuple, obj_id: str):
-        """Insert a bounding box (min_x, min_y, max_x, max_y)."""
-        leaf = self._choose_leaf(self.root, mbr)
-        leaf.entries.append((mbr, obj_id))
-        leaf.update_mbr()
-        if len(leaf.entries) > self.M:
-            self._split_node(leaf)
 
-    def _choose_leaf(self, node: RTreeNode, mbr: tuple) -> RTreeNode:
-        """Choose leaf by least area enlargement."""
-        if node.is_leaf:
-            return node
-        # Select child with minimum area enlargement
-        best = None
-        best_enlargement = float('inf')
-        for child_mbr, child_ptr in node.entries:
-            current_area = self._area(child_mbr)
-            enlarged = self._area(self._union(child_mbr, mbr))
-            enlargement = enlarged - current_area
-            if enlargement < best_enlargement:
-                best_enlargement = enlargement
-                best = child_ptr
-        return self._choose_leaf(best, mbr)
+class Node:
+    def __init__(self, entries, leaf: bool):
+        self.entries = entries          # leaf: [(mbr, obj_id)], internal: [(mbr, Node)]
+        self.leaf = leaf
+        self.mbr = (min(e[0][0] for e in entries), min(e[0][1] for e in entries),
+                    max(e[0][2] for e in entries), max(e[0][3] for e in entries))
 
-    def search(self, query_mbr: tuple) -> List[str]:
-        """Find all objects whose MBR overlaps query_mbr."""
-        return self._search(self.root, query_mbr, [])
 
-    def _search(self, node: RTreeNode, query: tuple, results: List[str]):
-        if not self._overlaps(node.mbr, query):
-            return results
-        if node.is_leaf:
-            for mbr, obj_id in node.entries:
-                if self._overlaps(mbr, query):
-                    results.append(obj_id)
-        else:
-            for child_mbr, child_ptr in node.entries:
-                self._search(child_ptr, query, results)
-        return results
-```
-
-**The R*-Tree Improvements — Why the Vanilla R-Tree Sucks:**
-
-```python
-# Vanilla R-Tree problem: poor split strategy leads to
-# overlapping MBRs, which means both branches must be searched.
-#
-# Worst case: 90% overlap → query touches 90% of nodes
-# (same as linear scan!)
-#
-# R*-Tree (Beckmann et al., 1990) fixes this with:
-
-# 1. BETTER SPLIT: Minimize overlap, not area
-#    Vanilla: quadratic split (O(M²)) chooses pair with least waste
-#    R*: choose split that minimizes OVERLAP between the two new nodes
-#
-# 2. FORCED REINSERT (the key insight):
-#    When a node overflows:
-#    a. Remove 30% of entries (those with centroids farthest from center)
-#    b. Reinsert them into the tree
-#    c. This often finds better placement and reduces overlap
-#
-# 3. TOP-DOWN BULK LOADING:
-#    When you know all entries upfront, use Sort-Tile-Recursive (STR):
-#    a. Sort by x, partition into √N slices
-#    b. Sort each slice by y, pack into nodes
-#    c. Result: no overlap, 100% fill rate
-
-def str_bulk_load(entries: List[tuple], M: int = 8):
-    """
-    Sort-Tile-Recursive bulk loading for R-Trees.
-    Produces a perfectly packed, non-overlapping R-Tree.
-    
-    Entries: [(mbr, obj_id), ...]
-    M: max entries per node
-    """
-    # Step 1: Sort by x-center, partition into slices
-    entries.sort(key=lambda e: (e[0][0] + e[0][2]) / 2)
-    num_slices = int(math.ceil(math.sqrt(len(entries) / M)))
-    slice_size = len(entries) // num_slices
-    slices = [entries[i:i + slice_size] for i in
-              range(0, len(entries), slice_size)]
-    
-    # Step 2: Sort each slice by y-center, pack into nodes
+def _pack(entries, M, leaf):
+    """One STR pass: sort by x-centre into √(n/M) vertical slices, sort each
+    slice by y-centre, cut into runs of M entries → one node per run."""
+    n = len(entries)
+    pages = math.ceil(n / M)
+    slices = math.ceil(math.sqrt(pages))
+    per_slice = slices * M
+    entries = sorted(entries, key=lambda e: e[0][0] + e[0][2])
     nodes = []
-    for slice_entries in slices:
-        slice_entries.sort(key=lambda e: (e[0][1] + e[0][3]) / 2)
-        for i in range(0, len(slice_entries), M):
-            node_entries = slice_entries[i:i + M]
-            node = RTreeNode(is_leaf=True)
-            node.entries = node_entries
-            node.update_mbr()
-            nodes.append(node)
-    
-    # Step 3: Recursively build internal nodes
-    while len(nodes) > 1:
-        nodes = str_bulk_load([(n.mbr, n) for n in nodes], M)
-    
-    tree = RTree(max_entries=M)
-    tree.root = nodes[0]
-    return tree
+    for s in range(0, n, per_slice):
+        part = sorted(entries[s:s + per_slice], key=lambda e: e[0][1] + e[0][3])
+        nodes += [Node(part[i:i + M], leaf) for i in range(0, len(part), M)]
+    return nodes
+
+
+def str_bulk_load(items, M: int = 16) -> Node:
+    """Sort-Tile-Recursive (Leutenegger et al., 1997): nearly 100% full nodes,
+    little overlap, built bottom-up level by level."""
+    level = _pack(items, M, leaf=True)
+    while len(level) > 1:
+        level = _pack([(n.mbr, n) for n in level], M, leaf=False)
+    return level[0]
+
+
+def overlaps(a, b) -> bool:
+    return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
+
+
+def search(node: Node, q, out=None, stats=None):
+    out = [] if out is None else out
+    if stats is not None:
+        stats["nodes"] += 1
+    for mbr, child in node.entries:
+        if overlaps(mbr, q):
+            if node.leaf:
+                out.append(child)
+            else:
+                search(child, q, out, stats)
+    return out
+
+
+import random
+random.seed(1)
+drivers = []
+for i in range(1_000_000 // 10):      # 100K points keeps the demo fast
+    x, y = random.uniform(-180, 180), random.uniform(-85, 85)
+    drivers.append(((x, y, x, y), f"d{i}"))
+root = str_bulk_load(drivers, M=32)
+viewport = (-5.0, -5.0, 5.0, 5.0)
+stats = {"nodes": 0}
+found = search(root, viewport, stats=stats)
+brute = [d for (b, d) in drivers if overlaps(b, viewport)]
+assert sorted(found) == sorted(brute)
+print(f"{len(found)} drivers in viewport, visited {stats['nodes']} nodes")
 ```
 
-**R-Tree vs Quad Tree vs B-Tree with Geohash:**
+Sample output: 178 drivers found in a 10° × 10° box while visiting 16 of the ~3,200 nodes.
 
-```python
-"""
-Query: "Find all restaurants in this viewport rectangle"
+**R*-tree (Beckmann et al., 1990) — why it beats Guttman's original:**
 
-                         R-Tree          Quad Tree       Geohash (B-tree)
-                         ------          ---------       ---------------
-Tree depth               log_M(N)        log_4(N)        B-tree height
-Balance                  Always          Depends on data Always balanced
-Update (single insert)   O(log_M N)      O(log N)        O(log_B N)
-Range query efficiency   Excellent       Good            Moderate
-Overlap management       R* heuristics   Adaptive split  9-cell query
-Dynamic                  ✅              ✅              ✅
-Bulk load optimal        ✅ (STR)        ❌              ✅
-Overlap in queries       Can degrade     No overlap      Prefix match floods
+1. **ChooseSubtree:** at the level above the leaves, pick the child whose **overlap** with siblings grows least (not just area).
+2. **Split:** choose the split axis by minimum total *margin* (perimeter), then the distribution with minimum overlap.
+3. **Forced reinsert:** on the first overflow at a level, remove the ~30% of entries farthest from the node's centre and reinsert them; this often finds better homes and avoids a split.
 
-For 1M drivers, viewport query:
-  R-Tree: ~30 node visits (depth 4-5, M=20)
-  Quad Tree: ~40 node visits (depth log_4(1M) ≈ 10, ×4 checks)
-  Geohash B-tree: ~100 key lookups (9 cells × 10-15 keys each)
-  
-Winner: R-Tree, especially for rectangle queries.
-But: Quad Tree wins for POINT queries (nearest neighbor).
-"""
-```
+**R-Tree vs Quad Tree vs Geohash-in-B-tree:**
+
+| | R-tree | Quadtree | Geohash / S2 cell in a B-tree |
+|---|---|---|---|
+| Partitions | The data (MBRs) | Space (fixed quadrants) | Space (fixed cells) |
+| Balanced | Always | Depends on data | B-tree is balanced |
+| Stores rectangles/polygons | Natively | Awkward (straddling items) | Via coverings |
+| Overlap between nodes | Yes, the main cost | None | None |
+| Disk-friendly | Yes (node = page) | Not naturally | Yes (ordinary index) |
+| Frequent point updates | Costly (reinsert, MBR updates) | Moderate | Cheap (update one key) |
+| Best for | Static/slow-changing geometry, viewport and intersection queries | In-memory, uneven point density | Moving points, simple stores, sharding by cell |
+
+**For the 1M moving drivers:** drivers report every ~4 s, i.e. ~250K updates/s. Keep them in memory bucketed by S2/H3/geohash cell (sharded by region), and answer a viewport query with the cells covering the viewport plus an exact filter. Reserve R-trees for the static layers (road segments, zones, POIs) that the map also needs.
 
 **Real-World Use:**
 
 | System | What it indexes | Variant |
 |--------|----------------|---------|
-| PostgreSQL GiST | All spatial data | R-Tree over GiST framework |
-| SQLite R*Tree | Geolocation | R*-Tree |
-| Oracle Spatial | Geographic data | R-Tree |
-| Elasticsearch | geoshape queries | Quadtree (recursive) |
+| PostgreSQL / PostGIS | Geometry, geography | R-tree implemented on GiST (also SP-GiST quadtrees/k-d trees) |
+| SQLite | Any rectangles | R*Tree module |
+| MySQL / InnoDB | `SPATIAL` indexes | R-tree |
+| Oracle Spatial | Geometry | R-tree |
+| Lucene / Elasticsearch / OpenSearch | `geo_point`, `geo_shape` | BKD trees (the older quadtree/geohash prefix trees are deprecated) |
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **MBR overlap problem** | Explains why overlapping MBRs cause query degradation |
-| **R*-Tree heuristics** | Mentions forced reinsert + overlap-minimized split |
-| **Bulk loading** | Knows STR packing for read-optimized trees |
-| **vs Quad Tree** | Gives principled comparison for rectangle vs point queries |
+| **MBR overlap problem** | Explains why overlapping MBRs cause multi-path searches |
+| **R*-Tree heuristics** | Mentions overlap-aware choose/split and forced reinsert |
+| **Bulk loading** | Knows STR packing for read-mostly data |
+| **Fit to workload** | Picks cell bucketing for fast-moving points, R-trees for static geometry |
 
 ---
 
@@ -1757,283 +1228,188 @@ But: Quad Tree wins for POINT queries (nearest neighbor).
 
 **What They're Really Testing:** Whether you understand that the Skip List's probabilistic balancing is a simpler alternative to the deterministic balancing of red-black or AVL trees — and how it handles concurrent access.
 
+!!! tip "30-second answer"
+    A skip list is a sorted linked list plus "express lanes": each node is promoted to the next level with probability p (1/2 or 1/4), so level i holds ~N·pⁱ nodes and a search drops down ~log_{1/p} N levels, O(log N) expected, with no rotations. Storing a **span** (how many nodes each pointer skips) on every link gives rank and select-by-rank in O(log N), which is exactly what "players around rank 5000" needs. Order by (score desc, player id) so ties don't collide, and pair it with a hash map from player to score. That's precisely a **Redis sorted set**: in practice you'd use `ZADD` / `ZREVRANK` / `ZREVRANGE` and shard or approximate when one node isn't enough.
+
 ### Answer
 
-**The Core Insight:**
-
-A Skip List is a **layered linked list** where each level is a "highway" skipping over elements at the level below.
+**Indexable Skip List + Leaderboard (runnable):**
 
 ```python
 import random
 
-class SkipListNode:
-    def __init__(self, score: float, value: str, level: int):
-        self.score = score
-        self.value = value
-        self.forward = [None] * (level + 1)  # Pointers to next nodes at each level
 
-class SkipList:
-    """
-    Probabilistic balanced ordered structure.
-    
-    Height: levels 0 to MAX_LEVEL.
-    Level i has approximately N/2^i nodes.
-    Expected search: O(log N).
-    
-    Memory overhead: N × (p + 1)/(p - 1) pointers per node
-                     ≈ 2N pointers for p = 0.5
-                     vs 3N for red-black tree (left + right + parent)
-    """
-    def __init__(self, max_level: int = 16, p: float = 0.5):
-        self.MAX_LEVEL = max_level
-        self.p = p  # Probability of promoting to next level
-        self.header = SkipListNode(float('-inf'), '', max_level)
-        self.level = 0  # Current max level
-        self.size = 0
+class _Node:
+    __slots__ = ("key", "next", "span")
 
-    def random_level(self) -> int:
-        """Geometric distribution: P(L=k) = (1-p) * p^{k-1}."""
-        level = 0
-        while random.random() < self.p and level < self.MAX_LEVEL:
-            level += 1
-        return level
+    def __init__(self, key, level: int):
+        self.key = key                   # (sort key, member) — unique even with equal scores
+        self.next = [None] * level       # forward pointer per level
+        self.span = [0] * level          # how many level-0 nodes each pointer jumps over
 
-    def insert(self, score: float, value: str) -> None:
-        """Insert or update a node with given score."""
-        update = [None] * (self.MAX_LEVEL + 1)
-        current = self.header
 
-        # Traverse from top level down, tracking nodes to update
-        for i in range(self.level, -1, -1):
-            while (current.forward[i] and
-                   current.forward[i].score < score):
-                current = current.forward[i]
-            update[i] = current
+class IndexableSkipList:
+    """Skip list with spans (Redis zskiplist style): insert, delete, rank and
+    select-by-rank all in expected O(log N). Each node is promoted to the next
+    level with probability p, so it carries 1/(1-p) pointers on average
+    (2 for p = 1/2; Redis uses p = 1/4 → 1.33)."""
 
-        # If score already exists, override value
-        current = current.forward[0]
-        if current and current.score == score:
-            current.value = value
-            return
+    MAX_LEVEL, P = 32, 0.25
 
-        # Create new node with random level
-        new_level = self.random_level()
-        if new_level > self.level:
-            for i in range(self.level + 1, new_level + 1):
-                update[i] = self.header
-            self.level = new_level
+    def __init__(self):
+        self.head = _Node(None, self.MAX_LEVEL)
+        self.level, self.size = 1, 0
 
-        new_node = SkipListNode(score, value, new_level)
-        for i in range(new_level + 1):
-            new_node.forward[i] = update[i].forward[i]
-            update[i].forward[i] = new_node
+    def _random_level(self) -> int:
+        lvl = 1
+        while lvl < self.MAX_LEVEL and random.random() < self.P:
+            lvl += 1
+        return lvl
 
+    def insert(self, key) -> None:
+        update, rank = [None] * self.MAX_LEVEL, [0] * self.MAX_LEVEL
+        x = self.head
+        for i in range(self.level - 1, -1, -1):
+            rank[i] = rank[i + 1] if i + 1 < self.level else 0
+            while x.next[i] and x.next[i].key < key:
+                rank[i] += x.span[i]
+                x = x.next[i]
+            update[i] = x
+        lvl = self._random_level()
+        if lvl > self.level:
+            for i in range(self.level, lvl):
+                rank[i], update[i] = 0, self.head
+                self.head.span[i] = self.size
+            self.level = lvl
+        node = _Node(key, lvl)
+        for i in range(lvl):
+            node.next[i], update[i].next[i] = update[i].next[i], node
+            node.span[i] = update[i].span[i] - (rank[0] - rank[i])
+            update[i].span[i] = rank[0] - rank[i] + 1
+        for i in range(lvl, self.level):
+            update[i].span[i] += 1                     # pointers that now jump one more node
         self.size += 1
 
-    def delete(self, score: float) -> bool:
-        """Delete node with given score. Returns True if found."""
-        update = [None] * (self.MAX_LEVEL + 1)
-        current = self.header
-
-        for i in range(self.level, -1, -1):
-            while (current.forward[i] and
-                   current.forward[i].score < score):
-                current = current.forward[i]
-            update[i] = current
-
-        current = current.forward[0]
-        if not current or current.score != score:
+    def delete(self, key) -> bool:
+        update = [None] * self.MAX_LEVEL
+        x = self.head
+        for i in range(self.level - 1, -1, -1):
+            while x.next[i] and x.next[i].key < key:
+                x = x.next[i]
+            update[i] = x
+        x = x.next[0]
+        if x is None or x.key != key:
             return False
-
-        for i in range(current.forward.count(None), len(current.forward)):
-            update[i].forward[i] = current.forward[i]
-
-        # Shrink level if top level is now empty
-        while self.level > 0 and self.header.forward[self.level] is None:
+        for i in range(self.level):
+            if update[i].next[i] is x:
+                update[i].span[i] += x.span[i] - 1
+                update[i].next[i] = x.next[i]
+            else:
+                update[i].span[i] -= 1
+        while self.level > 1 and self.head.next[self.level - 1] is None:
             self.level -= 1
-
         self.size -= 1
         return True
 
-    def find_by_rank(self, rank: int) -> tuple:
-        """Find the node at given rank (1-indexed). O(log N)."""
-        current = self.header
-        skipped = 0
-        if rank > self.size:
-            return None
-        # Use the topmost level to skip large ranges
-        for i in range(self.level, -1, -1):
-            while (current.forward[i] and
-                   skipped + self._span(current.forward[i], i) <= rank):
-                skipped += self._span(current.forward[i], i)
-                current = current.forward[i]
-        return (current.score, current.value)
+    def rank(self, key) -> int:
+        """1-based position of key, or 0 if absent."""
+        r, x = 0, self.head
+        for i in range(self.level - 1, -1, -1):
+            while x.next[i] and x.next[i].key <= key:
+                r += x.span[i]
+                x = x.next[i]
+            if x.key == key:
+                return r
+        return 0
 
-    def _span(self, node, level) -> int:
-        """Number of bottom-level nodes skipped by this pointer."""
-        # Simplified: could store span in each pointer for O(1)
-        # Or use count-based skip list variant
-        pass
-```
+    def by_rank(self, r: int):
+        """Node at 1-based rank r (walk forward from it for a range)."""
+        t, x = 0, self.head
+        for i in range(self.level - 1, -1, -1):
+            while x.next[i] and t + x.span[i] <= r:
+                t += x.span[i]
+                x = x.next[i]
+            if t == r:
+                return x
+        return None
 
-**Range Query — Leaderboard Use Case:**
 
-```python
 class Leaderboard:
-    """
-    Real-time game leaderboard using Skip List.
-    
-    Operations:
-    - update_score(player_id, delta): update by delta → O(log N)
-    - get_rank(player_id): current rank → O(log N)  
-    - get_top_k(k): top players → O(k + log N)
-    - get_around(rank, window): players ±window → O(log N + window)
-    """
+    """Highest score first; ties broken by player id. Same design as a Redis
+    ZSET: skip list for order + hash map for member → score."""
+
     def __init__(self):
-        self.scores = SkipList()
-        self.player_scores = {}  # player_id → score (for rank lookup)
+        self.sl, self.score = IndexableSkipList(), {}
 
-    def update_score(self, player_id: str, delta: float) -> float:
-        old_score = self.player_scores.get(player_id, 0)
-        new_score = old_score + delta
-        
-        if old_score > 0:
-            self.scores.delete(old_score)
-        self.scores.insert(new_score, player_id)
-        self.player_scores[player_id] = new_score
-        return new_score
+    def set_score(self, player: str, score: float) -> None:
+        if player in self.score:
+            self.sl.delete((-self.score[player], player))
+        self.score[player] = score
+        self.sl.insert((-score, player))
 
-    def get_rank(self, player_id: str) -> int:
-        score = self.player_scores.get(player_id)
-        if score is None:
-            return -1
-        # Count players with score > this score
-        # (Skip List can augment to track ranks via span counters)
-        return self.scores.count_greater_than(score) + 1
+    def rank(self, player: str) -> int:
+        return self.sl.rank((-self.score[player], player))
 
-    def get_top_k(self, k: int) -> List[tuple]:
-        """Return top k players by score."""
-        results = []
-        current = self.scores.header.forward[0]
-        while current and len(results) < k:
-            results.append((current.value, current.score))
-            current = current.forward[0]
-        return results
+    def around(self, player: str, window: int) -> list[tuple[int, str, float]]:
+        r = self.rank(player)
+        start = max(1, r - window)
+        node, out = self.sl.by_rank(start), []
+        for k in range(start, min(self.sl.size, r + window) + 1):
+            out.append((k, node.key[1], -node.key[0]))
+            node = node.next[0]
+        return out
 
-    def get_around(self, player_id: str, window: int) -> List[tuple]:
-        """Return players around this player's rank."""
-        score = self.player_scores.get(player_id)
-        if score is None:
-            return []
-        rank = self.scores.count_greater_than(score) + 1
-        start_rank = max(1, rank - window)
-        end_rank = min(self.scores.size, rank + window)
-        
-        results = []
-        current = self.scores.find_by_rank(start_rank)
-        for _ in range(end_rank - start_rank + 1):
-            results.append((current.value, current.score))
-            current = current.forward[0]
-        return results
+
+random.seed(42)
+lb = Leaderboard()
+scores = {f"p{i}": random.randint(0, 5000) for i in range(20_000)}
+for p, s in scores.items():
+    lb.set_score(p, s)
+for p in random.sample(sorted(scores), 2_000):           # score updates
+    scores[p] = random.randint(0, 5000)
+    lb.set_score(p, scores[p])
+expected = sorted(scores, key=lambda p: (-scores[p], p))
+assert all(lb.rank(p) == i + 1 for i, p in enumerate(expected[:500]))
+assert [x[1] for x in lb.around(expected[5000], 3)] == expected[4997:5004]
+print("rank/around correct; size", lb.sl.size)
 ```
 
-**Skip List vs Balanced BST — The Real Difference:**
+How the pieces work:
 
-```python
-"""
-                    Skip List               Red-Black Tree / AVL
-                    ---------               --------------------
-Balance method      Probabilistic (coin     Deterministic (rotations)
-                    flip)
-Insert/Delete       O(log N) expected       O(log N) worst-case
-                    O(N) worst-case (!)     
-Search              O(log N) expected       O(log N) worst-case
-                    O(N) worst-case
-Concurrent ops      SIMPLE: fine-grained    HARD: need global lock
-                    locking per level       or complex hand-over-hand
-Memory              ~2N pointers            ~3N pointers + color bits
-Range query         O(k + log N)            O(k + log N)
-                   (just traverse level 0)  (in-order traversal)
-Implementation     ~100 lines               ~300 lines (RB), 
-                                              ~200 lines (AVL)
-Cache performance   Poor (linked list)      Better (array-backed)
+- **Search** starts at the top level, moves right while the next key is smaller, then drops a level. Expected comparisons ≈ (1/p)·log_{1/p} N.
+- **Random level**: P(level ≥ k) = p^(k−1). Expected pointers per node = 1/(1−p): 2 for p = ½, 1.33 for p = ¼.
+- **Spans** make rank queries cheap: summing the spans of the pointers you follow is your rank; following pointers until the sum reaches r selects by rank.
+- **Ties**: keys are (−score, player_id), so equal scores order deterministically and never overwrite each other.
 
-Key takeaway:
-  Skip Lists win on: concurrent access, simplicity, range queries
-  BSTs win on: worst-case guarantees, cache locality, determinism
+**Skip List vs Balanced BST:**
 
-Redis uses Skip Lists for sorted sets (leaderboards)
-  Why? Because concurrent access is simpler and range queries
-  (ZRANGE, ZRANK) are natural on level-0 traversal.
-"""
-```
+| | Skip list | Red-black / AVL tree |
+|---|---|---|
+| Balance | Randomised, no rotations | Deterministic rotations |
+| Search/insert/delete | O(log N) **expected** (worst case O(N), astronomically unlikely) | O(log N) worst case |
+| Range scan | Walk level 0 | In-order traversal |
+| Rank / select | Span counters | Subtree-size counters (order-statistic tree) |
+| Memory | 1/(1−p) forward pointers + key per node (Redis also stores a backward pointer and a span per level) | 2 child pointers (+ parent) + colour/balance per node |
+| Lock-free concurrency | Practical: insert = CAS on level-0 link, then index levels (Java `ConcurrentSkipListMap`) | Hard: rotations touch several nodes at once |
+| Cache locality | Poor (pointer chasing) | Also pointer-based; B-trees win on locality |
 
-**Concurrent Skip List — The Real Advantage:**
+**Why Redis uses skip lists for sorted sets** (per its author): they're simpler to implement and debug than balanced trees, range operations (`ZRANGE`, `ZRANGEBYSCORE`) are a level-0 walk, memory can be tuned with p (Redis uses p = ¼, max 32 levels), and span counters give `ZRANK` cheaply. Concurrency isn't the reason: Redis executes commands on a single thread. A ZSET is a skip list **plus a hash table** (member → score); small ZSETs use a compact listpack instead.
 
-```python
-import threading
+**Production Design for 10M players, 100K updates/s:**
 
-class ConcurrentSkipList(SkipList):
-    """
-    Fine-grained locking: lock each node individually.
-    
-    The key insight: because updates only affect adjacent nodes,
-    and level-0 is a linked list, we can use hand-over-hand locking
-    (lock current, lock next, update, unlock current).
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.locks = threading.local()
-
-    def insert(self, score: float, value: str) -> None:
-        # Mark nodes to update (with locks)
-        prevs = [None] * (self.MAX_LEVEL + 1)
-        locks_held = []
-        
-        try:
-            current = self.header
-            for i in range(self.level, -1, -1):
-                while (current.forward[i] and
-                       current.forward[i].score < score):
-                    current = current.forward[i]
-                prevs[i] = current
-                # Lock the predecessor
-                # (In practice: use CAS operations, not locks)
-            
-            # ... rest of insert with locks held
-        finally:
-            for lock in locks_held:
-                lock.release()
-```
-
-**Production Lessons:**
-
-```
-War Story: "Skip List in Redis"
-- Redis uses Skip Lists for ZSET (sorted set) — NOT a balanced BST
-- Why?
-  1. Simpler concurrent implementation (single-threaded Redis anyway)
-  2. Efficient range queries (ZRANGE, ZRANK traverse level-0)
-  3. Less memory per element (~2 pointers vs ~3 for RB-tree)
-  4. Easier to debug and get right
-
-Memory comparison per 10M entries:
-  Skip List: 10M × 2 pointers × 8 bytes = 160MB
-  RB-Tree:  10M × 4 (parent + left + right + color) = 320MB
-  
-Trade-off: Skip List's O(log N) expected vs RB-tree's O(log N) worst-case
-  In practice: path length variation is small (sigma ≈ 1.5)
-  The 1-in-a-million worst case is ~6× expected — still only ~60 steps
-```
+- One Redis primary handles ~100K simple ops/s, so this is near one node's limit: `ZADD lb <score> <player>` (O(log N)), `ZREVRANK lb <player>`, `ZREVRANGE lb <start> <stop> WITHSCORES` for "around me" (O(log N + M)).
+- Memory: 10M members ≈ ~1 GB in a ZSET (skip list + dict + strings). Fine for one node.
+- Beyond one node: shard players by hash into several ZSETs and compute global rank as the sum of `ZCOUNT(score, +inf)` across shards (exact, one round trip per shard), or keep an approximate rank from a score histogram (bucket counts) for "you're in the top 3%" displays.
+- Ties: encode a tiebreak into the score (e.g. score × 2^k + (max_ts − ts)) if "who got there first" should win; Redis otherwise orders equal scores lexicographically by member.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Probabilistic balancing** | Explains how random level choice gives O(log N) expected time |
-| **Level promotion** | Uses geometric distribution (p=0.5) correctly |
-| **Range query** | Shows level-0 traversal as natural leaderboard |
-| **Concurrent** | Explains fine-grained locking advantage over BSTs |
+| **Probabilistic balancing** | Explains how random levels give O(log N) expected time |
+| **Rank queries** | Uses span counters (or knows ZSETs provide them) |
+| **Ties** | Orders by (score, id) so equal scores don't collide |
+| **Production** | Knows Redis ZSET internals and how to scale past one node |
 
 ---
 
@@ -2043,291 +1419,153 @@ Trade-off: Skip List's O(log N) expected vs RB-tree's O(log N) worst-case
 
 **What They're Really Testing:** Whether you understand the anti-entropy protocol — specifically, that Merkle tree comparison localizes differences to O(log N) hash exchanges instead of O(N) data transfer.
 
+!!! tip "30-second answer"
+    Each replica builds a hash tree over **fixed key ranges** (leaves = hash of all rows in a range). Two replicas compare roots; if they differ, they compare children and descend only where hashes differ, then stream just the differing ranges. Cost ≈ **D × 2·log₂(L)** hashes for D differing leaves out of L, versus shipping everything. The catch is local work: building the tree reads and hashes all the data, so systems either build trees on demand during repair (Cassandra) or maintain them incrementally on every write (Riak AAE, Merkle B-trees). With 1,000 replicas you don't compare all pairs: each replica syncs with a few peers (or its replica set), and gossip spreads the repairs.
+
 ### Answer
 
 **Core Concept:**
 
-A Merkle tree is a binary tree where each leaf is a hash of a data block, and each internal node is the hash of its two children. The root hash therefore commits the entire dataset.
+A Merkle tree is a tree where each leaf is the hash of a data block and each internal node is the hash of its children, so the root commits to the entire dataset: any change to any block changes the root. The runnable tree, inclusion proofs (with leaf/node domain separation) and hash-range anti-entropy are in [Interview Questions Q4](./INTERVIEW_QUESTIONS.md#4-merkle-trees-anti-entropy-verification). This section covers the protocol, costs and the variants used at scale.
 
-```python
-import hashlib
+**Anti-Entropy Protocol:**
 
-class MerkleNode:
-    def __init__(self, hash_val: bytes, left: 'MerkleNode' = None,
-                 right: 'MerkleNode' = None):
-        self.hash = hash_val
-        self.left = left
-        self.right = right
+```text
+Both replicas agree on the leaf layout: 2^d buckets of the key-hash (token) space.
 
-class MerkleTree:
-    """
-    Binary Merkle tree for data verification.
-    
-    Properties:
-    - Root hash commits the entire dataset
-    - Any change to any leaf changes the root
-    - Proof of inclusion: O(log N) hashes per leaf
-    - Comparison: O(log N) hash exchanges to find differing blocks
-    """
-    def __init__(self, data_blocks: List[bytes]):
-        self.leaves = [self._hash(b) for b in data_blocks]
-        self.root = self._build(self.leaves)
+1. Exchange root hashes. Equal → done (the common case).
+2. Exchange the 2 child hashes of each differing node; recurse into differing children.
+3. At the leaves, stream the rows of differing buckets (or per-row hashes, then rows).
+4. Resolve each differing row by the store's rule (latest timestamp, vector clock, CRDT merge).
 
-    def _hash(self, data: bytes) -> bytes:
-        return hashlib.sha256(data).digest()
-
-    def _build(self, hashes: List[bytes]) -> MerkleNode:
-        """Build tree bottom-up."""
-        if len(hashes) == 1:
-            return MerkleNode(hashes[0])
-
-        # Ensure even number of nodes
-        if len(hashes) % 2 != 0:
-            hashes.append(hashes[-1])  # Duplicate last for odd counts
-
-        parents = []
-        for i in range(0, len(hashes), 2):
-            combined = hashes[i] + hashes[i+1]
-            parent_hash = self._hash(combined)
-            parent = MerkleNode(parent_hash)
-            parent.left = MerkleNode(hashes[i])
-            parent.right = MerkleNode(hashes[i+1])
-            parents.append(parent_hash)
-        
-        return self._build(parents)
-
-    @property
-    def root_hash(self) -> bytes:
-        return self.root.hash if self.root else b''
-
-    def get_proof(self, index: int) -> List[bytes]:
-        """
-        Generate a Merkle proof of inclusion.
-        
-        Proof = sibling hashes along the path from leaf to root.
-        Verifier can reconstruct root using: leaf + proof siblings.
-        Proof size: log₂(N) hashes (≈20 for 1M blocks).
-        
-        Example: N=8, index=3 (leaf 3):
-          Path: leaf3 → hash(2,3) → hash(0-3) → hash(0-7)
-          Proof: [leaf2, hash(0,1), hash(4-7)]
-          
-          Verifier computes:
-            h03 = hash(leaf2 + leaf3)
-            h01 = hash(hash(0,1) as given)
-            root = hash(h01 + h03)
-            Verify: root == expected_root
-        """
-        proof = []
-        level = self.leaves[:]
-        idx = index
-
-        while len(level) > 1:
-            if len(level) % 2 != 0:
-                level.append(level[-1])
-
-            sibling_idx = idx ^ 1  # XOR to get sibling
-            proof.append(level[sibling_idx])
-
-            # Move to parent level
-            idx = idx // 2
-            level = [self._hash(level[i] + level[i+1])
-                     for i in range(0, len(level), 2)]
-
-        return proof
-```
-
-**Anti-Entropy Protocol — The Killer App:**
-
-```python
-class ReplicaSync:
-    """
-    Efficient reconciliation between replicas using Merkle trees.
-    
-    Protocol:
-    1. Exchange root hashes
-    2. If different: exchange children hashes
-    3. Recurse until differing leaf is found
-    4. Fetch only the differing data block
-    
-    Communication cost: O(log N) hash exchanges + O(1) data blocks
-    vs O(N) data transfer for full sync.
-    """
-    def __init__(self, data: Dict[int, bytes]):
-        self.data = data
-        self.merkle = MerkleTree([data[i] for i in sorted(data.keys())])
-
-    def sync_with(self, remote: 'ReplicaSync'):
-        """Reconcile differences with remote replica."""
-        differing_blocks = []
-        self._compare_node(self.merkle.root, remote.merkle.root,
-                          0, len(self.data) - 1, differing_blocks)
-        
-        # Fetch only the differing blocks
-        for block_id in differing_blocks:
-            self.data[block_id] = remote.data[block_id]
-        
-        # Rebuild tree
-        self.merkle = MerkleTree(
-            [self.data[i] for i in sorted(self.data.keys())]
-        )
-        return differing_blocks
-
-    def _compare_node(self, local_node, remote_node,
-                      start, end, differences):
-        """Recursive comparison — O(log N) hash exchange."""
-        if local_node.hash == remote_node.hash:
-            return  # Subtree is identical
-        
-        if start == end:
-            # Leaf level — we found a difference
-            differences.append(start)
-            return
-        
-        mid = (start + end) // 2
-        self._compare_node(local_node.left, remote_node.left,
-                          start, mid, differences)
-        self._compare_node(local_node.right, remote_node.right,
-                          mid + 1, end, differences)
+Choosing d: more leaves → less over-streaming per difference, more memory and
+more hashes to exchange. Cassandra bounds repair-tree size (2^15 leaves per
+range before 4.0, configurable since), which is why repairing a huge range can
+stream far more than the changed rows.
 ```
 
 **Communication Cost Analysis:**
 
-```python
-"""
-Cost to reconcile N blocks with D differences:
+```text
+N rows in L leaf buckets, D buckets differ:
+  Naive full comparison: ship all rows                      → O(N)
+  Merkle: about 2 hashes per level along each differing path → O(D·log L) hashes
+          + the rows in D buckets
 
-  Naive: transfer all N blocks → O(N) bandwidth
-  
-  Merkle tree comparison:
-    1. Exchange root: 1 hash (32 bytes)
-    2. For each differing branch, exchange another hash
-    3. Total: O(D × log N) hashes + D blocks
-  
-  Example: N = 1M blocks, D = 5 differences
-    Naive: 1M × 4KB = 4GB transferred
-    Merkle: 5 × 20 hashes × 32 bytes = 3.2KB + 5 blocks × 4KB = ~23KB
-    
-    Savings: ~175,000× less bandwidth
+Example: L = 2^20 buckets, D = 5, 32-byte hashes, ~1,000 rows of 1 KB per bucket
+  Hashes: 5 × 20 levels × 2 × 32 B ≈ 6.4 KB
+  Data:   5 buckets × 1 MB = 5 MB  (vs ~1 TB for everything)
+  The data, not the hashes, dominates; smaller buckets cut it but cost memory.
 
-Comparison with other techniques:
-
-  Technique              Bandwidth         CPU           Works with
-  ------                 ---------         ---           ---------
-  Full snapshot          O(N) × block      O(N) hash     Any data
-  Merkle tree            O(D log N)        O(N) hash     Any data
-  Bloom filter           O(N) log            O(N)          Membership only
-  Listen/notify          O(1) (signal)     O(1)          Active replication
-  CDC-based sync         O(D) (chunks)     O(N) cdc      File systems (rsync)
-
-  Merkle trees are best when:
-  - Differences are few (< 1% of data)
-  - Dataset is large (millions of blocks)
-  - You need cryptographic guarantees (not just checksums)
-"""
+Local cost: hashing every row once per tree build, which is why trees are
+built during repair (a "validation compaction" in Cassandra), throttled.
 ```
 
-**The Sparse Merkle Tree — Scaling to Billions of Keys:**
+| Technique | Bandwidth | Local CPU | Notes |
+|---|---|---|---|
+| Full snapshot | O(N) | O(N) | Simple; for bootstrapping a new replica |
+| Merkle tree | O(D·log L) + D buckets | O(N) per build (or incremental) | Best when differences are rare |
+| Per-row version/timestamp scan | O(N) small records | O(N) | Easy if rows carry versions |
+| rsync rolling checksums | O(N / block) + changed blocks | O(N) | Files, not key-value replicas |
+| Hinted handoff / read repair | O(changes) | O(1) per write/read | Fixes most divergence before anti-entropy runs |
+
+**Sparse Merkle Tree — Proving Membership AND Absence (runnable):**
+
+A Merkle tree over the whole 2²⁵⁶ space of key hashes, where empty subtrees have precomputed default hashes. Every key has a fixed position, so you can prove a key is *absent* (its leaf is the empty default), which a plain Merkle tree over a sorted list can't do without extra structure.
 
 ```python
-class SparseMerkleTree:
-    """
-    A Merkle tree over a potentially HUGE keyspace (2^256).
-    Only non-empty leaves are stored. Empty leaves have a
-    well-known default hash.
-    
-    Used in:
-    - Certificate Transparency (Google)
-    - Ethereum state trie
-    - Libra/Diem blockchain
-    - DynamoDB's cross-region replication
-    
-    Properties:
-    - Prove inclusion of any key in O(log N) hashes
-    - Prove NON-inclusion of any key in O(log N) hashes
-      (by proving the path leads to a default hash)
-    - Update any key in O(log N)
-    - Memory: O(N) where N = number of non-empty keys
-    """
-    EMPTY_HASH = hashlib.sha256(b'').digest()
-    
-    def __init__(self):
-        self.root = SparseNode()  # Empty tree
-    
-    def update(self, key: bytes, value: bytes) -> None:
-        """Insert or update a key-value pair."""
-        path = self._key_to_bits(key)
-        leaf_hash = hashlib.sha256(value).digest()
-        self.root = self._update(self.root, path, 0, leaf_hash)
+import hashlib
 
-    def _update(self, node, path: List[int], depth: int,
-                leaf_hash: bytes) -> 'SparseNode':
-        if depth == len(path):  # Leaf node
-            return SparseNode(hash_val=leaf_hash, is_leaf=True)
-        
-        bit = path[depth]
-        child = self._update(node.children[bit], path,
-                             depth + 1, leaf_hash)
-        return SparseNode().with_children(
-            child if bit == 0 else node.children[0],
-            child if bit == 1 else node.children[1]
-        )
-    
-    def prove_inclusion(self, key: bytes) -> List[bytes]:
-        """Merkle proof that this key is in the tree."""
-        proof = []
-        path = self._key_to_bits(key)
-        current = self.root
-        
-        for bit in path:
-            sibling_hash = (current.children[bit ^ 1].hash
-                           if current.children[bit ^ 1]
-                           else self.EMPTY_HASH)
-            proof.append(sibling_hash)
-            current = current.children[bit]
-        
-        return proof
+DEPTH = 256
+
+
+def H(*parts: bytes) -> bytes:
+    return hashlib.sha256(b"".join(parts)).digest()
+
+
+# DEFAULT[d] = hash of an empty subtree whose root is at depth d (leaves at depth 256)
+DEFAULT = [b""] * (DEPTH + 1)
+DEFAULT[DEPTH] = H(b"\x00empty")
+for d in range(DEPTH - 1, -1, -1):
+    DEFAULT[d] = H(b"\x01", DEFAULT[d + 1], DEFAULT[d + 1])
+
+
+def bits(key: bytes) -> str:
+    return format(int.from_bytes(hashlib.sha256(key).digest(), "big"), "0256b")
+
+
+class SparseMerkleTree:
+    """Merkle tree over all 2^256 key hashes. Only non-default nodes are stored
+    (dict keyed by path prefix), so memory is O(n · 256) for n keys. Empty
+    subtrees use precomputed DEFAULT hashes, which makes NON-membership provable:
+    the leaf for an absent key is the default empty leaf."""
+
+    def __init__(self):
+        self.nodes: dict[str, bytes] = {}           # prefix → hash ("" = root)
+
+    def _get(self, prefix: str) -> bytes:
+        return self.nodes.get(prefix, DEFAULT[len(prefix)])
+
+    @property
+    def root(self) -> bytes:
+        return self._get("")
+
+    def update(self, key: bytes, value: bytes) -> None:
+        path = bits(key)
+        self.nodes[path] = H(b"\x00", value)
+        for d in range(DEPTH - 1, -1, -1):          # recompute 256 ancestors
+            p = path[:d]
+            self.nodes[p] = H(b"\x01", self._get(p + "0"), self._get(p + "1"))
+
+    def prove(self, key: bytes) -> list[bytes]:
+        """Sibling hashes from the leaf up to the root (256 entries; real
+        systems compress default siblings into a bitmap)."""
+        path = bits(key)
+        return [self._get(path[:d] + ("1" if path[d] == "0" else "0"))
+                for d in range(DEPTH - 1, -1, -1)]
 
     @staticmethod
-    def verify_inclusion(proof: List[bytes], key_hash: bytes,
-                         root_hash: bytes) -> bool:
-        """Verify a Merkle proof of inclusion."""
-        current = key_hash
-        for sibling in proof:
-            current = hashlib.sha256(current + sibling).digest()
-        return current == root_hash
+    def verify(root: bytes, key: bytes, value: bytes | None, proof: list[bytes]) -> bool:
+        """value=None verifies NON-membership."""
+        path = bits(key)
+        h = DEFAULT[DEPTH] if value is None else H(b"\x00", value)
+        for d, sib in zip(range(DEPTH - 1, -1, -1), proof):
+            h = H(b"\x01", h, sib) if path[d] == "0" else H(b"\x01", sib, h)
+        return h == root
+
+
+smt = SparseMerkleTree()
+for i in range(100):
+    smt.update(f"user:{i}".encode(), f"balance={i}".encode())
+r = smt.root
+assert SparseMerkleTree.verify(r, b"user:7", b"balance=7", smt.prove(b"user:7"))
+assert not SparseMerkleTree.verify(r, b"user:7", b"balance=999", smt.prove(b"user:7"))
+assert SparseMerkleTree.verify(r, b"user:12345", None, smt.prove(b"user:12345"))   # absent
+print("inclusion and non-inclusion proofs verified; stored nodes:", len(smt.nodes))
 ```
+
+Real systems compress the 256 siblings (most are defaults) with a bitmap, or shortcut single-key subtrees (Diem/Aptos's Jellyfish Merkle Tree, a sparse Merkle radix tree). Uses: authenticated blockchain state (Diem/Aptos; Ethereum uses a related Merkle Patricia trie), key-transparency logs, verifiable key-value maps.
+
+**Keeping trees cheap under constant writes:**
+
+- **Incremental updates:** change one leaf → rehash its path (log L hashes). Riak's AAE keeps persistent hash trees per partition, updated on every write.
+- **Merkle B-trees / Prolly trees:** hash each B-tree page and its children (Dolt, Noms). Updates touch one root-to-leaf path, and content-defined page boundaries make two versions' trees share unchanged subtrees, so diffing two snapshots is proportional to the changes.
+- **Append-only logs** (Certificate Transparency, RFC 6962/9162): a dense Merkle tree over a growing list, with inclusion proofs and **consistency proofs** that a later tree extends an earlier one.
 
 **Production Lessons:**
 
-```
-War Story: "Merkle Tree Anti-Entropy at Amazon DynamoDB"
-- DynamoDB uses Merkle trees for cross-region replication
-- Each replica maintains a Merkle tree over its key range
-- During gossip: replicas exchange root hashes
-- When roots differ: recursive compare to find the difference
-- Result: most sync cycles find 0-1 differences, cost = O(log N) hashes
-
-But there's a catch — rebuilding the tree is expensive:
-  10M keys × 1 SHA-256 each ≈ 300ms on modern hardware
-  If keys change at 10K/sec, you need incremental updates
-
-Solution: use a Merkle B-Tree (merge of B-Tree + Merkle tree)
-- B-Tree naturally groups keys into pages
-- Build hash per page (not per key)
-- Root = hash of page hashes
-- Update only affects one page's hash and its path to root
-- Cost per update: O(log_B N) hashes instead of O(N) rebuild
-```
+- Repair is an operational process: run it within the tombstone GC window (Cassandra's `gc_grace_seconds`, default 10 days), or deleted data can resurrect from a replica that missed the delete.
+- Throttle tree builds and streaming; anti-entropy competes with foreground traffic.
+- Read repair and hinted handoff fix most divergence cheaply; Merkle repair is the backstop for what they miss.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Anti-entropy protocol** | Describes recursive hash comparison |
-| **Communication cost** | Quantifies O(D log N) hash exchange vs O(N) data transfer |
-| **Proof of inclusion** | Constructs and verifies Merkle proofs |
-| **Sparse variant** | Knows Sparse Merkle Tree for non-inclusion proofs at scale |
+| **Anti-entropy protocol** | Fixed hash-range leaves; recursive comparison; stream differing ranges |
+| **Communication cost** | Quantifies O(D log L) hashes and notes data volume dominates |
+| **Local cost** | Knows building the tree is O(N) and how systems avoid rebuilding |
+| **Sparse variant** | Knows sparse Merkle trees give non-membership proofs |
 
 ---
 
@@ -2335,17 +1573,17 @@ Solution: use a Merkle B-Tree (merge of B-Tree + Merkle tree)
 
 | Problem | Best Structure | Why |
 |---------|---------------|-----|
-| **Set membership** (deletable) | Cuckoo Filter | Lower memory than Counting BF |
-| **Set membership** (insert only) | Bloom Filter | Tighter memory, simpler |
-| **Cardinality estimation** | HyperLogLog | ~2KB for 1B distinct values |
-| **Frequency estimation** | Count-Min Sketch | Guaranteed no undercount |
-| **Set similarity** | MinHash + LSH | Sub-linear retrieval via banding |
-| **Geospatial proximity** | H3 | Uniform hex grid, k-ring queries |
-| **Geospatial storage** | S2 | 64-bit cell ID, Hilbert curve |
-| **Geospatial encoding** | Geohash | Simple string, prefix queries |
-| **2D collision/range** | Quad Tree | Adaptive partitioning |
-| **Rectangle queries** | R-Tree (R*) | Bounding box index, balanced |
-| **Ordered leaderboard** | Skip List | Concurrent, simple range queries |
-| **Data integrity** | Merkle Tree | O(log N) proof, anti-entropy |
-
-> *Master these structures and their trade-offs, and you'll be prepared for the most rigorous system design questions at Staff/Principal level — from database internals to distributed systems to geospatial indexing.*
+| **Set membership** (insert only) | Bloom filter (blocked) | Simple, never fails to insert, ~1.44·log₂(1/p) bits/key |
+| **Set membership** (with deletes, p ≲ 3%) | Cuckoo filter | Deletion, smaller than Bloom at low FP |
+| **Static membership** | Xor / binary-fuse / Ribbon filter | 15–30% smaller than Bloom |
+| **Cardinality estimation** | HyperLogLog (++) | Fixed KBs per counter, mergeable, ~1.04/√m error |
+| **Frequency estimation** | Count-Min Sketch | Never undercounts (insert-only), mergeable |
+| **Top-K only** | Space-Saving | k counters, deterministic bound |
+| **Set similarity** | MinHash + LSH | Jaccard estimate + sub-linear candidate search |
+| **Neighbourhood analytics** | H3 | Uniform hex neighbours, k-rings |
+| **Spatial indexing on a sphere** | S2 | 64-bit cell IDs, exact hierarchy, coverings → range scans |
+| **Simple geo in a KV/B-tree store** | Geohash | String/int prefix, 3×3 neighbour query |
+| **2D points, uneven density, in memory** | Quadtree (or uniform grid) | Adaptive partitioning |
+| **Rectangles / polygons, on disk** | R-tree (R*, STR-loaded) | Balanced, page-oriented |
+| **Ranked leaderboard** | Skip list with spans (Redis ZSET) | O(log N) update, rank and range |
+| **Replica reconciliation / integrity** | Merkle tree | O(D log L) comparison, inclusion proofs |
