@@ -9,7 +9,12 @@ String matching algorithms for pattern searching in text:
 • KMP (Knuth-Morris-Pratt): O(n + m) — uses LPS array to avoid backtracking
 • Rabin-Karp: O(n + m) average — uses rolling hash for pattern matching
 • Z-Algorithm: O(n) — computes Z-array for pattern matching
-• Boyer-Moore: O(n/m) best, O(nm) worst — skip heuristic
+• Boyer-Moore: O(n/m) best (sublinear: skips ahead), O(nm) worst for the
+  basic version (O(n + m) with the Galil rule) — what grep-style tools
+  build on
+• In practice: Python's str.find / `in` use a tuned two-way /
+  Boyer-Moore-Horspool hybrid; know KMP for the interview, call the
+  library in production
 
 String Transformation / Processing:
 ───────────────────────────────────
@@ -21,9 +26,13 @@ String Transformation / Processing:
 
 Suffix Data Structures:
 ───────────────────────
-• Suffix Array: sorted suffixes — O(n log n) to build
+• Suffix Array: sorted suffixes — O(n log n) by prefix doubling with
+  radix sort (O(n log² n) with a comparison sort, as below); O(n) with
+  SA-IS
 • LCP Array: longest common prefix between adjacent suffixes
-• Suffix Tree: compressed trie of all suffixes — O(n) suffix links
+• Suffix Tree: compressed trie of all suffixes — O(n) to build with
+  Ukkonen's algorithm (which uses suffix links); heavy constants, so
+  suffix array + LCP is usually preferred
 """
 
 from typing import List, Tuple, Optional
@@ -56,6 +65,9 @@ def kmp_search(text: str, pattern: str) -> List[int]:
        - On mismatch: if j > 0, set j = LPS[j-1]; else advance i
        - When j == len(pattern): found match, set j = LPS[j-1] to continue
     4. Key insight: KMP never backtracks the text pointer i
+    5. Why the LPS build is O(m): `length` rises by at most 1 per step
+       and every fallback strictly lowers it, so total fallbacks ≤ m
+    6. Empty pattern: matches at every index 0..n (str.find("") == 0)
 
     COMPLEXITY:
     ──────────
@@ -63,7 +75,7 @@ def kmp_search(text: str, pattern: str) -> List[int]:
     Space: O(m) — LPS array of size m
     """
     if not pattern:
-        return [] if not text else [0]
+        return list(range(len(text) + 1))
 
     # Build LPS (Longest Prefix Suffix) array
     lps = [0] * len(pattern)
@@ -123,21 +135,28 @@ def rabin_karp(text: str, pattern: str) -> List[int]:
     1. Compute hash of pattern and first window of text
     2. Slide the window: update hash in O(1) using rolling hash formula
     3. If hashes match, verify character-by-character (spurious hit)
-    4. Rolling hash formula (base = 256, mod = 101):
+    4. Rolling hash formula (base = 256, mod = prime):
        - hash = (hash - text[i] * base^(m-1)) * base + text[i+m]
-       - All modulo prime to avoid overflow
-    5. Good for multi-pattern search and plagiarism detection
+       - All modulo prime to keep numbers small (and, in Java/Go, to
+         avoid overflow: use a long and keep prime² below 2⁶³)
+    5. Choice of modulus matters: a tiny prime like 101 gives a spurious
+       hit roughly every 101 windows. Production code uses a large prime
+       (1e9+7, 2⁶¹-1) or two independent hashes, ideally with a random
+       base so adversarial inputs can't force collisions.
+    6. Strength: hash many patterns of the SAME length into a set and
+       scan once (plagiarism detection, repeated DNA sequences); also the
+       basis of "longest duplicate substring" (binary search + hashing).
 
     COMPLEXITY:
     ──────────
-    Time: O(n + m) average, O(nm) worst (many spurious hits)
-    Space: O(1) — only constant variables
+    Time: O(n + m) expected, O(nm) worst (every window a spurious hit)
+    Space: O(1) — besides the O(m) slice used to verify a hit
     """
     if not pattern or len(pattern) > len(text):
         return []
 
     base = 256  # Number of characters in alphabet
-    prime = 101  # A prime number for modulo
+    prime = 1_000_000_007  # Large prime: spurious hits become rare
 
     m, n = len(pattern), len(text)
     pattern_hash = 0
@@ -166,7 +185,8 @@ def rabin_karp(text: str, pattern: str) -> List[int]:
             window_hash = (base * (window_hash - ord(text[i]) * h) +
                            ord(text[i + m])) % prime
 
-            # Handle negative hash
+            # Python's % is already non-negative; in Java/C/Go the
+            # subtraction can go negative and you must add prime back
             if window_hash < 0:
                 window_hash += prime
 
@@ -201,6 +221,8 @@ def z_algorithm(text: str) -> List[int]:
     Space: O(n) — Z-array
     """
     n = len(text)
+    if n == 0:
+        return []
     z = [0] * n
     z[0] = n  # The whole string matches prefix at position 0
 
@@ -237,7 +259,9 @@ def z_search(text: str, pattern: str) -> List[int]:
     1. Create combined string: pattern + '$' + text
        ('$' is a sentinel character not in pattern or text)
     2. Compute Z-array of combined string
-    3. Every position i where Z[i] == len(pattern) indicates a match
+    3. Every position i where Z[i] >= len(pattern) indicates a match
+       (use >=, not ==: if text itself contains the separator, Z can run
+       past the pattern into it and an == test misses real matches)
 
     COMPLEXITY:
     ──────────
@@ -250,7 +274,7 @@ def z_search(text: str, pattern: str) -> List[int]:
 
     result = []
     for i in range(pattern_len + 1, len(combined)):
-        if z[i] == pattern_len:
+        if z[i] >= pattern_len:
             result.append(i - pattern_len - 1)
 
     return result
@@ -376,7 +400,11 @@ def run_length_encode(s: str) -> str:
     ────────────────
     1. Iterate through the string, counting consecutive identical chars
     2. When character changes, append char + count to result
-    3. This is a simple but effective compression technique
+    3. Only compresses data with long runs ("ABC" → "A1B1C1" doubles
+       in size); real formats (BMP, fax, columnar databases like
+       Parquet) use it where runs are common
+    4. This char+count format is ambiguous if the input contains digits
+       ("A12" could be "A" ×12); use escaping or length-prefixed fields
 
     COMPLEXITY:
     ──────────
@@ -423,7 +451,7 @@ def run_length_decode(s: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# QUESTION 6: Longest Common Substring (Suffix Array Approach)
+# QUESTION 6: Longest Common Substring (DP; Suffix Array follow-up)
 # ════════════════════════════════════════════════════════════════════════
 
 def longest_common_substring(s1: str, s2: str) -> str:
@@ -442,9 +470,14 @@ def longest_common_substring(s1: str, s2: str) -> str:
        - If s1[i-1] == s2[j-1]: dp[i][j] = 1 + dp[i-1][j-1]
        - Else: dp[i][j] = 0
        - O(m × n) time, O(n) space optimized
-    2. Suffix Array approach: Concatenate with sentinel, build suffix
-       array + LCP array, find max LCP across different strings
-    3. DP is simpler for interviews, O(mn) is acceptable for small strings
+    2. Suffix Array approach: Concatenate s1 + '#' + s2, build suffix
+       array + LCP array (Q7), and take the max LCP between ADJACENT
+       suffixes that come from different strings: O((m+n) log(m+n))
+    3. Binary search on the length + rolling hash also works:
+       O((m+n) log min(m, n)) expected
+    4. DP is simpler for interviews, O(mn) is acceptable for small strings
+    5. Don't confuse with Longest Common SUBSEQUENCE (DP Q5), where a
+       mismatch carries max(up, left) instead of resetting to 0
 
     COMPLEXITY:
     ──────────
@@ -476,15 +509,15 @@ def longest_common_substring(s1: str, s2: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# QUESTION 7: Suffix Array Construction (Manber-Myers O(n log n))
+# QUESTION 7: Suffix Array Construction (Prefix Doubling)
 # ════════════════════════════════════════════════════════════════════════
 
 def build_suffix_array(s: str) -> List[int]:
     """
     QUESTION:
     ─────────
-    Build a suffix array for string s in O(n log n) time.
-    Suffix array: sorted order of all suffixes of s.
+    Build a suffix array: the start indices of all suffixes of s, in
+    sorted order.
 
     Example:
         Input: "banana"
@@ -493,15 +526,21 @@ def build_suffix_array(s: str) -> List[int]:
 
     THOUGHT PROCESS:
     ────────────────
-    1. Start with sorting by first character (rank by ASCII)
-    2. For k = 1, 2, 4, 8, ... until 2^k ≥ n:
-       - Sort by rank and (rank of next 2^k chars)
-       - Assign new ranks based on sorted order
-    3. This is essentially a radix sort by pairs (rank[i], rank[i+k])
+    1. Naive: sort the n suffixes as strings — O(n² log n) worst
+       (each comparison can cost O(n))
+    2. Prefix doubling: rank[i] = rank of suffix i by its first k chars.
+       Start with k = 1 (rank by character).
+    3. For k = 1, 2, 4, 8, ...: the first 2k chars of suffix i are
+       (first k chars of i, first k chars of i + k), so sort by the PAIR
+       (rank[i], rank[i+k]) — no string comparisons needed. A suffix
+       too short to have a second half gets -1 (sorts first).
+    4. Re-rank; stop when all n ranks are distinct.
+    5. Sorting pairs with radix sort (Manber-Myers) gives O(n log n);
+       Python's comparison sort used here gives O(n log² n).
 
     COMPLEXITY:
     ──────────
-    Time: O(n log n) — Log n iterations, each O(n log n)
+    Time: O(n log² n) — O(log n) rounds, each an O(n log n) sort
     Space: O(n) — Rank arrays
     """
     n = len(s)
@@ -544,6 +583,11 @@ def build_lcp_array(s: str, suffix_arr: List[int]) -> List[int]:
     Build LCP (Longest Common Prefix) array using Kasai's algorithm.
     LCP[i] = longest common prefix between suffix_arr[i] and suffix_arr[i-1].
 
+    Why O(n): process suffixes in TEXT order (i = 0, 1, 2 ...). If suffix
+    i shares h chars with its predecessor in the suffix array, suffix i+1
+    shares at least h - 1 with ITS predecessor, so h drops by at most 1
+    per step and the total work of the inner while is O(n).
+
     Time: O(n), Space: O(n)
     """
     n = len(s)
@@ -574,11 +618,11 @@ def count_unique_substrings(s: str) -> int:
     """
     QUESTION:
     ─────────
-    Count the number of distinct substrings of a string.
+    Count the number of distinct non-empty substrings of a string.
 
     Example:
         Input: "ababa"
-        Output: 10  (a, b, ab, ba, aba, bab, abab, baba, ababa, ...)
+        Output: 9  (a, b, ab, ba, aba, bab, abab, baba, ababa)
 
     THOUGHT PROCESS:
     ────────────────
@@ -590,7 +634,9 @@ def count_unique_substrings(s: str) -> int:
 
     COMPLEXITY:
     ──────────
-    Time: O(n log n) — Building suffix array
+    Time: O(n log² n) — Building the suffix array dominates (O(n log n)
+          with radix sort); brute force with a set of all substrings is
+          O(n³) time and memory
     Space: O(n) — Suffix array and LCP array
     """
     n = len(s)

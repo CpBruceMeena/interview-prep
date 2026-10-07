@@ -25,8 +25,17 @@ Key Algorithms:
 • Euclidean GCD: gcd(a, b) = gcd(b, a % b), O(log min(a,b))
 • Sieve of Eratosthenes: O(n log log n) for primes up to n
 • Fast Exponentiation (Exponentiation by Squaring): O(log n)
-• Miller-Rabin: Probabilistic primality test
+• Miller-Rabin: Probabilistic primality test (deterministic for 64-bit
+  inputs with a fixed set of bases)
 • Pollard's Rho: Integer factorization
+
+Python notes:
+• Use math.isqrt(n) for integer square roots: int(n ** 0.5) goes through a
+  float and is off by one for large n (above ~2⁵²)
+• Built-ins: math.gcd, math.lcm (3.9+), math.comb, pow(b, e, m) for
+  modular exponentiation, pow(a, -1, m) for modular inverse (3.8+)
+• Java/Go: a * b overflows long past ~9.2e18; reduce mod m before
+  multiplying and keep m below ~3e9 so (m-1)² fits
 """
 
 from typing import List, Optional, Set, Tuple
@@ -57,7 +66,11 @@ def count_primes(n: int) -> int:
        - Count remaining True values
     2. Optimization: Start marking from i*i (not 2*i), because smaller
        multiples are already marked by smaller primes
-    3. Space optimization: Use bytearray instead of list of bools
+    3. Space optimization: bytearray (1 byte per number) instead of a
+       list of bools (an 8-byte pointer each); bitset or odd-only sieve
+       for more
+    4. Why only up to √n: a composite c < n has a prime factor ≤ √c,
+       so it is already crossed out by the time i passes √n
 
     COMPLEXITY:
     ──────────
@@ -70,7 +83,7 @@ def count_primes(n: int) -> int:
     is_prime = [True] * n
     is_prime[0] = is_prime[1] = False
 
-    for i in range(2, int(n ** 0.5) + 1):
+    for i in range(2, math.isqrt(n - 1) + 1):
         if is_prime[i]:
             # Mark multiples starting from i*i
             for j in range(i * i, n, i):
@@ -92,21 +105,33 @@ def gcd(a: int, b: int) -> int:
     1. Euclid's algorithm: gcd(a, b) = gcd(b, a % b)
     2. Base: gcd(a, 0) = a
     3. Repeatedly replace (a, b) with (b, a % b) until b = 0
-    4. Works because any common divisor of a and b also divides a % b
+    4. Works because a and b share exactly the same common divisors as
+       b and a % b (a % b = a - q·b)
+    5. Why O(log): every two steps the larger number at least halves;
+       consecutive Fibonacci numbers are the worst case (Lamé)
 
     COMPLEXITY:
     ──────────
     Time: O(log min(a, b)) — Number of divisions
     Space: O(1) — Iterative
     """
+    a, b = abs(a), abs(b)   # Python's % follows the divisor's sign
     while b:
         a, b = b, a % b
     return a
 
 
 def lcm(a: int, b: int) -> int:
-    """LCM = a * b / gcd(a, b)."""
-    return a * b // gcd(a, b)
+    """
+    LCM = |a * b| / gcd(a, b).
+
+    Divide BEFORE multiplying: a // gcd(a, b) * b. Same result, but the
+    intermediate stays small, which matters in Java/Go where a * b can
+    overflow even though the LCM itself fits. lcm(0, x) is 0.
+    """
+    if a == 0 or b == 0:
+        return 0
+    return abs(a // gcd(a, b) * b)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -129,14 +154,19 @@ def mod_pow(base: int, exp: int, mod: int) -> int:
        - If exp is even: base^exp = (base^2)^(exp/2)
        - If exp is odd: base^exp = base * base^(exp-1)
     2. Each step squaring reduces exponent by half → O(log n)
-    3. Apply modulo at each multiplication to prevent overflow
+    3. Apply modulo at each multiplication to keep numbers small (in
+       Java/Go this prevents overflow; in Python it keeps big-int
+       arithmetic fast)
+    4. Python built-in: pow(base, exp, mod). Uses: RSA, hashing, and
+       modular inverse via Fermat — a^(p-2) mod p when p is prime
+    5. Same squaring trick on matrices gives Fibonacci in O(log n)
 
     COMPLEXITY:
     ──────────
     Time: O(log exp) — Number of squarings
     Space: O(1) — Iterative
     """
-    result = 1
+    result = 1 % mod   # Not plain 1: x^0 mod 1 must be 0
     base %= mod
 
     while exp > 0:
@@ -169,11 +199,16 @@ def is_happy(n: int) -> bool:
     1. Use Floyd's Cycle Detection (slow/fast pointer) like linked list
     2. The sequence will either reach 1 or enter a cycle
     3. If slow == fast and slow != 1, we've detected a cycle
-    4. This avoids O(n) space of a hash set
+    4. This avoids the O(cycle length) space of a "seen" hash set
+    5. Why it must cycle or hit 1: for a number with d digits the next
+       value is at most 81·d, so values quickly fall below 243 and stay
+       in a finite set; the only unhappy cycle is 4 → 16 → 37 → 58 →
+       89 → 145 → 42 → 20 → 4
 
     COMPLEXITY:
     ──────────
-    Time: O(log n) — Number of digits decreases each iteration
+    Time: O(log n) — The first step costs O(digits); after that the
+          values are small, so the rest is bounded by a constant
     Space: O(1) — Only two pointers
     """
 
@@ -212,28 +247,38 @@ def prime_factors(n: int) -> List[int]:
     THOUGHT PROCESS:
     ────────────────
     1. Divide by 2 while even (handles all 2 factors)
-    2. Check odd divisors from 3 to sqrt(n)
-    3. Each time we find a divisor, divide completely
-    4. If remaining n > 1, it's a prime factor
+    2. Check odd divisors i while i * i <= n (n shrinking as we go)
+    3. Each time we find a divisor, divide completely — so every i that
+       divides n at that point is prime (its own factors are gone)
+    4. If remaining n > 1, it's a prime factor (at most one prime factor
+       exceeds √n)
     5. Optimization: After 2, only check odd numbers
+    6. Many queries up to N: precompute the smallest prime factor of
+       every number with a sieve, then factor each in O(log n)
 
     COMPLEXITY:
     ──────────
-    Time: O(√n) — Check up to square root
+    Time: O(√n) — Trial division up to the square root (stops early as
+          n shrinks); exponential in the number of DIGITS, which is why
+          RSA is safe
     Space: O(log n) — Number of prime factors
     """
     factors = []
+    if n < 2:
+        return factors
 
     # Count factor 2
     while n % 2 == 0:
         factors.append(2)
         n //= 2
 
-    # Check odd factors
-    for i in range(3, int(n ** 0.5) + 1, 2):
+    # Check odd factors while i <= √(remaining n)
+    i = 3
+    while i * i <= n:
         while n % i == 0:
             factors.append(i)
             n //= i
+        i += 2
 
     # If n is still > 1, it's a prime factor
     if n > 1:
@@ -266,10 +311,11 @@ def get_divisors(n: int) -> List[int]:
     COMPLEXITY:
     ──────────
     Time: O(√n) — Check up to square root
-    Space: O(√n) — Divisor count
+    Space: O(d(n)) — d(n) = number of divisors, far smaller than √n in
+           practice (at most 1344 for any n < 10⁹)
     """
     divisors = []
-    for i in range(1, int(n ** 0.5) + 1):
+    for i in range(1, math.isqrt(n) + 1):
         if n % i == 0:
             divisors.append(i)
             if i != n // i:
@@ -293,7 +339,8 @@ def int_to_roman(num: int) -> str:
 
     THOUGHT PROCESS:
     ────────────────
-    1. Greedy: Use the largest possible symbol at each step
+    1. Greedy: Use the largest possible symbol at each step (safe here
+       because the symbol set, with subtractive pairs, is canonical)
     2. Map values to symbols in descending order
     3. Subtract the value from num as many times as possible
     4. Include subtractive combinations (CM, CD, XC, XL, IX, IV)
@@ -321,6 +368,11 @@ def int_to_roman(num: int) -> str:
 def roman_to_int(s: str) -> int:
     """
     Convert Roman numeral to integer.
+
+    Scan right to left: a symbol smaller than the one to its right is
+    subtracted (the I in IV), otherwise added. Assumes valid input; it
+    does not reject malformed numerals like "IIII" or "IC".
+
     Time: O(n), Space: O(1)
     """
     roman_map = {'I': 1, 'V': 5, 'X': 10, 'L': 50,
@@ -397,9 +449,17 @@ def reservoir_sample(stream: List[int], k: int) -> List[int]:
     2. For i from k to n-1:
        - Randomly pick index j in [0, i]
        - If j < k, replace reservoir[j] with stream[i]
-    3. Proof: When processing element i, its probability of being in
-       the final sample is k/(i+1)
-    4. By induction, every element has probability k/n of being selected
+    3. Proof (n = final stream length, indices from 0):
+       - Element i (i >= k) enters with probability k/(i+1)
+       - At a later step t it is evicted only if j == its slot:
+         probability 1/(t+1), so it survives with t/(t+1)
+       - P(i in final) = k/(i+1) · (i+1)/(i+2) · ... · (n-1)/n = k/n
+       - The first k elements telescope the same way to k/n
+    4. Use it when n is unknown or the data doesn't fit in memory (log
+       streams, sampling rows in one pass). For a list already in
+       memory, random.sample(population, k) is simpler.
+    5. Weighted version: key = random() ** (1 / weight), keep the k
+       largest keys (Efraimidis-Spirakis)
 
     COMPLEXITY:
     ──────────
@@ -409,7 +469,7 @@ def reservoir_sample(stream: List[int], k: int) -> List[int]:
     if k <= 0:
         return []
 
-    reservoir = stream[:k].copy() if len(stream) >= k else stream.copy()
+    reservoir = list(stream[:k])  # Fewer than k items → return them all
 
     for i in range(k, len(stream)):
         # Random index from 0 to i
@@ -443,6 +503,8 @@ def segmented_sieve(low: int, high: int) -> List[int]:
     3. For each prime p from step 1, mark multiples in the range
        Start from max(p*p, ((low + p - 1) // p) * p)
     4. This avoids O(high) memory — only O(sqrt(high) + range)
+    5. A p*p start is needed so that p itself (when low <= p) is not
+       crossed out as a multiple of itself
 
     COMPLEXITY:
     ──────────
@@ -454,13 +516,13 @@ def segmented_sieve(low: int, high: int) -> List[int]:
     if high < 2:
         return []
 
-    limit = int(high ** 0.5) + 1
+    limit = math.isqrt(high) + 1
 
     # Simple sieve to find primes up to sqrt(high)
     is_prime_small = [True] * limit
     is_prime_small[0] = is_prime_small[1] = False
 
-    for i in range(2, int(limit ** 0.5) + 1):
+    for i in range(2, math.isqrt(limit - 1) + 1):
         if is_prime_small[i]:
             for j in range(i * i, limit, i):
                 is_prime_small[j] = False

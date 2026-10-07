@@ -61,11 +61,17 @@ def subsets(nums: List[int]) -> List[List[int]]:
     THOUGHT PROCESS:
     ────────────────
     1. At each element, we have two choices: include or exclude
-    2. Recursive decision tree — each level processes one element
-    3. The "include/exclude" pattern is the foundation of backtracking
-    4. Base case: when we've processed all elements, add current subset
-    5. Alternative: Iterative (start with [[]], for each num, add num
-       to each existing subset)
+    2. Two equivalent recursion shapes:
+       a) Binary include/exclude tree: record the subset only at the
+          leaves (after deciding all n elements)
+       b) "Pick the next element" loop (used below): every node of the
+          tree is a valid subset, so record it on entry; the loop from
+          `start` guarantees each subset is built in increasing index
+          order exactly once
+    3. The "choose → recurse → un-choose" pattern is the foundation of
+       backtracking
+    4. Alternatives: iterative (start with [[]], for each num, add num
+       to each existing subset), or bitmasks 0..2ⁿ-1
 
     COMPLEXITY:
     ──────────
@@ -206,7 +212,10 @@ def permute_unique(nums: List[int]) -> List[List[int]]:
           we're starting a new branch at this level)
     3. The condition: used[i-1] is False means we've already processed
        this value at this recursion level
-    4. This prevents swapping a duplicate into the same position
+    4. Net effect: equal values are always used in their sorted order,
+       so a duplicate is never placed into the same position twice
+    5. Alternative: iterate over a Counter of remaining values instead of
+       indices — no sorting and no skip rule needed
 
     COMPLEXITY:
     ──────────
@@ -369,8 +378,11 @@ def solve_n_queens(n: int) -> List[List[str]]:
 
     COMPLEXITY:
     ──────────
-    Time: O(n!) — First row n choices, second n-1, etc.
-    Space: O(n) — Board representation
+    Time: O(n!) — First row n choices, second n-1, etc. (an upper
+          bound; diagonal pruning cuts far more in practice)
+    Space: O(n²) — The board; the sets and recursion are O(n)
+           (storing one column index per row instead of a board makes it
+           O(n) overall)
     """
     cols = set()
     pos_diag = set()  # row + col
@@ -429,8 +441,9 @@ def generate_parentheses(n: int) -> List[str]:
 
     COMPLEXITY:
     ──────────
-    Time: O(4ⁿ/√n) — Catalan number C_n = (2n)!/((n+1)!n!)
-    Space: O(n) — Recursion depth (2n)
+    Time: O(4ⁿ/√n) — C_n = (2n)!/((n+1)!n!) ≈ 4ⁿ/(n^1.5·√π) results,
+          each O(n) to build
+    Space: O(n) — Recursion depth (2n), excluding output
     """
     result = []
 
@@ -481,6 +494,9 @@ def exist(board: List[List[str]], word: str) -> bool:
     5. Unmark when backtracking
     6. Optimization: Pre-check character frequencies
        (if board has fewer of any char than word needs, return False)
+    7. Optimization: if the word's last letter is rarer on the board than
+       its first, search for the reversed word (fewer starting points)
+    8. Many words at once → Trie + DFS (Trie Q2), not one search per word
 
     COMPLEXITY:
     ──────────
@@ -547,12 +563,18 @@ def solve_sudoku(board: List[List[str]]) -> None:
     3. If valid, place digit and recursively solve the rest
     4. If recursive call fails, backtrack (remove digit)
     5. Use sets for O(1) constraint checking
-    6. Optimization: Use bit masks for row/col/box constraints
+    6. Optimizations (what interviewers probe next):
+       - Bit masks instead of sets for row/col/box
+       - MRV heuristic: always fill the empty cell with the FEWEST legal
+         digits next; it fails fast and prunes enormously
+       - Constraint propagation (naked singles) before guessing
 
     COMPLEXITY:
     ──────────
-    Time: O(9^(81)) worst, but constraint propagation prunes heavily
-    Space: O(81) — Recursion stack
+    Time: O(9^E) worst case for E empty cells; the row/col/box checks
+          prune most branches (this code checks constraints but does not
+          propagate them)
+    Space: O(E) — Recursion stack, E ≤ 81
     """
     rows = [set() for _ in range(9)]
     cols = [set() for _ in range(9)]
@@ -599,6 +621,60 @@ def solve_sudoku(board: List[List[str]]) -> None:
         return False
 
     backtrack(0)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 11: Letter Combinations of a Phone Number
+# ════════════════════════════════════════════════════════════════════════
+
+def letter_combinations(digits: str) -> List[str]:
+    """
+    QUESTION:
+    ─────────
+    Given a string of digits 2-9, return all letter combinations they
+    could represent on a phone keypad (2 → "abc", ..., 9 → "wxyz").
+
+    Example:
+        Input: "23"
+        Output: ["ad","ae","af","bd","be","bf","cd","ce","cf"]
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Position i has len(mapping[digits[i]]) choices, independent of the
+       others → a Cartesian product. Backtracking fills one position per
+       recursion level.
+    2. No pruning is possible (every path is a valid answer), so this is
+       the simplest form of the template; the point is clean
+       choose/recurse/un-choose with a shared buffer.
+    3. Pythonic equivalent: itertools.product(*(mapping[d] for d in digits))
+    4. Empty input → [] (not [""]): a classic edge-case trap.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(4ⁿ · n) — Up to 4 letters per digit, each result O(n) to join
+    Space: O(n) — Recursion depth, excluding output
+    """
+    if not digits:
+        return []
+
+    mapping = {
+        "2": "abc", "3": "def", "4": "ghi", "5": "jkl",
+        "6": "mno", "7": "pqrs", "8": "tuv", "9": "wxyz",
+    }
+    result: List[str] = []
+    path: List[str] = []
+
+    def backtrack(i: int) -> None:
+        if i == len(digits):
+            result.append("".join(path))
+            return
+        for letter in mapping[digits[i]]:
+            path.append(letter)        # Choose
+            backtrack(i + 1)           # Explore
+            path.pop()                 # Un-choose
+
+    backtrack(0)
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -687,6 +763,11 @@ def demo():
     print(f"   Solved board:")
     for row in sudoku:
         print(f"     {' '.join(row)}")
+
+    # Q11
+    print("\n1️⃣1️⃣  Letter Combinations of a Phone Number")
+    print("-" * 40)
+    print(f"   \"23\": {letter_combinations('23')}")
 
     print("\n" + "=" * 70)
 

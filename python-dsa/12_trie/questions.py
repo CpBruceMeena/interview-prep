@@ -5,16 +5,24 @@ TRIE (Prefix Tree) — Core Concepts & Interview Questions
 Core Concepts:
 ──────────────
 • Tree data structure for efficient string/prefix operations
-• Each node represents a single character of the alphabet
-• Root is empty, paths from root represent words/prefixes
+• Each EDGE is labelled with a character; a node stands for the prefix
+  spelled by the path from the root
+• Root is the empty prefix
 • is_end flag marks the terminal character of a word
-• Space: O(total characters across all strings)
+• Space: O(total characters across all strings) nodes — but each node
+  carries a dict (or a 26-slot array), so the constant is large; tries
+  are often MORE memory-hungry than a hash set of the same words
 • Time: O(k) for insert/search/prefix where k = string length
+• Compressed variants: radix tree / Patricia trie (one edge per run of
+  single-child nodes) — used in routers' longest-prefix match and in
+  Linux and Redis internals
 
 Why Trie over Hash Set:
 ───────────────────────
 • Prefix search: Find all words with a given prefix — O(k) vs O(n) scan
-• Lexicographic ordering: In-order traversal gives sorted strings
+• Lexicographic ordering: a DFS that visits children in sorted order
+  emits the words sorted (Python dicts keep insertion order, so sort the
+  child keys or use a 26-slot array)
 • Memory sharing: Common prefixes share storage space
 • Auto-complete and spell-checking applications
 
@@ -65,6 +73,9 @@ class Trie:
     3. Search: traverse each character, if missing at any point → False
        return is_end of final node
     4. StartsWith: traverse each character, if missing → False, else True
+    5. Follow-ups: delete(word) — unset is_end, then prune nodes bottom-up
+       that have no children and are not word ends; count words with a
+       prefix — store a pass-through counter on each node
 
     COMPLEXITY:
     ──────────
@@ -136,8 +147,16 @@ def find_words(board: List[List[str]], words: List[str]) -> List[str]:
 
     COMPLEXITY:
     ──────────
-    Time: O(m × n × 4^L) — One DFS exploring all word paths
-    Space: O(total characters in words) — Trie storage
+    Time: O(m × n × 4 × 3^(L-1)) — L = longest word; after the first
+          step a path can't go back to the cell it came from, so 3
+          branches. Building the trie adds O(total characters).
+    Space: O(total characters in words) — Trie storage, plus O(L) stack
+
+    WHY PRUNING MATTERS:
+    ────────────────────
+    Without deleting exhausted branches, a board full of 'a' with words
+    like "aaaa…b" explores the same dead paths from every cell. Removing
+    found words and empty nodes shrinks the trie as the search proceeds.
     """
     # Build Trie
     root = TrieNode()
@@ -370,14 +389,24 @@ class AutoCompleteSystem:
     ────────────────
     1. Store sentences in a Trie where each node tracks sentences
        passing through it (with frequencies)
-    2. As user types, traverse Trie to current node
+    2. As user types, move ONE step from the current node (we keep the
+       node between keystrokes, so each keystroke is O(1) to navigate)
     3. Return top 3 hot sentences from current node
-    4. After space, save the completed sentence
+    4. '#' ends the input: save the completed sentence with count + 1
 
     COMPLEXITY:
     ──────────
-    Time: O(k + m log m) — k = typed chars, m = suggestions at node
-    Space: O(total characters across all sentences)
+    Time: O(m log m) per keystroke — sort the m sentences under the node
+          (heapq.nsmallest(3, ...) makes it O(m log 3) = O(m))
+    Space: O(Σ sentence lengths) dict entries — every node stores every
+           sentence passing through it
+
+    PRODUCTION / FOLLOW-UPS:
+    ────────────────────────
+    • Cache the top-k list at each node and update it on insert, so reads
+      are O(1); writes get more expensive (the usual read/write trade-off)
+    • Real systems precompute top-k offline from query logs, shard the
+      trie by prefix, and serve from memory or a cache
     """
 
     def __init__(self, sentences: List[str], times: List[int]):
@@ -449,9 +478,15 @@ def find_all_concatenated_words(words: List[str]) -> List[str]:
     4. Only words shorter than current are candidates
     5. DFS with memoization for overlapping subproblems
 
+    6. Same check as Word Break (DP Q12) with the dictionary = all
+       shorter words; a word must not be formed from itself, which the
+       "add to word_set after checking" order guarantees.
+
     COMPLEXITY:
     ──────────
-    Time: O(n × k²) — n words, k = avg length
+    Time: O(n log n + n × k³) — per word, O(k) memoized suffixes × O(k)
+          split points × O(k) to slice/hash each piece (often quoted
+          as O(n·k²) ignoring the slice cost)
     Space: O(n × k) — Word set
     """
     words.sort(key=len)

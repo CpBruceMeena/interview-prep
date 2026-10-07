@@ -98,9 +98,14 @@ class MinStack:
        - Pop: Just pop, min is restored automatically
        - This works because each element carries the min at that point
     3. Space-optimized: Use a separate min stack
-       - Only push to min stack when new_min changes
-       - Only pop from min stack when top equals current_min
+       - Push to min stack when val <= current min (the <= matters:
+         with duplicates of the minimum, using < would pop the min too
+         early)
+       - Pop from min stack when the popped value equals its top
        - Saves space when min doesn't change frequently
+    4. O(1)-extra-space trick (store 2*val - min encoded values) exists,
+       but in Java/Go it can overflow 32-bit ints; mention it, don't lead
+       with it
 
     COMPLEXITY:
     ──────────
@@ -250,13 +255,16 @@ def eval_rpn(tokens: List[str]) -> int:
        - When encountering operator, pop two operands, compute, push result
     2. Order matters: For subtraction and division, second pop is left operand
        e.g., "5 3 -" → pop 3, then pop 5 → 5 - 3 = 2
-    3. Integer division: Use int(a / b) for truncation toward zero
-       (Python's // floors toward negative infinity, not truncates)
+    3. Integer division must truncate toward zero (Java/Go/C semantics).
+       Python's // floors toward negative infinity: -7 // 2 == -4, but
+       the answer here is -3. int(a / b) is the common shortcut, but it
+       goes through a float and loses precision past 2⁵³, so we divide
+       magnitudes with // and reapply the sign.
 
     COMPLEXITY:
     ──────────
     Time: O(n) — Single pass through tokens
-    Space: O(n) — Stack can hold up to n/2 elements
+    Space: O(n) — Stack can hold up to (n+1)/2 operands
     """
     stack = []
 
@@ -271,8 +279,9 @@ def eval_rpn(tokens: List[str]) -> int:
                 stack.append(a - b)
             elif token == '*':
                 stack.append(a * b)
-            else:  # division: truncate toward zero
-                stack.append(int(a / b))
+            else:  # division: truncate toward zero, exactly
+                q = abs(a) // abs(b)
+                stack.append(q if (a >= 0) == (b > 0) else -q)
         else:
             stack.append(int(token))
 
@@ -305,8 +314,14 @@ def next_greater_elements(nums: List[int]) -> List[int]:
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Each element processed twice, stack operations O(1)
+    Time: O(n) — 2n iterations; each index pushed and popped at most once
     Space: O(n) — Result array + stack
+
+    EDGE CASES:
+    ──────────
+    • The maximum (and duplicates of it) stay -1 — nothing is strictly
+      greater even after wrapping
+    • All equal — every answer is -1 (strict >)
     """
     n = len(nums)
     result = [-1] * n
@@ -356,6 +371,11 @@ def validate_stack_sequences(pushed: List[int], popped: List[int]) -> bool:
     ──────────
     Time: O(n) — Each element pushed and popped at most once
     Space: O(n) — Stack storage
+
+    ASSUMPTION:
+    ──────────
+    Values are distinct and popped is a permutation of pushed (the
+    LeetCode constraint). With duplicates, greedy popping is ambiguous.
     """
     stack = []
     pop_idx = 0
@@ -400,8 +420,15 @@ def decode_string(s: str) -> str:
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Each character processed once
-    Space: O(n) — Stack stores intermediate strings
+    Time: O(n + L·d) — n = input length, L = decoded length, d = nesting
+          depth. NOT O(n): "3[3[3[a]]]" is 10 chars but decodes to 27,
+          and each nested level re-copies the string it builds.
+    Space: O(L) — The decoded string and the partial strings on the stack
+
+    EDGE CASES:
+    ──────────
+    • Multi-digit counts "12[a]" — accumulate current_count * 10 + d
+    • Letters after a bracket "2[a]bc" — appended to the outer string
     """
     count_stack = []
     string_stack = []
@@ -424,6 +451,72 @@ def decode_string(s: str) -> str:
             current_string += char
 
     return current_string
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 9: Basic Calculator II (+ - * / with precedence)
+# ════════════════════════════════════════════════════════════════════════
+
+def calculate(s: str) -> int:
+    """
+    QUESTION:
+    ─────────
+    Evaluate a string expression containing non-negative integers, the
+    operators + - * /, and spaces (no parentheses). Integer division
+    truncates toward zero. The expression is always valid.
+
+    Example:
+        Input: " 3+5 / 2 "
+        Output: 5
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. The difficulty is precedence: * and / bind tighter than + and -.
+    2. Stack of signed terms: when an operator ends a number, act on the
+       PREVIOUS operator:
+       - '+' → push num;  '-' → push -num
+       - '*' / '/' → pop the last term, combine it with num, push back
+       The answer is sum(stack): every remaining entry is an additive term.
+    3. Trigger evaluation when we hit an operator OR the last character,
+       otherwise the final number is never applied (the classic bug).
+    4. O(1)-space variant: keep only the last term in a variable instead
+       of a stack. With parentheses (Basic Calculator I/III), recurse or
+       push the running result and sign on '('.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — One pass
+    Space: O(n) — The stack of terms (O(1) with the last-term variant)
+
+    EDGE CASES:
+    ──────────
+    • "14-3/2" — the 3 is pushed as -3, so the division sees -3 / 2.
+      Truncating gives -1 (answer 13); Python's floor // would give -2
+      (answer 12). Truncation is what makes trunc(-b/c) == -(b/c) hold.
+    • Multi-digit numbers and arbitrary spaces
+    """
+    stack: List[int] = []
+    num = 0
+    prev_op = '+'
+
+    for i, ch in enumerate(s):
+        if ch.isdigit():
+            num = num * 10 + int(ch)
+        if (ch in '+-*/') or i == len(s) - 1:
+            if prev_op == '+':
+                stack.append(num)
+            elif prev_op == '-':
+                stack.append(-num)
+            elif prev_op == '*':
+                stack.append(stack.pop() * num)
+            else:  # '/': truncate toward zero
+                top = stack.pop()
+                q = abs(top) // num
+                stack.append(q if top >= 0 else -q)
+            prev_op = ch
+            num = 0
+
+    return sum(stack)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -500,6 +593,12 @@ def demo():
     tests = ["3[a]2[bc]", "3[a2[c]]"]
     for t in tests:
         print(f"   \"{t}\" → \"{decode_string(t)}\"")
+
+    # Q9
+    print("\n9️⃣  Basic Calculator II")
+    print("-" * 40)
+    for expr in ["3+2*2", " 3/2 ", " 3+5 / 2 ", "14-3/2"]:
+        print(f"   \"{expr}\" → {calculate(expr)}")
 
     print("\n" + "=" * 70)
 

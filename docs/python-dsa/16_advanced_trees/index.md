@@ -16,33 +16,46 @@ Core Concepts:
 Self-balancing trees maintain O(log n) height for all operations:
 • AVL Tree: Strictly height-balanced (|left_height - right_height| ≤ 1)
   - Rotations: LL, RR, LR, RL
-  - Used when frequent lookups outweigh insertions
+  - Shorter than red-black → slightly faster lookups; more rotations on
+    writes. Used when lookups dominate
 • Red-Black Tree: Loosely balanced using color constraints
   - Root is black, no adjacent reds, equal black-height
-  - Used in Java TreeMap, C++ std::map
-  - Insert: O(log n) with at most 2 rotations
+  - Used in Java TreeMap/TreeSet (and HashMap's treeified buckets),
+    C++ std::map in the common standard libraries, the Linux kernel
+    (CFS scheduler run queue, epoll)
+  - Insert: O(log n) with at most 2 rotations; delete at most 3
 
 Multi-way Trees:
 ────────────────
 • B-Tree: Generalization of BST with multiple keys per node
   - All leaves at same depth
   - Every node (except root) has between ceil(m/2)-1 and m-1 keys
-  - Used in databases and filesystems (SQLite, PostgreSQL indexes)
+  - Node size = one disk/SSD page, so each level costs one page read
 • B+ Tree: B-Tree variant where only leaves store data
   - Internal nodes store keys only (routing table)
   - Leaves form a linked list for range queries
-  - Used in most database indexes (MySQL InnoDB)
+  - What databases actually mean by "B-tree index": MySQL InnoDB
+    (clustered index), PostgreSQL nbtree (a Lehman-Yao B-link tree),
+    SQLite tables; also filesystems such as Btrfs, XFS and NTFS
+• Write-heavy alternative: LSM trees (RocksDB, Cassandra) trade read
+  cost for sequential writes
 
 Comparison:
 ───────────
 | Feature | AVL | Red-Black | B-Tree | B+ Tree |
 |---------|-----|-----------|--------|---------|
-| Height | ≤ 1.44 log n | ≤ 2 log n | ≤ log_m n | ≤ log_m n |
+| Height | ≤ 1.44 log₂ n | ≤ 2 log₂(n+1) | O(log_t n) | O(log_t n) |
 | Lookup | O(log n) | O(log n) | O(log n) | O(log n) |
 | Insert | O(log n) | O(log n) | O(log n) | O(log n) |
 | Delete | O(log n) | O(log n) | O(log n) | O(log n) |
 | Cache Misses | High | High | Low | Lowest |
-| Range Queries | O(n) | O(n) | O(n) | O(log n + k) |
+| Range (k results) | O(log n + k) | O(log n + k) | O(log n + k) | O(log n + k) |
+
+All four answer a range query in O(log n + k) via an in-order walk.
+The B+ tree's real advantage is I/O: after one descent, the k results
+are read from consecutive leaf pages via sibling links, while the
+B-tree's in-order walk keeps bouncing between internal and leaf pages.
+(t = minimum degree / branching factor, typically hundreds per page.)
 """
 
 from typing import List, Optional, Tuple, Union
@@ -104,7 +117,7 @@ class AVLTree:
         node.height = 1 + max(self._height(node.left), self._height(node.right))
 
     def _rotate_right(self, y: AVLNode) -> AVLNode:
-        """
+        r"""
         Right rotation (for LL imbalance):
             y               x
            / \             / \
@@ -124,7 +137,7 @@ class AVLTree:
         return x
 
     def _rotate_left(self, x: AVLNode) -> AVLNode:
-        """
+        r"""
         Left rotation (for RR imbalance):
             x               y
            / \             / \
@@ -483,10 +496,15 @@ class BTree:
 
     COMPLEXITY:
     ──────────
-    Search: O(log_m n) — Height = log_m n
-    Insert: O(log_m n) — Log_m n nodes visited
-    Delete: O(log_m n)
-    Space: O(n × m) — Each node stores up to m-1 keys
+    Search: O(log_t n) node visits (page reads); O(log n) comparisons
+            in total with binary search inside each node
+    Insert: O(t · log_t n) CPU — shifting keys within each split node —
+            but still O(log_t n) page reads, which is what matters on disk
+    Delete: O(log_t n) page reads (borrow from / merge with siblings)
+    Space: O(n) — every non-root node is at least half full
+
+    NOTE: this demo B-tree accepts duplicate keys and uses a linear scan
+    inside nodes; real implementations binary-search each page.
     """
 
     def __init__(self, t: int = 3):
@@ -608,7 +626,8 @@ Key Differences from B-Tree:
 │ Data pointers     │ All nodes          │ Leaf nodes only      │
 │ Internal nodes    │ Store keys + data  │ Store keys only      │
 │ Leaf structure    │ Scattered          │ Linked list chain    │
-│ Range queries     │ O(n) + height cost │ O(log n + k)         │
+│ Range queries     │ O(log n + k), but  │ O(log n + k), with   │
+│                    │ random page reads  │ sequential leaf reads│
 │ Cache efficiency  │ Lower              │ Higher (more keys    │
 │                    │                     │ per internal node)   │
 │ Fan-out          │ Lower              │ Higher               │
@@ -617,7 +636,8 @@ Key Differences from B-Tree:
 Structure:
 ─────────
 • Internal nodes: [k1, k2, ..., kn], each key is a routing value
-  - Children: c0, c1, ..., cn where c_i has keys in [k_i, k_{i+1}]
+  - Children: c0, c1, ..., cn where c_i holds keys in [k_i, k_{i+1})
+    (c0 holds keys < k1)
 • Leaf nodes: [k1:v1, k2:v2, ..., kn:vn] — key-value pairs
   - Leaves are linked: leaf.next = next_leaf (for range scans)
 • All leaves are at the same depth
@@ -637,11 +657,23 @@ Operations:
 Why B+ Tree Wins for Databases:
 ───────────────────────────────
 1. Higher fan-out = shorter tree = fewer disk seeks
-   - B+ Tree with order 100: 100^4 = 100M records in 4 levels
+   - B+ Tree with order 100: 100^4 = 100M records in 4 levels; real
+     fan-out with 8-16 KB pages is often several hundred, so 3-4
+     levels cover billions of rows
 2. Range queries: just walk the leaf linked list
-   - B-Tree requires random access to each leaf
-3. Better cache locality: internal nodes fit in cache
+   - B-Tree's in-order walk climbs back into internal nodes (more,
+     non-sequential page reads)
+3. Better cache locality: the few internal levels stay in the buffer
+   pool, so a lookup usually costs ~1 physical read (the leaf)
 4. Internal nodes store only keys (more keys per node)
+
+What interviewers probe next:
+• Clustered vs secondary index (InnoDB secondary leaves store the
+  primary key → a second lookup unless the index is covering)
+• Why random UUID primary keys hurt: inserts land on random leaves →
+  page splits and poor cache locality; time-ordered IDs (UUIDv7) fix it
+• Concurrency: latch crabbing / B-link trees (PostgreSQL) so readers
+  don't block on splits
 """
 
 
@@ -698,7 +730,7 @@ def demo():
     print("-" * 40)
     print("   See docstring for detailed explanation")
     print("   Key advantage: Range queries via leaf linked list")
-    print("   Used in: MySQL InnoDB, PostgreSQL indexes")
+    print("   Used in: MySQL InnoDB, PostgreSQL (nbtree), SQLite, many filesystems")
     print("   Fan-out of 100: 100^4 = 100M records in 4 levels")
 
     print("\n" + "=" * 70)

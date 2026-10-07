@@ -100,13 +100,28 @@ def max_subarray_sum(nums: List[int]) -> int:
        - At each position, decide: extend current subarray or start fresh?
        - If current_sum + nums[i] < nums[i], it's better to start fresh
        - Track global maximum across all positions
-    3. Why it works: Optimal subarray ending at i uses optimal subarray
-       ending at i-1 (optimal substructure)
+    3. Why it works: the best subarray ending at i is either nums[i] alone
+       or nums[i] appended to the best subarray ending at i-1 (optimal
+       substructure). It is really a 1-D DP with the table collapsed to
+       one variable.
 
     COMPLEXITY:
     ──────────
     Time: O(n) — Single pass with O(1) operations per element
     Space: O(1) — Only two variables needed
+
+    EDGE CASES:
+    ──────────
+    • All negative — answer is the largest single element (hence we seed
+      with nums[0], not 0; seeding with 0 is a classic bug)
+    • Empty input — undefined by the problem; raise or return a sentinel
+    • Java/Go: running sums can overflow a 32-bit int; use long / int64
+
+    FOLLOW-UPS INTERVIEWERS ASK:
+    ────────────────────────────
+    • Return the indices — track where the current run started
+    • Circular array — max(normal Kadane, total - min-subarray), unless all
+      elements are negative
     """
     max_ending_here = nums[0]
     max_so_far = nums[0]
@@ -149,6 +164,13 @@ def product_except_self(nums: List[int]) -> List[int]:
     ──────────
     Time: O(n) — Two passes over the array
     Space: O(1) — Output array doesn't count as extra space
+
+    EDGE CASES:
+    ──────────
+    • One zero — every output is 0 except at the zero's index
+    • Two or more zeros — every output is 0
+      (both fall out of prefix/suffix products naturally; this is also why
+      the "total / nums[i]" trick is wrong even when division is allowed)
     """
     n = len(nums)
     output = [1] * n
@@ -252,6 +274,12 @@ def find_duplicates(nums: List[int]) -> List[int]:
     ──────────
     Time: O(n) — Single pass
     Space: O(1) — Excluding output list
+
+    EDGE CASES:
+    ──────────
+    • The trick mutates the input; say so in the interview and restore it
+      (the second loop below) if the caller still needs the array
+    • Only valid because values are in [1, n]; otherwise use a hash set
     """
     result = []
 
@@ -299,7 +327,14 @@ def three_sum(nums: List[int]) -> List[List[int]]:
     COMPLEXITY:
     ──────────
     Time: O(n²) — Sorting O(n log n) + nested loops O(n²)
-    Space: O(1) or O(n) depending on sort implementation
+    Space: O(1) extra besides the output, but sorting needs space too
+           (Python's Timsort is O(n) worst case; sorts the input in place)
+
+    EDGE CASES:
+    ──────────
+    • Fewer than 3 elements — loop body never runs, returns []
+    • All zeros [0,0,0,0] — exactly one triplet thanks to the dedup skips
+    • The input list is sorted in place; copy first if the caller cares
     """
     nums.sort()
     result = []
@@ -366,14 +401,22 @@ def merge_intervals(intervals: List[List[int]]) -> List[List[int]]:
     COMPLEXITY:
     ──────────
     Time: O(n log n) — Sorting is the bottleneck
-    Space: O(n) — For sorted intervals (or O(1) if in-place sort)
+    Space: O(n) — The output (plus the sort's own buffer)
+
+    EDGE CASES:
+    ──────────
+    • Touching intervals [1,4],[4,5] — merged (we use <=); ask whether
+      the interviewer treats closed or half-open intervals
+    • One interval contains another [1,10],[2,3] — the max() keeps 10
+    • Don't alias the input: appending intervals[0] itself and then
+      mutating merged[-1] would silently rewrite the caller's data
     """
     if not intervals:
         return []
 
-    # Sort by start time
-    intervals.sort(key=lambda x: x[0])
-    merged = [intervals[0]]
+    # Sort by start time (sorted() leaves the caller's list untouched)
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [list(intervals[0])]
 
     for start, end in intervals[1:]:
         last_end = merged[-1][1]
@@ -417,8 +460,15 @@ def first_missing_positive(nums: List[int]) -> int:
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Each element is placed correctly in constant time
-    Space: O(1) — In-place swapping
+    Time: O(n) — Every swap puts one value into its final slot, so there
+          are at most n swaps in total across all iterations of the while
+    Space: O(1) — In-place swapping (mutates the input)
+
+    EDGE CASES:
+    ──────────
+    • Duplicates [1,1] — the loop condition compares against the value
+      already at the target slot (not against i+1), so it cannot spin forever
+    • All negatives / zeros — answer is 1
     """
     n = len(nums)
 
@@ -465,8 +515,15 @@ def rotate_array(nums: List[int], k: int) -> None:
     ──────────
     Time: O(n) — Three reverses, each O(n)
     Space: O(1) — In-place modifications
+
+    EDGE CASES:
+    ──────────
+    • k > n — reduce with k %= n first
+    • Empty array — guard before the modulo (k % 0 raises)
     """
     n = len(nums)
+    if n == 0:
+        return
     k %= n  # Handle k > n
 
     def reverse(start: int, end: int) -> None:
@@ -532,6 +589,111 @@ def longest_consecutive(nums: List[int]) -> int:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# QUESTION 11: Best Time to Buy and Sell Stock
+# ════════════════════════════════════════════════════════════════════════
+
+def max_profit(prices: List[int]) -> int:
+    """
+    QUESTION:
+    ─────────
+    prices[i] is a stock's price on day i. Choose one day to buy and a
+    later day to sell. Return the maximum profit, or 0 if no profit is
+    possible.
+
+    Example:
+        Input: [7, 1, 5, 3, 6, 4]
+        Output: 5  (buy at 1, sell at 6)
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Brute Force: Try every (buy, sell) pair with buy < sell — O(n²)
+    2. Key insight: if we sell on day i, the best buy day is the cheapest
+       price seen BEFORE i. So scan once, keeping the running minimum.
+    3. Profit on day i = prices[i] - min_so_far; track the max of that.
+    4. Same shape as Kadane's: it is max subarray on the day-to-day deltas.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — Single pass
+    Space: O(1) — Two variables
+
+    EDGE CASES:
+    ──────────
+    • Strictly decreasing prices — answer 0 (never trade)
+    • Empty or single-day input — 0
+
+    FOLLOW-UPS INTERVIEWERS ASK:
+    ────────────────────────────
+    • Unlimited transactions (II) — sum every positive day-to-day delta
+    • At most k transactions / cooldown / fee — state-machine DP
+    """
+    min_price = float("inf")
+    best = 0
+    for price in prices:
+        min_price = min(min_price, price)        # Cheapest buy so far
+        best = max(best, price - min_price)      # Sell today?
+    return best
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 12: Trapping Rain Water
+# ════════════════════════════════════════════════════════════════════════
+
+def trap_rain_water(height: List[int]) -> int:
+    """
+    QUESTION:
+    ─────────
+    Given n non-negative bar heights (width 1), compute how much water is
+    trapped after raining.
+
+    Example:
+        Input: [0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1]
+        Output: 6
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Water above bar i = min(max_left[i], max_right[i]) - height[i].
+       Brute force recomputes both maxima for each i — O(n²).
+    2. Precompute prefix-max and suffix-max arrays — O(n) time, O(n) space.
+    3. Two pointers drop the arrays to O(1) space:
+       - Keep left_max and right_max as we walk inward.
+       - If left_max < right_max, the water at `left` is bounded by
+         left_max: there is a wall at least right_max tall somewhere on
+         the right, so the right side can't be the limiting one.
+         Add left_max - height[left] and advance left.
+       - Otherwise, symmetric on the right.
+    4. Alternative: monotonic decreasing stack that fills water layer by
+       layer when a taller bar arrives (also O(n)).
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — Each index visited once
+    Space: O(1) — Four variables
+
+    EDGE CASES:
+    ──────────
+    • Fewer than 3 bars — 0
+    • Monotonic heights — 0 (no left or right wall)
+    • Plateaus and equal walls — handled by the `<` / else split
+    """
+    left, right = 0, len(height) - 1
+    left_max = right_max = 0
+    water = 0
+
+    while left < right:
+        left_max = max(left_max, height[left])
+        right_max = max(right_max, height[right])
+        if left_max < right_max:
+            water += left_max - height[left]     # Left wall is the bottleneck
+            left += 1
+        else:
+            water += right_max - height[right]   # Right wall is the bottleneck
+            right -= 1
+
+    return water
+
+
+# ════════════════════════════════════════════════════════════════════════
 # DEMO: Run all array problems
 # ════════════════════════════════════════════════════════════════════════
 
@@ -584,7 +746,7 @@ def demo():
     print("\n6️⃣  Three Sum")
     print("-" * 40)
     nums = [-1, 0, 1, 2, -1, -4]
-    result = three_sum(nums)
+    result = three_sum(nums[:])  # Pass copy (three_sum sorts in place)
     print(f"   Input: {nums}")
     print(f"   Triplets: {result}")
 
@@ -621,6 +783,20 @@ def demo():
     result = longest_consecutive(nums)
     print(f"   Input: {nums}")
     print(f"   Longest Consecutive Length: {result}")
+
+    # Q11: Best Time to Buy and Sell Stock
+    print("\n1️⃣1️⃣  Best Time to Buy and Sell Stock")
+    print("-" * 40)
+    prices = [7, 1, 5, 3, 6, 4]
+    print(f"   Input: {prices}")
+    print(f"   Max Profit: {max_profit(prices)}")
+
+    # Q12: Trapping Rain Water
+    print("\n1️⃣2️⃣  Trapping Rain Water")
+    print("-" * 40)
+    height = [0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1]
+    print(f"   Input: {height}")
+    print(f"   Trapped Water: {trap_rain_water(height)}")
 
     print("\n" + "=" * 70)
 

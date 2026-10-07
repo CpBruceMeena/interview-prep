@@ -17,6 +17,13 @@ When to Use Sliding Window:
   satisfying a condition
 • O(n) is required (or at least achievable)
 • Brute force would be O(n²) or O(n³)
+• The precondition people forget: the window must be MONOTONIC — growing
+  it can only make the condition "more violated" and shrinking it "less".
+  That holds for counts of distinct chars or sums of non-negative
+  numbers. With negative numbers it fails; use prefix sums + hash map
+  (Hashing Q1) or a monotonic deque instead.
+• "Exactly K" = atMost(K) - atMost(K - 1) (e.g. subarrays with exactly
+  K distinct integers)
 
 Template for Variable Window:
 ─────────────────────────────
@@ -116,11 +123,17 @@ def character_replacement(s: str, k: int) -> int:
     2. Maintain window with frequency counts
     3. Expand right, if invalid, shrink left
     4. Track max_freq in current window (optimized: overall max seen)
+    5. Why a STALE max_freq is safe: the answer can only grow when some
+       character reaches a new, higher count. While max_freq is stale,
+       the window just slides at its best length so far (the while
+       loop runs at most once per step) and never reports a length it
+       hasn't truly achieved before. Recomputing max over 26 counts is
+       the simpler, also-O(26n) alternative.
 
     COMPLEXITY:
     ──────────
     Time: O(n) — Each character visited at most twice
-    Space: O(1) — At most 26 characters (uppercase letters)
+    Space: O(1) — At most 26 characters (uppercase A-Z per the problem)
     """
     freq = [0] * 26
     max_len = 0
@@ -166,6 +179,9 @@ def min_subarray_len(target: int, nums: List[int]) -> int:
     2. Expand right until sum ≥ target
     3. Shrink left while sum ≥ target, tracking minimum length
     4. This finds the smallest window satisfying the condition
+    5. Relies on POSITIVE numbers (shrinking always lowers the sum).
+       With negatives: prefix sums + monotonic deque, O(n)
+       (LeetCode 862). Follow-up O(n log n): prefix sums + binary search.
 
     COMPLEXITY:
     ──────────
@@ -258,12 +274,16 @@ def check_inclusion(s1: str, s2: str) -> bool:
     ────────────────
     1. Fixed window size = len(s1)
     2. Count frequencies in s1, compare with each window in s2
-    3. Use a "matches" counter to avoid O(26) comparison each time
-    4. Only need to compare counts at string boundaries
+    3. The code compares the two 26-slot arrays each step: O(26) per
+       step, O(26·n) total — still linear for a fixed alphabet
+    4. Refinement: keep a `matches` counter of how many of the 26 slots
+       are equal, and update it only for the char entering and the char
+       leaving → O(1) per step
+    5. Same technique: Find All Anagrams in a String (return every index)
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — n = len(s2)
+    Time: O(26·n) = O(n) — n = len(s2) (assumes lowercase a-z)
     Space: O(1) — Two 26-element arrays
     """
     if len(s1) > len(s2):
@@ -361,9 +381,13 @@ def find_substring(s: str, words: List[str]) -> List[int]:
     3. Slide by word_len (not 1) since we're matching whole words
     4. Need to consider all starting offsets [0, word_len-1]
 
+    5. Words not in the dictionary reset the window; extra copies of a
+       valid word shrink it from the left until the count is legal again
+
     COMPLEXITY:
     ──────────
-    Time: O(n × m) — n = len(s), m = word_len (small)
+    Time: O(n × m) — m offsets × (n/m) steps × O(m) to slice each word
+          (n = len(s), m = word_len)
     Space: O(k) — k = unique words
     """
     if not s or not words:
@@ -435,6 +459,13 @@ def min_window_subsequence(s: str, t: str) -> str:
        b) Optimize from the right (find shortest match)
     3. For each start position, match as much of t as possible, then
        backtrack from the end to minimize the window
+    4. Why the backward pass: scanning forward gives the earliest END for
+       this start, but the start may be improvable; walking back from
+       that end and matching t in reverse finds the latest valid START
+       for that end. Then restart one position after that start.
+    5. Ties: the first (leftmost) minimum window wins, as the problem asks
+    6. DP alternative: dp[i][j] = latest start in s such that t[:j]
+       is a subsequence of s[start:i]; O(|s|·|t|) time
 
     COMPLEXITY:
     ──────────
@@ -478,6 +509,55 @@ def min_window_subsequence(s: str, t: str) -> str:
         i += 1
 
     return result
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 9: Subarrays with K Different Integers ("exactly K" trick)
+# ════════════════════════════════════════════════════════════════════════
+
+def subarrays_with_k_distinct(nums: List[int], k: int) -> int:
+    """
+    QUESTION:
+    ─────────
+    Count the contiguous subarrays that contain EXACTLY k distinct
+    integers.
+
+    Example:
+        Input: nums = [1, 2, 1, 2, 3], k = 2
+        Output: 7  ([1,2], [2,1], [1,2], [2,3], [1,2,1], [2,1,2], [1,2,1,2])
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. "Exactly k" is NOT monotonic: shrinking a window with k distinct
+       values can drop to k-1 or stay at k, so one window can't count it.
+    2. "At most k" IS monotonic, and for each right end the valid left
+       ends form a range [left, right] → right - left + 1 subarrays end
+       at `right`.
+    3. exactly(k) = atMost(k) - atMost(k - 1).
+    4. Reusable for: number of nice subarrays (exactly k odd numbers),
+       binary subarrays with sum = goal.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — Two linear passes
+    Space: O(k) — Frequency map
+    """
+    def at_most(limit: int) -> int:
+        if limit <= 0:
+            return 0
+        freq: Dict[int, int] = defaultdict(int)
+        left = total = 0
+        for right, x in enumerate(nums):
+            freq[x] += 1
+            while len(freq) > limit:
+                freq[nums[left]] -= 1
+                if freq[nums[left]] == 0:
+                    del freq[nums[left]]
+                left += 1
+            total += right - left + 1       # Subarrays ending at right
+        return total
+
+    return at_most(k) - at_most(k - 1)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -544,6 +624,12 @@ def demo():
     print("\n8️⃣  Minimum Window Subsequence")
     print("-" * 40)
     print(f"   s=\"abcdebdde\", t=\"bde\": \"{min_window_subsequence('abcdebdde', 'bde')}\"")
+
+    # Q9
+    print("\n9️⃣  Subarrays with K Different Integers")
+    print("-" * 40)
+    nums = [1, 2, 1, 2, 3]
+    print(f"   nums={nums}, k=2: {subarrays_with_k_distinct(nums, 2)}")
 
     # Q1 revisited: edge case
     print("\n   🔍 Edge Case: k=0 with distinct chars")

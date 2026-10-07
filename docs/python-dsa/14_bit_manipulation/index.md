@@ -18,10 +18,20 @@ Core Concepts:
   - & (AND): Both bits 1 → 1
   - | (OR): At least one 1 → 1
   - ^ (XOR): Bits different → 1
-  - ~ (NOT): Flip all bits
+  - ~ (NOT): Flip all bits (in Python ~x == -x - 1)
   - << (LEFT SHIFT): Multiply by 2^k
-  - >> (RIGHT SHIFT): Divide by 2^k (floor)
+  - >> (RIGHT SHIFT): Divide by 2^k, rounding toward -∞ (arithmetic
+    shift: the sign bit is copied in). Java/JS also have >>> (logical
+    shift, fills with 0); Go uses the type: >> on uint is logical
 • Two's complement: -x = ~x + 1
+• PYTHON GOTCHA: ints are unbounded and behave like two's complement
+  with infinitely many sign bits. A negative number has infinitely many
+  1s, so "loop until n == 0" never ends and bin(-5) is '-0b101'.
+  To emulate a 32-bit int: mask with x & 0xFFFFFFFF, and convert back
+  with x - (1 << 32) if x >= 1 << 31
+• Shifting a 32-bit int by >= 32: Java masks the count to 5 bits
+  (1 << 32 == 1), C makes it undefined behaviour, Go defines it as if
+  shifted one bit at a time (result 0, or -1 for negative >>)
 • XOR properties:
   - x ^ x = 0 (self-cancellation)
   - x ^ 0 = x (identity)
@@ -38,6 +48,9 @@ Key Tricks:
 • Remove lowest set bit: num & (num - 1)
 • Check if power of 2: num > 0 and (num & (num - 1)) == 0
 • Count set bits (Brian Kernighan): while n: n &= n - 1; count += 1
+  (built in: int.bit_count() since Python 3.10, Integer.bitCount in Java,
+  bits.OnesCount in Go — all compile to a POPCNT instruction where
+  available)
 """
 
 from typing import List, Optional
@@ -96,10 +109,15 @@ def single_number_ii(nums: List[int]) -> int:
     1. Count bits: For each bit position, sum all bits across numbers
     2. If sum % 3 == 1, that bit is set in the single number
     3. This works because bits from tripled numbers are divisible by 3
-    4. Alternative: Finite state machine with two variables (ones, twos)
-       - ones = XOR, clearing when seen in twos
-       - twos = XOR, clearing when seen in ones
-       - After three occurrences, both are 0
+       (generalises to "every element appears k times": use % k)
+    4. Alternative (implemented): a per-bit counter mod 3 stored in two
+       bitmasks (ones, twos) — state 00 → 01 → 10 → 00 for each bit
+       - ones = bits seen 1 (mod 3) times; twos = bits seen 2 times
+       - ones = (ones ^ num) & ~twos; twos = (twos ^ num) & ~ones
+       - After three occurrences a bit is back to 00
+    5. Negative inputs work in Python because ~ and & act on the
+       infinite two's complement form; with the bit-count method you must
+       treat bit 31 as the sign bit and convert back.
 
     COMPLEXITY:
     ──────────
@@ -141,11 +159,16 @@ def hamming_weight(n: int) -> int:
        - n = ...1000, n-1 = ...0111
        - n & (n-1) = ...0000 — lowest set bit cleared!
 
+    3. The input is UNSIGNED 32-bit. Java passes it as a signed int, so
+       inputs with the top bit set arrive negative. In Python a negative
+       n would loop forever (infinitely many 1 bits), so mask first.
+
     COMPLEXITY:
     ──────────
     Time: O(k) — k = number of set bits (≤ 32)
     Space: O(1) — Constant
     """
+    n &= 0xFFFFFFFF  # Treat as unsigned 32-bit (no-op for valid input)
     count = 0
     while n:
         n &= n - 1  # Remove lowest set bit
@@ -172,12 +195,10 @@ def count_bits(n: int) -> List[int]:
     THOUGHT PROCESS:
     ────────────────
     1. Brute force: Count bits for each number — O(n log n)
-    2. DP with offset:
-       - For any i, bits(i) = bits(i & (i-1)) + 1
-       - Or: bits(i) = bits(i // 2) + (i % 2)
-       - Or: bits(i) = bits(i >> 1) + (i & 1)
-    3. Key insight: i has one more bit than i with LSB removed
-       - bits(5) = bits(5 & 4) + 1 = bits(4) + 1 = 1 + 1 = 2
+    2. DP reusing smaller answers (both are O(1) per i):
+       - bits(i) = bits(i >> 1) + (i & 1)       — drop the last bit
+       - bits(i) = bits(i & (i - 1)) + 1        — drop the lowest SET bit
+    3. Example of the second: bits(5) = bits(5 & 4) + 1 = bits(4) + 1 = 2
 
     COMPLEXITY:
     ──────────
@@ -214,6 +235,9 @@ def reverse_bits(n: int) -> int:
        - Extract bit at position i: (n >> i) & 1
        - Place it at position (31-i): result |= bit << (31-i)
     3. This reverses the 32-bit representation
+    4. Follow-up "called many times": reverse each byte via a 256-entry
+       lookup table, or swap halves with masks in log₂32 = 5 steps
+       (swap 16-bit halves, then 8-bit, 4, 2, 1)
 
     COMPLEXITY:
     ──────────
@@ -280,8 +304,10 @@ def missing_number(nums: List[int]) -> int:
        - The result is the missing number
        - Because x ^ x = 0, duplicates cancel
     2. Mathematical: n*(n+1)/2 - sum(nums)
-       - But XOR avoids potential overflow
-    3. XOR is elegant and handles all cases
+       - Fine in Python; in Java/Go with 32-bit ints, n*(n+1) overflows
+         once n exceeds ~46,340. Use long, or XOR, which never overflows
+    3. Cyclic placement (Arrays Q8) and sorting also work; XOR is the
+       O(1)-space answer with no overflow concerns
 
     COMPLEXITY:
     ──────────
@@ -319,8 +345,12 @@ def get_sum(a: int, b: int) -> int:
        - carry = (a & b) << 1
        - a = sum, b = carry
     4. Handle Python's infinite bit representation:
-       - Mask to 32 bits: a & 0xFFFFFFFF
-       - Handle negative results
+       - Mask to 32 bits: a & 0xFFFFFFFF. Without the mask, a negative
+         operand makes the carry shift left forever (infinite loop).
+       - Convert back: if the 32-bit result has bit 31 set it is
+         negative; ~(a ^ MASK) sign-extends it (same as a - 2**32)
+    5. Overflow wraps like a Java int: get_sum(2**31 - 1, 1) == -2**31
+    6. In Java/Go/C the loop needs no masking: the fixed width does it
 
     COMPLEXITY:
     ──────────
@@ -395,6 +425,8 @@ def find_maximum_xor(nums: List[int]) -> int:
        - For each bit from MSB (31 down to 0):
          - See if we can achieve current_prefix | (1 << bit)
          - Use hash set of prefixes to check
+    4. Why greedy is right: a 1 at a higher bit outweighs ALL lower bits
+       combined (2^i > 2^i - 1), so always grab the higher bit if you can.
 
     COMPLEXITY:
     ──────────
@@ -406,7 +438,8 @@ def find_maximum_xor(nums: List[int]) -> int:
         def __init__(self):
             self.children = {}
 
-    # Build Trie with binary representations (31 bits for 32-bit ints)
+    # Build Trie over bits 31..0 (inputs are 0 <= x < 2^31 on LeetCode;
+    # negatives would need an offset or a sign-aware first level)
     root = BitTrieNode()
     for num in nums:
         node = root

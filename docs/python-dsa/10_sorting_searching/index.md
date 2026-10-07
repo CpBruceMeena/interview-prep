@@ -1,6 +1,6 @@
 # Sorting & Searching
 
-> Python implementation — 9 questions covering core concepts and interview patterns.
+> Python implementation — 11 questions covering core concepts and interview patterns.
 
 SORTING & SEARCHING — Core Concepts & Interview Questions
 
@@ -13,29 +13,39 @@ SORTING & SEARCHING — Core Concepts & Interview Questions
 
 Sorting Core Concepts:
 ──────────────────────
-• Comparison-based sorts: O(n log n) best-case average
-  - Quick Sort: O(n log n) avg, O(n²) worst, O(log n) space (in-place)
+• Comparison-based sorts can't beat Ω(n log n) comparisons in the worst
+  (or average) case: there are n! orderings and each comparison halves
+  the possibilities at best, so log₂(n!) ≈ n log n comparisons
+  - Quick Sort: O(n log n) avg, O(n²) worst, O(log n) expected stack (in-place)
   - Merge Sort: O(n log n) guaranteed, O(n) space (stable)
   - Heap Sort: O(n log n) guaranteed, O(1) space (unstable)
 • Non-comparison sorts: O(n + k) for integer keys
   - Counting Sort: O(n + k) range, O(k) space
   - Radix Sort: O(d × (n + b)) digits d, base b
-• Python's Timsort: O(n log n), adaptive stable sort (insertion + merge)
+• Python's sort (Timsort; Powersort merge policy since 3.11): O(n log n),
+  stable, adaptive — O(n) on already-sorted runs. Java sorts objects with
+  TimSort and primitives with dual-pivot quicksort (not stable)
 
 Searching Core Concepts:
 ────────────────────────
 • Linear Search: O(n), works on unsorted data
 • Binary Search: O(log n), requires sorted data
 • Binary Search variants:
-  - Lower bound (first occurrence)
-  - Upper bound (last occurrence)
+  - Lower bound: first index with value >= target (bisect_left)
+  - Upper bound: first index with value > target (bisect_right);
+    last occurrence = upper bound - 1
   - Search in rotated array
   - Search in infinite array
   - Find peak element
 
 Common Patterns:
 ────────────────
-• Binary search on answer (not just on array)
+• Binary search on answer (not just on array) — see Koko, Q10
+• Midpoint: write mid = lo + (hi - lo) // 2. In Python (lo + hi) // 2 is
+  fine, but in Java/C/Go `lo + hi` can overflow int for large arrays
+  (the famous JDK binarySearch bug, fixed in 2006)
+• Most binary-search bugs are off-by-one: pick an invariant ("answer is
+  in [lo, hi]") and make every branch preserve it
 • Divide and conquer
 • Partitioning (QuickSelect for kth largest)
 • Merging sorted arrays
@@ -58,12 +68,19 @@ def quick_sort(arr: List[int]) -> List[int]:
        (elements < pivot, pivot, elements > pivot)
     2. Conquer: Recursively sort the two partitions
     3. Combine: Naturally combined since in-place
-    4. Pivot selection matters: random pivot avoids O(n²) worst case
+    4. Pivot selection matters: a random pivot makes the O(n²) worst
+       case vanishingly unlikely on sorted / adversarial input
+    5. Lomuto partition (used here) degrades to O(n²) when MANY KEYS ARE
+       EQUAL (every element goes to one side). Fix with 3-way
+       (Dutch-flag) partitioning: < pivot | == pivot | > pivot.
+    6. Not stable. Production quicksorts (introsort in C++ std::sort)
+       switch to heapsort if recursion gets too deep.
 
     COMPLEXITY:
     ──────────
     Time: O(n log n) average, O(n²) worst
-    Space: O(log n) — Recursion stack
+    Space: O(log n) expected recursion depth; O(n) worst case unless you
+           recurse into the smaller side and loop on the larger one
     """
     def _partition(low: int, high: int) -> int:
         # Random pivot to avoid worst-case on sorted arrays
@@ -193,13 +210,20 @@ def find_kth_largest(nums: List[int], k: int) -> int:
     THOUGHT PROCESS:
     ────────────────
     1. Sort and index: O(n log n) — trivial but slower
-    2. Min-heap of size k: O(n log k)
+    2. Min-heap of size k: O(n log k) — the right answer for STREAMS
+       (one pass, O(k) memory)
     3. QuickSelect: O(n) average, O(n²) worst
-       - Partition around pivot
-       - If pivot is at position (n-k), return it
-       - If pivot is left of (n-k), search right half
-       - If pivot is right of (n-k), search left half
+       - Partition in DESCENDING order (>= pivot goes left), so the
+         answer sits at index k - 1
+       - If the pivot lands at k - 1, return it
+       - If it lands left of k - 1, search the right part
+       - If it lands right of k - 1, search the left part
+       - Only ONE side is recursed into: n + n/2 + n/4 ... = O(n)
     4. This is a "selection algorithm" — finds order statistic
+    5. Guaranteed O(n): median-of-medians pivot (rarely coded in
+       interviews; just name it). Mutates the input — copy if needed.
+    6. With many duplicates this 2-way partition degrades (all-equal
+       input is O(n²)); 3-way partitioning fixes it.
 
     COMPLEXITY:
     ──────────
@@ -265,6 +289,11 @@ def search_rotated(nums: List[int], target: int) -> int:
          - If target is in right half, search right
          - Else, search left
     3. Key insight: One half is always perfectly sorted after rotation
+    4. Use <= in nums[left] <= nums[mid]: when left == mid the "left
+       half" is the single element at mid, which is sorted.
+    5. Assumes distinct values. With duplicates (LeetCode 81),
+       nums[left] == nums[mid] == nums[right] hides which side is
+       sorted; shrink both ends by one, worst case O(n).
 
     COMPLEXITY:
     ──────────
@@ -316,7 +345,8 @@ def search_range(nums: List[int], target: int) -> List[int]:
     2. Left boundary: standard binary search that doesn't stop at first hit
        - When nums[mid] == target, still narrow right bound (to find leftmost)
     3. Right boundary: similar but narrow left bound
-    4. Alternative: Use bisect_left and bisect_right from Python's bisect
+    4. Alternative: lo = bisect_left(nums, target),
+       hi = bisect_right(nums, target) - 1; found iff lo <= hi
 
     COMPLEXITY:
     ──────────
@@ -377,8 +407,12 @@ def find_peak_element(nums: List[int]) -> int:
     2. Binary search: O(log n)
        - If nums[mid] > nums[mid+1], peak is in left half (including mid)
        - Else, peak is in right half
-    3. Why binary search works: By always moving towards the higher
-       neighbor, we guarantee finding SOME peak
+    3. Why binary search works: if nums[mid] < nums[mid+1], the values
+       must eventually come back down (nums[n] = -∞), so some peak
+       exists to the right; symmetric on the left. We are guaranteed
+       SOME peak, not the global maximum.
+    4. Needs adjacent elements to differ (the problem guarantees it);
+       with plateaus, binary search can't tell which way to go.
 
     COMPLEXITY:
     ──────────
@@ -413,11 +447,17 @@ def find_min_rotated(nums: List[int]) -> int:
 
     THOUGHT PROCESS:
     ────────────────
-    1. If array is not rotated: return nums[0]
-    2. Binary search to find the "inflection point"
-    3. If nums[mid] > nums[mid+1], nums[mid+1] is minimum
-    4. If nums[left] <= nums[mid], left half is sorted → minimum is on right
-    5. Else, right half is sorted → minimum is on left
+    1. Compare nums[mid] with nums[right] (not nums[left]):
+       - nums[mid] > nums[right] → the drop (and the minimum) is strictly
+         right of mid → left = mid + 1
+       - otherwise mid..right is sorted, so the minimum is at mid or to
+         its left → right = mid (keep mid: it may be the answer)
+    2. Loop while left < right; they converge on the minimum.
+    3. Why not compare with nums[left]? For an unrotated array,
+       nums[left] <= nums[mid] can't tell "rotated, min on the right"
+       from "not rotated, min at left" — the classic bug.
+    4. Assumes distinct values; with duplicates (LeetCode 154) handle
+       nums[mid] == nums[right] with right -= 1 (worst case O(n)).
 
     COMPLEXITY:
     ──────────
@@ -426,27 +466,14 @@ def find_min_rotated(nums: List[int]) -> int:
     """
     left, right = 0, len(nums) - 1
 
-    # Not rotated
-    if nums[left] <= nums[right]:
-        return nums[left]
-
-    while left <= right:
+    while left < right:
         mid = left + (right - left) // 2
-
-        # Check if mid+1 is the inflection point
-        if nums[mid] > nums[mid + 1]:
-            return nums[mid + 1]
-        # Check if mid is the inflection point
-        if nums[mid - 1] > nums[mid]:
-            return nums[mid]
-
-        # Decide which half to search
-        if nums[left] <= nums[mid]:
-            left = mid + 1  # Left half is sorted, min is in right half
+        if nums[mid] > nums[right]:
+            left = mid + 1      # Minimum is right of mid
         else:
-            right = mid - 1  # Right half is sorted, min is in left half
+            right = mid         # mid could be the minimum
 
-    return -1
+    return nums[left]
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -471,6 +498,9 @@ def search_matrix(matrix: List[List[int]], target: int) -> bool:
        row = idx // cols, col = idx % cols
     2. Standard binary search on the flattened array
     3. Time: O(log(m×n)), Space: O(1)
+    4. Different problem (LeetCode 240): rows AND columns sorted, but rows
+       don't continue each other. Then start at the top-right corner and
+       step left (too big) or down (too small): O(m + n).
 
     COMPLEXITY:
     ──────────
@@ -523,9 +553,14 @@ class TimeMap:
 
     THOUGHT PROCESS:
     ────────────────
-    1. Store key → list of (timestamp, value) pairs (timestamps are increasing)
+    1. Store key → list of (timestamp, value) pairs. Appending keeps it
+       sorted ONLY because set() timestamps are strictly increasing per
+       key (the problem guarantees it); otherwise use insort (O(n)) or a
+       balanced tree / sorted container
     2. get: Binary search for largest timestamp ≤ given timestamp
     3. This is bisect_right - 1 on timestamps
+    4. This is how MVCC snapshot reads work in databases: find the latest
+       version at or before the read timestamp
 
     COMPLEXITY:
     ──────────
@@ -586,6 +621,9 @@ def find_duplicate(nums: List[int]) -> int:
        Else, duplicate is in [mid+1, n]
     4. This works due to pigeonhole principle: if count > mid,
        there are more numbers than slots → some number repeated
+    5. O(n) alternative: treat i → nums[i] as a linked list. The
+       duplicate value is where two indices point to the same node, i.e.
+       the start of a cycle → Floyd's algorithm (Linked Lists Q3).
 
     COMPLEXITY:
     ──────────
@@ -674,6 +712,124 @@ def count_inversions(arr: List[int]) -> int:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# QUESTION 10: Koko Eating Bananas (Binary Search on the Answer)
+# ════════════════════════════════════════════════════════════════════════
+
+def min_eating_speed(piles: List[int], h: int) -> int:
+    """
+    QUESTION:
+    ─────────
+    piles[i] bananas in each pile. Each hour Koko picks one pile and eats
+    up to k bananas from it. Return the minimum integer speed k that lets
+    her finish all piles within h hours (h >= len(piles)).
+
+    Example:
+        Input: piles = [3, 6, 7, 11], h = 8
+        Output: 4
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. We are not searching an array; we are searching the ANSWER space
+       k ∈ [1, max(piles)].
+    2. The key property is monotonicity: if speed k works, every speed
+       > k also works. So the predicate "can finish at speed k" looks
+       like F F F T T T, and we binary search for the first T.
+    3. hours(k) = Σ ceil(p / k). Integer ceil: (p + k - 1) // k
+       (avoid floats; in Java/Go sum the hours in a long).
+    4. Same template: capacity to ship packages in D days, split array
+       largest sum, minimum days to make bouquets, smallest divisor.
+       Recognise it by "minimise the maximum" / "minimum X such that".
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n log M) — M = max(piles); log M guesses, O(n) check each
+    Space: O(1)
+    """
+    def hours_needed(k: int) -> int:
+        return sum((p + k - 1) // k for p in piles)
+
+    lo, hi = 1, max(piles)          # Invariant: answer is in [lo, hi]
+    while lo < hi:
+        mid = lo + (hi - lo) // 2
+        if hours_needed(mid) <= h:
+            hi = mid                # mid works; maybe something smaller does
+        else:
+            lo = mid + 1            # Too slow
+    return lo
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 11: Median of Two Sorted Arrays
+# ════════════════════════════════════════════════════════════════════════
+
+def find_median_sorted_arrays(nums1: List[int], nums2: List[int]) -> float:
+    """
+    QUESTION:
+    ─────────
+    Given two sorted arrays of sizes m and n, return the median of the
+    combined data in O(log(min(m, n))) time.
+
+    Example:
+        Input: [1, 3], [2]     → 2.0
+        Input: [1, 2], [3, 4]  → 2.5
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Merge and pick the middle: O(m + n). Fine as a first answer.
+    2. Think "partition", not "merge": cut nums1 after i elements and
+       nums2 after j elements so that the left side holds exactly half
+       of everything: i + j = (m + n + 1) // 2.
+    3. The cut is correct when everything on the left is <= everything
+       on the right:
+         nums1[i-1] <= nums2[j]  and  nums2[j-1] <= nums1[i]
+       (missing neighbours count as -inf / +inf).
+    4. Binary search i over [0, m] on the SHORTER array:
+       - nums1[i-1] > nums2[j] → i is too big, move left
+       - nums2[j-1] > nums1[i] → i is too small, move right
+    5. Median: odd total → max of the left side;
+       even → (max(left) + min(right)) / 2.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(log(min(m, n))) — Binary search on the shorter array
+    Space: O(1)
+
+    EDGE CASES:
+    ──────────
+    • One array empty → the cut is i = 0, handled by the ±inf sentinels
+    • All of nums1 smaller than nums2 (or larger)
+    • Searching the longer array instead can give j < 0 or j > n
+    """
+    if len(nums1) > len(nums2):
+        nums1, nums2 = nums2, nums1
+    m, n = len(nums1), len(nums2)
+    if m + n == 0:
+        raise ValueError("median of empty input")
+    half = (m + n + 1) // 2
+    NEG, POS = float("-inf"), float("inf")
+
+    lo, hi = 0, m
+    while lo <= hi:
+        i = (lo + hi) // 2            # Elements taken from nums1
+        j = half - i                  # Elements taken from nums2
+        left1 = nums1[i - 1] if i > 0 else NEG
+        right1 = nums1[i] if i < m else POS
+        left2 = nums2[j - 1] if j > 0 else NEG
+        right2 = nums2[j] if j < n else POS
+
+        if left1 > right2:
+            hi = i - 1                # Took too many from nums1
+        elif left2 > right1:
+            lo = i + 1                # Took too few from nums1
+        else:
+            if (m + n) % 2:
+                return float(max(left1, left2))
+            return (max(left1, left2) + min(right1, right2)) / 2
+
+    raise ValueError("inputs must be sorted")
+
+
+# ════════════════════════════════════════════════════════════════════════
 # DEMO
 # ════════════════════════════════════════════════════════════════════════
 
@@ -758,6 +914,19 @@ def demo():
     arr = [2, 4, 1, 3, 5]
     print(f"   Input: {arr}")
     print(f"   Inversions: {count_inversions(arr)}")
+
+    # Q10
+    print("\n🔟  Koko Eating Bananas (Binary Search on Answer)")
+    print("-" * 40)
+    piles, h = [3, 6, 7, 11], 8
+    print(f"   piles={piles}, h={h}")
+    print(f"   Min speed: {min_eating_speed(piles, h)}")
+
+    # Q11
+    print("\n1️⃣1️⃣  Median of Two Sorted Arrays")
+    print("-" * 40)
+    for a, b in (([1, 3], [2]), ([1, 2], [3, 4])):
+        print(f"   {a} + {b} → {find_median_sorted_arrays(a, b)}")
 
     print("\n" + "=" * 70)
 

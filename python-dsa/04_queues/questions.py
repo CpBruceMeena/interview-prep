@@ -53,6 +53,8 @@ def max_sliding_window(nums: List[int], k: int) -> List[int]:
        elements in the window, those older elements can never be max
        for any remaining window (since the new element is both larger
        and will stay longer)
+    4. Store INDICES, not values: the index tells us when the front has
+       slid out of the window, and duplicates stay distinguishable.
 
     COMPLEXITY:
     ──────────
@@ -150,9 +152,14 @@ class CircularQueue:
     ────────────────
     1. Array-based with front and rear pointers
     2. Circular indexing: (index + 1) % capacity
-    3. Empty: front == -1
-    4. Full: (rear + 1) % capacity == front
-    5. Wrap-around eliminates the need to shift elements
+    3. The hard part is telling "empty" from "full", because in both
+       cases the pointers can line up. Three standard fixes:
+       a) Keep a size counter (used here: full ⇔ size == capacity)
+       b) Sentinel: front == -1 means empty (also used here)
+       c) Waste one slot: full ⇔ (rear + 1) % capacity == front
+    4. Wrap-around eliminates the need to shift elements
+    5. Production ring buffers (e.g. LMAX Disruptor) use a power-of-two
+       capacity so `% capacity` becomes `& (capacity - 1)`
 
     COMPLEXITY:
     ──────────
@@ -220,19 +227,26 @@ def least_interval(tasks: List[str], n: int) -> int:
 
     THOUGHT PROCESS:
     ────────────────
-    1. Max-heap + Queue pattern:
+    1. Max-heap + Queue pattern (simulation, implemented below):
        - Count frequencies, push to max-heap
        - Schedule the highest frequency task available
        - After scheduling, task goes to "cooling queue" with cooldown time
-    2. Formula approach (for simple cases):
-       - Find max frequency (max_freq) and count of tasks with that frequency
-       - result = (max_freq - 1) * (n + 1) + count_max_freq
-       - But this doesn't account for interleaving, so use: max(result, len(tasks))
-    3. The heap+queue approach handles general cases correctly
+    2. Formula approach (exact, and the expected optimal answer):
+       - max_freq = highest count, num_max = how many tasks have it
+       - Frame: (max_freq - 1) full blocks of length n + 1, plus a last
+         block holding the num_max most frequent tasks
+         → (max_freq - 1) * (n + 1) + num_max
+       - If there are more tasks than idle slots, no idling is needed
+         and the answer is just len(tasks)
+       - answer = max(len(tasks), (max_freq - 1) * (n + 1) + num_max)
+    3. The simulation generalises (e.g. return the actual schedule); the
+       formula is O(m) and is what interviewers usually want to see.
+       Greedy Q9 implements the formula.
 
     COMPLEXITY:
     ──────────
-    Time: O(m log 26) = O(m) — m = total tasks, heap of size ≤ 26
+    Time: O(T log 26) = O(T) — T = the answer (one loop iteration per
+          time unit, idle units included); T ≤ m·(n + 1)
     Space: O(1) — At most 26 unique tasks
     """
     from collections import Counter
@@ -340,8 +354,9 @@ def reorder_log_files(logs: List[str]) -> List[str]:
 
     COMPLEXITY:
     ──────────
-    Time: O(m log m) — sorting letter-logs
-    Space: O(m) — For sorted result
+    Time: O(m·L·log m) — sorting m letter-logs; each string comparison
+          costs up to O(L) for log length L
+    Space: O(m·L) — Sort keys and the result
     """
     letter_logs = []
     digit_logs = []
@@ -358,6 +373,74 @@ def reorder_log_files(logs: List[str]) -> List[str]:
     letter_logs.sort(key=lambda x: (x.split(' ', 1)[1], x.split(' ', 1)[0]))
 
     return letter_logs + digit_logs
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 7: Rotting Oranges (Multi-Source BFS)
+# ════════════════════════════════════════════════════════════════════════
+
+def oranges_rotting(grid: List[List[int]]) -> int:
+    """
+    QUESTION:
+    ─────────
+    In a grid, 0 = empty, 1 = fresh orange, 2 = rotten orange. Every
+    minute, each fresh orange 4-directionally adjacent to a rotten one
+    becomes rotten. Return the minutes until no fresh orange remains, or
+    -1 if that is impossible.
+
+    Example:
+        Input: [[2,1,1],[1,1,0],[0,1,1]]
+        Output: 4
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Running BFS from each rotten orange separately and taking minima
+       is O((R·C)²).
+    2. Multi-source BFS: seed the queue with ALL rotten oranges at once
+       (distance 0). BFS then expands level by level, and each level is
+       one minute. The first time a fresh cell is reached is the earliest
+       it can rot, because BFS visits cells in order of distance.
+    3. Count fresh oranges up front; decrement as they rot. If any remain
+       when the queue empties, some orange is unreachable → -1.
+    4. Same pattern: "walls and gates", "01 matrix", nearest exit, the
+       distance from every cell to its nearest source.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(R·C) — Each cell enters the queue at most once
+    Space: O(R·C) — Queue in the worst case
+
+    EDGE CASES:
+    ──────────
+    • No fresh oranges at all → 0 (even if there are no rotten ones)
+    • Fresh oranges but no rotten ones → -1
+    • Mark a cell rotten when it is ENQUEUED, not when dequeued,
+      otherwise it can be enqueued twice
+    """
+    rows, cols = len(grid), len(grid[0]) if grid else 0
+    queue = deque()
+    fresh = 0
+
+    for r in range(rows):
+        for c in range(cols):
+            if grid[r][c] == 2:
+                queue.append((r, c))
+            elif grid[r][c] == 1:
+                fresh += 1
+
+    minutes = 0
+    while queue and fresh:
+        minutes += 1
+        for _ in range(len(queue)):          # Process one full level
+            r, c = queue.popleft()
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == 1:
+                    grid[nr][nc] = 2         # Mark on enqueue
+                    fresh -= 1
+                    queue.append((nr, nc))
+
+    return minutes if fresh == 0 else -1
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -409,6 +492,17 @@ def demo():
     print(f"   tasks={tasks}, n={n}")
     print(f"   min time: {least_interval(tasks, n)}")
 
+    # Q5
+    print("\n5️⃣  Stack using Queues")
+    print("-" * 40)
+    st = StackUsingQueues()
+    for x in (1, 2, 3):
+        st.push(x)
+    print(f"   push(1), push(2), push(3)")
+    print(f"   top(): {st.top()}")
+    print(f"   pop(): {st.pop()}")
+    print(f"   top() after pop: {st.top()}")
+
     # Q6
     print("\n6️⃣  Reorder Log Files")
     print("-" * 40)
@@ -416,6 +510,13 @@ def demo():
             "let2 own kit dig", "let3 art zero"]
     print(f"   Input: {logs}")
     print(f"   Output: {reorder_log_files(logs)}")
+
+    # Q7
+    print("\n7️⃣  Rotting Oranges (Multi-Source BFS)")
+    print("-" * 40)
+    grid = [[2, 1, 1], [1, 1, 0], [0, 1, 1]]
+    print(f"   Input: {grid}")
+    print(f"   Minutes: {oranges_rotting([row[:] for row in grid])}")
 
     print("\n" + "=" * 70)
 
