@@ -6,7 +6,184 @@
 
 ## 📊 Class Diagram
 
-![](cab-booking-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class CabBookingService {
+        +geo_index: GeoIndex
+        +zone_manager: ZoneManager
+        +broker: Optional~KafkaBroker~
+        +zone_analytics: Optional~ZoneAnalyticsAggregator~
+        -_matching: DriverMatchingStrategy
+        -_trips: Dict~str, Trip~
+        -_active_trip_by_rider: Dict~str, str~
+        +register_rider(name: str, phone: str) Rider
+        +register_driver(name: str, phone: str, license_number: str, cab_type: CabType) Driver
+        +update_driver_location(driver_id: str, location: Location, ts: float) None
+        +go_online(driver_id: str) bool
+        +go_offline(driver_id: str) bool
+        +request_ride(rider_id: str, pickup: Location, dropoff: Location, cab_type: CabType) Trip
+        +accept_trip(trip_id: str) Trip
+        +decline_trip(trip_id: str) Trip
+        +driver_arrived(trip_id: str) Trip
+        +start_trip(trip_id: str) Trip
+        +complete_trip(trip_id: str) Decimal
+        +cancel_trip(trip_id: str, reason: str) Trip
+        +rate_driver(trip_id: str, stars: float) None
+        +set_matching_strategy(strategy: DriverMatchingStrategy) None
+    }
+    class Rider {
+        +rider_id: str
+        +name: str
+        +phone: str
+    }
+    class Driver {
+        +driver_id: str
+        +name: str
+        +license_number: str
+        +cab_type: CabType
+        +status: CabStatus
+        +rating: float
+        +is_available() bool
+        +compare_and_set(expected: CabStatus, new: CabStatus) bool
+        +try_claim() bool
+        +add_rating(stars: float) None
+    }
+    class Trip {
+        <<dataclass>>
+        +trip_id: str
+        +rider: Rider
+        +driver: Driver
+        +pickup: Location
+        +dropoff: Location
+        +cab_type: CabType
+        +fare: Decimal
+        +surge_multiplier: Decimal
+        +status: TripStatus
+        +declined_by: Set~str~
+        +accept() None
+        +arrive() None
+        +start() None
+        +complete() Decimal
+        +cancel(reason: str) None
+        +reassign(new_driver: Driver) None
+    }
+    class Location {
+        <<dataclass>>
+        +lat: float
+        +lng: float
+        +distance_to(other: Location) float
+    }
+    class CabStatus {
+        <<enumeration>>
+        AVAILABLE
+        BOOKED
+        ON_TRIP
+        OFFLINE
+    }
+    class TripStatus {
+        <<enumeration>>
+        REQUESTED
+        ACCEPTED
+        DRIVER_ARRIVED
+        STARTED
+        COMPLETED
+        CANCELLED
+    }
+    class CabType {
+        <<enumeration>>
+        MINI
+        SEDAN
+        SUV
+        PREMIUM
+        AUTO
+    }
+    class PricingStrategy {
+        <<abstract>>
+        +calculate_fare(distance_km: float, duration_min: float) Decimal
+    }
+    class StandardPricing {
+        -_card: RateCard
+        +calculate_fare(distance_km: float, duration_min: float) Decimal
+    }
+    class SurgePricing {
+        -_base: PricingStrategy
+        -_multiplier: Decimal
+        +calculate_fare(distance_km: float, duration_min: float) Decimal
+    }
+    class DriverMatchingStrategy {
+        <<abstract>>
+        +rank(pickup: Location, candidates: List~Tuple~) List~Driver~
+    }
+    class NearestDriverMatching
+    class HighestRatedDriverMatching
+    class GeoIndex {
+        +PRECISION: int
+        +upsert(driver_id: str, location: Location, ts: float) bool
+        +remove(driver_id: str) None
+        +location_of(driver_id: str) Optional~Location~
+        +search(center: Location, radius_km: float) List~Tuple~
+    }
+    class KafkaBroker {
+        +create_topic(name: str, partitions: int) None
+        +produce(topic: str, key: str, value: dict) KafkaMessage
+        +poll(topic: str, group: str, max_messages: int) List~KafkaMessage~
+        +commit(group: str, msg: KafkaMessage) None
+    }
+    class Zone {
+        <<dataclass>>
+        +zone_id: str
+        +center: Location
+        +driver_count: int
+        +ride_request_count: int
+        +surge_multiplier: Decimal
+        +update_supply_demand(driver_count: int, ride_requests: int) None
+    }
+    class ZoneManager {
+        +PRECISION: int
+        +zones: List~Zone~
+        +zone_for(location: Location) Zone
+        +get_zone(zone_id: str) Optional~Zone~
+    }
+    class GPSLocationStreamProcessor {
+        +total_processed: int
+        +poll(max_messages: int) int
+    }
+    class ZoneAnalyticsAggregator {
+        +record_ride_request(pickup: Location) None
+        +aggregate() List~Zone~
+    }
+
+    PricingStrategy <|-- StandardPricing
+    PricingStrategy <|-- SurgePricing
+    SurgePricing o-- PricingStrategy : wraps
+    DriverMatchingStrategy <|-- NearestDriverMatching
+    DriverMatchingStrategy <|-- HighestRatedDriverMatching
+
+    CabBookingService *-- "*" Trip : trips
+    CabBookingService o-- "*" Rider
+    CabBookingService o-- "*" Driver
+    CabBookingService *-- GeoIndex
+    CabBookingService *-- ZoneManager
+    CabBookingService o-- KafkaBroker
+    CabBookingService *-- GPSLocationStreamProcessor
+    CabBookingService *-- ZoneAnalyticsAggregator
+    CabBookingService --> DriverMatchingStrategy : ranks with
+    CabBookingService ..> SurgePricing : prices with
+
+    Trip --> Rider
+    Trip --> "1" Driver : owns status while active
+    Trip --> TripStatus
+    Trip --> Location : pickup, dropoff
+    Driver --> CabStatus
+    Driver --> CabType
+    ZoneManager *-- "*" Zone
+    GPSLocationStreamProcessor --> KafkaBroker : consumes gps.raw
+    GPSLocationStreamProcessor --> GeoIndex : upserts
+    GPSLocationStreamProcessor --> ZoneManager
+    ZoneAnalyticsAggregator --> KafkaBroker : consumes gps.enriched
+    ZoneAnalyticsAggregator --> ZoneManager : updates surge
+```
 
 ---
 

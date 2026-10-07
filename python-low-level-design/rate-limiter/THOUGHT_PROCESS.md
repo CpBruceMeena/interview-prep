@@ -6,10 +6,95 @@
 
 ## 📊 Class Diagram
 
-![](rate-limiter-class-diagram.drawio)
+```mermaid
+classDiagram
+    class RateLimitRule {
+        <<dataclass>>
+        +max_requests: int
+        +window_seconds: float
+        +rate: float
+    }
+    class RateLimitDecision {
+        <<dataclass>>
+        +allowed: bool
+        +remaining: int
+        +retry_after: float
+    }
+    class RateLimitAlgorithm {
+        <<abstract>>
+        +rule: RateLimitRule
+        +new_state(now: float)* S
+        +try_acquire(state: S, now: float)* bool
+        +remaining(state: S, now: float)* int
+        +retry_after(state: S, now: float)* float
+        +is_idle(state: S, now: float) bool
+    }
+    class TokenBucket
+    class LeakyBucket
+    class FixedWindowCounter
+    class SlidingWindowLog
+    class SlidingWindowCounter
+    class _BucketState {
+        <<dataclass>>
+        +level: float
+        +last: float
+    }
+    class _WindowState {
+        <<dataclass>>
+        +window: int
+        +count: int
+        +prev_count: int
+    }
+    class _LogState {
+        <<dataclass>>
+        +timestamps: deque~float~
+    }
+    class RateLimiterFactory {
+        -_algorithms: Dict~str, type~
+        +register(name: str, algo: type) None
+        +create(name: str, rule: RateLimitRule) RateLimitAlgorithm
+    }
+    class _Entry {
+        +lock: Lock
+        +state: object
+        +evicted: bool
+    }
+    class RateLimiter {
+        -_algo: RateLimitAlgorithm
+        -_clock: Clock
+        -_entries: Dict~str, _Entry~
+        -_map_lock: Lock
+        +try_acquire(key: str) RateLimitDecision
+        +allow(key: str) bool
+        +peek(key: str) RateLimitDecision
+        +reset(key: str) None
+        +evict_idle() int
+    }
+    class RateLimitMiddleware {
+        -_clock: Clock
+        -_limiters: Dict~str, RateLimiter~
+        +add_rule(endpoint: str, rule: RateLimitRule, algorithm: str) None
+        +check(endpoint: str, client_id: str) RateLimitDecision
+    }
 
-!!! note "Diagram vs code"
-    The diagram predates the current code: it still shows `RateLimitResult` and algorithms that own their own per-key maps. The code now has `RateLimitDecision`, per-key state objects and locking in `RateLimiter`. Trust [the code](CODE.md) where they differ.
+    RateLimitAlgorithm <|-- TokenBucket
+    RateLimitAlgorithm <|-- LeakyBucket
+    RateLimitAlgorithm <|-- FixedWindowCounter
+    RateLimitAlgorithm <|-- SlidingWindowLog
+    RateLimitAlgorithm <|-- SlidingWindowCounter
+    RateLimitAlgorithm --> RateLimitRule : rule
+    TokenBucket ..> _BucketState : state
+    LeakyBucket ..> _BucketState : state
+    FixedWindowCounter ..> _WindowState : state
+    SlidingWindowCounter ..> _WindowState : state
+    SlidingWindowLog ..> _LogState : state
+    RateLimiterFactory ..> RateLimitAlgorithm : creates
+    RateLimiter o-- "1" RateLimitAlgorithm : policy
+    RateLimiter "1" *-- "*" _Entry : per key, own lock
+    RateLimiter ..> RateLimitDecision : returns
+    RateLimitMiddleware "1" *-- "*" RateLimiter : per endpoint
+    RateLimitMiddleware ..> RateLimiterFactory : uses
+```
 
 ---
 

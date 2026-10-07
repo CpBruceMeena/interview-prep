@@ -6,7 +6,127 @@
 
 ## 📊 Class Diagram
 
-![](snakes-and-ladders-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction TB
+    class Game {
+        -board: Board
+        -players: List~Player~
+        -dice: Dice
+        -overshoot: OvershootPolicy
+        -extra_turn_on_doubles: bool
+        -max_doubles: int
+        -observers: List~GameObserver~
+        -lock: Lock
+        +status: GameStatus
+        +winner: Optional~str~
+        +current_player: str
+        +positions() Dict~str, int~
+        +history() List~TurnResult~
+        +add_observer(observer: GameObserver) None
+        +play_turn(player_name: Optional~str~) TurnResult
+        +play(max_turns: int) str
+        -advance(start: int, steps: int) int
+    }
+    class Board {
+        +size: int
+        -jumps: Dict~int, Jump~
+        +jump_at(cell: int) Optional~Jump~
+        +resolve(cell: int) int
+        +jumps(kind: JumpKind) List~Jump~
+    }
+    class Jump {
+        <<dataclass>>
+        +start: int
+        +end: int
+        +kind: JumpKind
+    }
+    class Player {
+        <<dataclass>>
+        +name: str
+        +position: int
+    }
+    class Dice {
+        <<abstract>>
+        +roll()* Roll
+    }
+    class StandardDice {
+        -count: int
+        -sides: int
+        -rng: Random
+        +roll() Roll
+    }
+    class CrookedDice {
+        -rng: Random
+        +roll() Roll
+    }
+    class ScriptedDice {
+        -rolls: List~Tuple~
+        +roll() Roll
+    }
+    class Roll {
+        <<dataclass>>
+        +faces: Tuple~int~
+        +total: int
+        +is_doubles: bool
+    }
+    class TurnResult {
+        <<dataclass>>
+        +turn_no: int
+        +player: str
+        +roll: Roll
+        +start: int
+        +landed: int
+        +end: int
+        +jump: Optional~Jump~
+        +forfeited: bool
+        +extra_turn: bool
+        +won: bool
+    }
+    class GameObserver {
+        +on_turn(result: TurnResult) None
+        +on_game_over(winner: Player) None
+    }
+    class ConsoleLogger {
+        +on_turn(r: TurnResult) None
+        +on_game_over(winner: Player) None
+    }
+    class GameStatus {
+        <<enumeration>>
+        NOT_STARTED
+        IN_PROGRESS
+        FINISHED
+    }
+    class JumpKind {
+        <<enumeration>>
+        SNAKE
+        LADDER
+    }
+    class OvershootPolicy {
+        <<enumeration>>
+        STAY
+        BOUNCE
+        ALLOW
+    }
+
+    Game "1" o-- "1" Board
+    Game "1" *-- "2..*" Player
+    Game "1" o-- "1" Dice
+    Game "1" o-- "*" GameObserver : notifies
+    Game "1" *-- "*" TurnResult : history
+    Game --> OvershootPolicy
+    Game --> GameStatus
+    Board "1" *-- "*" Jump : keyed by start cell
+    Jump ..> JumpKind
+    Dice <|-- StandardDice
+    Dice <|-- CrookedDice
+    Dice <|-- ScriptedDice
+    Dice ..> Roll : produces
+    TurnResult --> Roll
+    TurnResult --> Jump
+    GameObserver <|-- ConsoleLogger
+    GameObserver ..> TurnResult
+```
 
 ---
 

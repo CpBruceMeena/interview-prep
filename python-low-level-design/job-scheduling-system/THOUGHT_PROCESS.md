@@ -6,10 +6,131 @@
 
 ## 📊 Class Diagram
 
-![](job-scheduling-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction TB
+    class JobScheduler {
+        +peak_running: int
+        -_strategy: SchedulingStrategy
+        -_executor: JobExecutor
+        -_jobs: Dict~str, Job~
+        -_ready: List~Tuple~
+        -_delayed: List~Tuple~
+        -_blocked: Dict~str, Set~
+        -_recurring: Dict~str, RecurringSchedule~
+        +add_listener(listener: JobListener) None
+        +submit(job: Job, delay: float, depends_on: Iterable~str~) str
+        +submit_threadsafe(job: Job) str
+        +schedule_recurring(factory: Callable, interval: float) str
+        +cancel_recurring(schedule_id: str) bool
+        +cancel(job_id: str) bool
+        +get(job_id: str) Job
+        +join() None
+        +start() None
+        +stop(cancel_running: bool) None
+    }
+    class Job {
+        <<abstract>>
+        +model: ConcurrencyModel
+        +job_id: str
+        +name: str
+        +priority: JobPriority
+        +timeout: Optional~float~
+        +retry: RetryPolicy
+        +deadline: Optional~float~
+        +status: JobStatus
+        +attempts: int
+        +result: Any
+        +run_at: float
+        +seq: int
+    }
+    class AsyncJob {
+        <<abstract>>
+        +run() Any
+    }
+    class BlockingJob {
+        <<abstract>>
+        +run_sync() Any
+    }
+    class CpuBoundJob {
+        <<abstract>>
+    }
+    class RetryPolicy {
+        <<dataclass>>
+        +max_retries: int
+        +base_delay: float
+        +max_delay: float
+        +jitter: bool
+        +delay(attempt: int, rng: Random) float
+    }
+    class SchedulingStrategy {
+        <<abstract>>
+        +key(job: Job) SortKey
+    }
+    class FIFOStrategy
+    class PriorityStrategy
+    class AgingPriorityStrategy {
+        -_age_rate: float
+    }
+    class EarliestDeadlineFirstStrategy
+    class JobExecutor {
+        -_threads: Optional~ThreadPoolExecutor~
+        -_processes: Optional~ProcessPoolExecutor~
+        +invoke(job: Job) Any
+        +shutdown() None
+    }
+    class RecurringSchedule {
+        +schedule_id: str
+        +factory: Callable
+        +interval: float
+        +next_run: float
+        +allow_overlap: bool
+        +active: bool
+        +advance(now: float) None
+    }
+    class JobStatus {
+        <<enumeration>>
+        PENDING
+        RUNNING
+        RETRY_WAIT
+        COMPLETED
+        FAILED
+        TIMED_OUT
+        CANCELLED
+        +is_terminal: bool
+    }
+    class JobPriority {
+        <<enumeration>>
+        LOW
+        MEDIUM
+        HIGH
+        CRITICAL
+    }
+    class ConcurrencyModel {
+        <<enumeration>>
+        ASYNC
+        THREAD
+        PROCESS
+    }
 
-!!! note
-    The diagram predates the v3 code. Names differ (`AsyncJobExecutor` is now `JobExecutor`, `*Scheduler` strategies are now `*Strategy`, and there is no `UnsafeCounter`/`SafeCounter`). [CODE.md](CODE.md) has the current class table.
+    Job <|-- AsyncJob
+    Job <|-- BlockingJob
+    BlockingJob <|-- CpuBoundJob
+    SchedulingStrategy <|-- FIFOStrategy
+    SchedulingStrategy <|-- PriorityStrategy
+    SchedulingStrategy <|-- AgingPriorityStrategy
+    SchedulingStrategy <|-- EarliestDeadlineFirstStrategy
+    JobScheduler o-- SchedulingStrategy : orders ready heap
+    JobScheduler *-- JobExecutor
+    JobScheduler o-- "0..*" Job : tracks
+    JobScheduler *-- "0..*" RecurringSchedule
+    RecurringSchedule ..> Job : factory creates
+    JobExecutor ..> Job : runs on loop, thread or process
+    Job *-- RetryPolicy
+    Job --> JobStatus
+    Job --> JobPriority
+    Job --> ConcurrencyModel
+```
 
 ---
 

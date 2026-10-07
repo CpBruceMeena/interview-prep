@@ -7,7 +7,134 @@
 
 ## 📊 Class Diagram
 
-![](parking-lot-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction TB
+    class ParkingLot {
+        +LOST_TICKET_PENALTY: Decimal
+        +name: str
+        -floors: List~ParkingFloor~
+        -active_by_plate: Dict~str, ParkingTicket~
+        -fee_calculator: FeeCalculator
+        -clock: Callable
+        -lock: Lock
+        +add_floor(floor: ParkingFloor) None
+        +find_available_spot(vehicle: Vehicle) Optional~ParkingSpot~
+        +park_vehicle(vehicle: Vehicle) ParkingTicket
+        +unpark_vehicle(ticket_id: str) Decimal
+        +unpark_lost_ticket(license_plate: str) Decimal
+        +get_ticket(ticket_id: str) Optional~ParkingTicket~
+        +available_count(spot_type: Optional~SpotType~) int
+        +show_available_spots() str
+        +set_fee_calculator(fee_calculator: FeeCalculator) None
+    }
+    class ParkingFloor {
+        +floor_number: int
+        -spots: Dict~str, ParkingSpot~
+        -free: Dict~SpotType, Dict~
+        +add_spot(spot: ParkingSpot) None
+        +find_spot(spot_id: str) Optional~ParkingSpot~
+        +get_available_spots(spot_type: Optional~SpotType~) List~ParkingSpot~
+        +available_count(spot_type: SpotType) int
+        +first_free(spot_type: SpotType) Optional~ParkingSpot~
+        +occupy(spot: ParkingSpot, vehicle: Vehicle) None
+        +release(spot: ParkingSpot) Vehicle
+    }
+    class ParkingSpot {
+        +spot_id: str
+        +floor: int
+        +spot_type: SpotType
+        +is_available: bool
+        +parked_vehicle: Optional~Vehicle~
+        +park(vehicle: Vehicle) None
+        +vacate() Vehicle
+    }
+    class Vehicle {
+        <<abstract>>
+        +license_plate: str
+        +vehicle_type: VehicleType
+        +get_required_spot_type()* SpotType
+    }
+    class Motorcycle
+    class Car
+    class Truck
+    class VehicleFactory {
+        +create_vehicle(vehicle_type: VehicleType, license_plate: str)$ Vehicle
+        +register_vehicle_type(vehicle_type: VehicleType, vehicle_class: Type)$ None
+    }
+    class SpotAllocationMapping {
+        +get_allowed_spots(vehicle: Vehicle)$ Tuple~SpotType~
+    }
+    class FeeCalculator {
+        <<abstract>>
+        +calculate_fee(duration: timedelta, spot_type: SpotType)* Decimal
+    }
+    class HourlyFeeCalculator {
+        +calculate_fee(duration: timedelta, spot_type: SpotType) Decimal
+    }
+    class DailyFeeCalculator {
+        +calculate_fee(duration: timedelta, spot_type: SpotType) Decimal
+    }
+    class TicketManager {
+        -tickets: Dict~str, ParkingTicket~
+        +create_ticket(spot: ParkingSpot, vehicle: Vehicle, entry_time: datetime) ParkingTicket
+        +get_ticket(ticket_id: str) Optional~ParkingTicket~
+    }
+    class ParkingTicket {
+        +ticket_id: str
+        +spot: ParkingSpot
+        +vehicle: Vehicle
+        +entry_time: datetime
+        +exit_time: Optional~datetime~
+        +fee: Optional~Decimal~
+        +status: ParkingTicketStatus
+        +close(exit_time: datetime, fee_calculator: FeeCalculator, penalty: Decimal, status: ParkingTicketStatus) Decimal
+    }
+    class DisplayBoard {
+        +render(floors: List~ParkingFloor~)$ str
+    }
+    class VehicleType {
+        <<enumeration>>
+        MOTORCYCLE
+        CAR
+        TRUCK
+    }
+    class SpotType {
+        <<enumeration>>
+        MOTORCYCLE
+        COMPACT
+        LARGE
+        +size: int
+    }
+    class ParkingTicketStatus {
+        <<enumeration>>
+        ACTIVE
+        PAID
+        LOST
+    }
+
+    ParkingLot "1" *-- "1..*" ParkingFloor : floors
+    ParkingFloor "1" *-- "*" ParkingSpot : spots
+    ParkingLot "1" *-- "1" TicketManager
+    TicketManager "1" *-- "*" ParkingTicket : issues
+    ParkingLot o-- FeeCalculator : pricing strategy
+    ParkingLot ..> SpotAllocationMapping : best-fit order
+    ParkingLot ..> DisplayBoard : renders
+    ParkingSpot "0..1" --> Vehicle : parked_vehicle
+    ParkingTicket --> ParkingSpot
+    ParkingTicket --> Vehicle
+    ParkingTicket ..> FeeCalculator : close()
+    ParkingTicket --> ParkingTicketStatus
+    ParkingSpot --> SpotType
+    Vehicle <|-- Motorcycle
+    Vehicle <|-- Car
+    Vehicle <|-- Truck
+    Vehicle --> VehicleType
+    Vehicle ..> SpotType : required spot
+    VehicleFactory ..> Vehicle : creates
+    FeeCalculator <|-- HourlyFeeCalculator
+    FeeCalculator <|-- DailyFeeCalculator
+```
 
 ---
 
@@ -321,16 +448,16 @@ class Truck(Vehicle):        # Truck IS-A Vehicle  ✅
 When you draw your class diagram, think about it layer by layer:
 
 ```
-Layer 1 (Top):          ParkingLot
-                           │
-Layer 2 (Middle):    ParkingFloor  ─── uses ─── FeeCalculator (interface)
-                      │        │                      │
-Layer 3 (Bottom):  ParkingSpot  TicketManager    HourlyFeeCalculator  DailyFeeCalculator
-                      │
+Layer 1 (Top):                         ParkingLot
+                        ┌──────────────────┼─────────────────────┐
+Layer 2 (Middle):  ParkingFloor      TicketManager      FeeCalculator (interface)
+                        │                  │                  ┌──┴───────────────┐
+Layer 3 (Bottom):  ParkingSpot       ParkingTicket    HourlyFeeCalculator  DailyFeeCalculator
+                        │
                   Vehicle (abstract)
-                      │
-               ┌──────┼──────┐
-             Car   Truck   Motorcycle
+                        │
+                 ┌──────┼──────┐
+               Car   Truck   Motorcycle
 ```
 
 **For each arrow, ask:**

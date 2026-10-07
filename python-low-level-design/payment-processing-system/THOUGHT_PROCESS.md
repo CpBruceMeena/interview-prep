@@ -6,10 +6,156 @@
 
 ## 📊 Class Diagram
 
-![](payment-processing-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class PaymentService {
+        +outbox: Outbox
+        -_merchants: Dict~str, Merchant~
+        -_payments: Dict~str, Payment~
+        -_by_key: Dict~Tuple, Payment~
+        -_refund_keys: Dict~Tuple, Refund~
+        +add_merchant(merchant: Merchant) None
+        +pay(request: PaymentRequest) Payment
+        +refund(payment_id: str, amount: Money, idempotency_key: str, reason: str) Refund
+        +reconcile() List~Payment~
+        +get(payment_id: str) Payment
+    }
+    class PaymentGateway {
+        <<abstract>>
+        +charge(idempotency_key: str, amount: Money, payment_token: str) GatewayResult
+        +refund(idempotency_key: str, charge_reference: str, amount: Money) GatewayResult
+    }
+    class SimulatedGateway {
+        +money_moved: List~Tuple~
+        +inject(faults: str) None
+    }
+    class GatewayResult {
+        <<dataclass>>
+        +decision: GatewayDecision
+        +reference: str
+        +reason: str
+    }
+    class GatewayDecision {
+        <<enumeration>>
+        APPROVED
+        DECLINED
+    }
+    class RetryPolicy {
+        +max_attempts: int
+        +run(fn: Callable) GatewayResult
+    }
+    class RiskRule {
+        <<abstract>>
+        +evaluate(request: PaymentRequest) Optional~str~
+    }
+    class AmountLimitRule {
+        -_limit: Money
+    }
+    class VelocityRule {
+        -_attempts: Dict~str, Deque~
+    }
+    class Outbox {
+        +append(type_: str, aggregate_id: str, payload: str) None
+        +relay(publish: Callable) int
+        +pending() List~OutboxEvent~
+    }
+    class OutboxEvent {
+        <<dataclass>>
+        +event_id: int
+        +type: str
+        +aggregate_id: str
+        +payload: Dict~str, str~
+    }
+    class Merchant {
+        <<dataclass>>
+        +merchant_id: str
+        +name: str
+        +fee_bps: int
+    }
+    class PaymentRequest {
+        <<dataclass>>
+        +idempotency_key: str
+        +merchant_id: str
+        +customer_id: str
+        +amount: Money
+        +payment_token: str
+    }
+    class Payment {
+        <<dataclass>>
+        +payment_id: str
+        +status: PaymentStatus
+        +gateway_ref: Optional~str~
+        +fee: Optional~Money~
+        +refunds: List~Refund~
+        +history: List~PaymentStatus~
+        +lock: Lock
+        +refunded() Money
+        +held_for_refunds() Money
+        +refundable() Money
+        +transition(to: PaymentStatus) None
+    }
+    class Refund {
+        <<dataclass>>
+        +refund_id: str
+        +payment_id: str
+        +idempotency_key: str
+        +amount: Money
+        +status: RefundStatus
+        +gateway_ref: Optional~str~
+    }
+    class Money {
+        <<dataclass>>
+        +amount: Decimal
+        +currency: Currency
+        +of(amount: str, currency: Currency) Money
+        +zero(currency: Currency) Money
+        +fee(basis_points: int) Money
+    }
+    class Currency {
+        <<enumeration>>
+        USD
+        EUR
+        INR
+        JPY
+        +code: str
+        +exponent: int
+    }
+    class PaymentStatus {
+        <<enumeration>>
+        PROCESSING
+        SUCCEEDED
+        FAILED
+        UNKNOWN
+        PARTIALLY_REFUNDED
+        REFUNDED
+    }
+    class RefundStatus {
+        <<enumeration>>
+        PENDING
+        SUCCEEDED
+        FAILED
+    }
 
-!!! note
-    The diagram shows the earlier version (Customer, PaymentValidator chain, three gateway stubs). The current classes are listed in Phase 1.
+    PaymentGateway <|-- SimulatedGateway
+    RiskRule <|-- AmountLimitRule
+    RiskRule <|-- VelocityRule
+    PaymentService --> PaymentGateway : charges via
+    PaymentService *-- RetryPolicy
+    PaymentService o-- "0..*" RiskRule : checks before charge
+    PaymentService *-- Outbox
+    PaymentService o-- "0..*" Merchant
+    PaymentService *-- "0..*" Payment
+    Outbox *-- "0..*" OutboxEvent
+    PaymentGateway ..> GatewayResult : returns
+    GatewayResult --> GatewayDecision
+    Payment *-- PaymentRequest
+    Payment *-- "0..*" Refund
+    Payment --> PaymentStatus
+    Refund --> RefundStatus
+    PaymentRequest --> Money
+    Money --> Currency
+```
 
 ---
 

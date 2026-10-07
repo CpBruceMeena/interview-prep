@@ -6,7 +6,88 @@
 
 ## 📊 Class Diagram
 
-![](tic-tac-toe-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction TB
+    class TicTacToeGame {
+        -players: Tuple~Player, Player~
+        -turn: int
+        -lock: Lock
+        +status: GameStatus
+        +winner: Optional~Player~
+        +current_player: Player
+        +board: Board
+        +reset() None
+        +make_move(symbol: PlayerSymbol, pos: Position) GameStatus
+        +undo() Position
+        +play_turn() GameStatus
+        +play(on_move: Optional~Callable~) GameStatus
+    }
+    class Board {
+        -grid: List~List~
+        -rows: List~int~
+        -cols: List~int~
+        -diag: int
+        -anti: int
+        -winner: Optional~PlayerSymbol~
+        +size: int
+        +history: List~Position~
+        +cell(pos: Position) Optional~PlayerSymbol~
+        +is_valid_move(pos: Position) bool
+        +place_move(pos: Position, symbol: PlayerSymbol) Optional~PlayerSymbol~
+        +undo_move() Position
+        +get_available_moves() List~Position~
+        +is_full() bool
+        +check_winner() Optional~PlayerSymbol~
+        +key() Tuple
+        +copy() Board
+        +render() str
+    }
+    class Player {
+        <<abstract>>
+        +name: str
+        +symbol: PlayerSymbol
+        +get_move(board: Board)* Position
+    }
+    class HumanPlayer {
+        -input_fn: Callable
+        -output_fn: Callable
+        +get_move(board: Board) Position
+    }
+    class BotPlayer {
+        -max_depth: Optional~int~
+        -memo: Dict~tuple, int~
+        +get_move(board: Board) Position
+        -score(board: Board, to_move: PlayerSymbol, depth: int) int
+    }
+    class ScriptedPlayer {
+        -moves: List~Position~
+        +get_move(board: Board) Position
+    }
+    class PlayerSymbol {
+        <<enumeration>>
+        X
+        O
+        +sign: int
+        +opponent() PlayerSymbol
+    }
+    class GameStatus {
+        <<enumeration>>
+        IN_PROGRESS
+        WIN
+        DRAW
+    }
+
+    TicTacToeGame "1" *-- "1" Board
+    TicTacToeGame "1" o-- "2" Player : players
+    TicTacToeGame --> GameStatus
+    Player <|-- HumanPlayer
+    Player <|-- BotPlayer
+    Player <|-- ScriptedPlayer
+    Player --> PlayerSymbol
+    Player ..> Board : get_move on a copy
+    Board --> PlayerSymbol : cells
+```
 
 ---
 

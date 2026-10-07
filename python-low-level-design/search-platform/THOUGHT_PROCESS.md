@@ -6,10 +6,126 @@
 
 ## 📊 Class Diagram
 
-![](search-platform-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction LR
+    class SearchEngine {
+        -_index: InvertedIndex
+        -_parser: QueryParser
+        -_scorer: Scorer
+        -_boosts: List~Boost~
+        -_suggest_df: Counter
+        +index(doc: Document) None
+        +index_many(docs: Iterable~Document~) None
+        +delete(doc_id: str) bool
+        +search(text: str, limit: int, category: Optional~str~, sort: SortOrder) List~SearchHit~
+        +explain_terms(text: str) Query
+        +suggest(prefix: str, limit: int) List~str~
+        +stats() Dict~str, float~
+    }
+    class Analyzer {
+        -_stop_words: FrozenSet~str~
+        -_stem: Callable
+        +analyze(text: str) List~Token~
+        +terms(text: str) List~str~
+    }
+    class Token {
+        <<dataclass>>
+        +term: str
+        +surface: str
+        +position: int
+    }
+    class QueryParser {
+        +parse(text: str) Query
+    }
+    class Query {
+        <<dataclass>>
+        +should: List~str~
+        +must: List~str~
+        +must_not: List~str~
+        +phrases: List~List~str~~
+        +is_empty: bool
+    }
+    class InvertedIndex {
+        +field_weights: Dict~str, float~
+        +postings: Dict~str, Dict~
+        +docs: Dict~str, Document~
+        +doc_len: Dict~str, float~
+        +n_docs: int
+        +avg_len: float
+        +upsert(doc: Document) None
+        +delete(doc_id: str) bool
+        +df(term: str) int
+        +docs_with(term: str) Dict~str, Posting~
+        +surface_words(doc_id: str) Set~str~
+    }
+    class Posting {
+        <<dataclass>>
+        +positions: Dict~str, List~
+        +weighted_tf(weights: Dict~str, float~) float
+    }
+    class Document {
+        <<dataclass>>
+        +doc_id: str
+        +title: str
+        +body: str
+        +tags: Tuple~str~
+        +category: str
+        +created_at: datetime
+        +popularity: int
+    }
+    class SearchHit {
+        <<dataclass>>
+        +doc: Document
+        +score: float
+    }
+    class SortOrder {
+        <<enumeration>>
+        RELEVANCE
+        NEWEST
+        POPULARITY
+    }
+    class Scorer {
+        <<abstract>>
+        +score(tf: float, df: int, n_docs: int, doc_len: float, avg_len: float) float
+    }
+    class BM25Scorer {
+        +k1: float
+        +b: float
+    }
+    class TfIdfScorer
+    class Boost {
+        <<abstract>>
+        +factor(doc: Document) float
+    }
+    class RecencyBoost {
+        -_now: datetime
+        -_half_life: float
+        -_weight: float
+    }
+    class PopularityBoost {
+        -_weight: float
+    }
 
-!!! note
-    The diagram predates the current code. `Tokenizer` is now `Analyzer`, `RankingStrategy` is split into `Scorer` (BM25 / TF-IDF) and `Boost` (recency / popularity), `FuzzyMatcher` is the `levenshtein` function, and `SearchService` is `SearchEngine`. [CODE.md](CODE.md) has the current class table.
+    Scorer <|-- BM25Scorer
+    Scorer <|-- TfIdfScorer
+    Boost <|-- RecencyBoost
+    Boost <|-- PopularityBoost
+    SearchEngine *-- InvertedIndex
+    SearchEngine *-- QueryParser
+    SearchEngine o-- Analyzer
+    SearchEngine o-- Scorer : strategy
+    SearchEngine o-- "0..*" Boost : multiplied in
+    SearchEngine ..> SearchHit : returns
+    SearchEngine ..> SortOrder
+    QueryParser --> Analyzer : same analyzer as indexing
+    QueryParser ..> Query : builds
+    InvertedIndex --> Analyzer
+    InvertedIndex *-- "0..*" Posting : term to doc_id
+    InvertedIndex o-- "0..*" Document
+    Analyzer ..> Token : produces
+    SearchHit --> Document
+```
 
 ---
 

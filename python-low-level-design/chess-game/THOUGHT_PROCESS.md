@@ -6,7 +6,156 @@
 
 ## 📊 Class Diagram
 
-![](chess-game-class-diagram.drawio)
+```mermaid
+classDiagram
+    direction TB
+    class ChessGame {
+        +board: Board
+        +current_player: Player
+        +status: GameStatus
+        +winner: Optional~Player~
+        +ply: int
+        +moves: List~Move~
+        -to_move: Color
+        -halfmove_clock: int
+        -positions: Counter
+        -lock: Lock
+        +player(color: Color) Player
+        +make_move(start: SquareLike, end: SquareLike, promotion: Optional~PieceType~, expected_ply: Optional~int~) Move
+        +undo_last_move() Move
+        +resign(color: Color) None
+        +can_claim_draw() bool
+        +claim_draw() None
+        +render() str
+    }
+    class MoveValidator {
+        -board: Board
+        +validate(player: Player, start: Square, end: Square) Piece
+    }
+    class Board {
+        -grid: List~List~
+        +en_passant_target: Optional~Square~
+        +from_fen(fen: str)$ Tuple~Board, Color~
+        +place(piece_type: PieceType, color: Color, pos: Square, has_moved: bool) Piece
+        +get_piece_at(pos: Square) Optional~Piece~
+        +pieces(color: Optional~Color~) List~Piece~
+        +find_king(color: Color) Optional~Piece~
+        +is_square_attacked(pos: Square, by_color: Color) bool
+        +is_in_check(color: Color) bool
+        +apply_move(start: Square, end: Square, promotion: Optional~PieceType~) Move
+        +undo_move(move: Move) None
+        +is_legal_move(piece: Piece, end: Square) bool
+        +legal_moves(color: Color) List~Tuple~
+        +has_legal_moves(color: Color) bool
+        +is_checkmate(color: Color) bool
+        +is_stalemate(color: Color) bool
+        +has_insufficient_material() bool
+        +position_key(side_to_move: Color) Tuple
+        +render() str
+    }
+    class Move {
+        <<dataclass>>
+        +start_pos: Square
+        +end_pos: Square
+        +piece: Piece
+        +captured_piece: Optional~Piece~
+        +captured_pos: Optional~Square~
+        +promotion: Optional~PieceType~
+        +promoted_piece: Optional~Piece~
+        +is_castling: bool
+        +is_en_passant: bool
+        +rook_from: Optional~Square~
+        +rook_to: Optional~Square~
+        +prev_en_passant_target: Optional~Square~
+        +prev_has_moved: bool
+    }
+    class Player {
+        <<dataclass>>
+        +name: str
+        +color: Color
+    }
+    class Piece {
+        <<abstract>>
+        +color: Color
+        +position: Square
+        +has_moved: bool
+        +piece_type: PieceType
+        +symbol: str
+        +get_possible_moves(board: Board)* List~Square~
+        +attacks(board: Board) List~Square~
+    }
+    class SlidingPiece {
+        +DIRECTIONS: Tuple
+        +get_possible_moves(board: Board) List~Square~
+    }
+    class Queen
+    class Rook
+    class Bishop
+    class Knight {
+        +JUMPS: Tuple
+        +get_possible_moves(board: Board) List~Square~
+    }
+    class King {
+        +attacks(board: Board) List~Square~
+        +get_possible_moves(board: Board) List~Square~
+        -can_castle(board: Board, rook_col: int, empty: Tuple, safe: Tuple) bool
+    }
+    class Pawn {
+        +direction: int
+        +attacks(board: Board) List~Square~
+        +get_possible_moves(board: Board) List~Square~
+    }
+    class PieceFactory {
+        +create_piece(piece_type: PieceType, color: Color, position: Square)$ Piece
+    }
+    class Color {
+        <<enumeration>>
+        WHITE
+        BLACK
+        +opponent: Color
+    }
+    class PieceType {
+        <<enumeration>>
+        KING
+        QUEEN
+        ROOK
+        BISHOP
+        KNIGHT
+        PAWN
+    }
+    class GameStatus {
+        <<enumeration>>
+        ACTIVE
+        CHECK
+        CHECKMATE
+        STALEMATE
+        DRAW
+        RESIGNED
+        +is_over: bool
+    }
+
+    ChessGame "1" *-- "1" Board
+    ChessGame "1" *-- "1" MoveValidator
+    ChessGame "1" *-- "2" Player : players
+    ChessGame "1" *-- "*" Move : history
+    ChessGame --> GameStatus
+    MoveValidator --> Board
+    Board "1" o-- "0..32" Piece : grid
+    Board ..> Move : apply_move / undo_move
+    Board ..> PieceFactory : place / promotion
+    PieceFactory ..> Piece : creates
+    Move --> Piece : piece, captured
+    Piece <|-- SlidingPiece
+    SlidingPiece <|-- Queen
+    SlidingPiece <|-- Rook
+    SlidingPiece <|-- Bishop
+    Piece <|-- Knight
+    Piece <|-- King
+    Piece <|-- Pawn
+    Piece --> Color
+    Piece --> PieceType
+    Player --> Color
+```
 
 ---
 

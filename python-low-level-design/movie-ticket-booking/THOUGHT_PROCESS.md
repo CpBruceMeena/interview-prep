@@ -6,10 +6,151 @@
 
 ## 📊 Class Diagram
 
-![](movie-ticket-class-diagram.drawio)
+```mermaid
+classDiagram
+    class Movie {
+        <<dataclass>>
+        +movie_id: str
+        +title: str
+        +genre: Genre
+        +duration_minutes: int
+        +language: str
+    }
+    class Theatre {
+        <<dataclass>>
+        +theatre_id: str
+        +name: str
+        +city: City
+    }
+    class Screen {
+        <<dataclass>>
+        +screen_id: str
+        +name: str
+        +seats: tuple~Seat~
+        +with_rows(screen_id: str, name: str, rows: Dict, per_row: int) Screen
+    }
+    class SeatCategory {
+        <<enumeration>>
+        REGULAR
+        PREMIUM
+        VIP
+    }
+    class Seat {
+        <<dataclass>>
+        +seat_id: str
+        +row: str
+        +number: int
+        +category: SeatCategory
+    }
+    class Show {
+        +show_id: str
+        +movie: Movie
+        +theatre: Theatre
+        +screen: Screen
+        +start_time: datetime
+        +end_time: datetime
+        +base_prices: Dict~SeatCategory, Decimal~
+        -_seats: Dict~str, ShowSeat~
+        +seat(seat_id: str) ShowSeat
+        +available_seat_ids(now: datetime) List~str~
+    }
+    class SeatStatus {
+        <<enumeration>>
+        AVAILABLE
+        HELD
+        BOOKED
+    }
+    class ShowSeat {
+        <<dataclass>>
+        +seat: Seat
+        +status: SeatStatus
+        +booking_id: Optional~str~
+        +hold_expires_at: Optional~datetime~
+        +lock: Lock
+        +is_free(now: datetime) bool
+        +held_by(booking_id: str) bool
+        +hold(booking_id: str, expires_at: datetime) None
+        +book() None
+        +release() None
+    }
+    class BookingStatus {
+        <<enumeration>>
+        PENDING
+        CONFIRMED
+        CANCELLED
+        EXPIRED
+    }
+    class Booking {
+        <<dataclass>>
+        +booking_id: str
+        +user_id: str
+        +show: Show
+        +seats: List~ShowSeat~
+        +line_prices: Dict~str, Decimal~
+        +expires_at: datetime
+        +status: BookingStatus
+        +payment_id: Optional~str~
+        +total: Decimal
+        +seat_ids: List~str~
+    }
+    class PricingStrategy {
+        <<abstract>>
+        +price(base: Decimal, show: Show, seat: Seat)* Decimal
+    }
+    class StandardPricing
+    class PeakHourPricing {
+        +hours: range
+        +multiplier: Decimal
+    }
+    class WeekendPricing {
+        +multiplier: Decimal
+    }
+    class CompositePricing {
+        +strategies: tuple~PricingStrategy~
+    }
+    class PaymentGateway {
+        <<abstract>>
+        +charge(idempotency_key: str, amount: Decimal)* str
+        +refund(payment_id: str, amount: Decimal)* None
+    }
+    class BookingService {
+        -_gateway: PaymentGateway
+        -_pricing: PricingStrategy
+        -_clock: Clock
+        -_hold_ttl: timedelta
+        -_shows: Dict~str, Show~
+        -_bookings: Dict~str, Booking~
+        -_registry_lock: Lock
+        +add_show(show: Show) None
+        +search(city, movie_id, on, genre) List~Show~
+        +available_seats(show_id: str) List~str~
+        +hold_seats(show_id: str, user_id: str, seat_ids: List~str~) Booking
+        +pay_and_confirm(booking_id: str) Booking
+        +cancel(booking_id: str) Booking
+        +release_expired() int
+    }
 
-!!! note "Diagram vs code"
-    The diagram predates the current code: it shows seat status on the screen's `Seat` and a single-lock `BookingManager`. The code now keeps status on a per-show `ShowSeat`, uses per-seat locks taken in order, and the facade is `BookingService`. Trust [the code](CODE.md) where they differ.
+    Screen "1" *-- "*" Seat : layout
+    Seat --> SeatCategory
+    Show --> Movie
+    Show --> Theatre
+    Show --> Screen
+    Show "1" *-- "*" ShowSeat : per-show inventory
+    ShowSeat --> Seat
+    ShowSeat --> SeatStatus
+    Booking --> Show
+    Booking "1" o-- "1..10" ShowSeat : held or booked
+    Booking --> BookingStatus
+    BookingService "1" *-- "*" Show
+    BookingService "1" *-- "*" Booking
+    BookingService o-- PricingStrategy
+    BookingService o-- PaymentGateway
+    PricingStrategy <|-- StandardPricing
+    PricingStrategy <|-- PeakHourPricing
+    PricingStrategy <|-- WeekendPricing
+    PricingStrategy <|-- CompositePricing
+    CompositePricing o-- "*" PricingStrategy : applies in sequence
+```
 
 ---
 
