@@ -16,7 +16,7 @@
 4. [Pod QoS Classes & Resource Management](#4-pod-qos-classes-resource-management)
 5. [Pod Priority, Preemption & Disruption Budgets](#5-pod-priority-preemption-disruption-budgets)
 6. [Pod Security: Standards, Contexts & Admission](#6-pod-security-standards-contexts-admission)
-7. [Kubernete Monitoring Stack: kubelet, cAdvisor, Metrics Server](#7-kubernetes-monitoring-stack-kubelet-cadvisor-metrics-server)
+7. [Kubernetes Monitoring Stack: kubelet, cAdvisor, Metrics Server](#7-kubernetes-monitoring-stack-kubelet-cadvisor-metrics-server)
 8. [kube-state-metrics & Node Exporter](#8-kube-state-metrics-node-exporter)
 9. [Prometheus Operator: ServiceMonitor, PodMonitor & Rules](#9-prometheus-operator-servicemonitor-podmonitor-rules)
 10. [Custom Metrics, KEDA & Event-Driven Autoscaling](#10-custom-metrics-keda-event-driven-autoscaling)
@@ -36,30 +36,51 @@
 
 ### Answer
 
+!!! tip "30-second answer"
+    `Pending` means the pod is accepted but either **not scheduled yet** (check the `PodScheduled` condition and scheduler events: insufficient requests headroom, taints, affinity, unbound or wrong-zone PVC, quota) or **scheduled but containers not created yet** (image pull, volume attach/mount, CNI sandbox setup, init containers). `kubectl describe pod` events tell you which half you're in within seconds. Phase is a coarse summary; conditions and per-container states carry the real signal.
+
 **Pod Phases (High-Level Lifecycle):**
 
 ```
            ┌──────────┐
-           │  Pending  │ ◄── Pod accepted, but not all containers running
+           │ Pending  │ ◄── Accepted; not scheduled yet, or images/volumes/init still in progress
            └────┬─────┘
                 │
                 ▼
            ┌──────────┐
-    ┌──────│ Running  │◄────── All containers running (at least one)
-    │      └────┬─────┘
+    ┌──────│ Running  │◄────── Bound to a node, all containers created,
+    │      └────┬─────┘        at least one running (or starting/restarting)
     │           │
     │      ┌────▼─────┐
-    │      │ Succeeded│◄────── All containers terminated with exit 0
-    │      └──────────┘
+    │      │ Succeeded│◄────── All containers terminated with exit 0, won't restart
+    │      └──────────┘        (only reachable with restartPolicy Never/OnFailure)
     │
     │      ┌──────────┐
-    └─────►│  Failed  │◄────── At least one container terminated with non-zero exit
-           └──────────┘
+    └─────►│  Failed  │◄────── All containers terminated, at least one failed,
+           └──────────┘        and it won't be restarted
 
            ┌──────────┐
-           │ Unknown  │◄────── Node communication lost
+           │ Unknown  │◄────── State can't be obtained (usually node unreachable)
            └──────────┘
+
+A Deployment pod (restartPolicy: Always) whose container keeps crashing stays in
+phase Running; "CrashLoopBackOff" is a container waiting reason, not a phase.
+"Terminating" in kubectl output is also not a phase: it means deletionTimestamp is set.
 ```
+
+**Why is my pod Pending? (diagnosis order)**
+
+| Symptom in `kubectl describe pod` | Cause | Fix |
+|---|---|---|
+| `FailedScheduling: Insufficient cpu/memory` | Sum of **requests** doesn't fit any node | Lower requests, add nodes (check autoscaler logs: max size, instance availability) |
+| `node(s) had untolerated taint` | Taints (GPU, dedicated, control-plane) | Add toleration or target other nodes |
+| `didn't match Pod's node affinity/selector` | Label typo, zone pinning | Fix selector or label nodes |
+| `pod has unbound immediate PersistentVolumeClaims` / `volume node affinity conflict` | PVC can't bind, or the disk lives in another zone | `WaitForFirstConsumer` StorageClass; check provisioner |
+| `didn't satisfy existing pods anti-affinity` / topology spread | Hard spread rules with too few domains | Use `ScheduleAnyway` or add capacity in the missing zone |
+| No events, pod has no `nodeName` | Scheduler down, or `schedulerName` points at a scheduler that doesn't exist; scheduling gates (`spec.schedulingGates`) not removed | Check scheduler, remove gate |
+| Scheduled, then `FailedMount` / `FailedAttachVolume` | CSI attach/mount problem, RWO volume still attached elsewhere | Check VolumeAttachment, old node |
+| Scheduled, `FailedCreatePodSandBox` | CNI out of IPs / misconfigured | Check CNI pods, subnet/ENI capacity |
+| `ResourceQuota exceeded` | Never even created as a pod; the ReplicaSet shows `FailedCreate` | Raise quota or add requests (quota requires them) |
 
 **Pod Conditions (Detailed Status):**
 
@@ -79,26 +100,25 @@
 # Conditions are individual status signals, each with True/False/Unknown
 # A pod can have multiple conditions simultaneously
 
+# Example: a pod whose readiness probe is failing
 conditions:
-  - type: PodScheduled          # Has the pod been scheduled to a node?
-    status: True
-    lastTransitionTime: ...
-    reason: SuccessAssigned
-    message: "Pod assigned to node ip-10-0-1-42"
-
-  - type: Initialized           # Have all init containers completed?
-    status: True
-    reason: Completed
-    message: "Init containers completed successfully"
-
-  - type: ContainersReady       # Are all containers ready?
-    status: True                # If False → readiness probe failing
-    reason: ReadinessProbeFailed
-    message: "Readiness probe failed: HTTP probe failed with statuscode: 503"
-
-  - type: Ready                 # Is the pod ready to serve traffic?
-    status: True
-    reason: MinimumReplicasAvailable
+  - type: PodScheduled              # Bound to a node?
+    status: "True"
+  - type: PodReadyToStartContainers # Sandbox + networking created by the runtime/CNI?
+    status: "True"
+  - type: Initialized               # All init containers done (sidecars started)?
+    status: "True"
+  - type: ContainersReady           # All containers passing readiness?
+    status: "False"
+    reason: ContainersNotReady
+    message: "containers with unready status: [app]"
+  - type: Ready                     # ContainersReady AND all readinessGates true
+    status: "False"                 # → pod removed from Service EndpointSlices
+    reason: ContainersNotReady
+# The probe failure itself shows up as an event:
+#   Warning  Unhealthy  Readiness probe failed: HTTP probe failed with statuscode: 503
+# readinessGates let external controllers (e.g. AWS LB controller) add conditions
+# that must also be True before the pod counts as Ready.
 ```
 
 **Container States (Inside Each Container):**
@@ -133,12 +153,13 @@ conditions:
 
 | Reason | Meaning | Diagnosis |
 |--------|---------|-----------|
-| `ContainerCreating` | Container is being created (image pull, volume mount) | Check image pull status, PVC binding |
+| `ContainerCreating` | Container is being created (image pull, volume mount, sandbox) | Check events for `FailedMount`, `FailedCreatePodSandBox`, slow pulls |
 | `PodInitializing` | Init containers running | `kubectl logs <pod> -c <init-container>` |
 | `ImagePullBackOff` | Image pull failed (backing off) | Check image name, registry credentials, network |
 | `ErrImagePull` | Image pull failed (initial attempt) | `kubectl describe pod <pod>` for events |
 | `CrashLoopBackOff` | Container starts and crashes repeatedly | Check logs, exit codes, resource limits |
-| `CreateContainerError` | Container creation failed | Check volume mounts, security context |
+| `CreateContainerConfigError` | Referenced ConfigMap/Secret/key missing | Check the names in `env`/`envFrom`/volumes |
+| `CreateContainerError` | Runtime failed to create the container | Check volume mounts, security context, command |
 | `InvalidImageName` | Image name is invalid | Check image:tag syntax |
 
 **CrashLoopBackOff Deep Dive:**
@@ -150,9 +171,10 @@ kubectl describe pod <pod>                  # Events, conditions, container stat
 kubectl logs <pod> -c <container> --previous # Logs from the PREVIOUS (crashed) instance
 kubectl logs <pod> --all-containers         # Logs from all containers
 
-# CrashLoopBackOff backoff progression:
-# 0s → 10s → 20s → 40s → 80s → 160s → 300s (capped at 5 min)
-# Resets after 10 minutes of stability
+# CrashLoopBackOff backoff progression (kubelet defaults):
+# 10s → 20s → 40s → 80s → 160s → 300s (capped at 5 min)
+# Resets after the container runs 10 minutes without crashing.
+# Since 1.32/1.33 there are alpha gates to tune this (per-node max, faster default decay).
 
 # Common causes:
 # 1. OOMKilled: container exceeded memory limit
@@ -163,8 +185,9 @@ kubectl logs <pod> --all-containers         # Logs from all containers
 #    → Container can't read configuration → panics → crashes
 #    Check: env vars, volume mounts in describe output
 #
-# 3. Port conflict: container tries to bind port already in use
-#    → Exit code: 1 or 125
+# 3. App error on startup (bad flag, failed migration, can't bind port)
+#    → Exit code 1 (or whatever the app returns); read logs --previous
+#    Exit 137 = SIGKILL (OOM or liveness kill), 143 = SIGTERM, 126/127 = command not executable/found
 #
 # 4. Liveness probe failure: probe fails → kubelet restarts container
 #    → Check liveness probe configuration
@@ -237,7 +260,9 @@ spec:
         secretKeyRef:
           name: db-secret
           key: url
-    # If migration fails → pod fails → Deployment controller recreates
+    # If migration fails → kubelet retries this init container with backoff
+    # (Init:CrashLoopBackOff). Caveat: with 10 replicas, 10 pods race to migrate.
+    # Prefer a pre-deploy Job (Helm hook / Argo sync wave) or a migration lock.
 
   containers:
   - name: main-app                       # Runs after both init containers succeed
@@ -247,9 +272,11 @@ spec:
 
 # Key behaviors:
 # - Init containers can have different images and resource requests than main
-# - Init containers can access secrets that main containers shouldn't (principle of least privilege)
-# - Pod restarts if any init container fails (backoff applies)
-# - Init containers with restartPolicy: Always are native sidecars (K8s 1.29+)
+# - Init containers can hold tools/secrets the main image shouldn't (least privilege)
+# - If an init container fails: with restartPolicy Always/OnFailure the kubelet retries
+#   it with backoff; with restartPolicy Never the whole pod goes Failed
+# - Init containers must be idempotent: they re-run if the pod sandbox is recreated
+# - Init containers with restartPolicy: Always are native sidecars (GA in 1.33)
 ```
 
 **Init Container Use Cases:**
@@ -262,17 +289,18 @@ spec:
 # 5. Check license keys or security policies
 # 6. Download model files for ML inference
 
-# Resource considerations:
-# - Init containers share pod-level resource requests/limits
-# - Highest init container resource request defines pod scheduling req
-# - Main container resources don't count until init is done
+# Resource considerations (scheduler's "effective request"):
+# - Init containers run one at a time, so the init part = the LARGEST single
+#   init container request (plus any sidecars already started before it)
+# - Pod effective request = max(sum of app containers + sidecars, init part)
+# - So a 4Gi migration init container makes the whole pod need 4Gi to schedule
 ```
 
-**Native Sidecar Containers (Kubernetes 1.29+):**
+**Native Sidecar Containers (beta and on by default in 1.29, GA in 1.33):**
 
 ```yaml
-# Sidecar containers run alongside main containers (not before)
-# Key: restartPolicy: Always in initContainers
+# A sidecar is an initContainer with restartPolicy: Always.
+# It starts in init order, then keeps running alongside the main containers.
 
 apiVersion: v1
 kind: Pod
@@ -281,15 +309,16 @@ metadata:
 spec:
   initContainers:
   - name: logging-sidecar                # Sidecar (runs alongside)
-    image: fluent-bit:2.1
+    image: fluent/fluent-bit:3.2
     restartPolicy: Always                # ← This makes it a sidecar!
+    # Optional startupProbe: the next init container waits until it succeeds
     volumeMounts:
     - name: logs
       mountPath: /var/log/app
 
   - name: wait-for-db                    # True init (runs first)
     image: busybox:1.36
-    command: ['sh', '-c', 'until nc -z db:5432; do sleep 2; done']
+    command: ['sh', '-c', 'until nc -z db 5432; do sleep 2; done']
 
   containers:
   - name: main-app
@@ -298,33 +327,40 @@ spec:
     - name: logs
       mountPath: /var/log/app
 
-# Sidecar vs Regular initContainers:
-# - Sidecar uses restartPolicy: Always → survives if it crashes
-# - Regular init containers stop on failure → pod restarts from first init
-# - Sidecars start in order but don't block next init from starting
-# - Sidecars stop AFTER all main containers (graceful shutdown)
+# What native sidecars guarantee:
+# - Start order: the next init container starts once the sidecar is STARTED
+#   (and its startupProbe passed, if set), so the mesh proxy is up before the app
+# - Restarted independently if they crash, even in restartPolicy: Never pods
+# - Don't block Job completion: the Job finishes when the main containers exit
+# - Shutdown: main containers get SIGTERM first; sidecars are stopped afterwards in
+#   reverse start order, so the proxy/log shipper outlives the app
+# - Support probes, unlike regular init containers
 
-# Traditional sidecar pattern (pre-1.29):
-# - Sidecar as a regular container (runs in parallel with main)
-# - No lifecycle ordering guarantees
-# - Must manually handle restart via liveness probe
+# Old pattern (sidecar as a regular container) problems it fixes:
+# - Proxy not ready when the app starts → app's first calls fail
+# - Jobs never complete because the proxy keeps running
+# - Proxy killed at the same time as the app → in-flight requests dropped
 ```
 
 **Ephemeral Containers (Debugging):**
 
 ```bash
-# Ephemeral containers are TEMPORARY — injected into RUNNING pods
-# No resource requests, no ports, no restart policy
-# Perfect for debugging without modifying the pod spec
+# Ephemeral containers (GA in 1.25) are added to a RUNNING pod via the
+# ephemeralcontainers subresource. No ports, probes or resources; never restarted;
+# can't be removed (they stay until the pod is deleted).
+# Ideal for distroless images that have no shell.
 
 # Debug a running pod:
-kubectl debug my-app-7d4f8b9c6-abc12 \
+kubectl debug -it my-app-7d4f8b9c6-abc12 \
   --image=nicolaka/netshoot:latest \
-  --target=main-app          # Attach to the same namespace/network as main-app
+  --target=main-app \
+  --profile=netadmin         # adds NET_ADMIN/NET_RAW for tcpdump
+# Every container already shares the pod's network namespace;
+# --target additionally shares main-app's PROCESS namespace (see its PIDs, /proc/<pid>/root)
 
-# Debug a node (creates a pod on the node):
-kubectl debug node/ip-10-0-1-42 \
-  --image=ubuntu:22.04
+# Debug a node (creates a pod on the node, host filesystem mounted at /host):
+kubectl debug node/ip-10-0-1-42 -it \
+  --image=ubuntu:24.04 --profile=sysadmin
 
 # Copy mode: create a copy of the pod with debug tools
 kubectl debug my-app-7d4f8b9c6-abc12 \
@@ -345,7 +381,7 @@ kubectl debug my-app-7d4f8b9c6-abc12 \
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Init containers** | Knows sequential execution, failure restarts from scratch, resource behavior |
-| **Sidecar patterns** | Understands native sidecars (1.29+) vs traditional sidecar-as-regular-container |
+| **Sidecar patterns** | Understands native sidecars (GA 1.33): startup ordering, Job completion, shutdown after the app |
 | **Ephemeral containers** | Knows `kubectl debug` for non-invasive troubleshooting |
 | **Use case distinction** | Can articulate when to use each: init for setup, sidecar for support, ephemeral for debug |
 
@@ -358,6 +394,9 @@ kubectl debug my-app-7d4f8b9c6-abc12 \
 **What They're Really Testing:** Whether you understand the three probe types and their distinct roles — startup (slow boot), readiness (traffic routing), and liveness (self-healing) — and can design a probe strategy for real application behaviors.
 
 ### Answer
+
+!!! tip "30-second answer"
+    502s during a rollout come from two windows. **Start:** a pod gets traffic before it can serve, fixed by an honest readiness probe (and a startup probe so a slow JVM isn't killed while booting). **Stop:** the old pod gets SIGTERM while load balancers and kube-proxy on other nodes still route to it, because endpoint removal and SIGTERM happen **in parallel**. Fix that with a `preStop` delay (5-15s) plus an app that drains in-flight requests on SIGTERM, all within `terminationGracePeriodSeconds`. Liveness is only for deadlocks; it never checks dependencies.
 
 **Three Probe Types:**
 
@@ -505,13 +544,16 @@ livenessProbe:
 # ✅ Fix: Liveness = process alive, Readiness = dependencies available
 
 # 🔴 ANTI-PATTERN 3: No startup probe for slow apps
-startupProbe: (missing)
-readinessProbe:
-  initialDelaySeconds: 5
-  failureThreshold: 30
-# Without startup probe, readiness counts failures from the start
-# App takes 90s to start → readiness fails for 90s → pod eventually restarts
-# ✅ Fix: Add startup probe with long failureThreshold
+livenessProbe:
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  failureThreshold: 3
+# No startupProbe: liveness starts after 10s and kills the container at ~40s,
+# before the 90s boot finishes → restart loop forever (CrashLoopBackOff).
+# (Readiness failing never restarts anything; it only withholds traffic.)
+# Raising initialDelaySeconds to 120 "works" but delays detection of real deadlocks
+# for every restart.
+# ✅ Fix: startupProbe with failureThreshold × periodSeconds > worst-case boot
 
 # 🔴 ANTI-PATTERN 4: Too aggressive liveness
 livenessProbe:
@@ -523,6 +565,49 @@ livenessProbe:
 # 🔴 ANTI-PATTERN 5: Not setting timeoutSeconds
 # Default timeout is 1 second — too short for many apps
 # ✅ Fix: Set timeoutSeconds to 3-5 seconds
+
+# 🔴 ANTI-PATTERN 6: Readiness checks a SHARED dependency
+# DB blips → every replica turns unready at once → Service has zero endpoints →
+# clients get connection errors instead of fast, explicit 503s from your app.
+# ✅ Fix: readiness reflects THIS pod's ability to serve (warmed up, not overloaded,
+#    not shutting down). Handle shared-dependency outages in the app (circuit breaker,
+#    degraded responses). Check a dependency in readiness only if pods can fail it
+#    independently (e.g. a per-pod connection pool).
+```
+
+**Graceful termination: the other half of zero-downtime rollouts**
+
+```
+kubectl delete / rollout / drain sets deletionTimestamp. Then IN PARALLEL:
+
+ Control plane path                         Kubelet path (on the pod's node)
+ ───────────────────                        ───────────────────────────────
+ EndpointSlice controller marks the pod     1. Run preStop hook (if any)
+ endpoint ready=false, terminating=true     2. After preStop returns, send SIGTERM
+   ↓ (watch propagation, ~0.1-2s+)             to PID 1 of each container
+ kube-proxy on every node removes it        3. Wait for exit until the grace period
+ Ingress/Gateway controllers, cloud LBs        (terminationGracePeriodSeconds, default
+ and mesh proxies stop sending to it           30s, counted from the START of preStop)
+   (cloud LB target deregistration can      4. SIGKILL anything still running
+    take several seconds more)              5. Native sidecars are stopped after the
+                                               main containers
+```
+
+- **Race:** if the app exits on SIGTERM immediately, requests still routed by slower components hit a closed socket → 502/connection reset. A `preStop` sleep holds SIGTERM until routing has converged.
+- **Use the native sleep action** (`lifecycle.preStop.sleep.seconds`, GA in v1.34) instead of `exec: sleep`, so distroless images without a shell work.
+- **The app must still handle SIGTERM**: stop accepting, finish in-flight requests, close keep-alive connections, then exit. PID 1 must actually receive the signal (use `exec` form in the Dockerfile or `tini`; a shell wrapper swallows it).
+- **Budget:** `terminationGracePeriodSeconds` ≥ preStop sleep + longest request drain + margin. If preStop overruns the grace period, the kubelet gives a one-time 2s extension and then kills.
+- **Long-lived connections** (WebSockets, gRPC streams) need the server to send GOAWAY/close and clients to reconnect; set a longer grace period for them.
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 45
+  containers:
+  - name: app
+    lifecycle:
+      preStop:
+        sleep:
+          seconds: 10      # let endpoint removal propagate before SIGTERM
 ```
 
 **Probe Recommendation by Application Type:**
@@ -543,6 +628,7 @@ livenessProbe:
 | **Dependency management** | Readiness checks dependencies, liveness checks process only |
 | **Slow startup handling** | Uses startup probe to prevent false-positive failures during boot |
 | **GC/deadlock awareness** | Knows GC pauses might fail readiness (OK) but not liveness (bad) |
+| **Termination ordering** | Knows endpoint removal and SIGTERM race; uses preStop + SIGTERM draining within the grace period |
 
 ---
 
@@ -554,11 +640,15 @@ livenessProbe:
 
 ### Answer
 
+!!! tip "30-second answer"
+    Two different killers act. The **kubelet** evicts pods before the node runs out (node-pressure eviction): it ranks pods by whether usage **exceeds requests**, then by **priority**, then by how far over requests they are. So BestEffort pods (request 0) go first in practice and a Guaranteed pod within its requests is evicted last. If memory runs out faster than the kubelet reacts, the **kernel OOM killer** picks a process by `oom_score`, which the kubelet biases per QoS (`oom_score_adj` 1000 for BestEffort, -997 for Guaranteed). Separately, any container exceeding its own memory **limit** is OOM-killed by its cgroup regardless of QoS. Protect critical pods with memory request = limit, accurate requests, PriorityClass, and enough `kube-reserved`/`system-reserved`.
+
 **QoS Classes Defined:**
 
 ```yaml
 # QOS CLASS: Guaranteed
-# Conditions: ALL containers have requests == limits for CPU AND memory
+# Conditions: EVERY container (incl. init/sidecars) sets CPU and memory limits,
+# and requests equal limits (if requests are omitted they default to the limits)
 resources:
   requests:
     cpu: 1
@@ -566,12 +656,14 @@ resources:
   limits:
     cpu: 1          # Same as request
     memory: 1Gi     # Same as request
-# → cgroup settings: cpu.shares=1024, memory.limit=1Gi
-# → Pod cannot exceed its limit
-# → Least likely to be evicted
+# → cgroup: CPU weight from 1 core of request (cpu.shares=1024 on v1, mapped to
+#   cpu.weight on v2), CFS quota of 1 core, memory.max=1Gi
+# → Eligible for exclusive CPUs with the static CPU manager policy (integer CPUs)
+# → Last to be evicted, oom_score_adj = -997
 
 # QOS CLASS: Burstable
-# Conditions: At least one container has request < limit (or only request)
+# Conditions: not Guaranteed, and at least one container has a CPU or memory
+# request or limit
 resources:
   requests:
     cpu: 500m       # Base reservation
@@ -579,44 +671,45 @@ resources:
   limits:
     cpu: 2          # Can burst up to 2 cores
     memory: 1Gi     # Can burst up to 1Gi
-# → cgroup settings: cpu.shares=512, memory.limit=1Gi
-# → Can use idle resources up to limit
-# → Medium eviction priority
+# → cgroup: CPU weight from 500m request, quota of 2 cores, memory.max=1Gi
+# → Can use idle node resources up to its limits
+# → Evicted when usage exceeds its requests under node pressure
 
 # QOS CLASS: BestEffort (NO requests or limits set)
 # Conditions: No resource requests or limits
 resources: {}   # Empty!
-# → No cgroup limits
-# → Uses whatever is available (competes with all processes)
-# → First to be evicted under pressure
-# → Can cause node instability (unbounded resource usage)
+# → Lowest CPU weight (cpu.shares=2), no memory limit
+# → Any usage is "above request" (request = 0), so evicted first under pressure
+# → oom_score_adj = 1000
+# → Scheduler reserves nothing for it, so it can overcommit nodes
 ```
 
 **OOM Kill Order Under Memory Pressure:**
 
 ```
-Node runs out of memory:
+Three different mechanisms, in the order they usually fire:
 
-1. Kernel invokes OOM killer
-2. Kubernetes kubelet monitors memory pressure
-3. Eviction order (by QoS):
+A. Container exceeds its OWN memory limit
+   → cgroup OOM inside that container, regardless of QoS or node state
+   → container restarted, reason OOMKilled, exit code 137
 
-   ┌─────────────────────────────────────────────────────┐
-   │ 1. BestEffort pods (killed first)                    │
-   │ 2. Burstable pods (killed next, by priority)          │
-   │ 3. Guaranteed pods (killed LAST, only if necessary)    │
-   └─────────────────────────────────────────────────────┘
+B. Node-pressure eviction by the kubelet (memory.available < evictionHard, default 100Mi;
+   optional evictionSoft with grace periods)
+   Ranking of pods to evict:
+     1. Is the pod's usage above its requests?   (above → evicted first)
+     2. Pod priority                            (lower → evicted first)
+     3. Usage minus requests                    (bigger overshoot → first)
+   Net effect: BestEffort first (request 0), then Burstable pods over their requests,
+   then pods within requests, Guaranteed last. Evicted pods are Failed (reason Evicted),
+   and PDBs and terminationGracePeriodSeconds are NOT honoured for hard thresholds.
 
-Within same QoS class:
-  - Pods are ordered by priority (higher priority = evicted later)
-  - Same priority: pod with higher memory usage vs request is evicted first
-
-Beyond QoS:
-  - Kernel OOM killer: chooses process with highest oom_score
-  - oom_score = memory_used * 10 + OOM_SCORE_ADJ (set by kubelet)
-  - Guaranteed pods: oom_score_adj = -998 (almost never killed)
-  - Burstable pods: oom_score_adj = min(1000, 1000 - (1000 * memory_request / memory_limit))
-  - BestEffort pods: oom_score_adj = 1000 (always killed first)
+C. Kernel OOM killer (node ran out before the kubelet could evict)
+   - Kills the process with the highest oom_score ≈ (share of node memory used × 1000)
+     + oom_score_adj. The kubelet sets oom_score_adj per QoS:
+       Guaranteed:  -997
+       BestEffort:  1000
+       Burstable:   min(max(2, 1000 - (1000 × memoryRequest / nodeMemoryCapacity)), 999)
+   - So a Burstable pod with a small request relative to node size is a likely victim.
 ```
 
 **Resource Management Design Patterns:**
@@ -627,12 +720,11 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: critical-payment-processor
-  annotations:
-    scheduler.alpha.kubernetes.io/critical-pod: ""
 spec:
-  priorityClassName: high-priority
+  priorityClassName: high-priority   # (the old critical-pod annotation was removed in 1.16)
   containers:
   - name: app
+    image: registry.example.com/payments:2.3.1
     resources:
       requests:
         cpu: 2
@@ -640,6 +732,8 @@ spec:
       limits:
         cpu: 2
         memory: 4Gi
+
+---
 # → Guaranteed QoS + high priority = survives eviction
 
 # Pattern 2: Burstable for elastic workloads
@@ -650,6 +744,7 @@ metadata:
 spec:
   containers:
   - name: worker
+    image: registry.example.com/worker:1.0.0
     resources:
       requests:
         cpu: 500m
@@ -657,8 +752,11 @@ spec:
       limits:
         cpu: 4
         memory: 1Gi
-# → Gets baseline 500m/256Mi, bursts to 4CPU/1Gi when available
-# → Medium eviction priority
+
+---
+# → Gets baseline 500m/256Mi, bursts to 4 CPU / 1Gi when available
+# → Memory above 256Mi is "borrowed": first in line for eviction under pressure.
+#   A large memory limit/request gap is how nodes get overcommitted.
 
 # Pattern 3: LimitRange for namespace policy
 apiVersion: v1
@@ -682,6 +780,7 @@ spec:
       memory: 64Mi         # Minimum per container
     type: Container
 
+---
 # Pattern 4: ResourceQuota for namespace limits
 apiVersion: v1
 kind: ResourceQuota
@@ -715,17 +814,21 @@ container with cpu: 500m (0.5 core)
 → After 50ms: throttled until next period
 → Even if CPU is idle, container is throttled!
 
-# Throttling-aware design:
-# - Set CPU limits HIGHER than requests for burstable workloads
-# - For latency-sensitive: use Guaranteed QoS (no throttling if within limits)
-# - Monitor: container_cpu_cfs_throttled_seconds_total
+# A multi-threaded app hits the quota fast: 8 busy threads with a 2-core limit burn the
+# 200ms quota in 25ms of each 100ms period, then stall for 75ms → p99 latency spikes even
+# though average CPU looks fine.
+# Guaranteed QoS does NOT avoid this: requests == limits still means a CFS quota.
 
-# Better approach for latency-sensitive:
-resources:
-  requests:
-    cpu: 2
-  limits:
-    cpu: 2        # Same = Guaranteed = no throttle worry
+# Throttling-aware design:
+# - Common practice: set CPU requests, omit CPU limits (CPU is compressible; requests
+#   still guarantee each pod its proportional share under contention)
+# - Keep limits where you need tenant isolation, and size them for bursts
+# - For latency-critical pods: Guaranteed with INTEGER CPUs + kubelet
+#   cpuManagerPolicy: static → exclusive cores, no sharing
+# - Tell the runtime its real CPU count (GOMAXPROCS via automaxprocs on older Go;
+#   Go 1.25+ and modern JVMs read the cgroup limit themselves)
+# - Monitor: rate(container_cpu_cfs_throttled_periods_total[5m])
+#            / rate(container_cpu_cfs_periods_total[5m])
 ```
 
 **Memory Limits Deep Dive:**
@@ -745,10 +848,15 @@ resources:
 # 4. Prometheus: kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}
 
 # Prevent OOM:
-# - Set memory limits based on actual usage (monitor with metrics-server)
-# - Add 20-30% headroom above steady-state for GC/surges
-# - Use VPA (Vertical Pod Autoscaler) to automatically adjust requests
-# - Set memory requests ≈ 80% of expected peak for Guaranteed QoS
+# - Unlike CPU, memory is NOT compressible: set memory request = limit for anything
+#   important, so the scheduler reserves what the pod can actually use
+# - Size from observed peak (container_memory_working_set_bytes, VPA recommendations)
+#   plus 20-30% headroom for GC/surges
+# - Tell the runtime its limit: -XX:MaxRAMPercentage=75 for JVM, GOMEMLIMIT for Go
+# - Since v1.35, CPU and memory requests/limits can be changed in place without
+#   restarting the pod (In-Place Pod Resize, GA); VPA's InPlaceOrRecreate uses this
+# - cgroup v2 is required in practice: since v1.35 the kubelet refuses to start on
+#   cgroup v1 nodes by default (failCgroupV1: true)
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -756,8 +864,8 @@ resources:
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **QoS classes** | Knows the exact conditions for each class (request = limit, request < limit, no request) |
-| **Eviction order** | Can explain the exact OOM kill order: BestEffort → Burstable → Guaranteed |
-| **CPU throttling** | Understands CFS quota and throttling as a real production issue |
+| **Eviction order** | Separates container-limit OOM, kubelet node-pressure eviction (usage vs requests, then priority) and kernel OOM (oom_score_adj) |
+| **CPU throttling** | Understands CFS quota throttling, why Guaranteed doesn't avoid it, and the "no CPU limits" trade-off |
 | **Resource planning** | Uses LimitRange + ResourceQuota for namespace governance |
 
 ---
@@ -769,6 +877,9 @@ resources:
 **What They're Really Testing:** Whether you understand the Kubernetes priority and preemption system — how PriorityClass controls scheduling order, how preemption evicts lower-priority pods, and how PDBs limit disruption.
 
 ### Answer
+
+!!! tip "30-second answer"
+    If the batch job's PriorityClass is higher than the web servers', the scheduler's PostFilter step finds a node where deleting the fewest, lowest-priority pods makes room, nominates that node, and deletes the victims with their normal grace period. PDBs are only **best effort** for preemption. PDBs fully apply to the **Eviction API** (drains, Cluster Autoscaler/Karpenter consolidation, descheduler): an eviction that would drop healthy pods below the budget gets HTTP 429 and is retried. They don't cover node failures, node-pressure evictions, direct deletes, or a Deployment's own rolling update. In this scenario the real design question is whether batch should ever outrank user-facing web; usually it shouldn't, and batch should get its own capacity or a queue like Kueue.
 
 **PriorityClass:**
 
@@ -800,11 +911,13 @@ metadata:
 value: 100
 description: "Low priority test/staging workloads"
 
-# Reserved priority range:
-# 1000000000+ : System critical pods (kube-system)
-# 1000000-999999999: User-facing production workloads
-# 1-999999: Batch, test, dev workloads
-# < 1: Best-effort (preempted first)
+# Priority ranges:
+# > 1,000,000,000: reserved for built-ins: system-cluster-critical (2,000,000,000)
+#                  and system-node-critical (2,000,001,000). Use these for CoreDNS, CNI, etc.
+# ≤ 1,000,000,000: user-defined classes (negative values allowed)
+# Pods with no class get the globalDefault class, or 0 if none.
+# preemptionPolicy: Never → pod is queued ahead of lower priorities but never evicts anyone
+#                           (good for "important but not urgent" batch)
 ```
 
 **Preemption in Action:**
@@ -827,23 +940,20 @@ description: "Low priority test/staging workloads"
 # 7. Schedule high-priority pod
 
 # Victim selection:
-# - Only preempt pods with LOWER priority
-# - Same priority: not preempted (need PriorityClass differentiation)
-# - PodDisruptionBudget: checked but NOT enforced (preemption overrides PDB!)
-# - Minimum victims: preempt the fewest pods to make room
+# - Only pods with LOWER priority are candidates
+# - Prefers nodes/victims that violate no PDB; if impossible, it violates them anyway
+#   (PDBs are best effort for preemption)
+# - Then: lowest highest-victim priority, fewest victims, latest start time
+# - Preemption ignores inter-pod affinity of lower-priority pods on OTHER nodes, so
+#   a pod with affinity to a lower-priority pod may still not fit afterwards
 
-# Preemption notification:
-# - Victim pods get: "Preempted by <high-priority-pod>"
-# - A preempted pod is NOT rescheduled (it's deleted)
-# - Its controller (Deployment, Job) will recreate it IF replicas < desired
-# - But recreated pod still has low priority → might be preempted again!
-
-apiVersion: v1
-kind: Pod
-metadata:
-  name: low-priority-web-abc
-  annotations:
-    preemption: "Preempted by batch-job-xyz to free resources on node-42"
+# What victims see:
+# - Event "Preempted" and pod condition DisruptionTarget=True,
+#   reason PreemptionByScheduler (useful in alerts)
+# - The pod is deleted, not moved; its controller creates a replacement, which is
+#   still low priority and goes Pending (and drives node autoscaling)
+# - The preemptor waits with status.nominatedNodeName set; another higher-priority
+#   pod can take that space first
 ```
 
 **PodDisruptionBudget (PDB):**
@@ -857,9 +967,10 @@ metadata:
 
 # PDB does NOT protect against:
 # - Node failure (involuntary)
-# - Preemption (higher-priority pod)
-# - Eviction by resource pressure (NodePressure)
-# - Manual pod deletion
+# - Preemption (best effort only, see above)
+# - Kubelet node-pressure eviction
+# - kubectl delete pod / direct deletes (only the Eviction API checks PDBs)
+# - The Deployment's own rolling update (maxUnavailable governs that)
 
 # Example: minAvailable
 apiVersion: policy/v1
@@ -872,6 +983,7 @@ spec:
     matchLabels:
       app: payment-service
 
+---
 # Example: maxUnavailable
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -893,9 +1005,14 @@ spec:
 
 # PDB calculation:
 # With deployment replicas=5, minAvailable=3:
-#   - Available pods must remain ≥ 3
-#   - Only 2 pods can be disrupted at a time
-#   - If 2 pods are already down (crash, restart): further eviction BLOCKED
+#   - status.disruptionsAllowed = currentHealthy - 3 = 2
+#   - If 2 pods are already unhealthy (crashing): disruptionsAllowed = 0 → drains BLOCK
+
+# Unhealthy pods blocking drains forever was a classic outage-during-upgrade cause.
+# Fix (GA in 1.31):
+spec:
+  unhealthyPodEvictionPolicy: AlwaysAllow   # pods that aren't Ready can always be evicted
+  # default IfHealthyBudget: unready pods only evictable while the budget is intact
 ```
 
 **PDB Design Patterns:**
@@ -907,12 +1024,16 @@ kind: PodDisruptionBudget
 metadata:
   name: kafka-broker-pdb
 spec:
-  minAvailable: 3              # At least 3 broker pods
+  maxUnavailable: 1            # One broker at a time
   selector:
     matchLabels:
       app: kafka-broker
-# Kafka requires majority for ISR → at least 2/3 for RF=3
-# minAvailable=3 ensures at least 3/5 brokers are up
+
+---
+# With replication.factor=3 and min.insync.replicas=2, losing 1 broker keeps every
+# partition writable; losing 2 brokers that share a partition makes it reject acks=all
+# writes. So the budget is "1 broker at a time" regardless of cluster size.
+# Same logic for quorum systems (etcd, ZooKeeper, Raft): maxUnavailable 1 for 3 or 5 members.
 
 # Pattern 2: Stateless services (max disruption)
 apiVersion: policy/v1
@@ -924,6 +1045,8 @@ spec:
   selector:
     matchLabels:
       app: web-server
+
+---
 # Rolling updates usually handle one at a time
 # PDB ensures drain doesn't take more than 25% at once
 
@@ -937,6 +1060,8 @@ spec:
   selector:
     matchLabels:
       app: single-instance
+
+---
 # WARNING: This blocks ALL drains!
 # Use only for truly singleton services with no HA
 # Better to: make it multi-instance instead
@@ -959,11 +1084,10 @@ spec:
 ```yaml
 # Priority levels for a production cluster:
 
-# Tier 1: Critical infrastructure (never preempted, PDB = 100%)
-- name: cluster-critical
-  value: 1000000000
-  # Pods: CoreDNS, kube-dns, networking (Cilium, Calico)
-  # PDB: Keep all available
+# Tier 1: Cluster infrastructure → use built-in system-cluster-critical /
+#         system-node-critical (don't invent your own)
+  # Pods: CoreDNS, CNI agents, CSI node plugins, kube-proxy
+  # PDB: maxUnavailable 1 for Deployments like CoreDNS (DaemonSets aren't drained)
 
 # Tier 2: User-facing production (preempted only by Tier 1)
 - name: production-critical
@@ -989,11 +1113,12 @@ spec:
   # Pods: Staging, dev environments, integration tests
   # PDB: none
 
-# Behavior under pressure:
-# 1. Node fills up → BestEffort pods evicted first
-# 2. More pressure → test pods preempted
-# 3. More pressure → batch pods preempted
-# 4. Critical: never preempted (highest priority + Guaranteed QoS)
+# Behavior when capacity runs out:
+# - Scheduling (preemption): a Pending production pod evicts test, then batch pods
+# - Node memory pressure (kubelet eviction): pods above their requests go first,
+#   lower priority first; production pods within requests survive
+# - Cluster autoscaler adds nodes for the evicted, now-Pending lower tiers
+#   (unless their priority is below its expendable cutoff, default -10)
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -1001,8 +1126,8 @@ spec:
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Preemption mechanics** | Knows victim selection algorithm (lowest priority, fewest pods) |
-| **PDB scope** | Understands PDB protects voluntary disruptions only (not preemption, not node failure) |
-| **PDB calculation** | Explains minAvailable = replicas - allowed_disruptions |
+| **PDB scope** | Knows PDBs gate the Eviction API only (not deletes, node failure, node-pressure eviction or rolling updates), and are best effort for preemption |
+| **PDB calculation** | Explains disruptionsAllowed = healthy - minAvailable, and unhealthyPodEvictionPolicy |
 | **Priority design** | Designs multi-tier priority with corresponding PDB strategies |
 
 ---
@@ -1015,11 +1140,14 @@ spec:
 
 ### Answer
 
+!!! tip "30-second answer"
+    Label production namespaces with Pod Security Admission `restricted` (start in `warn`/`audit`, then `enforce`). That covers non-root, drop ALL capabilities (only `NET_BIND_SERVICE` may be added back), no privilege escalation and seccomp `RuntimeDefault`. It does **not** cover `readOnlyRootFilesystem`, and PSA never mutates, so it can't fix 500 deployments for you. Add a policy engine (Kyverno, Gatekeeper, or built-in ValidatingAdmissionPolicy / MutatingAdmissionPolicy) to require read-only root filesystems and to **mutate in** secure defaults, then fix workloads team by team using the audit results.
+
 **Pod Security Standards (PSA — Pod Security Admission):**
 
 ```yaml
-# Pod Security Standards (replaces deprecated PodSecurityPolicy)
-# Three levels: Privileged, Baseline, Restricted
+# Pod Security Standards, enforced by the built-in Pod Security Admission controller.
+# PodSecurityPolicy (policy/v1beta1) was removed in 1.25; PSA is GA since 1.25.
 
 # Namespace enforcement labels:
 apiVersion: v1
@@ -1027,22 +1155,25 @@ kind: Namespace
 metadata:
   name: production
   labels:
-    pod-security.kubernetes.io/enforce: restricted    # REJECT violating pods
-    pod-security.kubernetes.io/enforce-version: v1.29 # Lock to specific version
-    pod-security.kubernetes.io/audit: baseline        # LOG violations (don't block)
-    pod-security.kubernetes.io/warn: restricted       # WARN user (don't block)
+    pod-security.kubernetes.io/enforce: restricted      # REJECT violating pods
+    pod-security.kubernetes.io/enforce-version: v1.37   # pin; default is "latest"
+    pod-security.kubernetes.io/audit: restricted        # annotate audit log events
+    pod-security.kubernetes.io/warn: restricted         # warning shown to kubectl user
 
 # Level differences:
-# PRIVILEGED: Unrestricted (for system components, service mesh sidecars)
-# BASELINE: Minimal restrictions (typical workloads)
-#   - Prevents: privileged containers, hostPID, hostNetwork, hostPorts > 1024
-#   - Requires: AppArmor (runtime/default), SELinux, seccomp
-# RESTRICTED: Full hardening (PCI/HIPAA/SOC2 compliance)
-#   - Adds: RunAsNonRoot: true, readOnlyRootFilesystem: true
-#   - Capabilities: drop ALL, add ONLY NET_BIND_SERVICE
-#   - seccomp: RuntimeDefault (mandatory)
+# PRIVILEGED: no restrictions (CNI, CSI node plugins, log/metrics agents needing host access)
+# BASELINE: blocks known privilege escalations
+#   - Forbids: privileged, hostNetwork/hostPID/hostIPC, hostPath volumes, hostPorts,
+#     adding capabilities beyond the default set, unsafe sysctls, procMount Unmasked,
+#     setting seccomp/AppArmor to Unconfined, custom SELinux user/role
+# RESTRICTED: baseline plus
+#   - runAsNonRoot: true (and runAsUser ≠ 0)
+#   - capabilities: drop ALL; may add back only NET_BIND_SERVICE
 #   - allowPrivilegeEscalation: false
-#   - Runs with specific seccomp profile
+#   - seccompProfile: RuntimeDefault or Localhost, set explicitly
+#   - volume types limited to configMap, secret, emptyDir, PVC, projected, ephemeral, ...
+# NOT in any level: readOnlyRootFilesystem, image registry rules, resource limits
+#   → use Kyverno / Gatekeeper / ValidatingAdmissionPolicy for those
 ```
 
 **SecurityContext Deep Dive:**
@@ -1064,6 +1195,7 @@ spec:
 
   containers:
   - name: app
+    image: registry.example.com/secure-app:1.0.0
     securityContext:                             # Container-level security (overrides pod-level)
       runAsNonRoot: true                         # Ensure container is NOT running as root
       readOnlyRootFilesystem: true               # Container's root FS is read-only
@@ -1074,7 +1206,8 @@ spec:
         add:                                     # Only add what's absolutely needed
         - NET_BIND_SERVICE                       # Allow binding to ports < 1024
       privileged: false                          # Not privileged (forbidden in baseline+)
-      procMount: Default                         # Mount /proc as read-only (strict: Unmasked)
+      # procMount: Default (the default) keeps sensitive /proc paths masked/read-only;
+      # Unmasked disables that and is forbidden by baseline
 
     volumeMounts:
     - name: tmp
@@ -1089,12 +1222,11 @@ spec:
     emptyDir: {}
 
 # For Pod Security Standard RESTRICTED compliance, a pod must have:
-# 1. runAsNonRoot: true (all containers)
-# 2. readOnlyRootFilesystem: true (all containers)
-# 3. allowPrivilegeEscalation: false (all containers)
-# 4. capabilities.drop: ["ALL"] (all containers)
-# 5. seccompProfile.type: "RuntimeDefault"
-# 6. runAsUser: not 0 (optional if runAsNonRoot: true)
+# 1. runAsNonRoot: true (pod or every container) and no runAsUser: 0
+# 2. allowPrivilegeEscalation: false (every container)
+# 3. capabilities.drop: ["ALL"] (every container), adds limited to NET_BIND_SERVICE
+# 4. seccompProfile.type: RuntimeDefault or Localhost (pod or every container)
+# readOnlyRootFilesystem: true is recommended hardening, enforced only by your own policy
 ```
 
 **SecurityContext for Common Workloads:**
@@ -1112,16 +1244,16 @@ spec:
       type: RuntimeDefault
   containers:
   - name: java-app
+    image: registry.example.com/java-app:1.0.0
     securityContext:
       runAsNonRoot: true
       readOnlyRootFilesystem: true        # Need writable volume for temp
       allowPrivilegeEscalation: false
       capabilities:
-        drop: ["ALL"]
-        add: ["NET_BIND_SERVICE"]         # Bind to port 8080
+        drop: ["ALL"]                     # Port 8080 needs no capability (only <1024 does)
     volumeMounts:
     - name: tmp
-      mountPath: /tmp                     # JVM JIT compilation needs writable /tmp
+      mountPath: /tmp                     # JVM writes hsperfdata, temp files, native libs here
     - name: logs
       mountPath: /var/log/app
   volumes:
@@ -1131,6 +1263,7 @@ spec:
     emptyDir: {}
   # Result: app writes to /tmp (ephemeral) and /var/log/app → security compliant
 
+---
 # Node.js (temp directory for npm modules)
 apiVersion: v1
 kind: Pod
@@ -1139,6 +1272,7 @@ metadata:
 spec:
   containers:
   - name: node-app
+    image: registry.example.com/node-app:1.0.0
     securityContext:
       runAsNonRoot: true
       readOnlyRootFilesystem: true
@@ -1153,6 +1287,7 @@ spec:
     emptyDir: {}
   # Note: Node might need NODE_OPTIONS=--max-old-space-size for tuning
 
+---
 # Nginx (needs to bind to port 80, write logs)
 apiVersion: v1
 kind: Pod
@@ -1161,21 +1296,25 @@ metadata:
 spec:
   containers:
   - name: nginx
+    # The official nginx image starts as root and fails runAsNonRoot; the unprivileged
+    # variant runs as UID 101 and listens on 8080.
+    image: nginxinc/nginx-unprivileged:1.27
     securityContext:
       capabilities:
-        drop: ["ALL"]
-        add: ["NET_BIND_SERVICE"]        # Bind to port 80 (or use port 8080)
+        drop: ["ALL"]                    # 8080 needs no NET_BIND_SERVICE
       readOnlyRootFilesystem: true
       runAsNonRoot: true
+      allowPrivilegeEscalation: false
     volumeMounts:
+    - name: nginx-cache
+      mountPath: /var/cache/nginx        # Nginx writes temp/cache files here
     - name: nginx-tmp
-      mountPath: /var/cache/nginx       # Nginx writes cache here
-    - name: nginx-run
-      mountPath: /var/run               # PID file
-    - name: nginx-logs
-      mountPath: /var/log/nginx
-    # With nginx on port 8080: no need for NET_BIND_SERVICE
-    # With nginx on port 80: need CAP_NET_BIND_SERVICE
+      mountPath: /tmp                    # PID file in the unprivileged image
+  volumes:
+  - name: nginx-cache
+    emptyDir: {}
+  - name: nginx-tmp
+    emptyDir: {}
 ```
 
 **Seccomp, AppArmor & SELinux:**
@@ -1186,41 +1325,24 @@ spec:
 #   1. RuntimeDefault: let container runtime manage (Docker/containerd default)
 #   2. Localhost: custom seccomp profile
 
-# Custom seccomp profile (audit-logs violations without blocking):
-# profiles/audit.json
-{
-  "defaultAction": "SCMP_ACT_LOG",           # Log all syscalls
-  "architectures": ["SCMP_ARCH_X86_64"],
-  "syscalls": [
-    {"names": ["execve", "execveat"], "action": "SCMP_ACT_ALLOW"},
-    {"names": ["clone", "fork", "vfork"], "action": "SCMP_ACT_ALLOW"},
-    {"names": ["mount", "umount2"], "action": "SCMP_ACT_ERRNO"}  # Block mounts
-  ]
-}
+# Custom profiles (type: Localhost) are JSON files on each node, referenced by path
+# relative to the kubelet's seccomp dir. Workflow: run with a logging profile
+# (defaultAction SCMP_ACT_LOG), record the syscalls actually used (the Security
+# Profiles Operator automates this), then ship an allow-list profile with
+# defaultAction SCMP_ACT_ERRNO. Hand-written allow-lists break on library upgrades,
+# so most teams stop at RuntimeDefault, which already blocks dozens of dangerous
+# syscalls (mount, kexec_load, reboot, ptrace in many runtimes, ...).
 
-# After audit, create strict profile:
-{
-  "defaultAction": "SCMP_ACT_ERRNO",         # Block unknown syscalls
-  "architectures": ["SCMP_ARCH_X86_64"],
-  "syscalls": [
-    {"names": ["read", "write", "open", "close", "stat", "mmap",
-               "brk", "sched_yield", "futex", "nanosleep", "exit_group",
-               "gettid", "set_robust_list", "rt_sigaction",
-               "epoll_create1", "epoll_wait", "epoll_ctl"], "action": "SCMP_ACT_ALLOW"},
-    # Add syscalls that the application ACTUALLY needs
-  ]
-}
-
-# APPARMOR: MAC (Mandatory Access Control) for file paths
-# SELinux: Label-based MAC (CentOS/RHEL)
-# Both provide: file access control, network access control, capability control
+# APPARMOR: path-based MAC (Ubuntu/Debian). GA in 1.30 as a securityContext field;
+#           the old container.apparmor.security.beta.kubernetes.io annotation is deprecated.
+# SELinux: label-based MAC (RHEL/Fedora/Bottlerocket).
 
 # For restricted compliance:
 securityContext:
   seccompProfile:
-    type: RuntimeDefault      # Minimum for Baseline, required for Restricted
-  # AppArmor annotation (deprecated, use seccomp instead):
-  # container.apparmor.security.beta.kubernetes.io/<container>: runtime/default
+    type: RuntimeDefault      # Must be set explicitly for restricted
+  appArmorProfile:
+    type: RuntimeDefault      # Field replaces the annotation (1.30+)
 ```
 
 **Enforcing Security Across All Pods:**
@@ -1235,31 +1357,32 @@ metadata:
   name: team-a-prod
   labels:
     pod-security.kubernetes.io/enforce: restricted
-    pod-security.kubernetes.io/enforce-version: v1.29
+    pod-security.kubernetes.io/enforce-version: v1.37
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted
 
-# Step 2: Exception for system namespaces
+---
+# Before flipping enforce, see what would break (server-side dry run prints warnings):
+#   kubectl label --dry-run=server --overwrite ns --all \
+#     pod-security.kubernetes.io/enforce=restricted
+
+# Step 2: System namespaces stay privileged
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kube-system
   labels:
-    pod-security.kubernetes.io/enforce: privileged    # System components
-    pod-security.kubernetes.io/enforce-version: v1.29
+    pod-security.kubernetes.io/enforce: privileged    # CNI, CSI, kube-proxy
 
-# Step 3: Exceptions for specific pods (via labels)
-apiVersion: v1
-kind: Pod
-metadata:
-  name: sidecar-injector
-  annotations:
-    pod-security.kubernetes.io/enforce: privileged    # Override namespace
-spec:
-  ...
+# Step 3: Exceptions. PSA has NO per-pod override label or annotation.
+# Options: put the workload in its own namespace with a lower level, or configure
+# exemptions (usernames, runtimeClassNames, namespaces) in the API server's
+# PodSecurity AdmissionConfiguration. Kyverno/Gatekeeper allow finer exceptions.
 
-# Step 4: Use Kyverno or OPA for advanced policies
-# (Beyond PSA's three levels — for custom rules)
+# Step 4: Policy engine for what PSA can't do
+# - Require readOnlyRootFilesystem, approved registries, signed images, limits
+# - MUTATE secure defaults into pods (Kyverno mutate, or MutatingAdmissionPolicy)
+#   so the 500 existing manifests don't all need edits on day one
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -1290,7 +1413,7 @@ spec:
 │  ┌────────────────────────────────────┐                     │
 │  │         kubelet                     │                     │
 │  │  ┌─────────────────────────────┐   │                     │
-│  │  │  /metrics/resource          │   │  ← Summary API      │
+│  │  │  /metrics/resource          │   │  ← Resource metrics │
 │  │  │  Pod CPU, Memory (15s)     │   │    (used by         │
 │  │  │  Scrape cost: LOW          │   │     metrics-server)  │
 │  │  └─────────────────────────────┘   │                     │
@@ -1334,7 +1457,8 @@ spec:
 
 ```yaml
 # metrics-server: the simplest, most essential monitoring component
-# Installed as a Deployment, scrapes kubelet /metrics/resource every 60s
+# Installed as a Deployment, scrapes kubelet /metrics/resource every 15s (default)
+# and serves the metrics.k8s.io API through API aggregation (promoted to v1 in v1.37)
 
 # Installation:
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
@@ -1352,7 +1476,7 @@ my-app-7d4f8b9c6-def34  200m         789Mi
 # metrics-server data flow:
 # 1. kubelet collects cAdvisor container stats every 10s
 # 2. kubelet caches and serves via /metrics/resource (lower cardinality)
-# 3. metrics-server scrapes all kubelets every 60s (configurable)
+# 3. metrics-server scrapes all kubelets every 15s (--metric-resolution)
 # 4. metrics-server aggregates and serves via Resource Metrics API
 # 5. HPA, kubectl top, VPA consume from Resource Metrics API
 
@@ -1360,8 +1484,9 @@ my-app-7d4f8b9c6-def34  200m         789Mi
 # - No network/disk metrics
 # - No container restart counts
 # - No filesystem usage
-# - Only current values (no historical data)
-# - ~60s delay (configurable with --metric-resolution)
+# - Only current values held in memory (no history): it's an autoscaling feed,
+#   not a monitoring system. Use Prometheus for dashboards and alerts.
+# - If metrics-server is down, HPA can't compute Resource metrics and stops scaling
 
 # Production deployment:
 apiVersion: apps/v1
@@ -1375,14 +1500,18 @@ spec:
     matchLabels:
       k8s-app: metrics-server
   template:
+    metadata:
+      labels:
+        k8s-app: metrics-server
     spec:
       containers:
       - name: metrics-server
         image: registry.k8s.io/metrics-server/metrics-server:v0.7.2
         args:
-        - --kubelet-insecure-tls         # For self-signed kubelet certs
+        # --kubelet-insecure-tls skips kubelet cert verification: only for dev/kind;
+        # in production give kubelets serving certs signed by the cluster CA
         - --kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP
-        - --metric-resolution=15s        # Scrape every 15s (default: 60s)
+        - --metric-resolution=15s        # Scrape interval (15s is the default)
         resources:
           requests:
             cpu: 100m
@@ -1398,17 +1527,20 @@ spec:
 # Key metrics exposed:
 # ── CPU ──
 container_cpu_usage_seconds_total{container="app", pod="my-app-abc", namespace="prod"}
+container_cpu_cfs_periods_total{container="app"}
+container_cpu_cfs_throttled_periods_total{container="app"}   # ratio to periods = throttling %
 container_cpu_cfs_throttled_seconds_total{container="app"}
-container_cpu_load_average_10s{container="app"}
 
 # ── Memory ──
-container_memory_usage_bytes{container="app", pod="my-app-abc"}
-container_memory_working_set_bytes{container="app"}                # Actual memory in use
-container_memory_rss{container="app"}                              # RSS only
+container_memory_usage_bytes{container="app", pod="my-app-abc"}    # includes page cache
+container_memory_working_set_bytes{container="app"}   # usage minus inactive file cache:
+                                                      # what the OOM killer and kubelet eviction
+                                                      # look at, and what kubectl top shows
+container_memory_rss{container="app"}                 # anonymous memory
 container_memory_cache{container="app"}
-container_memory_swap{container="app"}
-container_memory_failures_total{container="app"}                   # OOM events!
-container_memory_failcnt{container="app"}                          # OOM count
+container_oom_events_total{container="app"}           # OOM kills seen by cAdvisor
+container_memory_failures_total{container="app"}      # page FAULTS (pgfault/pgmajfault),
+                                                      # NOT OOMs, despite the name
 
 # ── Network ──
 container_network_receive_bytes_total{pod="my-app-abc"}
@@ -1435,7 +1567,8 @@ container_network_transmit_bytes_total{interface="eth0"}
 
 # Which source for what:
 # - HPA/VPA: metrics-server (low overhead, designed for autoscaling)
-# - OOM detection: cAdvisor (container_memory_failures_total)
+# - OOM detection: kube-state-metrics last_terminated_reason="OOMKilled" + restart count,
+#   or cAdvisor container_oom_events_total
 # - Network troubleshooting: cAdvisor (container_network_*)
 # - CPU throttling: cAdvisor (container_cpu_cfs_throttled_*)
 # - Disk usage: cAdvisor (container_fs_*)
@@ -1453,20 +1586,19 @@ container_network_transmit_bytes_total{interface="eth0"}
 #   - container, pod, namespace
 
 prober_probe_total{container="app", pod="my-app", namespace="prod",
-                    probe="readiness", result="succeeded"} 10
+                   probe_type="Readiness", result="successful"} 10
 prober_probe_total{container="app", pod="my-app", namespace="prod",
-                    probe="readiness", result="failed"} 2
+                   probe_type="Readiness", result="failed"} 2
 
 # Key metrics:
-prober_probe_total                               # Count of probe results
-prober_probe_duration_seconds{probe="readiness"} # How long probes took
-last_readiness_check_success_time{container="app"} # Timestamp of last success
+prober_probe_total                                       # Count of probe results
+prober_probe_duration_seconds{probe_type="Readiness"}    # Probe latency histogram
 
 # Alert queries:
-# High readiness failure rate
-rate(prober_probe_total{result="failed", probe="readiness"}[5m]) > 0.05
-# Probe taking too long
-histogram_quantile(0.99, rate(prober_probe_duration_seconds_bucket[5m])) > 5
+# Readiness failures per second, per pod
+rate(prober_probe_total{result="failed", probe_type="Readiness"}[5m]) > 0.05
+# Probes getting slow (close to timeoutSeconds = about to start failing)
+histogram_quantile(0.99, sum by (le, pod) (rate(prober_probe_duration_seconds_bucket[5m]))) > 2
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -1475,7 +1607,7 @@ histogram_quantile(0.99, rate(prober_probe_duration_seconds_bucket[5m])) > 5
 |-----------|----------------------|
 | **Metrics sources** | Can differentiate kubelet metrics, cAdvisor, and metrics-server by endpoint and use case |
 | **metrics-server role** | Knows it's for Resource Metrics API (HPA, kubectl top), not detailed monitoring |
-| **cAdvisor depth** | Knows specific metric names: container_memory_working_set_bytes, container_cpu_throttled |
+| **cAdvisor depth** | Knows specific metric names: container_memory_working_set_bytes (what OOM/eviction use), throttled periods ratio |
 | **Probe metrics** | Understands prober_probe_total for monitoring probe health |
 
 ---
@@ -1539,10 +1671,8 @@ kube_horizontalpodautoscaler_spec_max_replicas{hpa="my-app-hpa"}
 kube_horizontalpodautoscaler_status_current_replicas{hpa="my-app-hpa"}
 kube_horizontalpodautoscaler_status_desired_replicas{hpa="my-app-hpa"}
 
-# Event metrics:
-kube_event{type="Warning", reason="BackOff", namespace="prod"}
-kube_event{type="Warning", reason="FailedScheduling", namespace="prod"}
-kube_event{type="Warning", reason="NodeNotReady", node="node-1"}
+# Events: KSM does NOT export Events. Ship them with an event exporter
+# (kubernetes-event-exporter, Grafana Alloy/OTel k8sobjects receiver) — see §12.
 
 # Alert examples using KSM:
 # 1. Pod in CrashLoopBackOff:
@@ -1551,10 +1681,10 @@ kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"} > 0
 kube_deployment_status_replicas_unavailable > 0
 # 3. PVC stuck in Pending:
 kube_persistentvolumeclaim_status_phase{phase="Pending"} > 0
-# 4. Node not ready for 5 minutes:
+# 4. Node not ready (add `for: 5m` in the rule):
 kube_node_status_condition{condition="Ready", status="true"} == 0
 # 5. HPA at max replicas (can't scale further):
-kube_horizontalpodautoscaler_status_current_replicals == kube_horizontalpodautoscaler_spec_max_replicas
+kube_horizontalpodautoscaler_status_current_replicas == kube_horizontalpodautoscaler_spec_max_replicas
 ```
 
 **Node Exporter:**
@@ -1604,15 +1734,11 @@ node_sockstat_TCP_alloc                         # TCP sockets allocated
 node_sockstat_TCP_tw                            # TCP TIME_WAIT sockets
 node_entropy_available_bits                     # Entropy pool (for /dev/random)
 
-# Node exporter collectors (enable/disable via --collectors.<name>):
-# Enabled by default: cpu, diskstats, filesystem, loadavg, meminfo, netstat,
-#                     network, ntp, processes, stat, textfile, time, uname
-# Often enabled: systemd, nfs, nfsd, interrupts, cpufreq
-# Disabled by default: bonding, buddyinfo, drbd, edac, entropy, fibrechannel,
-#                       hwmon, infiniband, ipvs, lmsensors, mdadm, meminfo_numa,
-#                       mountstats, netclass, netdev, perf, powersupplyclass,
-#                       pressure, rapl, schedstat, selinux, sockstat, softnet,
-#                       tcpstat, thermal_zone, udp, xfs, zfs
+# Collectors: toggle with --collector.<name> / --no-collector.<name>.
+# Most useful ones are on by default (cpu, meminfo, diskstats, filesystem, netdev,
+# netstat, conntrack, loadavg, pressure (PSI), sockstat, textfile, ...).
+# Commonly turned on explicitly: systemd, processes, interrupts, tcpstat.
+# Check `node_exporter --help` for the exact defaults of your version.
 
 # Production deployment (DaemonSet):
 apiVersion: apps/v1
@@ -1625,12 +1751,17 @@ spec:
     matchLabels:
       app: node-exporter
   template:
+    metadata:
+      labels:
+        app: node-exporter
     spec:
       hostPID: true                          # Access host process info
       hostNetwork: true                       # Access host network stats
+      tolerations:
+      - operator: Exists                      # run on every node, tainted ones too
       containers:
       - name: node-exporter
-        image: prom/node-exporter:v1.8.2
+        image: quay.io/prometheus/node-exporter:v1.9.1
         args:
         - --path.procfs=/host/proc
         - --path.sysfs=/host/sys
@@ -1845,25 +1976,8 @@ spec:
         description: "Pod {{ $labels.pod }} in {{ $labels.namespace }} is in CrashLoopBackOff"
         runbook_url: "https://runbooks.internal/crashloop"
 
-    - alert: KubePodNotReady
-      expr: |
-        kube_pod_status_phase{phase="Running"} != 1
-        and on (pod, namespace)
-        kube_pod_status_phase{phase="Pending"} == 1
-      for: 15m
-      labels:
-        severity: warning
-      annotations:
-        summary: "Pod {{ $labels.pod }} is not ready for 15 minutes"
-
-    - alert: KubePodOOMKilled
-      expr: |
-        increase(kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}[5m]) > 0
-      labels:
-        severity: warning
-      annotations:
-        summary: "Pod {{ $labels.pod }} OOM killed"
-        description: "Container {{ $labels.container }} in {{ $labels.pod }} was OOM killed"
+    # Pod-level alerts (OOM, image pull, restarts, throttling, probes, Pending) are
+    # collected in §14 with their severities and runbooks.
 
     - alert: KubeDeploymentReplicasMismatch
       expr: |
@@ -1873,35 +1987,7 @@ spec:
         severity: warning
       annotations:
         summary: "Deployment {{ $labels.deployment }} replicas mismatch"
-        description: "Expected {{ $value }} replicas, not all available"
-
-    - alert: KubePodImagePullBackOff
-      expr: |
-        kube_pod_container_status_waiting_reason{reason="ImagePullBackOff"} > 0
-      for: 5m
-      labels:
-        severity: critical
-      annotations:
-        summary: "Pod {{ $labels.pod }} cannot pull image"
-
-    - alert: KubeContainerRestartHigh
-      expr: |
-        rate(kube_pod_container_status_restarts_total[1h]) > 5
-      labels:
-        severity: warning
-      annotations:
-        summary: "Container {{ $labels.container }} restarted {{ $value }} times per hour"
-
-    - alert: KubePodCPUThrottling
-      expr: |
-        rate(container_cpu_cfs_throttled_seconds_total{container!=""}[5m]) > 0.5
-        and on (container, pod, namespace)
-        container_cpu_cfs_periods_total{container!=""} > 0
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "Container {{ $labels.container }} CPU throttled {{ $value }}s/s"
+        description: "{{ $labels.namespace }}/{{ $labels.deployment }} has had unavailable replicas for 10m"
 
     - alert: KubePersistentVolumeUsageCritical
       expr: |
@@ -1911,20 +1997,6 @@ spec:
         severity: critical
       annotations:
         summary: "PV usage critical for {{ $labels.persistentvolumeclaim }}"
-
-    - alert: KubePodEphemeralStorageUsage
-      expr: |
-        (
-          sum by (pod, namespace) (
-            container_fs_usage_bytes{container!=""}
-          )
-          / sum by (pod, namespace) (
-            kube_pod_container_resource_limits{resource="ephemeral-storage"}
-          )
-        ) > 0.85
-      for: 5m
-      labels:
-        severity: warning
 
   - name: kubernetes-nodes
     interval: 30s
@@ -1990,7 +2062,7 @@ metadata:
   name: k8s
   namespace: monitoring
 spec:
-  version: v2.53.0
+  version: v3.5.0                        # Prometheus 3.x (3.5 is an LTS release)
   replicas: 2                            # HA pair
   retention: 30d
   retentionSize: 100GB
@@ -2045,6 +2117,9 @@ spec:
 
 ### Answer
 
+!!! tip "30-second answer"
+    HPA only reads three aggregated APIs: `metrics.k8s.io` (metrics-server: CPU/memory), `custom.metrics.k8s.io` (per-object metrics) and `external.metrics.k8s.io` (things outside the cluster, like queue depth). Something must serve those APIs. **prometheus-adapter** translates PromQL into them; **KEDA** serves `external.metrics.k8s.io` from 70+ built-in scalers (RabbitMQ, Kafka, SQS, Prometheus...) and creates the HPA for you. KEDA also handles **0 ↔ 1** (activation) itself, which plain HPA only gained as a beta feature in v1.37. For a RabbitMQ queue, use KEDA with `QueueLength` and a per-replica target, a `TriggerAuthentication` for credentials, and size `maxReplicaCount` against what the downstream (DB) can absorb.
+
 **Custom Metrics Pipeline:**
 
 ```
@@ -2068,19 +2143,23 @@ Stack:
 **KEDA (Kubernetes Event-Driven Autoscaling):**
 
 ```yaml
-# KEDA: Event-driven autoscaling — scale based on external event sources
-# No custom metrics adapter needed! KEDA creates/updates HPA resources directly
+# KEDA: Event-driven autoscaling — scale based on external event sources.
+# KEDA IS an external metrics adapter, plus an operator that writes the HPA for you.
 
 # KEDA architecture:
-# 1. ScaledObject (CRD): defines triggers (Kafka, RabbitMQ, Prometheus, etc.)
-# 2. KEDA operator: watches ScaledObjects, creates HPA
-# 3. KEDA metrics adapter: serves external metrics to HPA
-# 4. HPA: scales the target (Deployment, StatefulSet, etc.)
+# 1. ScaledObject (CRD): target + triggers (Kafka, RabbitMQ, Prometheus, SQS, cron, ...)
+# 2. KEDA operator: creates/owns an HPA (keda-hpa-<name>); scales 0 → 1 when a
+#    trigger is "active" and 1 → 0 after cooldownPeriod with no activity
+# 3. KEDA metrics server: serves external.metrics.k8s.io to that HPA (1 ↔ N scaling)
+# 4. ScaledJob (CRD): instead of scaling a Deployment, spawns one Job per batch of
+#    messages (good for long-running tasks that must not be killed by scale-in)
 
 # KEDA vs prometheus-adapter:
-# - KEDA: simpler, more scalers (50+), opinionated
-# - prometheus-adapter: more flexible for custom Prometheus queries
-# - KEDA supports: scaling to ZERO (HPA minReplicas can be 0!)
+# - KEDA: 70+ scalers, scale to zero, auth handled by TriggerAuthentication
+# - prometheus-adapter: everything must first be a Prometheus series; good when you
+#   already have the metric in Prometheus and only need custom.metrics.k8s.io
+# - Only ONE service can own external.metrics.k8s.io in a cluster, so KEDA and another
+#   external adapter can't both serve it
 ```
 
 **KEDA ScaledObject Examples:**
@@ -2097,17 +2176,19 @@ spec:
     name: worker-deployment          # Deployment to scale
     apiVersion: apps/v1
   minReplicaCount: 1                  # Minimum 1 replica (always on)
-  maxReplicaCount: 20                 # Maximum 20 replicas
+  maxReplicaCount: 20                 # Cap at what the downstream DB can absorb
   pollingInterval: 15                 # Check queue every 15 seconds
-  cooldownPeriod: 60                  # Wait 60s before scaling down
   triggers:
   - type: rabbitmq
     metadata:
-      protocol: amqp09
+      protocol: amqp
       queueName: tasks
-      mode: QueueLength               # Or: MessagesUnacked
-      value: "10"                     # Scale up when queue length > 10
+      mode: QueueLength               # Or: MessageRate (publish rate)
+      value: "10"                     # TARGET per replica: replicas ≈ ceil(queueLength / 10)
+    authenticationRef:
+      name: rabbitmq-auth             # TriggerAuthentication pulling "host" (amqp URL) from a Secret
 
+---
 # 2. Autoscale by Kafka consumer lag
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -2125,11 +2206,14 @@ spec:
       bootstrapServers: kafka-cluster:9092
       topic: orders
       consumerGroup: orders-consumer
-      lagThreshold: "100"             # Scale up when lag > 100 per partition
+      lagThreshold: "100"             # Target average lag per replica
+      # Replicas are capped at the topic's partition count by default (extra consumers
+      # in a group would sit idle)
       offsetResetPolicy: latest
     authenticationRef:
       name: keda-kafka-auth           # SASL/SCRAM authentication
 
+---
 # 3. Autoscale by Prometheus metric (HTTP request rate)
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -2145,13 +2229,12 @@ spec:
   - type: prometheus
     metadata:
       serverAddress: http://prometheus.monitoring:9090
-      metricName: http_requests_per_second
+      # The query must return a SINGLE value (total RPS), not one series per pod
       query: |
-        sum by (pod) (
-          rate(http_requests_total{namespace="prod", handler="api"}[2m])
-        )
-      threshold: "100"               # Scale up when RPS > 100 per pod
+        sum(rate(http_requests_total{namespace="prod", handler="api"}[2m]))
+      threshold: "100"               # Target 100 RPS per replica → replicas ≈ total/100
 
+---
 # 4. Autoscale by CPU + custom metric (combined)
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -2165,14 +2248,17 @@ spec:
   maxReplicaCount: 20
   triggers:
   - type: cpu
+    metricType: Utilization          # (metadata.type is deprecated)
     metadata:
-      type: Utilization
       value: "70"                    # Target 70% CPU utilization
-  - type: memory
+  - type: prometheus
     metadata:
-      type: Utilization
-      value: "80"                    # Target 80% memory utilization
+      serverAddress: http://prometheus.monitoring:9090
+      query: sum(rate(http_requests_total{service="my-app"}[2m]))
+      threshold: "200"
+  # cpu/memory triggers can't scale to zero (no pods → no CPU metric)
 
+---
 # 5. Scaling to ZERO (batch/worker workloads)
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -2184,17 +2270,19 @@ spec:
     name: batch-worker
   minReplicaCount: 0                  # Scale to ZERO when no work!
   maxReplicaCount: 20
+  cooldownPeriod: 300                 # 1 → 0 only after 5 min with no active trigger
   triggers:
   - type: rabbitmq
     metadata:
       queueName: batch-tasks
       mode: QueueLength
-      value: "1"                      # Scale from 0 to 1 when 1 message queued
-  advanced:
-    horizontalPodAutoscalerConfig:
-      behavior:
-        scaleDown:
-          stabilizationWindowSeconds: 300  # Wait 5 min before scaling to 0
+      value: "5"                      # Target 5 messages per replica (1 → N)
+      activationValue: "0"            # Active (0 → 1) when queue length > 0
+    authenticationRef:
+      name: rabbitmq-auth
+# Trade-off: the first message waits for a cold start (image pull + boot), so scale
+# to zero suits batch/async work, not latency-sensitive APIs.
+# Since v1.37 plain HPA can also use minReplicas: 0 (beta) with Object/External metrics.
 ```
 
 **KEDA Advanced Configuration:**
@@ -2232,6 +2320,7 @@ spec:
             periodSeconds: 60
           selectPolicy: Max
 
+---
 # Multiple triggers (scale on ANY trigger)
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -2265,8 +2354,7 @@ metadata:
   namespace: monitoring
 data:
   config.yaml: |
-    rules:
-    # Custom metrics (for workload-specific autoscaling)
+    rules:                     # → custom.metrics.k8s.io
     - seriesQuery: 'http_requests_total{namespace!="",pod!=""}'
       resources:
         overrides:
@@ -2278,15 +2366,17 @@ data:
       metricsQuery: |
         sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)
 
-    # External metrics (for infrastructure autoscaling)
-    - seriesQuery: 'rabbitmq_queue_messages{queue="tasks"}'
+    externalRules:             # → external.metrics.k8s.io
+    - seriesQuery: 'rabbitmq_queue_messages{queue!=""}'
       resources:
-        template: "queue"
+        overrides:
+          namespace: {resource: "namespace"}
       name:
         as: "rabbitmq_queue_depth"
       metricsQuery: |
-        avg(rabbitmq_queue_messages{queue="tasks"}) by (queue)
+        sum(<<.Series>>{<<.LabelMatchers>>}) by (queue)
 
+---
 # HPA using custom metric (with prometheus-adapter):
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -2314,8 +2404,8 @@ spec:
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **KEDA vs prometheus-adapter** | Can compare KEDA (simpler, 50+ scalers) vs adapter (more flexible, PromQL-based) |
-| **Scaling to zero** | Knows KEDA supports minReplicaCount: 0 for event-driven workloads |
+| **KEDA vs prometheus-adapter** | Knows KEDA is itself an external metrics adapter (70+ scalers) vs adapter (PromQL-based); only one external metrics server per cluster |
+| **Scaling to zero** | Knows KEDA handles 0↔1 (activation, cooldownPeriod) and HPA 1↔N; HPA scale-to-zero is beta since v1.37; cold-start trade-off |
 | **Multiple triggers** | Understands how KEDA combines multiple trigger metrics (max wins) |
 | **Authentication** | Knows how to configure trigger authentication (SASL, TLS, API keys) |
 
@@ -2329,16 +2419,22 @@ spec:
 
 ### Answer
 
+!!! tip "30-second answer"
+    Apps log structured JSON to stdout. The container runtime (containerd/CRI-O) writes each container's stream to `/var/log/pods/...` in CRI format and the kubelet rotates those files. A DaemonSet agent (Fluent Bit, Vector, Grafana Alloy or the OTel Collector) tails them, adds Kubernetes metadata, and ships to a buffer or aggregator, then to storage. 10 TB/day is about 115 MB/s on average, several times that at peak, so you need a buffer (Kafka) between agents and the backend, sampling or dropping of debug logs at the edge, and object-storage-backed storage: Loki (indexes only labels, cheap) or Elasticsearch/OpenSearch (full-text index, fast arbitrary search, 5-10× the cost). Correlate by putting `trace_id` in every log line and linking Grafana's Loki ↔ Tempo ↔ Prometheus (exemplars).
+
 **Kubernetes Logging Architecture:**
 
 ```
-Pod → stdout/stderr → container runtime → kubelet → log file (host)
+Pod → stdout/stderr → runtime shim (containerd / CRI-O) writes
+      /var/log/pods/<ns>_<pod>_<uid>/<container>/0.log   (symlinked from /var/log/containers)
+      kubelet rotates it (containerLogMaxSize 10Mi, containerLogMaxFiles 5 by default)
                                                          │
                                                     ┌────▼────┐
                                                     │  Agent   │ (DaemonSet)
-                                                    │ Fluentd  │
                                                     │ FluentBit│
-                                                    │ Logstash │
+                                                    │ Vector   │
+                                                    │ Alloy /  │
+                                                    │ OTel Col │
                                                     └────┬────┘
                                                          │
                                               ┌──────────┼──────────┐
@@ -2357,9 +2453,11 @@ Pod → stdout/stderr → container runtime → kubelet → log file (host)
 **Fluent Bit (DaemonSet):**
 
 ```yaml
-# Fluent Bit: lightweight log shipper (C-based, ~5MB binary)
-# vs Fluentd: heavier (Ruby, ~100MB, more plugins)
-# Recommendation: Fluent Bit for edge collection, Fluentd for aggregation
+# Fluent Bit: lightweight log shipper (C, low memory footprint)
+# vs Fluentd: heavier (Ruby + C, large plugin ecosystem)
+# Common pattern: Fluent Bit on every node; Fluentd/Vector/Kafka as the aggregation tier
+# Since dockershim was removed (1.24), nodes run containerd or CRI-O: logs are in CRI
+# format under /var/log/pods, not Docker JSON under /var/lib/docker/containers.
 
 apiVersion: apps/v1
 kind: DaemonSet
@@ -2371,11 +2469,16 @@ spec:
     matchLabels:
       app: fluent-bit
   template:
+    metadata:
+      labels:
+        app: fluent-bit
     spec:
       serviceAccountName: fluent-bit
+      tolerations:
+      - operator: Exists                   # collect from every node
       containers:
       - name: fluent-bit
-        image: cr.fluentbit.io/fluent/fluent-bit:3.0
+        image: cr.fluentbit.io/fluent/fluent-bit:4.0
         resources:
           requests:
             cpu: 100m
@@ -2385,20 +2488,13 @@ spec:
             memory: 256Mi
         volumeMounts:
         - name: varlog
-          mountPath: /var/log              # Host logs
-          readOnly: true
-        - name: varlibdockercontainers
-          mountPath: /var/lib/docker/containers   # Container logs
-          readOnly: true
+          mountPath: /var/log              # /var/log/containers + /var/log/pods
         - name: fluent-bit-config
           mountPath: /fluent-bit/etc/
       volumes:
       - name: varlog
         hostPath:
-          path: /var/log
-      - name: varlibdockercontainers
-        hostPath:
-          path: /var/lib/docker/containers
+          path: /var/log                   # writable: tail's position DB lives here
       - name: fluent-bit-config
         configMap:
           name: fluent-bit-config
@@ -2419,7 +2515,8 @@ data:
     [INPUT]
         name              tail
         path              /var/log/containers/*.log
-        parser            cri              # CRI-O log format (or docker, containerd)
+        multiline.parser  cri              # CRI format (containerd and CRI-O); joins
+                                           # partial lines split by the runtime
         tag               kube.*
         mem_buf_limit     50MB              # Prevent memory exhaustion
         skip_long_lines   on
@@ -2436,31 +2533,20 @@ data:
         keep_log            on
         labels              on              # Add k8s labels to log records
         annotations         on
-        use_kubelet         on              # Use kubelet API (faster, less API pressure)
+        use_kubelet         on              # Get pod metadata from the local kubelet instead of
+                                            # the API server (needs hostNetwork or node IP access)
 
     [OUTPUT]
         name            loki
         match           *
         host            loki-gateway.logging.svc
         port            3100
-        labels          job=fluentbit, namespace=$namespace, pod=$pod, container=$container
-        auto_kubernetes_labels on
-        label_map_path  /fluent-bit/etc/labelmap.json
-
-  labelmap.json: |
-    {
-      "kubernetes": {
-        "namespace": "namespace",
-        "pod": "pod",
-        "container": "container",
-        "host": "node",
-        "labels": {
-          "app": "k8s_app",
-          "version": "k8s_version",
-          "component": "k8s_component"
-        }
-      }
-    }
+        # Keep Loki labels LOW-cardinality (namespace, app, container). Unbounded values
+        # (trace IDs, user IDs, request IDs) as labels create a stream per value and
+        # wreck Loki performance; pod names churn on every rollout, so many teams keep
+        # them as structured metadata. Filter on those at query time instead.
+        labels          job=fluentbit, namespace=$kubernetes['namespace_name'], app=$kubernetes['labels']['app'], container=$kubernetes['container_name']
+        line_format     json
 
   parsers.conf: |
     [PARSER]
@@ -2475,10 +2561,13 @@ data:
 
 ```yaml
 # Loki: Prometheus-inspired log aggregation
-# - Labels-based indexing (not full-text like Elasticsearch)
-# - Cheaper: 1-2x storage cost vs ES at 10x compression
-# - Perfect for: logs with structured metadata (k8s labels, trace IDs)
-# - Not great for: full-text search across massive unlabeled data
+# - Indexes only labels; log lines are compressed chunks in object storage (S3/GCS)
+# - Much cheaper to ingest and store than a full-text index; queries brute-force scan
+#   the chunks selected by labels and time range (parallelised by queriers)
+# - Good for: "show me errors for app X in the last hour", label-scoped grep
+# - Weak at: needle-in-haystack search across everything over long time ranges
+#   (Elasticsearch/OpenSearch's inverted index wins there)
+# - Promtail is deprecated (EOL early 2026); Grafana Alloy is its replacement
 
 # Deploy Loki (single binary for small, microservices for large):
 helm upgrade --install loki grafana/loki \
@@ -2492,8 +2581,8 @@ helm upgrade --install loki grafana/loki \
 # Query logs in Grafana (LogQL):
 # Filter by labels
 {namespace="prod", app="payment-service"} |= "error" |= "timeout"
-# Filter by pod name
-{namespace="prod"} |~ "payment-service-[a-z0-9]*-[a-z0-9]{5}"
+# Regex match on the log LINE (not a label)
+{namespace="prod", app="payment-service"} |~ "timeout|deadline exceeded"
 # Parse JSON log line
 {namespace="prod"} | json | status=500 | duration > 500ms
 # Rate of errors
@@ -2553,25 +2642,18 @@ logger.Info("order processed",
 **Log Rotation & Retention:**
 
 ```yaml
-# Kubernetes Docker/containerd container log rotation:
+# Container log files (CRI runtimes):
 # /var/log/containers/<pod>_<namespace>_<container>-<container-id>.log
+#   → symlink to /var/log/pods/<ns>_<pod>_<uid>/<container>/<restart>.log
 
-# Container runtime log rotation config:
-cat /etc/containerd/config.toml
-# [plugins."io.containerd.grpc.v1.cri".containerd]
-#   max_container_log_line_size = 16384
+# Rotation is done by the KUBELET for CRI runtimes (Docker's daemon.json log-opts
+# only mattered in the dockershim era). KubeletConfiguration:
+containerLogMaxSize: 10Mi        # default
+containerLogMaxFiles: 5          # default
+# A noisy pod writing faster than the agent reads can lose lines at rotation: watch
+# the agent's lag/drop metrics.
 
-# Docker daemon log rotation:
-cat /etc/docker/daemon.json
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",       # Rotate log files at 10MB
-    "max-file": "3"           # Keep 3 rotated files
-  }
-}
-
-# Or configure per-pod:
+# Container logs count toward the pod's ephemeral-storage usage:
 apiVersion: v1
 kind: Pod
 metadata:
@@ -2585,19 +2667,23 @@ spec:
         ephemeral-storage: "1Gi"    # Ephemeral storage for logs
       limits:
         ephemeral-storage: "2Gi"
-# When pod exceeds ephemeral storage → evicted (if limit enforced)
-# Align with container log rotation to prevent eviction
+# Pod exceeding its ephemeral-storage limit (logs + emptyDir + writable layer) → evicted
 
-# Loki retention:
-storage:
-  schema:
-    config:
-      configs:
-      - from: "2024-01-01"
-        store: tsdb            # TSDB index (more efficient than boltdb-shipper)
-        object_store: s3
-        schema: v13
-  retention: 744h              # 31 days (or longer for compliance)
+# Loki schema + retention (retention is enforced by the compactor):
+schema_config:
+  configs:
+  - from: "2024-01-01"
+    store: tsdb                # TSDB index (replaces boltdb-shipper)
+    object_store: s3
+    schema: v13
+    index:
+      prefix: index_
+      period: 24h
+compactor:
+  retention_enabled: true
+  delete_request_store: s3
+limits_config:
+  retention_period: 744h       # 31 days (per-tenant overrides possible)
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -2622,35 +2708,36 @@ storage:
 **Kubernetes Events:**
 
 ```yaml
-# Events: ephemeral records of cluster activity
-# Stored in etcd, but time-limited (default: 1 hour retention)
-# Events explain WHY something happened (scheduling failure, probe failure, etc.)
+# Events: ephemeral records of cluster activity, written by components
+# (scheduler, kubelet, controllers) through the API server.
+# Stored in etcd with a TTL (kube-apiserver --event-ttl, default 1h).
+# Best effort: they can be rate-limited, deduplicated or dropped. Don't build
+# correctness on them.
 
-# View events:
-kubectl get events -n prod
-kubectl get events --field-selector involvedObject.name=my-pod-abc
-kubectl get events --field-selector type=Warning
+# View events (kubectl events sorts by time, unlike kubectl get events):
+kubectl events -n prod --for pod/my-pod-abc
+kubectl events -n prod --types=Warning
+kubectl get events -n prod --sort-by=.lastTimestamp
 
 # Watch events in real-time:
 kubectl get events -n prod --watch
 
-# Example events for a failing pod:
-LAST SEEN   TYPE      REASON                OBJECT                  MESSAGE
-5m          Warning   FailedScheduling      pod/my-app-7d4f8b9c6   0/3 nodes are available:
-                                                                   1 node had taint (NoSchedule)
-                                                                   2 nodes had insufficient memory
-3m          Normal    Pulling               pod/my-app-7d4f8b9c6   Pulling image "my-app:latest"
-3m          Warning   BackOff               pod/my-app-7d4f8b9c6   Back-off restarting failed container
-2m          Warning   FailedNeedsStart      pod/my-app-7d4f8b9c6   CNI network: no IP addresses available
-1m          Normal    Scheduled             pod/my-app-7d4f8b9c6   Successfully assigned to node-3
-30s         Warning   Unhealthy             pod/my-app-7d4f8b9c6   Liveness probe failed: HTTP probe failed
+# Example events for a failing pod (oldest first):
+LAST SEEN   TYPE      REASON                   OBJECT                    MESSAGE
+6m          Warning   FailedScheduling         pod/my-app-7d4f8b9c6-x1   0/3 nodes are available: 1 node(s) had
+                                                                         untolerated taint, 2 Insufficient memory
+4m          Normal    Scheduled                pod/my-app-7d4f8b9c6-x1   Successfully assigned prod/... to node-3
+4m          Warning   FailedCreatePodSandBox   pod/my-app-7d4f8b9c6-x1   ... failed to assign an IP address
+3m          Normal    Pulling                  pod/my-app-7d4f8b9c6-x1   Pulling image "my-app:1.4.2"
+1m          Warning   Unhealthy                pod/my-app-7d4f8b9c6-x1   Liveness probe failed: HTTP probe failed
+30s         Warning   BackOff                  pod/my-app-7d4f8b9c6-x1   Back-off restarting failed container
 
 # Event structure:
 {
   "metadata": {
     "name": "my-pod-abc.17d3f9c8bf9a",
     "namespace": "prod",
-    "creationTimestamp": "2024-01-15T12:00:00Z",
+    "creationTimestamp": "2024-01-15T12:00:00Z"
   },
   "involvedObject": {
     "kind": "Pod",
@@ -2675,10 +2762,10 @@ LAST SEEN   TYPE      REASON                OBJECT                  MESSAGE
 **Event Export & Persistence:**
 
 ```yaml
-# Events are ephemeral (1 hour TTL). For historical analysis, export them:
-
-# 1. event_exporter: exports events to Prometheus
-# https://github.com/opsgenie/kubernetes-event-exporter
+# Events are ephemeral (1 hour TTL). For historical analysis, export them.
+# Options: kubernetes-event-exporter (the maintained fork is resmoio/
+# kubernetes-event-exporter; the opsgenie repo is archived), Grafana Alloy's
+# loki.source.kubernetes_events, or the OTel Collector k8s_events/k8sobjects receivers.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -2690,11 +2777,14 @@ spec:
     matchLabels:
       app: event-exporter
   template:
+    metadata:
+      labels:
+        app: event-exporter
     spec:
-      serviceAccountName: event-exporter
+      serviceAccountName: event-exporter   # needs get/list/watch on events
       containers:
       - name: event-exporter
-        image: ghcr.io/opsgenie/kubernetes-event-exporter:v1.7
+        image: ghcr.io/resmoio/kubernetes-event-exporter:v1.7
         args:
         - -conf=/data/config.yaml
         volumeMounts:
@@ -2712,53 +2802,31 @@ metadata:
   name: event-exporter-config
 data:
   config.yaml: |
-    logLevel: debug
+    logLevel: info
     logFormat: json
     route:
       routes:
       - match:
-          - receiver: "prometheus"
-            type: "prometheus"
-            metrics:
-              - name: "kubernetes_event_total"
-                help: "Kubernetes events"
-                labels:
-                  - key: "reason"
-                    value: "reason"
-                  - key: "type"
-                    value: "type"
-                  - key: "namespace"
-                    value: "namespace"
-                  - key: "kind"
-                    value: "kind"
-                  - key: "name"
-                    value: "name"
-                increment: true
-      - match:
-          - receiver: "loki"
-      receivers:
-      - name: "prometheus"
-        prometheus: {}
-      - name: "loki"
-        loki:
-          endpoint: http://loki-gateway.logging:3100/loki/api/v1/push
-          extraLabels:
-            source: event-exporter
+        - receiver: "loki"           # send every event to Loki
+    receivers:
+    - name: "loki"
+      loki:
+        url: http://loki-gateway.logging:3100/loki/api/v1/push
+        streamLabels:
+          source: event-exporter
 
-# 2. Prometheus metrics from events:
-# kubernetes_event_total{reason="BackOff", type="Warning", namespace="prod"} 5
-# kubernetes_event_total{reason="FailedScheduling", type="Warning"} 12
-# kubernetes_event_total{reason="NodeNotReady", type="Warning"} 1
-
-# 3. Alert on events:
+---
+# Alert on events with a Loki ruler (LogQL metric query), e.g. warning-event spikes:
 - alert: KubeEventWarningHighRate
   expr: |
-    rate(kubernetes_event_total{type="Warning"}[5m]) > 10
+    sum by (namespace) (
+      count_over_time({source="event-exporter"} | json | type="Warning" [5m])
+    ) > 50
   for: 5m
   labels:
     severity: warning
   annotations:
-    summary: "High rate of warning events"
+    summary: "High rate of warning events in {{ $labels.namespace }}"
 ```
 
 **Kubernetes Audit Logs:**
@@ -2775,15 +2843,17 @@ data:
 # --audit-log-maxsize=100
 # --audit-policy-file=/etc/kubernetes/audit-policy.yaml
 
-# Audit policy (what to log):
+# Audit policy (what to log). Rules are evaluated in order; FIRST match wins.
 apiVersion: audit.k8s.io/v1
 kind: Policy
+omitStages: ["RequestReceived"]     # halve the volume: log only when done
 rules:
-# Log ALL requests to secrets (sensitive!)
-- level: RequestResponse
+# Secrets/ConfigMaps/tokens: Metadata ONLY. Request/RequestResponse would write
+# secret values into the audit log.
+- level: Metadata
   resources:
   - group: ""
-    resources: ["secrets"]
+    resources: ["secrets", "configmaps", "serviceaccounts/token"]
 
 # Log all requests to pods (verbose but useful)
 - level: Request
@@ -2841,7 +2911,9 @@ rules:
 # 1. Security: who deleted the production namespace?
 # 2. Debugging: who created a pod with privileged: true?
 # 3. Compliance: which users accessed secrets?
-# 4. Capacity: what's the API request pattern (read-heavy? write-heavy?)
+# 4. Capacity: which client is hammering the API server with LISTs?
+# On managed clusters (EKS, GKE, AKS) you enable audit logs through the provider and
+# read them in its log service; you can't set the policy file yourself.
 ```
 
 **Events vs Audit Logs:**
@@ -2932,7 +3004,7 @@ variables:
 
 # Row 1: Cluster Health (Stat panels)
 Stat: "Nodes Up"
-  query: count(kube_node_status_condition{condition="Ready", status="true"})
+  query: sum(kube_node_status_condition{condition="Ready", status="true"})   # series are 0/1: sum, don't count
   threshold: < 3 = red, < 5 = yellow
   show: current value
 
@@ -2941,7 +3013,7 @@ Stat: "CPU Utilization"
   unit: percent
 
 Stat: "Memory Utilization"
-  query: 100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+  query: 100 * (1 - sum(node_memory_MemAvailable_bytes) / sum(node_memory_MemTotal_bytes))
   unit: percent
 
 Stat: "Total Pods"
@@ -2953,8 +3025,8 @@ Stat: "Pending Pods"
   colors: [green, yellow, red]
   thresholds: [0, 5, 20]
 
-Stat: "Warning Events (1h)"
-  query: sum(rate(kubernetes_event_total{type="Warning"}[1h])) * 3600
+Stat: "Warning Events (1h)"          # Loki datasource (events exported, see §12)
+  query: sum(count_over_time({source="event-exporter"} | json | type="Warning" [1h]))
 
 # Row 2: Node Resource Usage (Time series)
 TimeSeries: "Node CPU Usage (Top 10)"
@@ -2967,7 +3039,7 @@ TimeSeries: "Node Memory Usage (Top 10)"
 TimeSeries: "API Server Latency (p99)"
   query: |
     histogram_quantile(0.99,
-      sum(rate(apiserver_request_duration_seconds_bucket[5m])) by (le, verb)
+      sum(rate(apiserver_request_duration_seconds_bucket{verb!~"WATCH|CONNECT"}[5m])) by (le, verb)
     )
 
 TimeSeries: "API Server Request Rate"
@@ -2995,10 +3067,10 @@ variables:
 # Selected by: cluster → namespace
 
 Stat: "Pods Running"
-  query: count(kube_pod_status_phase{phase="Running", namespace="$namespace"})
+  query: sum(kube_pod_status_phase{phase="Running", namespace=~"$namespace"})
 
 Stat: "Pods Pending"
-  query: count(kube_pod_status_phase{phase="Pending", namespace="$namespace"})
+  query: sum(kube_pod_status_phase{phase="Pending", namespace=~"$namespace"})
   colors: [green, yellow, red]
   thresholds: [0, 1, 5]
 
@@ -3014,22 +3086,24 @@ Stat: "Memory Usage / Limits"
     / sum(kube_pod_container_resource_limits{namespace="$namespace", resource="memory"})
   unit: percent
 
+# cAdvisor series carry namespace/pod/container but NOT pod labels like "app";
+# join with kube_pod_labels (KSM) to group by app:
 TimeSeries: "CPU Usage by App"
   query: |
-    sum by (app) (rate(container_cpu_usage_seconds_total{namespace="$namespace"}[5m]))
-  legend: {{app}}
-
-TimeSeries: "Memory Usage by App"
-  query: sum by (app) (container_memory_working_set_bytes{namespace="$namespace"})
+    sum by (label_app) (
+      rate(container_cpu_usage_seconds_total{namespace="$namespace", container!=""}[$__rate_interval])
+      * on (namespace, pod) group_left (label_app) kube_pod_labels{namespace="$namespace"}
+    )
+  legend: "{{label_app}}"
 
 Table: "Pods with Issues"
   query: |
     kube_pod_status_phase{phase!="Running", namespace="$namespace"} == 1
   columns: ["pod", "phase", "namespace", "node"]
 
-Table: "Recent Warning Events"
+Logs: "Recent Warning Events"          # Loki datasource, events shipped by an exporter
   query: |
-    topk(10, sum by (reason) (rate(kubernetes_event_total{type="Warning", namespace="$namespace"}[1h])))
+    {source="event-exporter"} | json | type="Warning" | involvedObject_namespace="$namespace"
 ```
 
 **Pod Detail Dashboard:**
@@ -3070,12 +3144,13 @@ TimeSeries: "Memory Usage vs Request/Limit"
     kube_pod_container_resource_limits{pod="$pod", resource="memory"}
 
 # Row 3: Probes
-TimeSeries: "Probe Results (1 = failed)"
+TimeSeries: "Probe failures per minute"
   query: |
-    prober_probe_total{pod="$pod", container="$container", result="failed"}
-TimeSeries: "Probe Latency"
+    sum by (probe_type) (rate(prober_probe_total{pod="$pod", container="$container", result="failed"}[$__rate_interval])) * 60
+TimeSeries: "Probe Latency p99"
   query: |
-    prober_probe_duration_seconds{pod="$pod", container="$container"}
+    histogram_quantile(0.99, sum by (le, probe_type) (
+      rate(prober_probe_duration_seconds_bucket{pod="$pod", container="$container"}[$__rate_interval])))
 
 # Row 4: Network
 TimeSeries: "Network In/Out"
@@ -3086,22 +3161,22 @@ TimeSeries: "Network In/Out"
 # Row 5: Events & Logs
 Logs: "Pod Logs (Loki)"
   query: |
-    {pod="$pod", namespace="$namespace"}
+    {namespace="$namespace", container="$container"} | pod="$pod"   # pod as structured metadata
   datasource: Loki
 
-Events: "Recent Pod Events"
+Logs: "Recent Pod Events"
   query: |
-    {namespace="$namespace", involvedObject_name="$pod"}
+    {source="event-exporter"} | json | involvedObject_name="$pod"
   datasource: Loki (via event-exporter)
 ```
 
 **Dashboard Efficiency Tips:**
 
 ```yaml
-# 1. Use dashboard-level $__rate_interval
-#   - Prometheus auto-selects an appropriate rate interval
-#   - Prevents "interval too short" or "too much data" errors
-#   - Set in Dashboard Settings → Variables → __rate_interval
+# 1. Use Grafana's built-in $__rate_interval in rate()/increase()
+#   - Grafana computes it from the panel's step and the datasource's scrape interval
+#     (at least 4× scrape interval), so rate() never gets fewer than 2 samples
+#   - Hard-coded [1m] with a 30s scrape gives gaps; [1h] on a 6h panel hides spikes
 
 # 2. Use recording rules for expensive queries
 #   - Pre-compute per-pod CPU/memory usage
@@ -3203,8 +3278,11 @@ groups:
 
     # P0: Pod OOMKilled repeatedly
     - alert: KubePodOOMKilledRepeatedly
+      # restarts in the last 15m, counted only while the last termination was an OOM
       expr: |
-        rate(kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}[15m]) > 2
+        (increase(kube_pod_container_status_restarts_total[15m]) > 2)
+        and ignoring (reason)
+        (kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1)
       labels:
         severity: critical
       annotations:
@@ -3216,9 +3294,9 @@ groups:
     # P0: Pod not ready for extended period
     - alert: KubePodNotReady
       expr: |
-        kube_pod_status_phase{phase="Running"} != 1
-        and on (pod, namespace)
-        kube_pod_status_phase{phase="Pending"} == 1
+        sum by (namespace, pod) (
+          kube_pod_status_phase{phase=~"Pending|Unknown|Failed"}
+        ) > 0
       for: 15m
       labels:
         severity: critical
@@ -3233,26 +3311,26 @@ groups:
     # P1: Container restarts (not crash-looping, just restarting)
     - alert: KubeContainerRestartHigh
       expr: |
-        rate(kube_pod_container_status_restarts_total[15m]) > 3
+        increase(kube_pod_container_status_restarts_total[1h]) > 3
       labels:
         severity: warning
       annotations:
         summary: "Container {{ $labels.container }} restarting frequently"
         description: "{{ $labels.container }} in {{ $labels.pod }} restarted
-                      {{ $value }} times per hour"
+                      {{ $value }} times in the last hour"
 
     # P1: CPU throttling
     - alert: KubePodCPUThrottling
       expr: |
-        rate(container_cpu_cfs_throttled_seconds_total{container!=""}[5m]) > 1
-        and on (container, pod, namespace)
-        container_cpu_cfs_periods_total{container!=""} > 0
-      for: 10m
+        sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_periods_total{container!=""}[5m]))
+        / sum by (namespace, pod, container) (rate(container_cpu_cfs_periods_total{container!=""}[5m]))
+        > 0.25
+      for: 15m
       labels:
         severity: warning
       annotations:
-        summary: "{{ $labels.container }} CPU throttled >1s/s"
-        description: "Container is being throttled. Consider increasing CPU limit."
+        summary: "{{ $labels.container }} throttled in >25% of CFS periods"
+        description: "Raise or remove the CPU limit, or fix the hot path (see §4)."
 
     # P1: Pod using too much memory (near limit)
     - alert: KubePodMemoryNearLimit
@@ -3290,7 +3368,7 @@ groups:
     # P1: Liveness probe failing
     - alert: KubePodLivenessProbeFailing
       expr: |
-        rate(prober_probe_total{probe="liveness", result="failed"}[5m]) > 0
+        rate(prober_probe_total{probe_type="Liveness", result="failed"}[5m]) > 0
       for: 5m
       labels:
         severity: warning
@@ -3301,7 +3379,7 @@ groups:
     # P1: Readiness probe failing
     - alert: KubePodReadinessProbeFailing
       expr: |
-        rate(prober_probe_total{probe="readiness", result="failed"}[5m]) > 0
+        rate(prober_probe_total{probe_type="Readiness", result="failed"}[5m]) > 0
       for: 10m
       labels:
         severity: warning
@@ -3313,11 +3391,9 @@ groups:
     - alert: KubePodPendingScheduling
       expr: |
         kube_pod_status_phase{phase="Pending"} == 1
-        and on (pod)
-        (
-          time() - kube_pod_start_time{pod=~".+"} > 300
-        )
-      for: 5m
+        and on (namespace, pod)
+        kube_pod_status_scheduled{condition="false"} == 1
+      for: 10m
       labels:
         severity: warning
       annotations:
@@ -3325,17 +3401,17 @@ groups:
         description: "Check scheduling constraints, resources, node capacity.
                       kubectl describe pod {{ $labels.pod }}"
 
-    # P1: Readiness gate fail (for service mesh sidecars)
-    - alert: KubePodReadinessGateFail
+    # P1: Running but not Ready (failing readiness probe or readiness gate)
+    - alert: KubePodRunningNotReady
       expr: |
         kube_pod_status_phase{phase="Running"} == 1
         and on (pod, namespace)
-        kube_pod_status_ready_condition{condition="true"} != 1
-      for: 5m
+        kube_pod_status_ready{condition="false"} == 1
+      for: 15m
       labels:
         severity: warning
       annotations:
-        summary: "Pod {{ $labels.pod }} running but not ready (readiness gate)"
+        summary: "Pod {{ $labels.pod }} running but not Ready for 15m"
 ```
 
 **Pod Disruption Budget Alerts:**
@@ -3344,8 +3420,7 @@ groups:
 # PDB alerts: warn when pods can't be evicted
 - alert: KubePDBBlockingDrain
   expr: |
-    kube_poddisruptionbudget_status_current_healthy
-    == kube_poddisruptionbudget_status_desired_healthy
+    kube_poddisruptionbudget_status_pod_disruptions_allowed == 0
     and
     kube_poddisruptionbudget_status_current_healthy > 0
   for: 30m
@@ -3378,28 +3453,28 @@ groups:
 # CPU spike: Wait 5m
 # Pod restart from rolling update: Wait 10m
 
-# Strategy 2: Exclude rolling updates with annotations
-# Add annotation to pods during rolling updates:
-metadata:
-  annotations:
-    rollingupdate: "true"
-# Alert with exclusion:
+# Strategy 2: Alert on the WORKLOAD, not on every pod blip during rollouts
+# Pods restarting or unready during a rollout are normal. Page when the rollout itself
+# is stuck (Progressing=False after progressDeadlineSeconds) or availability is low:
 expr: |
-  kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}
-  unless on (pod) kube_pod_annotations{annotation="rollingupdate", value="true"}
+  kube_deployment_status_condition{condition="Progressing", status="false"} == 1
+# and exclude Job pods from pod-level alerts (they're expected to terminate):
+#   ... unless on (namespace, pod) kube_pod_owner{owner_kind="Job"}
 
-# Strategy 3: Alert on symptoms, not causes
-# BAD: "Node disk usage > 80%" (100 alerts per hour, not actionable)
-# GOOD: "predict_linear(node_filesystem_free_bytes[6h], 24*3600) < 0"
-#       (actionable: will run out of disk in 24 hours)
+# Strategy 3: Page on symptoms, ticket on causes
+# PAGE: SLO burn-rate alerts (error rate / latency on user-facing endpoints)
+# TICKET: causes such as "disk will fill in 24h":
+#   predict_linear(node_filesystem_avail_bytes[6h], 24*3600) < 0
+# BAD: static "disk > 80%" pages (noisy, often not actionable)
 
 # Strategy 4: Use inhibition rules
-# If node is down → suppress ALL pod alerts on that node
+# If node is down → suppress pod alerts on that node
+# (pod alerts need a "node" label for this: join with kube_pod_info in the rule)
 inhibit_rules:
-  - source_match:
-      alertname: 'KubeNodeNotReady'
-    target_match_re:
-      alertname: 'KubePod.*|KubeContainer.*'
+  - source_matchers:
+      - alertname = "KubeNodeNotReady"
+    target_matchers:
+      - alertname =~ "KubePod.*|KubeContainer.*"
     equal: ['node']
 
 # Strategy 5: Use grouping
@@ -3434,11 +3509,14 @@ curl -X POST http://alertmanager:9093/api/v2/silences \
 #
 # 1. CHECK: What's the exit code?
 #    kubectl logs <pod> --previous
-#    Exit code 0: container completed (expected if Job)
+#    (kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[*].lastState}')
+#    Exit code 0: process exited "successfully" but restartPolicy Always restarts it
+#                 → wrong workload type (should be a Job) or entrypoint not blocking
 #    Exit code 1: application error (check application logs)
-#    Exit code 137: OOMKilled (increase memory limit)
+#    Exit code 137: SIGKILL. Reason OOMKilled → memory; otherwise liveness kill or
+#                   grace period expired
 #    Exit code 139: SIGSEGV (segfault, application bug)
-#    Exit code 143: SIGTERM (graceful shutdown)
+#    Exit code 143: SIGTERM (killed by kubelet, e.g. liveness failure, and exited cleanly)
 #
 # 2. CHECK: Any configuration issues?
 #    kubectl describe pod <pod>
@@ -3525,7 +3603,8 @@ curl -X POST http://alertmanager:9093/api/v2/silences \
 # eBPF-based monitoring:
 # - No application changes required
 # - Sees EVERY syscall, TCP connection, file I/O
-# - Zero instrumentation overhead (sandboxed in kernel)
+# - Low overhead (verified programs run in-kernel, no context switch per event),
+#   but not zero: per-packet/per-syscall hooks cost CPU at high rates
 # - Captures: TCP handshakes, DNS queries, HTTP requests/responses,
 #             SSL/TLS handshakes, database queries
 ```
@@ -3542,11 +3621,11 @@ cilium hubble port-forward&
 hubble observe --from-pod payment-service --to-pod database
 
 # What Hubble sees:
-# - Every TCP connection (SYN, SYN-ACK, ACK, FIN, RST)
-# - DNS queries and responses
-# - HTTP request/response (status code, latency, method)
-# - Dropped packets (network policy violations)
-# - Service mesh mutual-TLS handshake status
+# - L3/L4 by default (pure eBPF): every flow with identities, TCP flags, verdicts
+# - Dropped packets with the reason (policy denied, no route, ...)
+# - L7 (HTTP method/path/status/latency, DNS, Kafka) ONLY for traffic that goes through
+#   Cilium's L7 proxy (Envoy), i.e. selected by an L7 network policy / visibility config
+# - It does NOT parse database protocols (Postgres, MySQL) or see inside TLS
 
 # Hubble CLI examples:
 # View all flows for a pod:
@@ -3558,8 +3637,9 @@ hubble observe --verdict DROPPED
 # View HTTP requests:
 hubble observe --http
 
-# View TCP handshake times:
-hubble observe --type trace:syn,syn-ack,ack
+# View new connections (SYN) and resets:
+hubble observe --tcp-flags SYN
+hubble observe --tcp-flags RST
 
 # Hubble UI (graphical service map):
 # cilium hubble ui
@@ -3568,17 +3648,17 @@ hubble observe --type trace:syn,syn-ack,ack
 # Prometheus metrics from Hubble:
 # hubble_http_requests_total{source="payment", destination="orders", method="POST"}
 # hubble_http_request_duration_seconds{source="payment", destination="orders"}
-# hubble_tcp_handshake_time_seconds{source="payment", destination="orders"}
-# hubble_drop_total{source="payment", destination="database", reason="policy denied"}
+# hubble_tcp_flags_total{flag="RST", ...}
+# hubble_drop_total{reason="POLICY_DENIED", ...}
+# hubble_dns_queries_total / hubble_dns_responses_total{rcode="NXDomain"}
 
 # How to use Hubble for debugging:
-# Scenario: "Payment service is slow"
-# 1. Hubble shows payment-service makes many TCP connections to database
-# 2. Each connection shows 10ms handshake → OK
-# 3. But hubble_http_request_duration_seconds shows 500ms p99
-# 4. Looking at HTTP flows: database queries take 450ms
-# 5. Root cause: missing database index → 450ms query time
-# 6. Without Hubble: would see "payment is slow" but not WHY
+# Scenario: "Payment service is slow, CPU/memory normal"
+# 1. hubble_http_request_duration_seconds: p99 500ms only on calls to orders-service
+# 2. hubble observe --to-pod orders-service --verdict DROPPED: intermittent drops,
+#    reason POLICY_DENIED from a recently tightened NetworkPolicy on one port
+# 3. Clients retry after a timeout → latency spikes, no CPU signal anywhere
+# 4. Without flow data you'd see "payment is slow" but not WHY
 ```
 
 **Pixie (Kubernetes Debugging):**
@@ -3587,8 +3667,8 @@ hubble observe --type trace:syn,syn-ack,ack
 # Pixie: eBPF-based observability for Kubernetes
 # No instrumentation needed — auto-telemetry for ALL pods
 
-# Install:
-pixie deploy
+# Install (CLI or Helm). Pixie is a CNCF sandbox project (donated by New Relic):
+px deploy
 
 # Key Pixie features:
 # 1. Auto-instrumentation: HTTP, gRPC, MySQL, Postgres, Redis, DNS, TCP
@@ -3624,11 +3704,10 @@ px run px/profile -n prod -p payment-service
 
 # Pixie for root cause analysis:
 # Scenario: "Pod is slow but CPU/Memory are fine"
-# 1. Pixie continuous profile shows: function parseRequest() takes 80% of CPU time
-# 2. But CPU metrics show low utilization → puzzling
-# 3. Pixie HTTP data shows: many requests with large payloads (100MB+)
-# 4. Root cause: client sending oversized requests → JSON parsing dominates
-# 5. Fix: add request size limit on the server → problem solved
+# 1. px/dns_data shows each outbound call to api.partner.com issuing 4 lookups:
+#    the ndots:5 search-domain expansion, one of which times out at CoreDNS
+# 2. That adds ~200ms to every request; nothing shows in CPU/memory metrics
+# 3. Fix: trailing dot / lower ndots in dnsConfig, NodeLocal DNSCache
 
 # Scenario: "Database queries are slow"
 # 1. Pixie MySQL script shows slow query: SELECT * FROM orders WHERE ...
@@ -3679,17 +3758,20 @@ Application changes needed | ✅ (metrics endpoint)| ❌ (zero instrumentation)
 **eBPF Tools Comparison:**
 
 ```yaml
-Tool              | Focus                     | Installation Complexity | Resource Overhead
-------------------|---------------------------|------------------------|------------------
-Cilium Hubble     | Network observability     | Medium (requires Cilium)| Low (~5% CPU)
-Pixie             | Full-stack observability   | Low (helm chart)        | Low (~3% CPU, ~1GB RAM)
-Parallax          | Node-level debugging       | Low                     | Very low
-BPFtrace          | Custom eBPF programs       | Low (CLI tool)          | Minimal (one-time use)
-Falco*            | Security (syscall monitor) | Medium (DaemonSet)      | Low
+Tool                 | Focus                                   | Notes
+---------------------|-----------------------------------------|------------------------------
+Cilium Hubble        | Network flows, drops, L7 via proxy      | Requires Cilium as the CNI
+Pixie                | Protocol tracing, profiling, in-cluster | Short in-memory retention;
+                     | data (HTTP, gRPC, SQL, DNS)             | needs memory per node
+Grafana Beyla / OTel | Auto-instrumented RED metrics + traces  | Exports standard OTel data
+  eBPF Instrumentation |                                       | to your existing backends
+Inspektor Gadget     | kubectl-native ad-hoc tracing gadgets   | Good for one-off debugging
+bpftrace             | Custom one-liners on a node             | Needs node access
+Falco / Tetragon     | Runtime SECURITY (syscall/process rules)| Detection, not observability:
+                     |                                         | "shell in container", etc.
 
-# * Falco: not strictly observability, but related eBPF tool for security
-#   - Detects: shell in container, unusual file access, privilege escalation
-#   - Rules: "Terminal shell in container", "Write to /etc/passwd"
+# Measure overhead in your own environment; it depends on traffic rate and which
+# hooks/protocol parsers are enabled.
 ```
 
 ### 🔍 Staff-Level Evaluation

@@ -220,15 +220,15 @@
 
 | Tool | Questions | Key Depth Areas |
 |------|-----------|-----------------|
-| **[Kafka](tools-interview/kafka/INTERVIEW_QUESTIONS.md)** | 12 Q | Log internals, ISR, EOS, rebalancing, Streams |
-| **[Redis](tools-interview/redis/INTERVIEW_QUESTIONS.md)** | 12 Q | Data structures, persistence, sentinel, cluster |
+| **[Kafka](tools-interview/kafka/INTERVIEW_QUESTIONS.md)** | 12 Q | Kafka 4.x (KRaft), ISR/ELR, EOS, KIP-848 rebalancing, share groups |
+| **[Redis](tools-interview/redis/INTERVIEW_QUESTIONS.md)** | 12 Q | Redis 8 / Valkey, persistence, sentinel, cluster |
 | **[Elasticsearch](tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md)** | 8 Q | Inverted index, sharding, query DSL |
-| **[Docker](tools-interview/docker/INTERVIEW_QUESTIONS.md)** | 8 Q | Container runtime, networking, multi-stage builds |
+| **[Docker](tools-interview/docker/INTERVIEW_QUESTIONS.md)** | 8 Q | Namespaces/cgroups, BuildKit, supply chain, limits, networking |
 | **[Kubernetes](tools-interview/kubernetes/INTERVIEW_QUESTIONS.md)** | 12+ Q | Scheduler, RBAC, pod lifecycle, monitoring |
-| **[CI/CD & Deployment](tools-interview/ci-cd-deployment/DEPLOYMENT_GUIDE.md)** | Guide | Frontend, backend, mobile, monolith, microservices |
+| **[CI/CD & Deployment](tools-interview/ci-cd-deployment/DEPLOYMENT_GUIDE.md)** | Guide | Pipelines, deployment strategies, progressive delivery, OIDC, SLSA |
 | **[MongoDB](tools-interview/mongodb/INTERVIEW_QUESTIONS.md)** | 6 Q | Document model, replica sets, aggregation |
-| **[Prometheus & Grafana](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md)** | 8 Q | TSDB internals, PromQL, Thanos |
-| **[Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS.md)** | 8 Q | State management, modules, providers |
+| **[Prometheus & Grafana](tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md)** | 8 Q | Prometheus 3.x, PromQL, Alertmanager, Thanos/Mimir, SLOs |
+| **[Terraform](tools-interview/terraform/INTERVIEW_QUESTIONS.md)** | 8 Q | State/locking, modules & tests, providers, OpenTofu |
 | **[Nginx](tools-interview/nginx/INTERVIEW_QUESTIONS.md)** | 10 Q | Event loop, reverse proxy, TLS, tuning |
 | **[Compression](tools-interview/compression/INTERVIEW_QUESTIONS.md)** | 10 Q | zstd, Brotli, gzip, HPACK, dictionary training |
 

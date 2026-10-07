@@ -1,6 +1,6 @@
 # CI/CD & Deployment — Complete Guide
 
-> **How modern engineering teams ship code to production reliably, repeatably, and safely across different architectures and platforms.**
+> **How modern engineering teams ship code to production reliably, repeatably and safely: the pipeline, deployment strategies, per-platform packaging, supply-chain security and progressive delivery. Tool versions are current as of October 2026.**
 
 ---
 
@@ -22,56 +22,58 @@
 
 ## 1. Core Concepts
 
+!!! tip "30-second answer"
+    **CI** merges small changes to a shared trunk often, each verified by an automated build and test. **Continuous delivery** keeps every passing build releasable, with a human deciding when to release; **continuous deployment** removes that human and ships every passing change. The goal is small batches: they're easier to review, test, roll back and debug. You measure the system with the **DORA metrics**, and you make it safe with immutable artifacts, progressive rollout and fast rollback.
+
 ### Continuous Integration (CI)
 
-Developers merge code into a shared repository multiple times a day. Each merge triggers an automated build-and-test pipeline to catch integration issues early.
+Developers merge into a shared branch at least daily. Each merge triggers an automated build-and-test pipeline, so integration problems surface within minutes rather than at release time.
 
-**CI Pipeline Stages:**
 ```
-Code Push → Lint → Unit Tests → Build → Integration Tests → Artifact
+Code push → Lint/format → Unit tests → Build → Integration tests → Versioned artifact
 ```
 
-### Continuous Delivery (CDel)
+### Continuous Delivery vs Continuous Deployment
 
-Every change that passes CI is automatically prepared for release. Deployment to production requires a manual approval gate.
-
-### Continuous Deployment (CDep)
-
-Every change that passes all automated tests is automatically deployed to production with no human intervention.
+| | Continuous Delivery | Continuous Deployment |
+|---|---|---|
+| Every passing change is... | Releasable | Released |
+| Production deploy | Manual approval or scheduled | Automatic |
+| Prerequisites | Good tests, automated deploy | Plus progressive rollout, automated analysis and rollback, feature flags |
 
 ### Pipeline-as-Code
 
-Pipeline definitions are checked into version control alongside application code, ensuring reproducibility, auditability, and versioning of the delivery process itself.
+Pipeline definitions live in the repository with the code (`.github/workflows/*.yml`, `.gitlab-ci.yml`, `Jenkinsfile`), so changes to the delivery process are reviewed, versioned and auditable like any other change.
 
-```
-.github/workflows/deploy.yml   # GitHub Actions
-.gitlab-ci.yml                  # GitLab CI
-Jenkinsfile                     # Jenkins
-```
+### Measuring delivery: DORA metrics
+
+| Metric | What it measures | Elite-ish target |
+|---|---|---|
+| Deployment frequency | How often you ship to production | On demand, many times a day |
+| Lead time for changes | Commit → running in production | Less than a day |
+| Change failure rate | Share of deployments causing a failure needing remediation | Low single digits to ~15% |
+| Failed deployment recovery time | Time to restore after a bad deploy | Under an hour |
+
+DORA's research also added **rework rate** (unplanned deployments to fix production issues) in 2024. Speed and stability correlate positively: teams that deploy more often also fail less, because each change is smaller.
 
 ---
 
 ## 2. End-to-End Flow: Repository → Production
 
-This section traces the complete journey of a code change — from a developer's first commit to running in production — across different project types and architectures.
+This section traces a change from first commit to running in production, across project types and architectures.
 
 ---
 
 ### 2.1 The Complete Pipeline (Overview)
 
-Every deployment follows the same high-level flow regardless of tech stack:
-
 ```
 ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│ Developer │───▶│   Git    │───▶│    CI    │───▶│  Build & │───▶│   CD /   │───▶│ Production│
-│  Commit   │    │  Repo    │    │  (Test)  │    │  Package  │    │  Deploy  │    │          │
+│ Developer│───▶│   Git    │───▶│    CI    │───▶│ Build &  │───▶│  CD /    │───▶│Production│
+│  commit  │    │  repo    │    │  (test)  │    │ package  │    │  deploy  │    │          │
 └──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
-     │              │              │              │              │              │
-     │ push / PR    │ trigger      │ run tests    │ create       │ roll out    │ serve users
-     │              │ webhook      │ & lint       │ artifact     │ to env      │
+     │ push / PR      │ webhook       │ tests, lint    │ immutable      │ promote       │ serve,
+     │                │               │ scans          │ artifact       │ through envs  │ observe
 ```
-
-**Each stage in detail:**
 
 ### 🎬 Animated Sequence Diagram
 <p align="center">
@@ -83,48 +85,48 @@ Every deployment follows the same high-level flow regardless of tech stack:
   <em>🎬 Animated Sequence — CI/CD Pipeline — Code → Commit → CI (Test) → Build (Artifact) → CD (Promote) → Production (Serve). Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
-
-
 | Stage | What Happens | Output |
 |-------|-------------|--------|
-| **1. Developer Commit** | Write code, run pre-commit hooks (lint, format) | Clean commit with passing pre-checks |
-| **2. Git Repo** | Push to remote (GitHub/GitLab/Bitbucket). Triggers webhook | Code stored with commit hash (e.g., `abc1234`) |
-| **3. CI (Test)** | Clone repo → Install deps → Lint → Unit tests → Integration tests | Test report + coverage |
-| **4. Build & Package** | Compile/transpile → Docker build / bundle → Push to registry | Artifact (Docker image, `.js` bundle, `.ipa`, `.aab`) |
-| **5. CD / Deploy** | Promote artifact through environments (dev → staging → canary → prod) | Running application |
-| **6. Production** | Serve traffic, monitor metrics, watch for alerts | Live service |
+| **1. Developer commit** | Write code, run pre-commit hooks (format, lint, secret scan) | Clean commit |
+| **2. Git repo** | Push to GitHub/GitLab/Bitbucket; webhook triggers CI; branch protection requires checks and reviews | Commit SHA (e.g. `abc1234`) |
+| **3. CI (test)** | Install deps → lint → unit tests → integration tests → security scans | Test report, coverage |
+| **4. Build & package** | Build once → container image / bundle / app binary → push to registry → sign and attest | Immutable artifact identified by **digest** |
+| **5. CD / deploy** | Promote **the same artifact** through environments (dev → staging → canary → prod) | Running application |
+| **6. Production** | Serve traffic, watch SLOs, alert, roll back if needed | Live service |
+
+**Build once, deploy many:** never rebuild per environment. The thing you tested in staging must be byte-for-byte the thing in production; only configuration differs.
 
 ---
 
 ### 2.2 Branch Strategy & Environment Mapping
 
-How branches map to environments determines the deployment flow.
+Two common models:
 
 ```
-Branch                    Environment     Deploy Trigger
+Release branches / tags (GitFlow-like)
+Branch                    Environment     Deploy trigger
 ──────────────────────────────────────────────────────────
-feature/xxx               None            CI only (tests + lint)
-                     
-develop / main ──────────▶ Dev / Staging   Auto-deploy on merge
-                     
-release/v1.2 ────────────▶ Staging         Manual approval gate
-                     
-tag: v1.2.0 ──────────────▶ Production      Tag triggers prod deploy
+feature/xxx               none            CI only
+main                      dev / staging   auto on merge
+release/v1.2              staging         manual approval
+tag v1.2.0                production      tag triggers prod deploy
 ```
 
-**Trunk-Based Development (CI/CD-friendly):**
+**Trunk-based development** (what the DORA research associates with high performance):
 
 ```
 Developer                 main                  Production
 ─────────────────────────────────────────────────────────────
                     ┌──────────┐              ┌──────────┐
-feature/short-lived ─▶│  main    │──(auto)────▶│  Prod    │
-  (PR + merge)      │  branch  │              │          │
+short-lived branch ─▶│  main    │──(auto)────▶│  Prod    │
+  (PR, < 1-2 days)  │          │              │ (canary) │
                     └──────────┘              └──────────┘
                          │                        │
-                    Short-lived feature flags   Canary deploy
-                    keep incomplete code safe   monitors health
+                Incomplete work hidden      Progressive rollout,
+                behind feature flags        automated rollback
 ```
+
+Long-lived branches create merge pain and big-bang releases; trunk-based development with feature flags keeps batches small.
 
 ---
 
@@ -133,27 +135,19 @@ feature/short-lived ─▶│  main    │──(auto)────▶│  Prod  
 #### Frontend (React / Next.js / Vue)
 
 ```
-Developer                    GitHub                    CI (GitHub Actions)              CDN / Hosting
-────────────────────────────────────────────────────────────────────────────────────────────────────
-         │                      │                            │                              │
-         │-- git push -------▶  │                            │                              │
-         │                      │-- push webhook ---------▶  │                              │
-         │                      │                            │                              │
-         │                      │                            ├─ npm ci                      │
-         │                      │                            ├─ npm run lint                │
-         │                      │                            ├─ npm test -- --coverage      │
-         │                      │                            ├─ npm run build               │
-         │                      │                            │   (produces dist/)           │
-         │                      │                            ├─ Upload to S3                │
-         │                      │                            ├─ Invalidate CloudFront       │
-         │                      │                            │                              │
-         │                      │                            │──▶ Asset uploaded ──────────▶│
-         │                      │                            │                              │── User hits URL
-         │                      │                            │                              │── CDN serves new files
-         │                      │                            │                              │
+Developer          GitHub              CI (GitHub Actions)                 CDN / hosting
+─────────────────────────────────────────────────────────────────────────────────────────
+   │-- git push ──▶  │                       │                                 │
+   │                 │── webhook ──────────▶ │                                 │
+   │                 │                       ├─ npm ci                         │
+   │                 │                       ├─ lint, type-check, unit tests   │
+   │                 │                       ├─ npm run build (dist/)          │
+   │                 │                       ├─ upload hashed assets (long TTL)│
+   │                 │                       ├─ upload index.html (no-cache)   │
+   │                 │                       ├─ invalidate index.html ────────▶│
+   │                 │                       │                                 ├─ users get new HTML,
+   │                 │                       │                                 │  which references new assets
 ```
-
-**Real Example — Tracing a Commit:**
 
 ### 🎬 Animated Sequence Diagram
 <p align="center">
@@ -165,51 +159,35 @@ Developer                    GitHub                    CI (GitHub Actions)      
   <em>🎬 Animated Sequence — Frontend Deployment — Developer → GitHub → CI → Build → S3/CloudFront CDN. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
-
+**Tracing a commit:**
 
 ```
-1. Developer runs: git add . && git commit -m "feat: add dark mode"
-2. Developer runs: git push origin feat/dark-mode
-3. GitHub creates PR #123
-4. CI triggers on push: runs lint + test + build
-5. Reviewer approves PR
-6. Developer clicks "Merge pull request"
-7. CI triggers on main branch:
-   - Runs all tests again
-   - Builds production bundle (dist/)
-   - Uploads to S3 bucket
-   - Invalidates CloudFront cache
-8. Production serves new dark mode feature
+1. git commit -m "feat: add dark mode" && git push origin feat/dark-mode
+2. PR #123 opened → CI runs lint + tests + build, and a preview deployment
+3. Reviewer approves, PR merges to main
+4. CI on main: tests again → production build → upload to S3 → invalidate index.html
+5. Users loading the page get the new HTML and the new hashed bundles
 ```
+
+Upload order matters: assets first, HTML last. Users with the old HTML still fetch old asset names, which must remain available for a while, so don't delete old hashed files on every deploy.
 
 ---
 
 #### Backend (Node.js / Python / Go / Java / Rust)
 
 ```
-Developer                    GitHub                    CI (GitHub Actions)              Container Registry          Kubernetes
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-         │                      │                            │                              │                          │
-         │-- git push -------▶  │                            │                              │                          │
-         │                      │-- push webhook ---------▶  │                              │                          │
-         │                      │                            │                              │                          │
-         │                      │                            ├─ Install deps                │                          │
-         │                      │                            ├─ Run linter                  │                          │
-         │                      │                            ├─ Run unit tests              │                          │
-         │                      │                            ├─ Docker build               │                          │
-         │                      │                            ├─ Docker push ─────────────▶ │                          │
-         │                      │                            │                              │                          │
-         │                      │                            │──▶ Image stored ────────────▶│                          │
-         │                      │                            │                              │                          │
-         │                      │                            ├─ kubectl set image ──────────────────────────────────▶ │
-         │                      │                            │                              │                          │
-         │                      │                            │                              │                          ├─ Rolling update
-         │                      │                            │                              │                          ├─ Health check
-         │                      │                            │                              │                          ├─ Ready → serve
-         │                      │                            │                              │                          │
+Developer     GitHub          CI (GitHub Actions)                Registry           Kubernetes
+──────────────────────────────────────────────────────────────────────────────────────────────
+   │-- push ──▶ │                  │                                │                   │
+   │            │── webhook ──────▶├─ install deps, lint, test      │                   │
+   │            │                  ├─ docker build                  │                   │
+   │            │                  ├─ push image ──────────────────▶│                   │
+   │            │                  ├─ sign + attest (digest)        │                   │
+   │            │                  ├─ update desired image ─────────┼─────────────────▶ │
+   │            │                  │  (GitOps commit or kubectl)    │                   ├─ rolling / canary
+   │            │                  │                                │                   ├─ readiness gates
+   │            │                  │                                │                   ├─ serve traffic
 ```
-
-**Real Example — Tracing a Commit (Backend):**
 
 ### 🎬 Animated Sequence Diagram
 <p align="center">
@@ -221,30 +199,17 @@ Developer                    GitHub                    CI (GitHub Actions)      
   <em>🎬 Animated Sequence — Backend Deployment — Dockerized service pipeline from commit to Kubernetes. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
-
+**Tracing a commit:**
 
 ```
-1. Developer pushes to main on GitHub
-2. GitHub triggers GitHub Actions workflow:
-   Job 1 — Test:
-     - Checkout code
-     - Install dependencies
-     - Run linter (ruff/golangci-lint/eslint)
-     - Run unit tests with coverage
-     - Run integration tests (with test database)
-   Job 2 — Build & Push:
-     - needs: test
-     - Build Docker image with commit SHA tag: myapp:abc1234
-     - Push to Docker Hub / ECR / GHCR
-   Job 3 — Deploy:
-     - needs: build-and-push
-     - Update Kubernetes deployment:
-       kubectl set image deployment/myapp myapp=myapp:abc1234
-3. Kubernetes performs rolling update:
-   - Creates new pod with new image
-   - Waits for readiness probe to pass
-   - Terminates old pod
-4. Service is now running the new code
+1. PR merged to main
+2. Job "test":   checkout → install → lint (ruff / golangci-lint / eslint) → unit + integration tests
+3. Job "build":  needs test → build image → push ghcr.io/acme/myapp:abc1234 → record digest
+                 → attest SLSA provenance for that digest
+4. Job "deploy": needs build → set desired image to ghcr.io/acme/myapp@sha256:...
+                 (commit to the GitOps repo for Argo CD/Flux, or kubectl for simple setups)
+5. Kubernetes rolls out: new pods start → readiness probe passes → old pods drained
+6. Pipeline (or Argo Rollouts) watches error rate and latency; rolls back on regression
 ```
 
 ---
@@ -252,137 +217,99 @@ Developer                    GitHub                    CI (GitHub Actions)      
 #### Mobile (iOS / Android)
 
 ```
-Developer                    GitHub                    CI (GitHub Actions / Bitrise)        App Store / Play Store
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-         │                      │                            │                                    │
-         │-- git push -------▶  │                            │                                    │
-         │                      │-- push webhook ---------▶  │                                    │
-         │                      │                            │                                    │
-         │                      │                            ├─ Install dependencies               │
-         │                      │                            ├─ Run linter + tests                │
-         │                      │                            ├─ Build (archive / bundle)          │
-         │                      │                            ├─ Sign with certificate             │
-         │                      │                            ├─ Upload to TestFlight / Play       │
-         │                      │                            │                                    │
-         │                      │                            │──▶ App uploaded ──────────────────▶│
-         │                      │                            │                                    ├─ Internal testing
-         │                      │                            │                                    ├─ Alpha / Closed beta
-         │                      │                            │                                    ├─ Open beta
-         │                      │                            │                                    ├─ Submit for review
-         │                      │                            │                                    ├─ Phased rollout
-         │                      │                            │                                    │
+Developer     GitHub          CI (GitHub Actions / Bitrise / Xcode Cloud)      App Store / Play Store
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+   │-- push ──▶ │                  │                                                │
+   │            │── webhook ──────▶├─ install deps, lint, unit tests                │
+   │            │                  ├─ build archive / app bundle                    │
+   │            │                  ├─ sign (certs/keystore from secure storage)     │
+   │            │                  ├─ upload ──────────────────────────────────────▶├─ internal testing
+   │            │                  │                                                ├─ closed / open beta
+   │            │                  │                                                ├─ store review
+   │            │                  │                                                ├─ phased / staged rollout
 ```
+
+Mobile can't roll back: once installed, an old binary lives on users' devices. Hence staged rollouts, server-driven feature flags, and APIs that support several app versions at once.
 
 ---
 
 ### 2.4 Monolith Flow
 
 ```
-┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
-│  Dev   │──▶│  PR    │──▶│  CI    │──▶│ Build  │──▶│ Stage  │──▶│  Prod  │──▶│  Live  │
-│ Commit │   │ Review │   │  Test  │   │ Image  │   │ Deploy │   │Deploy  │   │  Site  │
-└────────┘   └────────┘   └────────┘   └────────┘   └────────┘   └────────┘   └────────┘
-                                                           │            │
-                                                     Manual approval   Blue-Green
+┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
+│  Dev   │──▶│  PR    │──▶│  CI    │──▶│ Build  │──▶│ Stage  │──▶│  Prod  │
+│ commit │   │ review │   │  test  │   │ image  │   │ deploy │   │ deploy │
+└────────┘   └────────┘   └────────┘   └────────┘   └────────┘   └────────┘
+                                                        │            │
+                                                 smoke/E2E tests  blue-green or canary
 ```
 
-**Key characteristics:**
-- Single pipeline for the entire application
-- One artifact (one Docker image) that contains everything
-- Longer build + test time (15-30+ min for large monoliths)
-- Rollback means reverting the entire application
-- Database migrations must be backward-compatible
+- One pipeline, one artifact; build and test time grow with the codebase (invest in caching and test selection).
+- Rollback reverts everything, including unrelated teams' changes in the same release.
+- Database migrations must be backward-compatible (expand-contract, [section 7](#7-monolith-architecture)).
 
 ---
 
 ### 2.5 Microservices Flow
 
-```
-Service A (Python FastAPI):
-┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
-│  CI    │──▶│ Build  │──▶│ Push   │──▶│ Deploy │──▶│  Live  │
-│  Test  │   │ Image  │   │ ECR    │   │ K8s    │   │ Service│
-└────────┘   └────────┘   └────────┘   └────────┘   └────────┘
-
-Service B (Go):
-┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
-│  CI    │──▶│ Build  │──▶│ Push   │──▶│ Deploy │──▶│  Live  │
-│  Test  │   │ Image  │   │ ECR    │   │ K8s    │   │ Service│
-└────────┘   └────────┘   └────────┘   └────────┘   └────────┘
-
-Service C (Java Spring Boot):
-┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐
-│  CI    │──▶│ Build  │──▶│ Push   │──▶│ Deploy │──▶│  Live  │
-│  Test  │   │ Image  │   │ ECR    │   │ K8s    │   │ Service│
-└────────┘   └────────┘   └────────┘   └────────┘   └────────┘
-
-Each service has its OWN independent pipeline. They deploy independently.
-```
-
-**Deploying a coordinated change across services:**
+Each service has its own pipeline and deploys independently:
 
 ```
-1. Developer commits changes to Service A and Service B in separate PRs
-2. Service A PR merges → CI builds → deploys Service A v2 (with backward-compatible API)
-3. Service B PR merges → CI builds → deploys Service B v2 (now calls Service A v2's new endpoint)
-4. Both services are updated without downtime because:
-   - Service A's new endpoint is additive (old + new both work)
-   - Service B's change only uses the new endpoint after Service A is confirmed healthy
+Service A (Python FastAPI):  CI test → build image → push → deploy (K8s) → live
+Service B (Go):              CI test → build image → push → deploy (K8s) → live
+Service C (Java Spring):     CI test → build image → push → deploy (K8s) → live
 ```
+
+**Coordinated change across services** (no lockstep deploys):
+
+```
+1. Service A adds the new endpoint/field additively (old and new both work) → deploy A
+2. Service B starts using it, behind a flag if risky → deploy B
+3. After all consumers moved, A removes the old endpoint in a later release
+```
+
+Contract tests (Pact) in each pipeline catch a provider change that would break a consumer before it ships.
 
 ---
 
 ### 2.6 Deployment Pipeline Visualization — Full Detail
 
-Here is what a complete GitHub Actions → Kubernetes pipeline looks like step by step:
-
 ```
-GitHub Repository                          GitHub Actions                         Kubernetes Cluster
-┌──────────────────────┐              ┌────────────────────────────┐         ┌──────────────────────────┐
-│                      │              │                            │         │                          │
-│  main branch         │──push────▶   │  Job 1: Test               │         │  ┌──────────────────┐    │
-│  ┌────────────────┐  │              │  ├── Checkout code         │         │  │  Namespace: prod  │    │
-│  │ backend/main.py │  │              │  ├── pip install          │         │  │                   │    │
-│  │ frontend/       │  │              │  ├── pytest               │         │  │  Service: myapp   │    │
-│  │ Dockerfile      │  │              │  └── Upload coverage      │         │  │  ┌─────────────┐  │    │
-│  │ deploy.yml      │  │              │                            │         │  │  │ Pod (v2)    │  │    │
-│  └────────────────┘  │              │  Job 2: Build & Push       │         │  │  │ image: v2   │  │    │
-│                      │              │  ├── Docker build -t v2    │         │  │  │ ready: yes   │  │    │
-│  PR #123             │              │  ├── Docker push to ECR    │         │  │  └─────────────┘  │    │
-│  feat/add-payment    │              │  └── Tag image: v2         │         │  │  ┌─────────────┐  │    │
-│  (awaiting review)   │              │                            │         │  │  │ Pod (v1)    │  │    │
-│                      │              │  Job 3: Deploy             │         │  │  │ image: v1   │  │    │
-│  ✓ lint passes       │              │  ├── kubectl set image     │──────▶  │  │  │ draining    │  │    │
-│  ✓ tests pass        │              │  ├── kubectl rollout status│         │  │  └─────────────┘  │    │
-│  ✓ 2 approvals       │              │  ├── kubectl get pods      │         │  │                   │    │
-│                      │              │  └── Health check: pass    │         │  │  Ingress ──▶ Users │    │
-└──────────────────────┘              └────────────────────────────┘         └──────────────────────────┘
+GitHub repository                    GitHub Actions                       Kubernetes cluster
+┌──────────────────────┐        ┌────────────────────────────┐       ┌──────────────────────────┐
+│ main branch          │─push──▶│ Job 1: test                │       │ Namespace: prod          │
+│  backend/  Dockerfile│        │  ├─ checkout, install      │       │  Service: myapp          │
+│                      │        │  ├─ lint, unit tests       │       │  ┌────────────────────┐  │
+│ PR #123 (merged)     │        │  └─ upload coverage        │       │  │ Pod (v2) ready     │  │
+│  ✓ checks pass       │        │ Job 2: build               │       │  └────────────────────┘  │
+│  ✓ 2 approvals       │        │  ├─ docker build + push    │       │  ┌────────────────────┐  │
+│                      │        │  └─ attest provenance      │       │  │ Pod (v1) draining  │  │
+│                      │        │ Job 3: deploy (env: prod)  │──────▶│  └────────────────────┘  │
+│                      │        │  ├─ OIDC → cloud role      │       │  Ingress/Gateway ─▶ users│
+│                      │        │  ├─ set image by digest    │       │                          │
+│                      │        │  └─ rollout status         │       │                          │
+└──────────────────────┘        └────────────────────────────┘       └──────────────────────────┘
 ```
 
 ---
 
 ### 2.7 Artifact Promotion Across Environments
 
-Every artifact goes through a promotion pipeline where it is validated at each stage before progressing:
-
 ```
-Commit: abc1234
-               
-Build: myapp:abc1234
+Commit abc1234 → Build ghcr.io/acme/myapp@sha256:9f2c... (one artifact)
    │
    ▼
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │  Dev        │────▶│  Staging    │────▶│  Canary     │────▶│  Production │
-│             │     │             │     │             │     │             │
-│ Auto-deploy │     │ Auto-deploy │     │ 5% traffic  │     │ 100% traffic│
-│ on merge    │     │ smoke tests │     │ monitored   │     │ full rollout│
+│ auto-deploy │     │ auto-deploy │     │ 5-10% of    │     │ 100%        │
+│ on merge    │     │ smoke + E2E │     │ traffic     │     │             │
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
       │                    │                    │                    │
-      │                    │                    │                    │
-      ▼                    ▼                    ▼                    ▼
-  Unit tests           E2E tests           Metrics check        Alert threshold
-  Integration tests    Performance tests   Error budget         Monitoring
+  unit/integration     E2E, performance    automated analysis:   SLO burn-rate
+  tests                tests               error rate, latency   alerts
 ```
+
+Promotion means changing *which digest an environment runs* (a Git commit in a GitOps repo, or a deploy job input), never rebuilding.
 
 ---
 
@@ -398,45 +325,43 @@ Build: myapp:abc1234
   <em>🎬 Animated Sequence — Artifact Promotion — Dev → Staging → Canary → Production with validation gates. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
-
-
-The end-to-end flow is the same pattern repeated across all project types:
-
 > **Code → Commit → CI (Test) → Build (Artifact) → CD (Promote) → Production (Serve)**
 
-The differences are only in the specific tools and artifacts:
-- Frontend: `npm build` → `dist/` → S3/CDN
-- Backend: `docker build` → image → Kubernetes
-- Mobile: `xcodebuild` → `.ipa` → TestFlight → App Store
+Only the tools and artifacts differ:
+
+- Frontend: `npm run build` → `dist/` → object storage + CDN
+- Backend: `docker build` → image digest → Kubernetes / ECS / Cloud Run
+- Mobile: `xcodebuild` / Gradle → `.ipa` / `.aab` → TestFlight / Play tracks → store
 
 ---
 
 ## 3. Deployment Strategies
 
-| Strategy | Mechanism | Zero-Downtime | Rollback Speed | Risk |
-|----------|-----------|:---:|:---:|:---:|
-| **Rolling Update** | Replace instances gradually | ✅ | Slow | Low |
-| **Blue-Green** | Two identical environments, switch traffic | ✅ | Instant | Very Low |
-| **Canary Release** | Route small % of traffic to new version | ✅ | Instant | Very Low |
-| **Shadow/Mirroring** | Send real traffic to both, ignore new response | ✅ | N/A | None |
-| **Recreate** | Kill all old, start all new | ❌ | Fast | High |
-| **Feature Flag** | Deploy code disabled, toggle on per-rollout | ✅ | Instant | Very Low |
+!!! tip "30-second answer"
+    **Rolling** replaces instances gradually; cheap, the default in Kubernetes, but old and new versions serve together and rollback is another rollout. **Blue-green** runs a full second environment and flips traffic; instant rollback but double capacity during the switch. **Canary** sends a small, growing share of real traffic to the new version and promotes or aborts based on metrics; the best risk/cost balance and the basis of **progressive delivery** (Argo Rollouts, Flagger). **Feature flags** decouple deploy from release. Every strategy except recreate requires that two versions can run at once, which constrains your database and API changes.
+
+| Strategy | Mechanism | Zero downtime | Rollback | Main cost / risk |
+|----------|-----------|:---:|:---:|---|
+| **Rolling update** | Replace instances in batches (`maxSurge`/`maxUnavailable`) | ✅ | Minutes (roll back = roll forward to old version) | Mixed versions during rollout; bad version reaches everyone eventually |
+| **Blue-green** | Two full environments, switch the router | ✅ | Seconds (flip back) | 2× capacity during switch; shared DB must suit both |
+| **Canary** | Small % of traffic to new version, increase on healthy metrics | ✅ | Seconds (route back to stable) | Needs traffic splitting and good metrics; low-traffic services give weak signal |
+| **Shadow / mirroring** | Copy live requests to new version, discard its responses | ✅ | Not applicable (no user impact) | **Side effects:** mirrored writes, emails, payments must be stubbed; doubles load |
+| **Recreate** | Stop all old, start all new | ❌ | Redeploy | Downtime; only when versions can't coexist |
+| **Feature flag** | Deploy code dark, enable per user/segment | ✅ | Instant (flag off) | Flag debt; combinatorial testing; flag service is a dependency |
 
 ### Blue-Green Deployment
 
 ```
        ┌─────────────┐     ┌─────────────┐
-Users ─▶│  Load       │────▶│   Blue      │ (v1 — active)
-       │  Balancer   │     └─────────────┘
+Users ─▶│ Load        │────▶│   Blue      │ (v1 — live)
+       │ balancer    │     └─────────────┘
        └─────────────┘     ┌─────────────┐
-                           │   Green     │ (v2 — idle)
+                           │   Green     │ (v2 — deployed, smoke-tested, idle)
                            └─────────────┘
 
-Switch: Update load balancer to route to Green.
-Rollback: Switch back to Blue.
+Switch:   point the LB/DNS/Service selector at Green
+Rollback: point it back at Blue (keep Blue running until confident)
 ```
-
-### Canary Release
 
 ### 🎬 Animated Sequence Diagram
 <p align="center">
@@ -448,17 +373,17 @@ Rollback: Switch back to Blue.
   <em>🎬 Animated Sequence — Blue-Green Deployment — Two identical environments with instant switch and rollback. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
+Pitfalls: DNS-based switches are slow and uneven because of client caching; long-lived connections (WebSockets, gRPC streams) stay on Blue until they reconnect; and the database is shared, so the switch doesn't roll back schema changes.
 
+### Canary Release
 
 ```
-Users ─▶ Load Balancer ──── 90% ──▶ Old Version (v1)
-                           └── 10% ──▶ New Version (v2)
+Users ─▶ Router ──── 95% ──▶ stable (v1)
+                └──── 5% ──▶ canary (v2)
 
-Monitor metrics for 10% canary. If healthy → 25% → 50% → 100%.
-If degraded → rollback instantly.
+Each step: hold, compare canary vs stable (error rate, p99 latency, saturation, business KPIs).
+Healthy → 25% → 50% → 100%.  Degraded → route 100% back to stable automatically.
 ```
-
-### Feature Flags (Feature Toggles)
 
 ### 🎬 Animated Sequence Diagram
 <p align="center">
@@ -470,20 +395,93 @@ If degraded → rollback instantly.
   <em>🎬 Animated Sequence — Canary Release — Progressive traffic shift with metric-based gates. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
+**Progressive delivery** automates this loop. With **Argo Rollouts**, a `Rollout` replaces the `Deployment` and an `AnalysisTemplate` defines the metric gate:
 
-
-```javascript
-// Code is deployed but feature is off
-if (featureFlags.isEnabled('new-checkout-flow')) {
-  // New implementation
-} else {
-  // Old implementation
-}
-
-// Toggle on via dashboard → no redeploy needed
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: checkout
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      containers:
+        - name: checkout
+          image: ghcr.io/acme/checkout:1.4.2
+          ports:
+            - containerPort: 8080
+  strategy:
+    canary:
+      stableService: checkout-stable
+      canaryService: checkout-canary
+      trafficRouting:
+        istio:
+          virtualService:
+            name: checkout
+            routes:
+              - primary
+      analysis:                    # background analysis from step 1 onwards
+        templates:
+          - templateName: success-rate
+        startingStep: 1
+        args:
+          - name: service
+            value: checkout-canary
+      steps:
+        - setWeight: 5
+        - pause: { duration: 10m }
+        - setWeight: 25
+        - pause: { duration: 10m }
+        - setWeight: 50
+        - pause: { duration: 10m }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+spec:
+  args:
+    - name: service
+  metrics:
+    - name: success-rate
+      interval: 1m
+      failureLimit: 2              # abort and roll back after 2 failed measurements
+      successCondition: result[0] >= 0.99
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(http_requests_total{service="{{args.service}}", status!~"5.."}[2m]))
+            /
+            sum(rate(http_requests_total{service="{{args.service}}"}[2m]))
 ```
 
-**Tools:** LaunchDarkly, Split.io, Flagsmith, OpenFeature
+**Flagger** does the same with an operator that watches ordinary Deployments and drives Istio, Linkerd, Gateway API, NGINX or App Mesh-style routing. Pick one; both integrate with Argo CD/Flux.
+
+Canary pitfalls: low-traffic services don't produce statistically meaningful error rates in 10 minutes (use longer steps or synthetic traffic); sticky sessions and caches skew comparisons; and a canary that writes incompatible data has already done damage before it's rolled back.
+
+### Feature Flags (Feature Toggles)
+
+```javascript
+// Deployed dark; released by changing the flag, not by deploying
+const enabled = await flags.getBooleanValue('new-checkout-flow', false, { targetingKey: user.id });
+if (enabled) {
+  renderNewCheckout();
+} else {
+  renderOldCheckout();
+}
+```
+
+- **Release flags** (temporary; delete after rollout), **ops/kill switches** (long-lived), **experiment flags** (A/B), **permission flags** (entitlements). Treat release flags as debt with an expiry date.
+- Evaluate flags locally from a cached ruleset so a flag-service outage doesn't take you down, and define safe defaults.
+- **Tools:** LaunchDarkly, Harness FME (formerly Split), Flagsmith, Unleash, GrowthBook, cloud-native options (AWS AppConfig). **OpenFeature** (CNCF) is the vendor-neutral SDK API in front of any of them, as in the snippet above.
 
 ---
 
@@ -491,209 +489,234 @@ if (featureFlags.isEnabled('new-checkout-flow')) {
 
 ### React / Next.js / Vue / Angular
 
-**Typical Pipeline:**
+**Typical pipeline:**
 
 ```
-1. Install dependencies    npm ci / yarn install --frozen-lockfile
-2. Lint & type-check       npm run lint / tsc --noEmit
-3. Unit tests              npm test -- --coverage
-4. Build                   npm run build (produces dist/ or .next/)
-5. Analyze bundle          npx source-map-explorer dist/*.js
-6. Upload artifacts        Upload to CDN / S3 / CloudFront
-7. Invalidate cache        Purge CDN cache for new assets
-8. E2E tests               npx playwright test
-9. Deploy                  Update S3 + invalidate CloudFront
+1. Install          npm ci                      (exact lockfile install)
+2. Lint & types     npm run lint && tsc --noEmit
+3. Unit tests       npm test -- --coverage
+4. Build            npm run build               (dist/ or .next/)
+5. E2E              npx playwright test         (against a preview deployment)
+6. Upload assets    content-hashed files, Cache-Control: max-age=31536000, immutable
+7. Upload HTML      index.html with Cache-Control: no-cache
+8. Invalidate       CDN invalidation for HTML paths only
 ```
-
-**Key Considerations:**
 
 | Concern | Solution |
 |----------|----------|
-| **Cache busting** | Content-hashed filenames (`app.a1b2c3.js`) |
-| **CDN distribution** | CloudFront, Cloudflare, Fastly, Akamai |
-| **SSR/SSG (Next.js)** | Deploy to Vercel, or self-host with Node.js + Docker |
-| **Environment config** | Runtime env vars (not build-time) for different stages |
-| **Preview deployments** | Vercel/Netlify PR previews, or GitHub Pages for docs |
-| **Static vs SPA** | SPA needs fallback to `index.html` for client-side routing |
+| **Cache busting** | Content-hashed filenames (`app.a1b2c3.js`), immutable caching; HTML never long-cached |
+| **CDN** | CloudFront, Cloudflare, Fastly, Akamai |
+| **SSR (Next.js, Nuxt)** | It's a server: deploy as a container or to a platform (Vercel, Netlify, AWS Amplify, Cloudflare); needs the same rollout care as a backend |
+| **Environment config** | Build once; inject runtime config (`/config.json` or server-rendered values) rather than baking per-env builds |
+| **Preview deployments** | Per-PR environments (Vercel/Netlify or your own) for review and E2E |
+| **SPA routing** | Fall back to `index.html` for unknown paths (CDN custom error response or edge function) |
+| **Rollback** | Re-point to the previous build's HTML; keep old hashed assets |
 
-**Example GitHub Actions Workflow (React):**
+**Example GitHub Actions workflow (static SPA to S3 + CloudFront):**
 
 ```yaml
-name: Deploy Frontend
+name: frontend
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
-          cache: 'npm'
-
+          node-version: 24
+          cache: npm
       - run: npm ci
       - run: npm run lint
       - run: npm test -- --coverage
       - run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
 
-      - name: Deploy to S3
-        run: aws s3 sync dist/ s3://${{ secrets.S3_BUCKET }}
-
-      - name: Invalidate CloudFront
-        run: aws cloudfront create-invalidation --distribution-id ${{ secrets.CF_DIST_ID }} --paths "/*"
+  deploy:
+    if: github.event_name == 'push'      # never deploy from pull requests
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write                    # OIDC: no stored AWS keys
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Upload hashed assets (long cache)
+        run: >
+          aws s3 sync dist/ "s3://${{ vars.S3_BUCKET }}/"
+          --exclude "index.html"
+          --cache-control "public,max-age=31536000,immutable"
+      - name: Upload HTML last (no cache)
+        run: >
+          aws s3 cp dist/index.html "s3://${{ vars.S3_BUCKET }}/index.html"
+          --cache-control "no-cache"
+      - name: Invalidate HTML
+        run: >
+          aws cloudfront create-invalidation
+          --distribution-id "${{ vars.CF_DISTRIBUTION_ID }}"
+          --paths "/index.html" "/"
 ```
 
 ---
 
 ## 5. Backend Deployment by Language
 
-### 4.1 Node.js / TypeScript
+Common rules for every Dockerfile below: multi-stage builds, pinned base images (by digest in production), dependencies copied before source for layer caching, run as a **non-root** user, and nothing from the build toolchain in the runtime image.
 
-**Build & Package:**
+### 5.1 Node.js / TypeScript
+
 ```dockerfile
-FROM node:20-alpine AS builder
+FROM node:24-slim AS deps
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev                 # production dependencies only
+
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci                            # dev deps needed to compile
 COPY . .
 RUN npm run build
 
-FROM node:20-alpine AS runner
+FROM node:24-slim
+ENV NODE_ENV=production
 WORKDIR /app
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY package*.json ./
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json ./
+USER node
 EXPOSE 3000
 CMD ["node", "dist/main.js"]
 ```
 
-**Pipeline:**
-```
-npm ci → lint → test (jest/mocha) → build (tsc) → docker build → push → deploy
-```
+**Pipeline:** `npm ci → lint → test (Vitest/Jest) → build (tsc) → docker build → push → deploy`
 
-**Framework-specific:**
-- **Express/Fastify:** Standard Docker + reverse proxy (nginx)
-- **NestJS:** Builds to `dist/`, same Docker pattern
-- **Serverless:** Use `serverless` framework, deploy to AWS Lambda / Vercel Functions
+- Node.js 20 reached end of life in April 2026; use an active LTS (22 or 24).
+- `CMD ["node", ...]` (exec form) makes Node PID 1 so it receives SIGTERM; handle it to drain connections.
+- Express/Fastify/NestJS all follow the same pattern. Serverless targets (AWS Lambda, Vercel Functions) deploy bundles instead of images.
 
-### 4.2 Python (FastAPI / Django / Flask)
+### 5.2 Python (FastAPI / Django / Flask)
 
-**Build & Package:**
 ```dockerfile
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS build
 WORKDIR /app
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
 COPY . .
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 
-# Multi-stage: smaller runtime image
-FROM python:3.12-slim
-WORKDIR /app
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /app /app
+FROM python:3.14-slim
+RUN useradd --create-home --uid 10001 app
+COPY --from=build /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1
+USER app
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "myapp.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-**Pipeline:**
-```
-pip install → lint (ruff/flake8) → type-check (mypy) → test (pytest) → build wheel → docker build → push → deploy
-```
+Copying a **virtualenv** carries both packages and their console scripts (`uvicorn`, `gunicorn`); copying only `site-packages` from the system interpreter leaves the entry-point scripts behind and the container fails to start. `uv` (`uv sync --frozen`) is a much faster drop-in for the install steps.
 
-**Framework-specific:**
-- **FastAPI:** Uvicorn/Gunicorn, auto-generated OpenAPI docs benefit staging review
-- **Django:** `python manage.py migrate` must run as pre-deploy hook, collectstatic for assets
-- **Flask:** Simple WSGI with Gunicorn + nginx
+**Pipeline:** `install (uv/pip) → lint (ruff) → type-check (mypy/pyright) → test (pytest) → build wheel → docker build → push → deploy`
 
-**Database Migrations (Django):**
+- **FastAPI:** Uvicorn workers (or Gunicorn with Uvicorn workers); scale with replicas rather than many workers per pod.
+- **Django:** run `python manage.py migrate` as a separate, single-run step before the new pods take traffic (a Kubernetes Job, Helm pre-upgrade hook, or Argo CD PreSync hook), never in every container's entrypoint, where replicas race. `collectstatic` belongs in the image build.
+- **Flask:** Gunicorn behind a reverse proxy.
+
 ```yaml
-# Pre-deploy step — run before traffic switch
+# Pre-deploy step in a pipeline (runs once, before traffic shifts)
 - name: Run migrations
   run: python manage.py migrate --noinput
 ```
 
-### 4.3 Go
+### 5.3 Go
 
-**Build & Package:**
 ```dockerfile
-FROM golang:1.22 AS builder
-WORKDIR /app
+FROM golang:1.26 AS build
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
-COPY --from=builder /app/server /server
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/server /server
 EXPOSE 8080
-CMD ["/server"]
+USER nonroot:nonroot
+ENTRYPOINT ["/server"]
 ```
 
-**Pipeline:**
-```
-go mod download → lint (golangci-lint) → test (go test -race) → build → docker build (scratch/alpine) → push → deploy
-```
+**Pipeline:** `go mod download → lint (golangci-lint) → go vet → go test -race → build → docker build → push → deploy`
 
-**Key advantages:**
-- Single binary — no runtime dependencies
-- Builds to `scratch` or `alpine` — tiny images (~5-15MB)
-- Fast compile times
-- Native cross-compilation: `GOOS=linux GOARCH=arm64 go build`
+- Static binary: no runtime needed, so `distroless/static` or `scratch` images are a few MB. Distroless includes CA certificates and timezone data; `scratch` doesn't.
+- Cross-compilation is built in: `GOOS=linux GOARCH=arm64 go build`. Use `docker buildx` for multi-arch images (amd64 + arm64 for Graviton/Ampere nodes).
 
-### 4.4 Java / Spring Boot
+### 5.4 Java / Spring Boot
 
-**Build & Package:**
 ```dockerfile
-FROM maven:3.9-eclipse-temurin-21 AS builder
+FROM maven:3.9-eclipse-temurin-25 AS build
 WORKDIR /app
 COPY pom.xml .
-RUN mvn dependency:go-offline
+RUN mvn -B dependency:go-offline
 COPY src ./src
-RUN mvn package -DskipTests
+RUN mvn -B package -DskipTests       # tests ran in an earlier CI job
 
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:25-jre
+RUN useradd --uid 10001 app
 WORKDIR /app
-COPY --from=builder /app/target/*.jar app.jar
+COPY --from=build /app/target/*.jar app.jar
+USER app
 EXPOSE 8080
-CMD ["java", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]
 ```
 
-**Pipeline:**
-```
-mvn compile → test → package → docker build → push → deploy
-```
+**Pipeline:** `mvn verify (compile + unit + integration tests) → package → docker build → push → deploy`
 
-**Key considerations:**
-- **JVM tuning:** `-Xms`, `-Xmx`, GC flags per environment
-- **GraalVM Native Image:** Smaller images, faster startup (good for serverless/K8s)
-- **Build time:** Maven/Gradle caching is critical for CI speed
-- **Health checks:** Spring Boot Actuator endpoints (`/actuator/health`)
+- **Memory:** the JVM is container-aware; size the heap as a percentage of the container limit (`MaxRAMPercentage`) instead of hard-coding `-Xmx` per environment.
+- **Startup time** affects rollout speed and autoscaling: Spring Boot layered jars or Jib for better caching, CDS/AOT cache (Project Leyden features in JDK 24+), or GraalVM Native Image for fast-start services.
+- **Health:** Spring Boot Actuator exposes liveness and readiness groups (`/actuator/health/liveness`, `/actuator/health/readiness`); wire them to Kubernetes probes, and enable graceful shutdown (`server.shutdown=graceful`).
+- Java 25 is the current LTS (September 2025); 21 is the previous one.
 
-### 4.5 Rust
+### 5.5 Rust
 
 ```dockerfile
-FROM rust:1.77 AS builder
+FROM rust:1 AS build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release  # Cache dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release        # caches compiled dependencies in this layer
 COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/myapp /myapp
+FROM debian:trixie-slim
+RUN useradd --uid 10001 app
+COPY --from=build /app/target/release/myapp /usr/local/bin/myapp
+USER app
 EXPOSE 8080
-CMD ["/myapp"]
+CMD ["myapp"]
 ```
+
+The runtime image must have a glibc at least as new as the build image's; the `rust:1` image tracks current Debian, so pair it with the same Debian release (or build a static musl binary for `scratch`/distroless). `cargo-chef` is a more robust way to cache dependency builds than the dummy-`main.rs` trick.
 
 ---
 
@@ -701,55 +724,49 @@ CMD ["/myapp"]
 
 ### iOS (Swift / SwiftUI / UIKit)
 
-**Pipeline:**
 ```
-1. Install dependencies    bundle install && pod install / SPM resolve
-2. Lint & analyze          swiftlint / SwiftLint
-3. Unit tests              xcodebuild test -scheme App
-4. UI tests                xcodebuild test -scheme AppUITests -destination
-5. Archive                 xcodebuild archive -scheme App
-6. Export IPA              xcodebuild -exportArchive
-7. Upload to TestFlight    xcrun altool --upload-app
-8. Submit for review       App Store Connect API
-9. Promote to production   Manual approval → release
+1. Dependencies       Swift Package Manager resolve (or CocoaPods for legacy projects)
+2. Lint               SwiftLint
+3. Unit tests         xcodebuild test -scheme App -destination 'platform=iOS Simulator,name=iPhone 16'
+4. UI tests           xcodebuild test -scheme AppUITests -destination ...
+5. Archive            xcodebuild archive -scheme App -archivePath build/App.xcarchive
+6. Export IPA         xcodebuild -exportArchive -exportOptionsPlist ExportOptions.plist
+7. Upload             fastlane pilot / App Store Connect API (or Xcode Cloud end to end)
+8. TestFlight         internal, then external testers
+9. Release            submit for review → phased release
 ```
 
-**Key Considerations:**
-- **Code signing:** Managed via Fastlane match + Apple Developer Portal
-- **TestFlight:** Internal/External testing before App Store release
-- **Phased release:** Roll out over 7 days to catch issues
-- **CI runners:** Mac mini/MacStadium runners required (GitHub Actions now offers macOS)
+- **Code signing:** certificates and provisioning profiles from a secure store (fastlane `match`, or Xcode Cloud's managed signing); authenticate to App Store Connect with an **API key**, not an Apple ID password.
+- **Phased release** spreads automatic updates over 7 days and can be paused; users can still update manually.
+- **Runners:** macOS runners (GitHub-hosted, Xcode Cloud, Bitrise, or self-hosted Macs).
 
-**Fastlane Example:**
 ```ruby
-lane :deploy do
-  match(type: "appstore")
-  gym(scheme: "App")
-  pilot(
-    app_identifier: "com.example.app",
-    beta_app_review_info: { contact_email: "team@example.com" }
+lane :beta do
+  app_store_connect_api_key(
+    key_id: ENV["ASC_KEY_ID"],
+    issuer_id: ENV["ASC_ISSUER_ID"],
+    key_content: ENV["ASC_KEY_CONTENT"]
   )
+  match(type: "appstore", readonly: true)
+  build_app(scheme: "App")
+  upload_to_testflight(skip_waiting_for_build_processing: true)
 end
 ```
 
 ### Android (Kotlin / Jetpack Compose)
 
-**Pipeline:**
 ```
 1. Lint                  ./gradlew lint
-2. Unit tests            ./gradlew testDebugUnitTest
-3. Build APK/Bundle      ./gradlew bundleRelease
-4. Sign release          (via gradle + keystore)
-5. Upload to Play Console  gradle publishReleaseBundle
-6. Internal testing track  → Alpha → Beta → Production
-7. Staged rollout          e.g., 5% → 20% → 100%
+2. Unit tests            ./gradlew testReleaseUnitTest
+3. Build bundle          ./gradlew bundleRelease          (.aab, R8 minification on)
+4. Sign                  upload key from CI secrets; Play App Signing holds the app signing key
+5. Upload                Gradle Play Publisher (publishReleaseBundle) or fastlane supply
+6. Tracks                internal → closed → open → production
+7. Staged rollout        e.g. 1% → 5% → 20% → 50% → 100%, halt on crash-rate regressions
 ```
 
-**Key Considerations:**
-- **App Bundle (.aab):** Preferred over APK for Play Store distribution
-- **ProGuard/R8:** Code obfuscation and minification enabled for release
-- **Google Play Console API:** Automate track promotion
-- **Testing tracks:** Internal → Closed Alpha → Open Beta → Production
+- **Android App Bundles (.aab)** are required for new apps on Google Play; Play generates optimised APKs per device.
+- Watch Android vitals (crash and ANR rates) between rollout steps; a staged rollout can be halted but not "undone" for users who already updated, so the fix is a new, higher version code.
 
 ---
 
@@ -757,51 +774,60 @@ end
 
 ### Characteristics
 
-- Single deployable unit (one binary/container)
-- Shared database
-- Tightly coupled modules
+- Single deployable unit (one binary or image), usually one shared database
+- Modules coupled in-process; refactoring is easy, independent release isn't
 
 ### CI/CD Strategy
 
-```yaml
-Pipeline:
-  ├── Pre-commit hooks (lint, format)
-  ├── CI (per branch):
-  │   ├── Lint + Type-check
-  │   ├── Unit tests
-  │   ├── Build (compile + Docker)
-  │   └── Integration tests
-  ├── Staging (on merge to main):
-  │   ├── Deploy to staging environment
-  │   ├── Smoke tests
-  │   └── E2E tests
-  └── Production (on release tag):
-      ├── Deploy → Blue-Green or Rolling
-      ├── Health checks
-      └── Monitoring alert
+```
+Pipeline
+├── Pre-commit hooks (format, lint, secret scan)
+├── CI on every PR
+│   ├── lint + type-check
+│   ├── unit tests (parallelised, sharded)
+│   ├── build image
+│   └── integration tests (Testcontainers)
+├── Staging (on merge to main)
+│   ├── deploy
+│   └── smoke + E2E tests
+└── Production (on release, or continuously)
+    ├── blue-green or canary
+    ├── health checks and automated analysis
+    └── monitoring and alerts
 ```
 
 ### Database Migrations
 
-**Expand-Contract Pattern (Backward-Compatible):**
+!!! tip "30-second answer"
+    During any non-recreate rollout, old and new code run against the same database, so every schema change must work with **both**. Use **expand → migrate → contract** across separate releases, run migrations once as their own step (not in every pod), make them online (no long table locks), and remember that you can roll back code but rarely data, so prefer rolling forward.
+
+**Expand-contract example: renaming `users.name` to `users.full_name`:**
 
 ```sql
--- Phase 1 (Expand): Add new column, keep old
-ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT FALSE;
+-- Release 1 (expand): add the new column; app writes BOTH columns, reads old
+ALTER TABLE users ADD COLUMN full_name TEXT;
 
--- Phase 2 (Migrate): Backfill data in background
-UPDATE users SET email_verified = ...;
+-- Background job (migrate): backfill in small batches to avoid long locks
+UPDATE users SET full_name = name
+WHERE id IN (
+  SELECT id FROM users WHERE full_name IS NULL LIMIT 10000
+);
+-- repeat until no rows remain
 
--- Phase 3 (Contract): Remove old column (next release)
-ALTER TABLE users DROP COLUMN email_verified_legacy;
+-- Release 2: app reads full_name, still writes both (safe to roll back to release 1)
+
+-- Release 3 (contract): app stops writing name; then drop it
+ALTER TABLE users DROP COLUMN name;
 ```
+
+Operational details: in PostgreSQL, create indexes with `CREATE INDEX CONCURRENTLY`, add `NOT NULL` via a `CHECK ... NOT VALID` constraint validated later, and set a short `lock_timeout` so a migration waiting on a lock doesn't queue all traffic behind it. Tools like gh-ost/pt-online-schema-change (MySQL) or pgroll (PostgreSQL) automate online changes.
 
 ### Production Concerns
 
-- **Build time:** Large monoliths can take 15-30+ minutes to build — invest in caching
-- **Test time:** Parallel test execution, test splitting, and selective test execution
-- **Rollback complexity:** Single rollback affects entire application
-- **Scaling:** Scale entire app (vertical scaling) or run multiple instances behind LB
+- **Build and test time:** remote build caching (Gradle/Bazel), test sharding, and running only tests affected by the change.
+- **Release coordination:** many teams in one artifact → release trains or, better, trunk-based with flags.
+- **Rollback scope:** one rollback reverts everyone's changes; feature flags let you disable one feature instead.
+- **Scaling:** scale the whole app horizontally behind a load balancer; heavy modules can't scale independently.
 
 ---
 
@@ -809,101 +835,116 @@ ALTER TABLE users DROP COLUMN email_verified_legacy;
 
 ### Characteristics
 
-- Multiple independently deployable services
-- Each service owns its data/database
-- Communicate via APIs (REST/gRPC/messaging)
-- Polyglot — different services can use different languages
+- Independently deployable services, each owning its data
+- Communicate via APIs (REST/gRPC) and events (Kafka, SNS/SQS)
+- Polyglot where justified; a shared platform (golden paths) keeps 50 pipelines from becoming 50 snowflakes
 
 ### CI/CD Strategy
 
-```yaml
-Per-Service Pipeline (independent):
-  ├── CI: Lint → Test → Build → Docker Image → Push to Registry
-  ├── CD:
-  │   ├── Deploy to staging (namespace per PR/branch)
-  │   ├── Integration tests (contract tests via Pact)
-  │   └── Deploy to production via GitOps (ArgoCD)
+```
+Per-service pipeline (independent)
+├── CI: lint → test → contract tests (Pact) → build image → sign/attest → push
+└── CD:
+    ├── preview environment per PR (namespace or vcluster)
+    ├── staging via GitOps (Argo CD / Flux)
+    └── production via GitOps + progressive delivery (Argo Rollouts / Flagger)
 
-Shared Platform Pipeline:
-  ├── Infrastructure-as-Code (Terraform/Pulumi)
-  ├── Kubernetes manifests
-  ├── Service mesh config (Istio/Linkerd)
-  └── Monitoring & alerting rules
+Shared platform pipelines
+├── Infrastructure as code (Terraform/OpenTofu, Pulumi, Crossplane)
+├── Cluster add-ons and policies (Kyverno/Gatekeeper)
+├── Service mesh / Gateway API config
+└── Monitoring and alerting rules
 ```
 
-### GitOps with ArgoCD
+Reusable pipeline templates (GitHub reusable workflows, GitLab CI components) give every service the same security scanning, provenance and deployment steps; teams supply parameters, not pipelines.
+
+### GitOps with Argo CD
 
 ```
-                      ┌─────────────────┐
-                      │   Git Repository │
-                      │ (manifests repo) │
-                      └────────┬────────┘
-                               │ watch / sync
-                               ▼
-                      ┌─────────────────┐
-                      │    ArgoCD        │
-                      │  (in-cluster)    │
-                      └────────┬────────┘
-                               │ apply
-                               ▼
-                      ┌─────────────────┐
-                      │  Kubernetes     │
-                      │  Cluster        │
-                      └─────────────────┘
+            ┌──────────────────────┐
+  CI ──────▶│ Git: env manifests   │  (CI commits new image digest, or Argo CD Image Updater does)
+            │ (Helm/Kustomize)     │
+            └──────────┬───────────┘
+                       │ pull, diff, sync
+                       ▼
+            ┌──────────────────────┐
+            │ Argo CD (in cluster) │  detects and reverts drift (self-heal)
+            └──────────┬───────────┘
+                       │ apply
+                       ▼
+            ┌──────────────────────┐
+            │ Kubernetes cluster   │
+            └──────────────────────┘
 ```
+
+Why GitOps: the cluster pulls desired state, so CI needs no cluster credentials; Git history is the deployment audit log; rollback is `git revert`; drift is visible and corrected. Trade-offs: secrets need a separate solution (External Secrets Operator, Sealed Secrets, SOPS), and "deploy succeeded" now means "Argo CD synced and the app is healthy", which pipelines must wait for if they run post-deploy tests.
 
 ### Service Mesh (Istio) for Deployments
 
 ```yaml
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: user-service
+spec:
+  host: user-service
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+---
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: user-service
 spec:
   hosts:
-  - user-service
+    - user-service
   http:
-  - match:
-    - headers:
-        x-canary:
-          exact: "true"
-    route:
-    - destination:
-        host: user-service
-        subset: v2
-      weight: 100
-  - route:
-    - destination:
-        host: user-service
-        subset: v1
-      weight: 90
-    - destination:
-        host: user-service
-        subset: v2
-      weight: 10
+    - name: canary-header         # testers opt in with a header
+      match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: user-service
+            subset: v2
+    - name: primary               # everyone else: weighted split
+      route:
+        - destination:
+            host: user-service
+            subset: v1
+          weight: 90
+        - destination:
+            host: user-service
+            subset: v2
+          weight: 10
 ```
+
+Hand-editing weights is how you start; in production let Argo Rollouts or Flagger own them. The Kubernetes **Gateway API** `HTTPRoute` supports the same weighted `backendRefs` and header matches without mesh-specific CRDs, and is the direction most ingress and mesh projects are converging on.
 
 ### Inter-Service Testing
 
 | Test Type | Tool | Purpose |
 |-----------|------|---------|
-| **Contract tests** | Pact, Spring Cloud Contract | Verify API compatibility between services |
-| **Integration tests** | Testcontainers | Test against real dependencies |
-| **E2E tests** | Playwright, Cypress | Full system validation |
-| **Chaos engineering** | Chaos Mesh, Litmus | Test resilience under failure |
+| **Contract tests** | Pact, Spring Cloud Contract | Consumer expectations verified against the provider in the provider's pipeline |
+| **Integration tests** | Testcontainers | Real databases and brokers in CI |
+| **E2E tests** | Playwright, Cypress | A few critical user journeys; expensive and flaky at scale |
+| **Chaos engineering** | Chaos Mesh, LitmusChaos, AWS FIS | Verify resilience under failure |
 
 ### Production Deployment Steps
 
 ```
-1. Build service A (new version)
-2. Run unit + integration tests for service A
-3. Run contract tests (service A producer, consumers validate)
-4. Deploy service A to staging
-5. Run smoke + E2E tests
-6. Deploy service A to production with canary (10%)
-7. Monitor metrics (latency, errors, CPU, memory)
-8. Gradual rollout: 25% → 50% → 100%
-9. If healthy → mark complete; if degraded → rollback
+1. Build service A (new version), unit + integration tests
+2. Contract tests: A's provider verification against all consumers' pacts ("can-i-deploy")
+3. Deploy A to staging via GitOps; smoke + E2E tests
+4. Production: canary 5% with automated analysis (error rate, p99, saturation vs stable)
+5. Promote 25% → 50% → 100% if healthy; automatic abort and rollback if not
+6. Post-deploy: SLO burn-rate alerts watch the full rollout
 ```
 
 ---
@@ -913,13 +954,16 @@ spec:
 ### GitHub Actions
 
 ```yaml
-name: CI/CD
+name: ci-cd
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -930,186 +974,250 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           POSTGRES_DB: test
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
-          cache: 'pip'
-      - run: pip install -r requirements.txt
-      - run: pip install -r requirements-dev.txt
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: ruff check .
       - run: mypy .
       - run: pytest --cov --cov-report=xml
-      - uses: codecov/codecov-action@v3
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+      - uses: codecov/codecov-action@v7
 
-  build-and-push:
+  build:
     needs: test
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write          # sign the attestation with the workflow's OIDC identity
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
+      - id: push
+        uses: docker/build-push-action@v7
         with:
+          context: .
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/attest@v4          # SLSA build provenance for the image digest
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
   deploy:
-    needs: build-and-push
+    needs: build
     runs-on: ubuntu-latest
-    environment: production
+    environment: production              # required reviewers / wait timer live here
+    permissions:
+      contents: read
+      id-token: write                    # OIDC → AWS role, no stored keys
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v3
-      - run: |
-          kubectl set image deployment/myapp \
-            myapp=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: azure/setup-kubectl@v5
+      - run: aws eks update-kubeconfig --name prod-cluster --region us-east-1
+      - name: Deploy by digest and wait
+        run: |
+          kubectl -n prod set image deployment/myapp \
+            myapp=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+          kubectl -n prod rollout status deployment/myapp --timeout=10m
 ```
+
+Notes on what makes this production-grade:
+
+- **Least-privilege `GITHUB_TOKEN`**: read-only by default, write scopes granted per job.
+- **OIDC to the cloud** (`id-token: write` + `configure-aws-credentials`): the AWS role's trust policy should pin `sub` to `repo:<org>/<repo>:environment:production`, so only this repo's production environment can deploy.
+- **Deploy by digest**, not a mutable tag, so what was tested is what runs.
+- **Provenance:** `actions/attest` produces a signed SLSA build provenance attestation for the image digest (verifiable with `gh attestation verify`). This meets **SLSA Build Level 2**; building in a reusable workflow that the calling repo can't tamper with gets you to **Level 3**.
+- **Pin third-party actions to full commit SHAs** (Dependabot/Renovate keep them updated). The March 2025 `tj-actions/changed-files` compromise retagged versions to leak secrets from thousands of repositories; SHA pins were unaffected. GitHub's allowed-actions policy can now enforce SHA pinning organisation-wide.
+- For GitOps, replace the deploy job with a step that commits the new digest to the environment repo, and let Argo CD/Flux apply it.
 
 ### GitLab CI
 
 ```yaml
-stages:
-  - test
-  - build
-  - deploy
+stages: [test, build, deploy]
 
 variables:
-  DOCKER_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
 
 test:
   stage: test
+  image: python:3.14-slim
   script:
-    - pip install -r requirements.txt
-    - pytest --cov --cov-report=xml
-  coverage: '/^TOTAL.+s+(d++)%/'
+    - pip install -r requirements.txt -r requirements-dev.txt
+    - pytest --cov --cov-report=term --cov-report=xml:coverage.xml
+  coverage: '/TOTAL.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
 
 build:
   stage: build
+  image: docker:29
+  services:
+    - docker:29-dind
   script:
-    - docker build -t $DOCKER_IMAGE .
-    - docker push $DOCKER_IMAGE
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$IMAGE" .
+    - docker push "$IMAGE"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 deploy:
   stage: deploy
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
   script:
-    - kubectl set image deployment/myapp myapp=$DOCKER_IMAGE
+    - kubectl set image deployment/myapp myapp="$IMAGE"
+    - kubectl rollout status deployment/myapp --timeout=10m
   environment:
     name: production
-  only:
-    - main
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual            # continuous delivery: a human presses deploy
 ```
+
+`only:`/`except:` are legacy; use `rules:`. The cluster connection comes from the GitLab agent for Kubernetes (`KUBECONFIG` context) rather than stored credentials; GitLab also issues OIDC ID tokens (`id_tokens:`) for cloud federation. Reusable **CI/CD components** (catalog) play the role of GitHub reusable workflows. Docker-in-Docker needs privileged runners; Kaniko is no longer maintained, so rootless BuildKit or Buildah are the usual alternatives.
 
 ### Jenkins Pipeline (Declarative)
 
 ```groovy
 pipeline {
-    agent any
-
+    agent { label 'docker' }
+    environment {
+        IMAGE = "registry.example.com/myapp:${env.GIT_COMMIT}"
+    }
     stages {
-        stage('Checkout') {
-            steps { checkout scm }
-        }
         stage('Test') {
             steps {
                 sh 'npm ci'
                 sh 'npm test'
             }
         }
-        stage('Build') {
+        stage('Build & Push') {
             steps {
-                sh 'npm run build'
-                sh 'docker build -t myapp:${BUILD_NUMBER} .'
-            }
-        }
-        stage('Push') {
-            steps {
-                sh 'docker push myapp:${BUILD_NUMBER}'
+                withCredentials([usernamePassword(credentialsId: 'registry',
+                                  usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+                    sh 'echo "$REG_PASS" | docker login -u "$REG_USER" --password-stdin registry.example.com'
+                    sh 'docker build -t "$IMAGE" . && docker push "$IMAGE"'
+                }
             }
         }
         stage('Deploy') {
+            when { branch 'main' }
             steps {
-                sh 'kubectl set image deployment/myapp myapp=myapp:${BUILD_NUMBER}'
+                input message: 'Deploy to production?'
+                sh 'kubectl set image deployment/myapp myapp="$IMAGE"'
+                sh 'kubectl rollout status deployment/myapp --timeout=10m'
             }
         }
     }
-
     post {
         failure {
-            slackSend(
-                color: 'danger',
-                message: "Build failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
-            )
+            slackSend(color: 'danger', message: "Build failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
         }
     }
 }
 ```
 
+Jenkins remains common in enterprises; its costs are plugin maintenance, controller security and the lack of ephemeral, isolated runners by default (use Kubernetes agents).
+
 ---
 
 ## 10. Production Best Practices
 
-### Security
+### Security and the software supply chain
+
+!!! tip "30-second answer"
+    Assume the build system is a target. Use **short-lived OIDC credentials** instead of stored secrets, **pin dependencies and actions** (lockfiles, SHAs), build in **ephemeral isolated runners**, produce an **SBOM** and **signed provenance** (SLSA) for every artifact, and **verify signatures and provenance at deploy time** (admission control), so only artifacts built by your pipeline from your repo can run.
 
 | Practice | Description |
 |----------|-------------|
-| **Shift left** | Scan dependencies (Snyk, Trivy) and secrets (truffleHog) in CI |
-| **Image scanning** | Scan Docker images for vulnerabilities before deploy (Trivy, Grype) |
-| **Minimal base images** | Use `distroless`, `alpine`, or `scratch` to reduce attack surface |
-| **SBOM** | Generate Software Bill of Materials for each release (CycloneDX) |
-| **Short-lived credentials** | Use OIDC/OAuth2 instead of long-lived secrets in CI |
+| **Secrets** | OIDC federation to cloud providers; secret scanning (gitleaks, TruffleHog, GitHub push protection) |
+| **Dependency scanning** | Dependabot/Renovate updates; SCA (Snyk, Trivy, Grype, OSV-Scanner) |
+| **Image scanning** | Trivy/Grype on build and continuously in the registry; fail on fixable criticals |
+| **Minimal images** | Distroless, Chainguard/Wolfi, `scratch`, or slim bases; non-root; read-only root filesystem |
+| **SBOM** | CycloneDX or SPDX per artifact (Syft, `docker buildx --sbom`), stored as an attestation |
+| **Provenance (SLSA)** | Signed statement of what source, builder and steps produced the artifact; GitHub artifact attestations or the SLSA GitHub generator; target Build L3 for critical services |
+| **Signing** | Sigstore cosign keyless signing (identity from the CI OIDC token, recorded in the Rekor transparency log) |
+| **Verify at deploy** | Kyverno `verifyImages`, Sigstore policy-controller or Ratify reject unsigned images or images without provenance from your builder |
+| **Workflow hardening** | Least-privilege tokens, no `pull_request_target` with untrusted checkout, protected environments, CODEOWNERS on pipeline files |
 
-### Observability
+### Observability-driven deploy gates
 
-```yaml
-Deploy Gate Checks (automated):
-  ├── P99 latency < 500ms
-  ├── Error rate < 0.1%
-  ├── CPU usage < 80%
-  ├── Memory usage < 85%
-  └── No critical alerts firing
 ```
+Automated analysis during rollout (canary vs stable, not absolute thresholds alone):
+  ├── error ratio not worse than stable by > X%
+  ├── p99 latency not worse than stable by > Y ms
+  ├── saturation (CPU throttling, memory, pool usage) within limits
+  ├── business KPIs (checkout success, sign-ups) not regressing
+  └── no SLO burn-rate alert firing
+```
+
+Compare canary with stable at the same time rather than with fixed thresholds: it cancels out daily traffic patterns and incidents unrelated to the deploy. Annotate dashboards with every deploy so humans can correlate too.
 
 ### Rollback Playbook
 
 ```
-1. Detect: Alert triggers (latency spike, error rate increase)
-2. Decide: On-call engineer confirms rollback
-3. Rollback:
-   Blue-Green:  Switch load balancer back to Blue
-   Rolling:     kubectl rollout undo deployment/myapp
-   Canary:      Shift traffic back to 100% old version
-4. Verify: Monitor metrics return to baseline
-5. Investigate: Root cause analysis → fix → re-deploy
+1. Detect:   automated analysis or burn-rate alert fires
+2. Decide:   automation aborts canaries; humans decide for full rollouts (bias towards rollback)
+3. Roll back:
+     Canary / Argo Rollouts:  abort → traffic returns to stable
+     Blue-green:              switch the router back to blue
+     Rolling (Kubernetes):    kubectl rollout undo deployment/myapp, or git revert in GitOps
+     Feature flag:            turn the flag off
+4. Verify:   metrics return to baseline
+5. Learn:    blameless review → fix forward → add the missing test, alert or analysis metric
 ```
+
+Rollback doesn't undo data. If the bad version wrote data in a new format or ran a destructive migration, you're rolling forward with a fix, which is why expand-contract and backward-compatible writes matter.
 
 ### Environment Parity
 
 | Aspect | Staging | Production |
 |--------|---------|------------|
-| **OS/runtime** | Same Docker image | Same Docker image |
-| **Database** | Same version, smaller instance | Same version, sized for load |
-| **Config** | Separate values, same structure | Production values |
-| **Network** | Simulated topology | Real topology |
-| **Data** | Anonymized subset | Real data |
+| **Artifact** | Same image digest | Same image digest |
+| **Database** | Same engine and version, smaller instance | Sized for load |
+| **Config** | Same structure, different values | Production values |
+| **Infrastructure** | Same IaC modules, smaller scale | Full scale, multi-AZ |
+| **Data** | Synthetic or anonymised subset | Real data |
+
+Staging never fully matches production (traffic shape, data volume, noisy neighbours), which is why production canaries and feature flags exist.
 
 ---
 
@@ -1132,13 +1240,26 @@ Deploy Gate Checks (automated):
 
 ### Senior / Staff
 
+Each comes with an answer sketch: the points an interviewer expects to hear.
+
 10. **Design a CI/CD pipeline for a 50-microservice system with polyglot services (Go, Python, Java). How do you handle cross-service contract testing?**
+    Shared reusable pipeline templates per language (lint, test, build, scan, SBOM, provenance, deploy) so each service only declares parameters; build once and promote by digest via GitOps; consumer-driven contracts (Pact) published to a broker, with the provider pipeline verifying all consumer pacts and a `can-i-deploy` gate before production. Avoid a shared E2E environment as the main gate: it becomes the bottleneck and the flakiest part of the system.
+
 11. **How do you ensure backward compatibility during a multi-service rollout?**
+    Additive API changes only (new optional fields, new endpoints), tolerant readers, versioned APIs or schemas for breaking changes (with schema registry compatibility rules for events), expand-contract for data, deploy providers before consumers, and feature flags so the consumer side can be turned off independently of deploys.
+
 12. **Design a deployment system that can handle 1,000+ deployments per day across 200 services.**
+    Self-service golden paths; fully automated pipelines with no human gates for low-risk changes; progressive delivery with automated analysis as the safety net instead of approvals; GitOps controllers sharded per cluster; deploy queues or merge queues to serialise per service; strong observability (deploy markers, per-version metrics); and DORA metrics to show change failure rate stays flat as frequency rises.
+
 13. **How do you implement progressive delivery with feature flags and canary releases in a service mesh?**
+    Argo Rollouts or Flagger owns the mesh or Gateway API traffic weights and runs metric analysis against Prometheus at each step, aborting automatically. Feature flags then release functionality to user segments independently of the binary rollout. Discuss metric choice, minimum traffic for significance, header-based routing for internal testers, and session affinity.
+
 14. **How would you migrate a monolith to microservices incrementally using CI/CD?**
+    Strangler fig: route specific paths to new services at the edge (gateway/mesh), extract by domain boundary, use change data capture or events to sync data during transition, keep the monolith's pipeline healthy (it still ships most changes), and give each extracted service its own pipeline from day one. Measure lead time and change failure rate to show the migration is helping.
+
 15. **How do you handle the "diamond dependency" problem in microservice deployments?**
+    When two services depend on different versions of a shared library or a shared downstream contract: keep shared libraries thin and backward-compatible, version them with semver and automate upgrades (Renovate), avoid lockstep releases, and for shared runtime contracts use compatibility rules plus contract tests so each consumer can upgrade on its own schedule.
 
 ---
 
-> **Key Takeaway:** CI/CD is not just about automation — it's about building a repeatable, auditable, and safe delivery system that enables teams to ship frequently with confidence. The right strategy depends on your architecture, team size, risk tolerance, and business requirements.
+> **Key Takeaway:** CI/CD is a safety system as much as an automation system: build once, prove it, promote the same artifact, roll out progressively with automated analysis, and keep rollback (or roll-forward) cheap. Supply-chain controls (OIDC, pinning, SBOM, signed provenance verified at deploy) are now baseline expectations at senior and staff level.

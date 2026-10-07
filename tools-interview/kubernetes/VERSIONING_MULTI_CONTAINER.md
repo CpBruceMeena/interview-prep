@@ -1,6 +1,7 @@
 # 📦 Versioning in Multi-Container / Multi-Service Deployments
 
-> **Context:** Staff/Principal Engineer interview — API versioning, database migrations, rolling deployments, container image strategy, and backward compatibility across microservices.  \n
+> **Context:** Staff/Principal Engineer interview — API versioning, database migrations, rolling deployments, container image strategy, and backward compatibility across microservices.
+>
 > **Focus:** Real production patterns with code examples, not theory.
 
 ---
@@ -26,6 +27,9 @@ In a **monolith**, versioning is simple: deploy one artifact, tag the release. I
 - **Inconsistent deployments:** Canary deployment of Service A's v2 goes wrong because it expects a DB schema that hasn't been migrated yet.
 - **Rollback nightmares:** Rolling back Service A to v1 means you must also roll back the DB schema, which may have already been used by Service B v2.
 - **Debugging chaos:** Which version of which service is running in production? Without proper tagging, you can't tell.
+
+!!! tip "30-second answer"
+    During any rollout, old and new versions run **at the same time**: old and new pods, old and new consumers, old and new code against one schema. So every change must be compatible in both directions for at least one release: additive API changes (new major version only for true breaks), **expand → migrate → contract** for schemas, tolerant readers, and schema-registry compatibility rules for events. Deploy images by immutable tag or digest, make the rollout progressive (canary with automated analysis), and keep rollback a code-only operation: you roll code back, not the schema.
 
 ### Core Principles
 
@@ -55,8 +59,8 @@ def list_users_v1():
 @app.route('/v2/users')
 def list_users_v2():
     """V2: Adds phone, removes email, uses cursor pagination"""
-    cursor = request.args.get('cursor')
-    users = User.query.filter(User.id > cursor).limit(20).all()
+    cursor = int(request.args.get('cursor', 0))
+    users = User.query.filter(User.id > cursor).order_by(User.id).limit(20).all()
     return jsonify({
         "data": [{"id": u.id, "name": u.name, "phone": u.phone}
                  for u in users],
@@ -70,11 +74,12 @@ def list_users_v2():
 ### 2.2 Header Versioning (Cleaner URL)
 
 ```python
-# Flask example — version via Accept header
+# Flask example — version via a request header (custom "Accept-Version" here;
+# the media-type variant is Accept: application/vnd.example.v2+json)
 
 @app.route('/users')
 def list_users():
-    version = request.headers.get('Accept-Version', '1')
+    version = request.headers.get('Accept-Version', '1')   # default = oldest supported
     
     if version == '1':
         return jsonify([u.to_dict_v1() for u in User.query.all()])
@@ -88,34 +93,44 @@ def list_users():
 ```
 
 **Pros:** Clean URLs, RESTful, version negotiation.  \
-**Cons:** Not visible in browser dev tools, harder to cache.
+**Cons:** Invisible in URLs and logs unless you log the header; caches and CDNs must key on it (`Vary: Accept-Version`), or they serve v1 bodies to v2 clients.
 
 ### 2.3 gRPC / Protobuf Versioning (Binary Protocol)
 
 ```protobuf
-// users.proto
+// users/v1/user.proto  (one package per file; v2 lives in users/v2/user.proto)
 syntax = "proto3";
+package users.v1;          // ← major version in the package name
 
-package users.v1;       // ← Version in package name!
-
-message UserV1 {
+message User {
     string id = 1;
     string name = 2;
-    string email = 3;
-}
-
-// New version adds phone, deprecates email
-package users.v2;
-
-message UserV2 {
-    string id = 1;
-    string name = 2;
-    string phone = 3;      // New field
-    string email = 4 [deprecated = true];  // Still present for backward compat
+    string email = 3 [deprecated = true];  // keep the field; mark it
+    string phone = 4;                      // NON-breaking addition: new number
+    reserved 5;                            // a removed field: number never reused
+    reserved "fax";
 }
 ```
 
-**Key gRPC rule:** Never re-use field numbers. Always add new fields. Old clients ignore unknown fields. This makes gRPC naturally backward-compatible.
+```protobuf
+// users/v2/user.proto: only for a real breaking change (types or semantics change).
+// Both packages are served side by side until v1 clients are gone.
+syntax = "proto3";
+package users.v2;
+
+message User {
+    string id = 1;
+    string display_name = 2;
+    ContactInfo contact = 3;
+}
+
+message ContactInfo {
+    string email = 1;
+    string phone = 2;
+}
+```
+
+**Key protobuf rules:** never reuse or renumber a field (use `reserved`), never change a field's type, add new fields with new numbers. Old readers skip unknown fields and new readers see defaults for missing ones, so additive changes are compatible both ways. Renames are wire-safe but break JSON transcoding and generated code, so treat them as breaking. Tools like `buf breaking` enforce this in CI.
 
 ### 2.4 Version Compatibility Matrix
 
@@ -154,15 +169,25 @@ In a multi-container deployment, multiple versions of a service run simultaneous
 
 -- STEP 1 (Expand): Add the new column + keep old one
 -- Deploy this BEFORE the new code
-ALTER TABLE users ADD COLUMN contact_email VARCHAR(255);
-CREATE INDEX idx_users_contact_email ON users(contact_email);
+ALTER TABLE users ADD COLUMN contact_email VARCHAR(255);  -- nullable: metadata-only, instant
+-- Plain CREATE INDEX blocks writes for the whole build; on a live table use
+-- CONCURRENTLY (cannot run inside a transaction block)
+CREATE INDEX CONCURRENTLY idx_users_contact_email ON users(contact_email);
 
--- Create a trigger to keep both columns in sync
+-- Trigger keeps both columns in sync while old and new code both write.
+-- It must copy whichever column CHANGED; a naive COALESCE would keep a stale
+-- contact_email when old code updates email.
 CREATE OR REPLACE FUNCTION sync_user_email()
 RETURNS TRIGGER AS $$
 BEGIN
-    NEW.contact_email = COALESCE(NEW.contact_email, NEW.email);
-    NEW.email = COALESCE(NEW.email, NEW.contact_email);
+    IF TG_OP = 'INSERT' THEN
+        NEW.contact_email := COALESCE(NEW.contact_email, NEW.email);
+        NEW.email         := COALESCE(NEW.email, NEW.contact_email);
+    ELSIF NEW.email IS DISTINCT FROM OLD.email THEN
+        NEW.contact_email := NEW.email;            -- old code wrote email
+    ELSIF NEW.contact_email IS DISTINCT FROM OLD.contact_email THEN
+        NEW.email := NEW.contact_email;            -- new code wrote contact_email
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -171,7 +196,9 @@ CREATE TRIGGER trg_sync_user_email
     BEFORE INSERT OR UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION sync_user_email();
 
--- Backfill: populate contact_email from email
+-- Backfill: populate contact_email from email.
+-- On a large table do this in batches (e.g. 10k ids per transaction) to avoid
+-- long locks, bloat and replication lag; shown as one statement for brevity.
 UPDATE users SET contact_email = email WHERE contact_email IS NULL;
 
 -- At this point: old code reads/writes `email`, new code reads/writes `contact_email`
@@ -186,10 +213,11 @@ UPDATE users SET contact_email = email WHERE contact_email IS NULL;
 -- ============================================================
 
 -- STEP 3 (Contract): Remove the old column
--- Deploy AFTER old code is completely gone
-ALTER TABLE users DROP COLUMN email CASCADE;
+-- Deploy AFTER old code is completely gone (including batch jobs, other services,
+-- BI queries and anything that can still roll back to it)
 DROP TRIGGER IF EXISTS trg_sync_user_email ON users;
 DROP FUNCTION IF EXISTS sync_user_email();
+ALTER TABLE users DROP COLUMN email;
 ```
 
 ### 3.2 Migration Tooling (Alembic Example)
@@ -217,7 +245,8 @@ def upgrade():
     op.add_column('users', sa.Column('contact_email', sa.String(255), nullable=True))
     op.create_index('idx_users_contact_email', 'users', ['contact_email'])
     
-    # Backfill
+    # Backfill (fine for small tables; batch it outside the migration for large ones,
+    # since Alembic runs the whole migration in one transaction on Postgres)
     op.execute("UPDATE users SET contact_email = email WHERE contact_email IS NULL")
 
 
@@ -272,25 +301,24 @@ steps:
 
 ### 3.4 Handling Rollbacks with Schema Migrations
 
-```bash
-# If v2 deploy fails, rollback order is CRITICAL:
-# 1. Roll back service code to v1 (kubectl rollout undo)
-# 2. Run DB migration DOWN (only if schema change hasn't been consumed)
+With expand-contract, **rolling back is a code-only operation**. The expanded schema already works with v1, so you roll the Deployment back and leave the schema alone. Running the down migration would drop `contact_email` and destroy every value v2 wrote. Down migrations are for dev environments or for migrations nothing has used yet; in production you fix forward.
 
-# Rollback script:
+```bash
 #!/bin/bash
+# If v2 misbehaves: roll back CODE, keep the expanded schema.
 set -euo pipefail
 
-echo "Step 1: Rollback service deployments"
+echo "Step 1: Roll back the deployment"
 kubectl rollout undo deployment/user-service
 kubectl rollout status deployment/user-service --timeout=5m
 
-echo "Step 2: Verify all pods are on v1"
-kubectl get pods -l app=user-service -o jsonpath='{.items[*].spec.containers[*].image}'
-# Expected: user-service:v1.0.0 (not v2.0.0)
+echo "Step 2: Verify all pods run the old image"
+kubectl get pods -l app=user-service \
+  -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}' | sort | uniq -c
+# Expected: only user-service:v1.x
 
-echo "Step 3: Run DB migration DOWN"
-alembic downgrade -1  # Revert the last migration
+echo "Step 3: Leave the schema as is. The sync trigger keeps email and"
+echo "contact_email consistent, so v1 keeps working and v2 can be re-deployed."
 ```
 
 ---
@@ -300,18 +328,20 @@ alembic downgrade -1  # Revert the last migration
 ### 4.1 Tagging Strategy
 
 ```yaml
-# Bad: mutable tags cause production issues
-registry.example.com/user-service:latest     # ← NEVER do this!
-registry.example.com/user-service:stable     # ← Also bad!
+# Bad: moving tags in deployment manifests
+registry.example.com/user-service:latest     # ← NEVER deploy this
+registry.example.com/user-service:stable     # ← same problem
+# Nodes cache images, so pods on different nodes can run different "latest" builds,
+# and rollbacks can't target a known artifact.
 
-# Good: immutable, traceable tags
+# Good: unique, traceable tags
 registry.example.com/user-service:v1.2.3           # Semantic version
-registry.example.com/user-service:v1.2.3-build.456 # + CI build number
-registry.example.com/user-service:sha-a1b2c3d4     # Git commit SHA
+registry.example.com/user-service:v1.2.3-abcdef1   # + git SHA (unique per build)
 
-# Best: combination for human-readability + traceability
-registry.example.com/user-service:v1.2.3
-registry.example.com/user-service:v1.2.3-abcdef1
+# Best: deploy by digest (or tag@digest). A tag is only immutable if the registry
+# enforces it (e.g. ECR tag immutability, Harbor immutable tag rules); a digest
+# always identifies the exact bytes, and image signing/admission policies key on it.
+registry.example.com/user-service:v1.2.3@sha256:4f1c...e9
 ```
 
 ### 4.2 Multi-Architecture Images
@@ -329,7 +359,6 @@ docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --tag registry.example.com/user-service:${VERSION} \
   --tag registry.example.com/user-service:${VERSION}-${SHA} \
-  --tag registry.example.com/user-service:latest \
   --push \
   .
 
@@ -358,8 +387,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      sha: ${{ steps.sha.outputs.sha }}
+      version: ${{ steps.meta.outputs.version }}   # must reference the step id "meta"
+      sha: ${{ steps.meta.outputs.sha }}
     
     steps:
       - uses: actions/checkout@v4
@@ -371,7 +400,7 @@ jobs:
           echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
       
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: services/user-service
           push: true
@@ -414,7 +443,7 @@ metadata:
 spec:
   replicas: 5
   revisionHistoryLimit: 5           # Keep last 5 revisions for rollback
-  minReadySeconds: 30                # Wait 30s after pod is ready
+  minReadySeconds: 30                # Pod must stay Ready 30s before it counts as available
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -427,7 +456,8 @@ spec:
     metadata:
       labels:
         app: user-service
-        version: v2.0.0              # Label for monitoring
+        version: v2                         # coarse label used by mesh subsets
+        app.kubernetes.io/version: v2.0.0   # exact version for dashboards/alerts
     spec:
       containers:
       - name: user-service
@@ -465,11 +495,14 @@ kubectl rollout undo deployment/user-service --to-revision=3
 kubectl rollout history deployment/user-service
 # Output:
 # REVISION  CHANGE-CAUSE
-# 1         v1.0.0: Initial deploy
 # 2         v1.1.0: Add logging
 # 3         v1.2.0: Bug fix
-# 4         v2.0.0: Rename email to contact_email  ← Current
-# 5         v2.0.1: Hotfix  ← Rolling back to this
+# 4         v2.0.0: Rename email to contact_email
+# 5         v2.0.1: Hotfix                         ← current
+# `undo --to-revision=3` re-applies revision 3's pod template as a NEW revision 6.
+# Rollback only restores the pod template: not ConfigMaps/Secrets it references,
+# not the schema, not other services. In GitOps setups, revert the commit instead,
+# or the controller will re-apply the bad version.
 ```
 
 ### 5.3 Progressive Delivery with Flagger (Automated Canary)
@@ -488,17 +521,18 @@ spec:
   service:
     port: 8080
   analysis:
-    interval: 30s
-    iterations: 10               # 10 × 30s = 5 min total analysis
-    threshold: 5                 # Max 5% error rate
+    interval: 30s                # run checks every 30s
+    threshold: 5                 # roll back after 5 FAILED checks (not a % error rate)
     maxWeight: 50                # Max 50% traffic to canary
-    stepWeight: 5                # Increment traffic by 5% each iteration
+    stepWeight: 5                # +5% per passing interval → 10 steps ≈ 5 min to 50%
     metrics:
-    - name: request-success-rate
-      threshold: 99              # 99% of requests must succeed
+    - name: request-success-rate # built-in metric (needs a mesh/ingress provider)
+      thresholdRange:
+        min: 99                  # ≥ 99% non-5xx
       interval: 1m
     - name: request-duration
-      threshold: 500             # p99 latency < 500ms
+      thresholdRange:
+        max: 500                 # p99 latency ≤ 500ms
       interval: 1m
     webhooks:
     - name: load-test
@@ -508,11 +542,13 @@ spec:
         cmd: "hey -z 2m -q 10 http://user-service-canary:8080/health"
 
 # Flagger automates:
-# 1. Creates canary deployment (user-service-canary) with new version
-# 2. Incrementally shifts traffic: 5% → 10% → 15% → ... → 50%
-# 3. At each step, checks success rate + latency
-# 4. If metrics degrade → full rollback automatically
-# 5. If all iterations pass → promote canary to primary
+# 1. Copies your Deployment to user-service-primary (serves traffic); your own
+#    Deployment becomes the canary and is scaled to 0 between releases
+# 2. On a new pod template it scales the canary up and shifts traffic
+#    5% → 10% → ... → 50% via the mesh / ingress / Gateway API
+# 3. At each step, checks success rate + latency (and runs webhooks, e.g. load tests)
+# 4. If `threshold` checks fail → route 100% back to primary, scale canary to 0
+# 5. If it reaches maxWeight healthy → copy the new spec to primary, then scale canary to 0
 ```
 
 ---
@@ -523,7 +559,7 @@ spec:
 
 ```yaml
 # istio-canary.yaml
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1    # v1 is GA since Istio 1.22; v1beta1 still served
 kind: VirtualService
 metadata:
   name: user-service
@@ -551,7 +587,7 @@ spec:
       weight: 10                     # 10% traffic to v2
 
 ---
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: user-service
@@ -560,10 +596,10 @@ spec:
   subsets:
   - name: v1
     labels:
-      version: v1.0.0
+      version: v1                    # pods need a matching label; keep it coarse
   - name: v2
     labels:
-      version: v2.0.0
+      version: v2
 ```
 
 ### 6.2 Blue-Green Deployment
@@ -609,13 +645,20 @@ spec:
   selector:
     app: user-service
     color: blue
+  ports:
+  - port: 80
+    targetPort: 8080
 
 ---
-# Step 3: After green is verified, switch service to green
-# kubectl patch service user-service -p '{"spec":{"selector":{"color":"green"}}}'
+# Step 3: After green is verified (smoke tests against a separate green Service),
+# switch the live Service to green:
+# kubectl patch service user-service -p '{"spec":{"selector":{"app":"user-service","color":"green"}}}'
+# The switch is "atomic" for NEW connections only: existing keep-alive connections
+# stay on blue until they close, so drain blue gracefully.
 
-# Step 4: Keep blue for rollback. Scale down green if promoted.
-# Rollback: patch service back to blue
+# Step 4: Keep blue running for fast rollback (patch the selector back), then
+# scale blue down once green has proven itself. Cost: 2× capacity during the switch,
+# and the DB schema must work for both colours (expand-contract again).
 ```
 
 ### 6.3 gRPC Service Versioning with Multiple Deployments
@@ -634,6 +677,7 @@ spec:
     version: v1
   ports:
   - port: 50051
+    appProtocol: grpc
 
 ---
 apiVersion: v1
@@ -646,8 +690,12 @@ spec:
     version: v2
   ports:
   - port: 50051
+    appProtocol: grpc
 
 ---
+# gRPC uses long-lived HTTP/2 connections: kube-proxy balances per CONNECTION, so
+# one client can pin to one pod. Use client-side balancing (headless Service +
+# round_robin), a mesh, or periodic connection recycling (MaxConnectionAge).
 # Client configuration: choose which version to call
 # user-service-v1.default.svc.cluster.local:50051 → v1
 # user-service-v2.default.svc.cluster.local:50051 → v2
@@ -684,17 +732,20 @@ class UserServiceClient:
 # Feature flags let you deploy code that's "dark" (not active)
 # This decouples deployment from feature activation.
 
-from launchdarkly import LDClient
+import ldclient
+from ldclient import Context
+from ldclient.config import Config
 
-client = LDClient("sdk-key")
+ldclient.set_config(Config("sdk-key"))
+client = ldclient.get()
 
 class UserService:
     def list_users(self):
         # Check if user is in the v2 experiment
         use_v2_response = client.variation(
-            "user-list-v2-response",     # Feature flag key
-            {"key": current_user_id},     # User context
-            False                         # Default: use v1
+            "user-list-v2-response",                 # Feature flag key
+            Context.builder(current_user_id).build(),  # Evaluation context
+            False                                    # Default if flag service is down: v1
         )
         
         if use_v2_response:
@@ -704,7 +755,7 @@ class UserService:
     
     def _list_users_v2(self):
         """V2 response with pagination and phone numbers"""
-        cursor = request.args.get('cursor', 0)
+        cursor = int(request.args.get('cursor', 0))
         users = User.query.filter(User.id > cursor).limit(20).all()
         return {
             "data": [{"id": u.id, "name": u.name, "phone": u.phone}
@@ -715,12 +766,15 @@ class UserService:
 
 ### 7.3 Versioned Event Schemas (Kafka)
 
-```json
-// Kafka event: UserCreated
-// Rule: never modify existing fields, only add new ones.
-// Use Schema Registry to enforce compatibility.
+```javascript
+// Kafka event: UserCreated (JSON shown; Avro/Protobuf work the same way)
+// Rule: never modify or remove existing fields; add new OPTIONAL fields with defaults.
+// Use a Schema Registry compatibility mode to enforce it at produce time:
+//   BACKWARD (default): new schema can read old data → upgrade consumers first
+//   FORWARD:  old schema can read new data           → upgrade producers first
+//   FULL:     both                                   → any order
 
-// v1 event (evolved from original)
+// schema_version 2 of the event (v1 had no "phone")
 {
   "schema_version": 2,
   "event_type": "UserCreated",
@@ -731,8 +785,9 @@ class UserService:
   "timestamp": 1704067200000
 }
 
-// Consumer that only processes v1 events can still read v2 events:
-// It ignores "phone" field (tolerant reader).
+// A consumer written for v1 can still read v2 events: it ignores "phone"
+// (tolerant reader). Topics are replayed and retained, so consumers must also keep
+// reading OLD versions for as long as retention (or compaction) keeps them.
 ```
 
 ### 7.4 Breaking Change Checklist
@@ -748,7 +803,7 @@ Before releasing a MAJOR version (breaking change):
 - [ ] Database migration follows expand-contract pattern
 - [ ] Feature flags in place for gradual rollout
 - [ ] Monitoring dashboards updated to compare v1 vs v2 metrics
-- [ ] Rollback plan documented (code rollback + DB migration down)
+- [ ] Rollback plan documented (code-only rollback; schema stays expanded until contract)
 - [ ] Canary deployment configured with Flagger/Istio
 - [ ] Load test run against v2 to verify performance
 - [ ] All dependent services tested against new version in staging
@@ -825,7 +880,7 @@ jobs:
         run: echo "version=v$(jq -r .version services/user-service/package.json)" >> $GITHUB_OUTPUT
       
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: services/user-service
           push: true
@@ -865,9 +920,13 @@ jobs:
       
       - name: Check canary metrics
         run: |
-          ERROR_RATE=$(curl -s prometheus:9090/api/v1/query?query=...)
-          if [ "$ERROR_RATE" > "0.01" ]; then
-            echo "Error rate too high! Rolling back..."
+          # (In practice let Flagger/Argo Rollouts do this analysis; shown for clarity.)
+          ERROR_RATE=$(curl -s --get http://prometheus:9090/api/v1/query \
+            --data-urlencode 'query=sum(rate(http_requests_total{app="user-service",version="v2",code=~"5.."}[5m])) / sum(rate(http_requests_total{app="user-service",version="v2"}[5m]))' \
+            | jq -r '.data.result[0].value[1] // "0"')
+          # [ "$A" > "B" ] would be a shell REDIRECT, not a comparison; compare floats with awk
+          if awk -v r="$ERROR_RATE" 'BEGIN { exit !(r > 0.01) }'; then
+            echo "Error rate $ERROR_RATE too high! Rolling back..."
             kubectl apply -f k8s/istio-canary-v1.yaml  # Rollback
             exit 1
           fi
@@ -878,34 +937,29 @@ jobs:
             user-service=${{ env.REGISTRY }}/${{ env.SERVICE }}:${{ needs.build-and-push.outputs.version }}
           kubectl apply -f k8s/istio-primary-v2.yaml
 
-  contract-db:
-    needs: deploy-production
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Wait for old pods to drain (24h)
-        run: sleep 86400   # 24 hours
-      
-      - name: Run CONTRACT migration (drop old columns)
-        run: |
-          # Only run this AFTER verifying no old code is running
-          psql "$DATABASE_URL" -c "
-            ALTER TABLE users DROP COLUMN IF EXISTS email;
-            DROP TRIGGER IF EXISTS trg_sync_user_email ON users;
-          "
-      
-      - name: Update migration plan
-        run: |
-          echo "migration: RENAME_EMAIL complete" >> deployment-log.txt
+# CONTRACT is NOT a job in this pipeline: a GitHub-hosted job can't wait 24h
+# (6h job limit), and the trigger is a human/automated CHECK, not a timer.
+# Ship it as the next release's migration, gated on evidence that nothing reads
+# `email` anymore (all deployments on ≥ v2, pg_stat_statements shows no queries
+# touching the column, a protected-environment approval):
+#
+#   DROP TRIGGER IF EXISTS trg_sync_user_email ON users;
+#   DROP FUNCTION IF EXISTS sync_user_email();
+#   ALTER TABLE users DROP COLUMN IF EXISTS email;
 ```
 
 ### 8.2 Health Check Endpoint for Version Awareness
 
 ```python
-# /health endpoint that reports version info for operational awareness
-# This lets monitoring tools know which version is deployed
+# Version/build info endpoint for operators. Keep it separate from the probe endpoints
+# (probes must be cheap and must not depend on Redis/Kafka), and don't expose hosts
+# publicly. For dashboards, also export a constant metric such as
+#   app_build_info{version="v2.0.0", commit="a1b2c3d4"} 1
+# so every graph can be split by version during a canary.
+import time
+START_TIME = time.time()
 
-@app.route('/health')
+@app.route('/internal/version')
 def health():
     return jsonify({
         "service": "user-service",

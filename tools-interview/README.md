@@ -1,6 +1,6 @@
 # 🛠️ Tools & Platforms — Staff-Level Interview Questions
 
-> *Deep-dive questions for Kafka, Redis, Elasticsearch, Docker/Kubernetes, and MongoDB — every question expects principal engineer-level depth with production-operational insight.*
+> *Deep-dive questions on the infrastructure tools a senior or staff backend engineer is expected to know: Kafka, Redis, Elasticsearch, MongoDB, Docker, Kubernetes, nginx, Prometheus/Grafana, Terraform, compression, and CI/CD. Each answer leads with the short version, then the mechanism, trade-offs, failure modes and likely follow-ups.*
 
 ---
 
@@ -12,17 +12,18 @@ tools-interview/
 ├── kafka/                ← 12 questions: log internals, ISR, rebalancing, exactly-once
 ├── redis/                ← 12 questions: data structures, persistence, clustering, sentinel
 ├── elasticsearch/        ← 8 questions: inverted index, sharding, query DSL, cluster mgmt
-├── docker/               ← 2 questions: container runtime, namespaces, cgroups, images
+├── docker/               ← 8 questions: namespaces/cgroups, images, BuildKit, supply chain, limits, networking, hardening, PID 1
 ├── kubernetes/           ← 6 questions: k8s scheduler, networking, RBAC, storage, controllers, production
 │   ├── INTERVIEW_QUESTIONS.md
 │   ├── POD_LIFECYCLE_AND_MONITORING.md   ← 15 sections: pod lifecycle, probes, QoS, monitoring stack, alerting, eBPF
 │   ├── PRODUCTION_CONTROL.md             ← 12 sections: GitOps, admission, deployment strategies, service mesh, CNI, DR
 │   └── VERSIONING_MULTI_CONTAINER.md     ← versioning, DB migrations, canary deployments
 ├── mongodb/              ← 6 questions: document model, replica sets, aggregation, transactions
-├── prometheus-grafana/   ← 8 questions: TSDB internals, PromQL, alerting, Thanos/Mimir
-├── nginx/                ← 10 questions: event loop, reverse proxy, TLS, clustering
+├── prometheus-grafana/   ← 8 questions: TSDB and Prometheus 3.x, relabeling, PromQL, Alertmanager, Grafana, recording rules, Thanos/Mimir, OpenTelemetry and SLOs
+├── nginx/                ← 10 questions: process model, event loop, proxying and buffering, load balancing, TLS, sendfile, backpressure, config, alternatives, 502 debugging
 ├── compression/          ← 10 questions: gzip, deflate, zstd, brotli, HPACK/QPACK
-└── terraform/            ← 8 questions: state management, modules, providers, policy as code
+├── terraform/            ← 8 questions: state and locking, graph, modules and tests, environments, providers, CI/CD, HCL, secrets and policy (plus OpenTofu)
+└── ci-cd-deployment/     ← guide (11 sections): pipelines, deployment strategies, progressive delivery, per-language images, supply-chain security, interview questions
 ```
 
 ## 🎯 How to Use

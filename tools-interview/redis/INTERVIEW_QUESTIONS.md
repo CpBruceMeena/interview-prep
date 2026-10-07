@@ -1,6 +1,11 @@
 # 🔴 Redis — Staff-Level Interview Questions
 
-> *12 questions covering Redis internals, data structures, persistence, clustering, and operational excellence — every question expects principal engineer-level depth with production patterns and failure analysis.*
+> *12 questions covering Redis internals, data structures, persistence, clustering, and operational excellence. Version notes are current as of October 2026 (Redis Open Source 8.10, Valkey 9.x).*
+
+!!! info "Which Redis?"
+    - **Redis Open Source 8.x** (Redis Ltd.): since **8.0 (May 2025)** licensed under your choice of **RSALv2, SSPLv1 or AGPLv3**. The Query Engine, JSON, time series, probabilistic structures and vector sets are built in (no more separate Redis Stack modules).
+    - **Valkey** (Linux Foundation, **BSD-3**): forked from Redis 7.2.4 in March 2024 after Redis 7.4 moved to RSALv2/SSPLv1. Wire- and RDB-compatible with Redis 7.2; it has since diverged (Valkey 8/9 features are not all in Redis and vice versa).
+    - Most internals below (single-threaded command execution, RDB/AOF, PSYNC2, Sentinel, Cluster) apply to both. Where behaviour is version-specific, the version is stated.
 
 ---
 
@@ -23,89 +28,84 @@
 
 ## 1. Data Structure Internals
 
-**Q:** "A user stores 1M small key-value pairs (32B key, 64B value). Redis reports 2GB RSS. Diagnose the overhead. How does Redis store strings (SDS), sets (intset vs skiplist), and hashes (ziplist vs hashtable)?"
+**Q:** "A user stores 1M small key-value pairs (32B key, 64B value). Redis reports 2GB RSS. Diagnose the overhead. How does Redis store strings (SDS), sets (intset vs listpack vs hashtable), and hashes (listpack vs hashtable)?"
 
-**What They're Really Testing:** Whether you understand Redis's memory-efficient data structures — SDS overhead, dict hashing, and encoding thresholds.
+**What They're Really Testing:** Whether you can estimate per-key overhead from first principles, and know the compact encodings and their thresholds.
+
+!!! tip "30-second answer"
+    Each top-level key costs roughly **100–150 bytes of overhead** beyond the raw bytes (dict entry, `robj`, SDS headers, hash-table buckets, allocator size-class rounding). 1M such keys should use **~150–200 MB**, not 2 GB. A 10× gap means something else: a past **memory peak** that the allocator hasn't returned (fragmentation), large **client output buffers**, a big **replication backlog**, a **fork in progress** (copy-on-write), or simply far more keys than claimed. Check `INFO memory` and `MEMORY DOCTOR` before blaming the data. The structural fix for many tiny keys is to **bucket them into small hashes** so they use the compact listpack encoding.
 
 ### Answer
 
-**Memory Overhead Breakdown:**
+**Per-key cost (string key → string value, 64-bit build):**
 
+| Component | Approx. bytes | Notes |
+|---|---|---|
+| `dictEntry` | 24 | key ptr, value ptr, next ptr (chaining) |
+| Bucket slot in the main dict | 8–16 | 8 bytes per bucket; table is sized to a power of two ≥ key count |
+| Key SDS (32 B) | 32 + 3 header + 1 NUL → **48** size class | Allocators round up to size classes |
+| Value `robj` + SDS (64 B, so `raw` encoding) | 16 + (64+3+1 → **80** class) | `embstr` (one allocation) only applies to ≤ 44 bytes |
+| Expires dict entry (only if a TTL is set) | ~32 | A second dict maps key → expiry |
+| **Total** | **~150–180** | vs 96 raw bytes |
+
+Measured on Redis 8.8 for exactly this shape: **~158 MB for 1M keys**, `MEMORY USAGE` of one key = 144 bytes. Exact numbers shift between versions (Valkey 8 and Redis 8.x both shaved per-key overhead) and allocators, so treat this as an order-of-magnitude estimate.
+
+**So where did 2 GB come from?** Check, in this order:
+
+```bash
+INFO memory        # used_memory vs used_memory_rss vs used_memory_peak
+MEMORY DOCTOR      # human-readable diagnosis
+MEMORY STATS       # breakdown: dataset, overhead, clients, replication backlog, AOF buffer
+INFO keyspace      # actual key count per DB
 ```
-Raw data: 1M × (32 + 64) = 96MB
-Reported RSS: 2GB → 20× overhead
 
-Sources of overhead:
-├── Server base memory: ~1MB
-├── dictEntry (24 bytes each): 1M × 24 = 24MB
-├── SDS header for key (sdshdr8: 3 bytes + 32 bytes data = 35 bytes): 35MB
-├── SDS header for value (sdshdr8: 3 bytes + 64 bytes data = 67 bytes): 67MB
-├── robj (16 bytes each): 1M × 16 = 16MB
-├── Hash table buckets: 2M × 8 = 16MB (load factor ~0.5)
-├── jemalloc fragmentation: 10-30% → 200-600MB
-├── Active keyspace metadata: ~100MB
-└── Total: ~450MB + fragmentation → 1.5-2GB (consistent!)
-    
-Diagnosis: Normal! The overhead is from Redis's C structs and jemalloc.
-```
+| Symptom | Likely cause |
+|---|---|
+| `used_memory` ≈ 160 MB, RSS ≈ 2 GB, `used_memory_peak` high | Fragmentation after a peak (see [Q9](#9-memory-optimization-fragmentation)) |
+| `mem_clients_normal` large | Slow consumers / `MONITOR` / huge pipelined replies filling output buffers |
+| `mem_replication_backlog` large | Oversized `repl-backlog-size` |
+| RSS spikes during `BGSAVE` / AOF rewrite | Copy-on-write after `fork()`, worse with Transparent Huge Pages |
 
-**SDS (Simple Dynamic String) Structure:**
+**SDS (Simple Dynamic String):**
 
 ```c
 struct __attribute__((__packed__)) sdshdr8 {
-    uint8_t len;         // Used length (1 byte) → O(1) strlen
-    uint8_t alloc;       // Allocated length
-    unsigned char flags; // Type flags (sdshdr5, 8, 16, 32, 64)
-    char buf[];          // Binary safe (can contain null bytes!)
+    uint8_t len;         // used length → O(1) strlen
+    uint8_t alloc;       // allocated length (excluding header and NUL)
+    unsigned char flags; // header type: sdshdr5/8/16/32/64
+    char buf[];          // binary-safe payload, still NUL-terminated
 };
-
-// Why SDS, not C strings?
-// C strings: O(n) strlen, terminated by '\0', not binary safe
-// SDS: O(1) strlen, binary safe, pre-allocation for append efficiency
+// Header width adapts to string length (1-byte lengths for < 256 B, etc.).
+// Why not C strings: O(n) strlen, not binary-safe, and every append reallocates.
+// SDS pre-allocates on growth (doubling up to 1 MB, then +1 MB) so APPEND is amortized O(1).
 ```
 
-**Encoding Optimizations:**
+**Encodings and thresholds (Redis 7.0+ defaults; listpack replaced ziplist in 7.0):**
 
-```yaml
-Type    | Encoding | Condition                    | Memory/Key
---------|----------|------------------------------|---------------
-String  | int      | Value is 64-bit integer       | 8 bytes (no SDS!)
-String  | embstr   | Length ≤ 44 bytes             | Single malloc (robj + SDS contiguous)
-String  | raw      | Length > 44 bytes             | Two mallocs (robj + SDS separately)
-Hash    | ziplist  | ≤ 512 entries AND all ≤ 64B   | ~37 bytes per field
-Hash    | hashtable| Threshold exceeded            | ~200 bytes per field (dict overhead)
-Set     | intset   | All integers AND ≤ 512        | Sorted array → binary search O(log N)
-Set     | hashtable| Threshold exceeded            | dict with NULL values
-ZSet    | ziplist  | ≤ 128 entries AND all ≤ 64B   | Compact list of score-member pairs
-ZSet    | skiplist | Threshold exceeded            | skiplist + dict hybrid for O(log N)
-List    | quicklist| Always (replaced linkedlist)  | Linked list of ziplist segments
+| Type | Compact encoding | Switches to | Default threshold (config) |
+|---|---|---|---|
+| String | `int` (fits in a long), `embstr` (≤ 44 B, one allocation) | `raw` | fixed |
+| Hash | `listpack` | `hashtable` | > 512 fields or any value > 64 B (`hash-max-listpack-entries/value`) |
+| Set | `intset` (all integers) | `listpack` / `hashtable` | intset ≤ 512 (`set-max-intset-entries`); non-integer listpack ≤ 128 entries, ≤ 64 B (since 7.2) |
+| Sorted set | `listpack` | `skiplist` + dict | > 128 entries or member > 64 B (`zset-max-listpack-*`) |
+| List | `listpack` (small lists, 7.2+) | `quicklist` (linked list of listpacks) | `list-max-listpack-size -2` (8 KB per node) |
 
-# Memory savings via encoding:
-# 1M hashes, 5 fields each, 20B values:
-#   ziplist: ~185MB
-#   hashtable: ~1GB
-#   Ratio: 5.4× savings!
-```
+Why listpack replaced ziplist: ziplist entries stored the *previous* entry's length, so one insert could trigger a **cascading update** across the whole list. Listpack stores each entry's own length at its end, removing the cascade.
 
-**Active Defragmentation (Redis 4+):**
+Compact encodings are O(N) to search but N is small and the data is contiguous, so they are cache-friendly and typically **5–10× smaller** than a hashtable. The conversion is one-way (a hash never shrinks back to listpack until rewritten).
 
-```bash
-activedefrag yes
-active-defrag-threshold-lower 10    # Start defrag when fragmentation > 10%
-active-defrag-threshold-upper 100   # Max fragmentation before aggressive defrag
-active-defrag-cycle-min 25          # % of CPU time for defrag (minimum)
-active-defrag-cycle-max 75          # % of CPU time for defrag (maximum)
-active-defrag-ignore-bytes 100mb   # Skip if frag overhead < 100MB
-```
+**The bucketing trick** (from Instagram's well-known write-up): instead of 1M string keys, store `HSET bucket:{id // 500} {id % 500} value`. 2,000 hashes of 500 fields each stay under the 512-entry threshold, remain listpack-encoded, and cut per-entry overhead from ~100+ bytes to a few bytes. Trade-off: no per-field TTL in older versions (Redis 7.4+ has **hash field expiration**: `HEXPIRE`, `HTTL`, `HPERSIST`), and eviction works per key, not per field.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **SDS internals** | Knows SDS is a length-prefixed, binary-safe string with pre-allocation |
-| **Encoding thresholds** | Can recite the magic numbers: 44 bytes for embstr, 512 entries for ziplist |
-| **Memory diagnosis** | Can compute memory overhead and identify jemalloc fragmentation |
-| **Active defrag** | Knows Redis can defragment in-place without downtime |
+| **Estimation** | Gets per-key overhead to the right order of magnitude and notices 2 GB is *not* normal |
+| **Diagnosis** | Reaches for `INFO memory`, `MEMORY STATS`, `MEMORY DOCTOR` before guessing |
+| **Encodings** | Knows listpack/intset thresholds and that ziplist is gone since 7.0 |
+| **Remedy** | Proposes hash bucketing and knows its trade-offs (eviction granularity, field TTL) |
+
+**What they probe next:** "How would you find which key prefixes use the memory?" → `redis-cli --bigkeys` / `--memkeys` (sampled via `SCAN` + `MEMORY USAGE`), or offline RDB analysis; Redis 8.6+ also has `HOTKEYS` and per-type key-size histograms.
 
 ---
 
@@ -113,123 +113,98 @@ active-defrag-ignore-bytes 100mb   # Skip if frag overhead < 100MB
 
 **Q:** "Your Redis instance holds 50GB and crashes. Walk through recovery. Compare RDB vs AOF. How does AOF rewrite work, and why might it cause latency spikes?"
 
-**What They're Really Testing:** Whether you understand Redis's persistence trade-offs — fork() overhead, COW memory amplification, and the recovery time budget.
+**What They're Really Testing:** Persistence trade-offs: `fork()` cost, copy-on-write memory amplification, fsync policy, and the recovery-time budget.
+
+!!! tip "30-second answer"
+    **RDB** = periodic point-in-time snapshot from a forked child: compact, fast to load, but you lose everything since the last snapshot. **AOF** = log of every write, fsynced per `appendfsync` (`everysec` loses ~1 s). Production default: **AOF `everysec` with the RDB preamble** (`aof-use-rdb-preamble yes`, the default), which gives RDB-speed loading plus a short loss window. Both rely on `fork()`, whose cost is page-table copying (~10–20 ms per GB of RSS on bare metal) plus COW memory growth under write load. Redis replication is async, so persistence alone is not durability across machines.
 
 ### Answer
 
-**RDB Snapshot (BGSAVE):**
+**RDB snapshot (`BGSAVE`):**
 
 ```
-fork() → child process → writes snapshot to disk (.rdb file)
+fork() → child walks the dataset and writes a compact binary .rdb file (LZF-compressed strings)
 
 Memory during BGSAVE:
-  1. Parent process: 50GB dataset
-  2. fork() creates child: pages are marked COW (Copy-On-Write)
-  3. If parent continues writing: each modified page is COPIED
-  4. Peak RSS: 50GB + (write rate × COW duration)
-     Example: 10K writes/s × 4KB pages × 10s = 400MB → 50.4GB peak
-  
-  5. If no writes during BGSAVE: child shares all pages with parent (zero overhead!)
+  1. fork() copies the PAGE TABLES (not the data): ~10-20 ms/GB → 0.5-1 s stall for 50 GB
+     (much worse on some hypervisors). The main thread is blocked for this time.
+  2. Parent and child share pages copy-on-write.
+  3. Every page the parent modifies is copied: peak RSS = dataset + (pages dirtied during the save).
+     Example: writes touching 100K distinct 4 KB pages → +400 MB.
+  4. With Transparent Huge Pages enabled, each COW copies 2 MB instead of 4 KB → huge RSS spikes
+     and latency. Redis warns at startup; disable THP.
 
-RDB file format:
-  MAGIC("REDIS") | RDB_VERSION | DATABASE_SECTION | EOF_CHECKSUM
-  Compressed via LZF (optional: rdbcompression yes)
-
-Recovery time: 50GB RDB on NVMe → ~30-60 seconds (sequential read)
+Load time: dominated by CPU (deserialising objects, rebuilding dicts), not disk.
+  Expect minutes, not seconds, for 50 GB. Measure it; it's your RTO.
 ```
 
 **AOF (Append-Only File):**
 
-```yaml
-AOF format: Redis protocol commands, appended:
-  SET key1 value1\r\n
-  SET key2 value2\r\n
-  ...
+| `appendfsync` | Behaviour | Loss window | Cost |
+|---|---|---|---|
+| `always` | write + fsync before replying, **batched per event-loop iteration** (group commit) | ~0 (only the in-flight batch) | Throughput bounded by fsync latency; fine on NVMe, painful on network disks |
+| `everysec` (default, recommended) | background thread fsyncs once per second | ~1 s (up to ~2 s if the disk stalls; Redis then delays writes) | Near in-memory speed |
+| `no` | kernel decides (Linux flushes dirty pages after ~30 s) | up to ~30 s | Fastest |
 
-fsync modes:
-  always:
-    - fsync() AFTER every write command
-    - ~200 ops/s (fsync bottleneck)
-    - Never lose data (durability on every write)
-    
-  everysec (recommended):
-    - bg thread fsyncs every 1 second
-    - ~100K+ ops/s
-    - Lose ≤1 second of data on crash
-    
-  no:
-    - OS decides when to flush (typically 30s)
-    - Maximum throughput
-    - Lose 30-60s of data
-
-50GB AOF replay:
-  - Parse protocol commands
-  - Re-execute ALL write commands sequentially
-  - ~5-30 minutes (vs 30-60s for RDB!)
-```
-
-**AOF Rewrite Mechanics:**
+**AOF rewrite (compaction), Redis 7.0+ multi-part AOF:**
 
 ```
-State before rewrite:
-  AOF file: 50GB (accumulated over days/weeks)
-  
-Rewrite triggers:
-  auto-aof-rewrite-percentage 100     # Grow 100% before rewrite
-  auto-aof-rewrite-min-size 64mb      # Minimum size to trigger
+appenddirname/
+  appendonly.aof.1.base.rdb    ← base snapshot (RDB format by default)
+  appendonly.aof.1.incr.aof    ← commands since the base
+  appendonly.aof.manifest      ← which files make up the current AOF
 
-Rewrite process:
-  1. fork() → child process
-  2. Child reads entire dataset into memory
-  3. Child writes MINIMAL commands:
-     Instead of: SET k1 v1 ... SET k1 v2 ... (multiple updates to same key)
-     Writes: SET k1 v2 (only the latest value!)
-  4. Parent appends all new writes to a buffer (during rewrite)
-  5. When child finishes: parent swaps old file with new file
-  6. Parent appends buffered writes to new file
+Rewrite (triggered by auto-aof-rewrite-percentage / -min-size, or BGREWRITEAOF):
+  1. Parent opens a NEW incr file and keeps appending live writes there.
+  2. fork() → child writes a new base file from its COW view of the dataset.
+  3. On success, the manifest is atomically switched to new base + new incr;
+     old files are deleted.
 
-Latency spikes during rewrite:
-  - fork() on 50GB instance: ~500ms-2s (page table copy)
-  - COW amplification: heavy writes during rewrites double memory
-  - Page cache churn: child reads all pages, evicting hot data
-  - Solution: auto-aof-rewrite-min-size = 4GB (never rewrite while busy)
-
-Tuning for production:
-  appendonly yes
-  appendfsync everysec
-  no-appendfsync-on-rewrite yes  # Don't fsync during rewrite (OS handles it)
-  auto-aof-rewrite-percentage 200  # Less frequent rewrites
-  auto-aof-rewrite-min-size 4gb
+Before 7.0 the parent buffered writes in memory during the rewrite and
+the parent had to flush that buffer at the end: extra memory and a final stall.
+Multi-part AOF removed both.
 ```
 
-**RDB + AOF Combined (Best Practice):**
+**Why rewrites (and BGSAVE) cause latency spikes:**
 
-```yaml
-# RDB for fast recovery + AOF for durability
-save 900 1     # RDB snapshot after 15 min if ≥1 key changed
-save 300 10    # RDB snapshot after 5 min if ≥10 keys changed
-save 60 10000  # RDB snapshot after 1 min if ≥10000 keys changed
-appendonly yes # AOF for durability (lose ≤1s)
+- **`fork()` stall** proportional to RSS (above).
+- **COW memory growth** under heavy writes; can trigger the OOM killer if `maxmemory` leaves no headroom.
+- **Disk contention:** the child's large sequential write competes with the parent's AOF `fsync`. If the fsync takes > 2 s, `everysec` blocks writes. `no-appendfsync-on-rewrite yes` avoids this **at the cost of a larger loss window during rewrites** (up to ~30 s).
+- Mitigations: disable THP, keep instances small (many 10–25 GB shards beat one 100 GB instance), leave 30–50% RAM headroom, run persistence on replicas only if you accept the trade-offs, use fast local disks.
 
-# Recovery order:
-# 1. Check AOF: if exists, load it (more complete)
-# 2. Else check RDB: load it
-# 3. Empty DB if neither exists
+**Recovery order (important, often answered wrong):**
 
-# Strategy: combine for best of both
-# - RDB: fast recovery (30-60s for 50GB)
-# - AOF: no data loss (≤1s on crash)
-# - Recovery loads AOF first → if AOF is corrupt, fall back to RDB
+```
+appendonly yes  → Redis loads ONLY the AOF (base + incr). It does NOT fall back to the RDB.
+                  A truncated tail is tolerated (aof-load-truncated yes); mid-file corruption
+                  stops startup → fix with redis-check-aof.
+appendonly no   → Redis loads the .rdb file if present.
+```
+
+Gotcha: enabling AOF on a running instance by editing the config and restarting starts with an **empty** AOF and loads nothing. Use `CONFIG SET appendonly yes` first (it triggers a rewrite), then persist the config.
+
+**Recommended production config:**
+
+```bash
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes          # default since 5.0: base file is RDB → fast load
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+save 3600 1 300 100 60 10000      # Redis 7 default RDB schedule; RDB files are also handy for backups
 ```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **fork() overhead** | Explains COW pages, page table copy time commensurate with RSS |
-| **AOF rewrite cost** | Knows rewrite fork is same as BGSAVE fork — double memory during heavy writes |
-| **Recovery order** | AOF is preferred (more complete), falls back to RDB |
-| **fsync trade-offs** | Can compare always (200 ops/s) vs everysec (100K ops/s) |
+| **fork() cost** | Page-table copy proportional to RSS, COW growth, THP warning |
+| **fsync trade-offs** | Knows `always` uses group commit, `everysec` ≈ 1 s loss |
+| **Recovery order** | AOF only if enabled; no automatic fallback to RDB |
+| **Modern AOF** | Multi-part AOF (7.0), RDB preamble |
+| **Durability framing** | Persistence ≠ replication durability; async replicas can still lose acknowledged writes |
+
+**What they probe next:** "How do you back up a 50 GB instance?" → copy the latest RDB/AOF directory (files are immutable once the manifest moves on) from a replica; Redis 8.10 adds a node-side `BACKUP` command built on multi-part AOF.
 
 ---
 
@@ -237,112 +212,75 @@ appendonly yes # AOF for durability (lose ≤1s)
 
 **Q:** "A Redis replica disconnects from its master for 45 seconds. When it reconnects, the master decides to do a FULL resync instead of a partial resync. Diagnose why. How does PSYNC2 (Redis 4+) improve on PSYNC?"
 
-**What They're Really Testing:** Whether you understand Redis replication's internal state machine — replication ID, offset, and backlog buffer sizing.
+**What They're Really Testing:** The replication state machine: replication ID, offset, backlog sizing, and what forces a full sync.
+
+!!! tip "30-second answer"
+    A partial resync needs two things: the replica's **replication ID** must match one the master knows, and the replica's **offset** must still be inside the master's **backlog** (a circular buffer, default **1 MB**). 45 s of writes almost always overflows 1 MB, so the master falls back to a full RDB transfer. Fix: size `repl-backlog-size` ≈ write throughput × tolerated disconnect × safety factor. PSYNC2 (4.0) keeps the *previous* replication ID after a failover and persists replication info in the RDB, so failovers and replica restarts no longer force full syncs.
 
 ### Answer
 
-**PSYNC2 Protocol:**
+**State on the master:**
 
 ```
-Master maintains:
-  - master_replid (random ID, changes on failover)
-  - master_repl_offset (current position in replication stream)
-  - repl_backlog_buffer (circular buffer, size = repl-backlog-size)
-  - repl_backlog_histlen (how much is actually stored)
-  - repl_backlog_idx (current write position in circular buffer)
+master_replid         random 40-char ID for the current replication history
+master_replid2        previous ID (PSYNC2), with second_repl_offset
+master_repl_offset    bytes of replication stream produced so far
+repl_backlog          circular buffer of the most recent repl-backlog-size bytes
 
-Replica connects:
-  1. REPLCONF listening-port 6379
-  2. REPLCONF capa psync2
-  3. PSYNC ? -1 (first connect) or PSYNC <replid> <offset> (reconnect)
-
-Master checks:
-  if replica_replid == master_replid AND offset in backlog:
-    → PARTIAL RESYNC (CONTINUE)
-  else:
-    → FULL RESYNC (send RDB)
+Replica (re)connects:  PSYNC <replid> <offset>      (PSYNC ? -1 on first sync)
+  replid matches (current, or replid2 with offset ≤ second_repl_offset)
+  AND offset is still in the backlog      → +CONTINUE  (partial: send the missing bytes)
+  otherwise                               → +FULLRESYNC (RDB snapshot + buffered stream)
 ```
 
-**Why Full Resync Happened:**
+**Why the full resync happened (most likely first):**
 
-```yaml
-Two possibilities:
-  
-1. Backlog too small:
-    repl-backlog-size = 1MB  (default!)
-    Replica disconnected for 45 seconds
-    During that time: 100K ops × 200 bytes = 20MB of new data
-    Backlog only holds 1MB → master wrote past the replica's offset!
-    Result: FULL RESYNC
+1. **Backlog too small.** Default `repl-backlog-size 1mb`. At even 500 KB/s of writes, 45 s = 22 MB. The replica's offset has been overwritten.
+2. **Replica output buffer overflow during an earlier sync.** `client-output-buffer-limit replica 256mb 64mb 60` disconnects a replica that can't keep up, which can loop full syncs forever on a big, busy dataset.
+3. **Replication ID mismatch**: the master changed (failover to a node that doesn't share the history), or the master restarted *without* persistence and got a new ID.
+4. **Pre-4.0 replica restart**: the replica lost its replid/offset on restart. Since 4.0 they are stored in the RDB, so a replica restarting from its own RDB can partially resync.
 
-2. Master failover during disconnection:
-    Replica was connected to Master-A (replid=abc)
-    Master-A crashes, replica reconnects to Master-B (replid=xyz)
-    Master-B's replid ≠ abc → FULL RESYNC (unless PSYNC2 can handle it)
-
-Fix:
-    repl-backlog-size 500mb   # Hold 500MB of replication data
-    # At 20MB/45s = ~444KB/s → 500MB = ~18min of buffer
-```
-
-**Backlog Sizing Formula:**
+**Backlog sizing:**
 
 ```bash
-# repl-backlog-size = (expected throughput) × (max replica disconnect time) × 2
-
-# Example: 10MB/s writes, 5 minute replica disconnect tolerance
-# 10MB/s × 300s × 2 = 6GB
-
-repl-backlog-size 6gb
-# Note: backlog memory is allocated at master startup
-# NOT dynamically grown! Set it correctly upfront.
+# repl-backlog-size ≈ write throughput × max disconnect to survive × safety factor
+# 10 MB/s × 300 s × 2 = 6 GB
+CONFIG SET repl-backlog-size 6gb   # runtime-settable; memory is allocated as the stream grows
 ```
 
-**PSYNC2 Improvement (Redis 4.0+):**
+Since Redis 7.0 the backlog and all replica output buffers share **one replication buffer** (a linked list of blocks), so a large backlog no longer means each replica gets its own copy. The backlog is freed `repl-backlog-ttl` seconds (default 3600) after the last replica disconnects.
+
+**PSYNC2 (4.0+) after a failover:**
 
 ```
-PSYNC (pre-4.0): After master failover, ALL replicas need full resync
-  - Master-A fails → replica promotes to master-B
-  - master-B has DIFFERENT replication ID
-  - Other replicas: PSYNC old-id old-offset → master-B: "id mismatch → FULL RESYNC"
+Master-A (replid=abc) dies at offset 50000.
+Replica B is promoted: replid=xyz, replid2=abc, second_repl_offset=50001.
+Replica C reconnects to B with:  PSYNC abc 45000
+B: abc == replid2 and 45000 ≤ 50001 → +CONTINUE (partial resync from B's backlog)
 
-PSYNC2 (4.0+): Master keeps TWO replication IDs
-  - master_replid: current ID (changed after failover)
-  - master_replid2: previous ID (old master's ID)
-  - second_repl_offset: offset where ID switch happened
-
-  Replica connects with old replid + offset:
-  if replica_replid == master_replid2 AND offset < second_repl_offset:
-    → PARTIAL RESYNC (because we know the old ID's history!)
-  
-  Example:
-    Master-A (replid=abc) fails at offset 50000
-    Master-B promotes (replid=xyz, replid2=abc, second_repl_offset=50001)
-    Replica: PSYNC abc 45000
-    Master-B: abc == replid2, 45000 < 50001 → CONTINUE (partial resync!)
+Pre-4.0: B would answer FULLRESYNC to every replica after every failover.
 ```
 
-**Connection Handling (Replication Timeout):**
+**Useful settings:**
 
 ```bash
-# /etc/redis/redis.conf
-repl-timeout 60                       # Master/replica timeout (default: 60s)
-repl-backlog-size 1gb                 # Sufficient backlog buffer
-repl-backlog-ttl 3600                 # Release backlog after 1h if no replicas
-repl-diskless-sync yes                # Send RDB directly via socket (no temp file)
-repl-diskless-sync-delay 5            # Wait 5s to batch multiple replicas
-replica-serve-stale-data yes          # Serve stale data during FULL resync
-replica-read-only yes                 # Replicas are read-only (enforced)
+repl-diskless-sync yes        # default since 7.0: stream the RDB over the socket, no temp file
+repl-diskless-sync-delay 5    # wait to batch several replicas onto one fork
+repl-diskless-load disabled   # replica side; 'swapdb'/'on-empty-db' load straight from the socket
+replica-serve-stale-data yes  # serve old data while syncing (consistency trade-off)
+repl-timeout 60
 ```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **PSYNC2 mechanism** | Understands dual replication IDs for seamless failover |
-| **Backlog sizing** | Can compute required backlog size from throughput and disconnect tolerance |
-| **Replication timeout** | Knows repl-timeout vs repl-backlog-ttl behavior |
-| **Diskless sync** | Understands diskless sync avoids RDB temp file bottlenecks |
+| **PSYNC conditions** | Replid match + offset within backlog |
+| **Backlog sizing** | Computes it from throughput × disconnect tolerance; knows default is 1 MB |
+| **Full-sync loops** | Mentions replica output-buffer limits |
+| **PSYNC2** | Dual replication IDs; replication info persisted in RDB |
+
+**What they probe next:** "What does a full sync cost the master?" → a `fork()` plus streaming the whole dataset, possibly to several replicas; on big instances that is the main reason to keep shards small and backlogs generous.
 
 ---
 
@@ -350,109 +288,80 @@ replica-read-only yes                 # Replicas are read-only (enforced)
 
 **Q:** "Design a Redis high-availability setup for a payment service that requires <5 seconds of downtime during failover and zero data loss. Walk through Redis Sentinel's monitoring, quorum, and failover process."
 
-**What They're Really Testing:** Whether you understand Sentinel's distributed election protocol — quorum-based ODOWN detection, leader election via Raft-inspired consensus, and the failover state machine.
+**What They're Really Testing:** SDOWN/ODOWN, the leader election among Sentinels, replica selection, and honesty about what async replication can't guarantee.
+
+!!! tip "30-second answer"
+    Run ≥ 3 Sentinels in separate failure domains. A Sentinel marks the master **SDOWN** after `down-after-milliseconds`; when `quorum` Sentinels agree it becomes **ODOWN**; a **majority** of Sentinels must then elect one leader (per epoch) to run the failover, which promotes the best replica and reconfigures the rest. Sub-5 s failover is possible with `down-after-milliseconds` ≈ 1–2 s on a reliable network, at the risk of false failovers. **Zero data loss is not achievable**: replication is async, and even `WAIT` doesn't stop Sentinel promoting a replica that missed a write. For money, the source of truth belongs in a database with synchronous replication; Redis is the cache or rate limiter in front.
 
 ### Answer
 
-**Sentinel Architecture:**
+**Architecture:**
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Sentinel A     │    │  Sentinel B     │    │  Sentinel C     │
-│  (voting)       │───▶│  (voting)       │───▶│  (voting)       │
-│  port 26379     │    │  port 26379     │    │  port 26379     │
-└────────┬────────┘    └────────┬────────┘    └────────┬────────┘
-         │                      │                      │
-         ▼                      ▼                      ▼
-┌───────────────────────────────────────────────────────────────┐
-│                       Redis Master:6379                        │
-│  Monitors: PING every 1s (down-after-milliseconds 5000)       │
-│  Monitored by ALL 3 sentinels                                  │
-│  Subjective Down (SDOWN): single sentinel can't reach          │
-│  Objective Down (ODOWN): quorum sentinels agree               │
-├───────────────────────────────────────────────────────────────┤
-│                       Replica 1:6380                           │
-│                       Replica 2:6381                           │
-└───────────────────────────────────────────────────────────────┘
+   Sentinel A        Sentinel B        Sentinel C       (3 AZs, quorum = 2)
+       │  PING/INFO every 1 s; gossip via __sentinel__:hello pub/sub
+       ▼
+  ┌──────────────┐   async replication   ┌────────────┐  ┌────────────┐
+  │ Master :6379 │ ───────────────────▶  │ Replica 1  │  │ Replica 2  │
+  └──────────────┘                       └────────────┘  └────────────┘
+  Clients ask Sentinel "where is master payment-master?" and reconnect on +switch-master.
 ```
 
-**Failover Process (Step by Step):**
+**Failover, step by step:**
 
 ```
-Phase 1: ODOWN Detection
-  Sentinel A detects: PONG timeout (no response in 5s)
-  Sentinel A marks master as sdown (subjectively down)
-  Sentinel A asks B and C: "is master down?"
-  B and C respond: "yes, non-responsive"
-  Sentinel A: quorum=2 reached → master is ODOWN (objectively down)
-
-Phase 2: Leader Election (Raft-like)
-  Sentinel A sends: "I want to be leader for epoch 42"
-  Sentinel B: "I vote for A in epoch 42" (first-come-first-served)
-  Sentinel C: "I vote for A in epoch 42"
-  Sentinel A: 3 votes ≥ majority (3/3) → I AM THE LEADER
-
-Phase 3: Failover
-  Leader (A) chooses best replica:
-    Criteria (in order):
-    1. priority (replica-priority 0 = never promote)
-    2. replication offset (most up-to-date wins)
-    3. run ID (lexicographically smallest, tiebreaker)
-  
-  Leader A sends: SLAVEOF NO ONE to chosen replica
-  A waits: REPLCONF ACK from new master (old replicas now follow)
-  A broadcasts: +switch-master <old-master> <new-master>
-  B and C: acknowledge the new master
-
-Timing:
-  Detection: 5s (down-after-milliseconds)
-  Election: <500ms (network round trips)
-  Promotion: <1s (SLAVEOF NO ONE + config rewrite)
-  Total: <6.5s typical → your 5s target is TIGHT
+1. SDOWN   Sentinel A gets no valid PING reply for down-after-milliseconds.
+2. ODOWN   A asks the others (SENTINEL is-master-down-by-addr). quorum (2) agree → ODOWN.
+3. Elect   A increments the epoch and asks for votes. Each Sentinel votes once per epoch,
+           first come first served. Leader needs a MAJORITY of all Sentinels (2 of 3),
+           and at least quorum. No majority (e.g. partition) → no failover.
+4. Select  Leader filters out replicas disconnected from the master for too long, then ranks:
+             replica-priority (lower wins; 0 = never promote)
+             → replication offset (most data wins)
+             → run ID (lexicographically smallest)
+5. Promote REPLICAOF NO ONE on the winner; waits until INFO shows role:master.
+6. Reconfigure other replicas: REPLICAOF <new-master> (parallel-syncs at a time).
+7. Announce +switch-master; old master is reconfigured as a replica when it returns.
 ```
 
-**Configuration for Sub-5s Failover:**
+Note the two thresholds: **quorum** decides *detection*; **majority** decides *authorization*. Setting quorum = 1 with 3 Sentinels speeds detection but still needs 2 votes to act.
+
+**Timing budget for < 5 s:**
+
+| Phase | Typical |
+|---|---|
+| Detection | `down-after-milliseconds` (1–2 s on same-region networks; 5 s+ is safer across AZs) |
+| ODOWN agreement + election | tens to hundreds of ms |
+| Promotion + client reconnection | ~1 s, dominated by clients noticing (Sentinel-aware client, pub/sub notification) |
 
 ```bash
-# /etc/redis-sentinel.conf
-sentinel monitor payment-master 192.168.1.10 6379 2
-sentinel down-after-milliseconds payment-master 1000   # 1s detection (was 5s)
-sentinel failover-timeout payment-master 5000          # 5s max failover
-sentinel parallel-syncs payment-master 1               # Sync one replica at a time
-sentinel auth-pass payment-master MySecretPass         # For AUTH-enabled instances
-sentinel notification-script payment-master /opt/notify.py  # Alert on failover
-
-# Limitation with aggressive timing:
-# 1s down-after-milliseconds → false positives on network jitter
-# Use only if network is VERY reliable (same rack/AZ)
-# Recommended: 3-5s in multi-AZ deployments
+sentinel monitor payment-master 10.0.1.10 6379 2
+sentinel down-after-milliseconds payment-master 2000
+sentinel failover-timeout payment-master 10000   # also the retry back-off between attempts
+sentinel parallel-syncs payment-master 1
+sentinel auth-pass payment-master <secret>
 ```
 
-**Zero Data Loss Configuration:**
+**Reducing (not eliminating) data loss:**
 
-```yaml
-# Master config: synchronous replication cannot be enforced in Redis
-# Redis replication is ASYNCHRONOUS!
-# Data loss window: last writes that master accepted before dying
-# Solution: MINIMAL
-  - WAIT command in application:
-    WAIT 1 1000    # Wait for min 1 replica to acknowledge (timeout 1s)
-    # WAIT returns: num_replicas_acked
-  
-  - Trade-off: WAIT blocks the client, increases p99 latency
-  
-# Alternative: write to multiple primaries (active-active)
-  - Redis Enterprise or CRDT-based (conflict resolution required)
-```
+| Mechanism | What it does | What it does not do |
+|---|---|---|
+| `min-replicas-to-write 1` + `min-replicas-max-lag 10` | A master isolated from its replicas stops accepting writes after ~10 s, bounding split-brain loss | Doesn't make replication synchronous |
+| `WAIT 1 100` | Blocks the client until ≥ 1 replica acknowledged the write (or timeout) | Sentinel may still promote a *different* replica that lacks it; a timed-out write is still applied on the master |
+| `WAITAOF 1 1 100` (7.2+) | Waits until the write is fsynced to the local AOF and ≥ 1 replica's AOF | Same failover caveat |
+
+Active-active geo-replication (CRDT-based) exists in Redis Software / Redis Cloud, not in Redis Open Source, and it trades consistency for availability rather than giving "zero loss".
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **ODOWN protocol** | Explains SDOWN vs ODOWN quorum mechanism |
-| **Leader election** | Understands Raft-like epoch-based voting among sentinels |
-| **Replica selection** | Knows priority > replication offset > run ID hierarchy |
-| **Data loss awareness** | Acknowledges async replication means potential data loss |
+| **SDOWN/ODOWN** | Quorum for detection vs majority for the failover leader |
+| **Replica selection** | Disconnection filter → priority → offset → run ID |
+| **Honesty on loss** | Says zero loss is impossible with async replication; knows `min-replicas-to-write`, `WAIT`, `WAITAOF` limits |
+| **Client side** | Clients must discover the master via Sentinel and handle reconnection |
+
+**What they probe next:** "Sentinel or Cluster?" → Sentinel = HA for one dataset that fits in one node; Cluster = sharding + HA built in, at the cost of multi-key restrictions and smarter clients.
 
 ---
 
@@ -460,127 +369,80 @@ sentinel notification-script payment-master /opt/notify.py  # Alert on failover
 
 **Q:** "You need to add 3 nodes to a 6-node Redis Cluster handling 1M ops/s. Walk through hash slot assignment, MOVED/ASK redirections, and resharding without downtime. How do you handle resharding while maintaining p99 < 5ms?"
 
-**What They're Really Testing:** Whether you understand Redis Cluster's distributed hash slot scheme — the difference between MOVED (permanent) and ASK (temporary) redirects, and the resharding protocol.
+**What They're Really Testing:** Slot mapping and hash tags, MOVED vs ASK semantics, how key-by-key migration works, and why big keys are what hurt p99.
+
+!!! tip "30-second answer"
+    16,384 slots; `slot = CRC16(key) mod 16384`, hashing only the `{tag}` if present. Clients cache slot → node and get **MOVED** (permanent, update the map) or **ASK** (one-off redirect during migration, send `ASKING` first). Classic resharding moves keys one batch at a time with `MIGRATE`, which **blocks both nodes** for each batch, so a single multi-MB key is what blows p99. Mitigate with small batches, finding and splitting big keys first, and moving slots off-peak. **Redis 8.4+** (and Valkey 9.0+) add **atomic slot migration** (`CLUSTER MIGRATION`), which replicates a whole slot in the background and flips ownership atomically, removing ASK redirects and multi-key errors during the move.
 
 ### Answer
 
-**Hash Slot Scheme:**
+**Slot mapping and hash tags:**
 
 ```
-Total slots: 16384 (2^14)
+slot = CRC16-XMODEM(key) mod 16384
+  user:100:profile      → CRC16("user:100:profile") mod 16384 = 4836
+  user:{100}:profile    → only "100" is hashed           → 339
+  user:{100}:cart       → only "100" is hashed           → 339   (same slot)
 
-Slot assignment: CRC16(key) mod 16384
-
-Topic → Slot mapping:
-  user:{100}:profile → CRC16("user:{100}:profile") mod 16384 = slot 7842
-  session:{abc}:data → CRC16("session:{abc}:data") mod 16384 = slot 12001
-  
-  Hash tags: use {...} to pin keys to the same slot
-  user:{100}:profile, user:{100}:cart → SAME slot (transactional!)
-  # Redis cluster doesn't support multi-key operations across slots!
+Multi-key commands (MGET, MULTI/EXEC, Lua with several KEYS, SUNIONSTORE…) only work
+when all keys share one slot → CROSSSLOT error otherwise. Hash tags make that possible,
+at the risk of hot slots if one tag gets too much traffic.
+Why 16384? Slot ownership is gossiped as a 2 KB bitmap; 16K slots is plenty for ~1000 nodes.
 ```
 
-**MOVED vs ASK Redirects:**
+**MOVED vs ASK:**
 
-```
-MOVED (permanent):
-  Client sends command to Node A
-  Key's slot lives on Node B → MOVED <slot> <B-ip>:<port>
-  Client caches: "slot 7842 is on Node B" → FUTURE requests go directly to B
-  Only replied by the CORRECT node for the slot
+| | MOVED | ASK |
+|---|---|---|
+| When | Any node that doesn't own the slot | Source node, during migration, when the key is **not present locally** (already moved or new) |
+| Meaning | "This slot lives on B now" | "Try B for this one request" |
+| Client action | Update slot map, retry on B | Send `ASKING` then the command to B; **don't** update the map |
 
-ASK (temporary, during resharding):
-  Node A has slot but is migrating data to Node B
-  Client: GET key → ASK <slot> <B-ip>:<port>
-  Client sends ASKING command to B (one-time flag) → then GET key
-  Client does NOT update slot cache (next request still goes to A first)
-  ASKING flag: allows one read/write to a migrating slot
-```
+If the key is still on the source, the source just serves it. Multi-key operations spanning moved and unmoved keys return `TRYAGAIN`.
 
-**Resharding Process:**
+**Adding 3 nodes to 6:**
 
 ```bash
-# /usr/bin/redis-cli --cluster reshard <source>:<port> --cluster-from <node-id> \
-#   --cluster-to <node-id> --cluster-slots <count> --cluster-yes
+redis-cli --cluster add-node new1:6379 existing:6379        # repeat for new2, new3 (empty, 0 slots)
+redis-cli --cluster add-node r1:6379 existing:6379 --cluster-slave --cluster-master-id <new1-id>  # their replicas
 
-# Step 1: Add new nodes to cluster
-redis-cli --cluster add-node new-node:6379 existing-node:6379
-# New nodes are empty → no slots assigned
+# Move ~16384/9 ≈ 1820 slots onto each new master, evenly from the old ones:
+redis-cli --cluster rebalance existing:6379 --cluster-use-empty-masters \
+  --cluster-pipeline 10 --cluster-threshold 1
 
-# Step 2: Reshard slots from existing nodes to new nodes
-redis-cli --cluster reshard 192.168.1.10:6379
-
-# Interactive prompts:
-How many slots do you want to move? 2730
-What is the receiving node ID? <new-node-id>
-Source node: all
-Do you want to proceed? yes
-
-# Step 3: Check cluster health
-redis-cli --cluster check 192.168.1.10:6379
-
-redis-cli cluster info
-# cluster_state:ok         # Must be ok
-# cluster_slots_assigned:16384
-# cluster_known_nodes:9    # 6 old + 3 new
+redis-cli --cluster check existing:6379    # all 16384 slots covered, no open slots
 ```
 
-**Resharding Internals (Slot Migration):**
+**Classic migration protocol (per slot), what `redis-cli` does under the hood:**
 
 ```
-Phase 1: Set slot MIGRATING on source (IMPORTING on destination)
-  CLUSTER SETSLOT 7842 MIGRATING <source-node-id>
-  CLUSTER SETSLOT 7842 IMPORTING <dest-node-id>
-
-Phase 2: Migrate keys (batch)
-  For each key in slot 7842 (discovered via CLUSTER GETKEYSINSLOT 7842 count):
-    MIGRATE dest-ip dest-port key dest-db timeout [COPY] [REPLACE]
-    # MIGRATE: atomically transfers key, removes from source
-  
-Phase 3: Set slot NODE (broadcast)
-  CLUSTER SETSLOT 7842 NODE <dest-node-id>
-  # Broadcast via gossip to ALL nodes
-  # After this: ALL nodes know the new slot owner
-  # MOVED redirects from old owner now go to new owner
+1. On destination: CLUSTER SETSLOT <slot> IMPORTING <source-id>
+2. On source:      CLUSTER SETSLOT <slot> MIGRATING <dest-id>
+3. Loop:  CLUSTER GETKEYSINSLOT <slot> <count>
+          MIGRATE dest-host dest-port "" 0 <timeout> KEYS k1 k2 … kN
+          (atomic per call: DUMP + RESTORE + DEL; both nodes block until done)
+4. CLUSTER SETSLOT <slot> NODE <dest-id> on destination, source, then everyone (gossip spreads it)
 ```
 
-**P99 < 5ms During Resharding:**
+**Keeping p99 < 5 ms:**
 
-```yaml
-Challenges:
-  - MIGRATE commands are blocking (single-threaded Redis!)
-  - Each MIGRATE blocks the event loop for ~100-500μs
-  - 10K keys × 100μs = 1 second of event loop blocked!
-
-Solutions:
-  
-  1. Batch migrations:
-    redis-cli --cluster reshard uses batch MIGRATE (multiple keys per call)
-    trade-off: larger batches = longer single pause
-    
-  2. Throttle migration rate:
-    redis-cli --cluster reshard --cluster-pipeline 10
-    # Pipeline 10 MIGRATE commands at a time → 10 × 500μs = 5ms pause
-    # With pipeline: ~50ms pause every 10 keys → acceptable for p99 < 5ms
-    # (p99 unaffected because pause is ~50ms once per batch)
-    
-  3. Reshard during low traffic:
-    Schedule reshard during off-peak hours
-    
-  4. Pin clients:
-    # Cluster down? Actually, cluster is DOWN if any slot is unreachable
-    # BUT: cluster-require-full-coverage no (accept partial coverage)
-    cluster-require-full-coverage no
-```
+- **Big keys are the real risk.** Migrating a 50 MB hash serializes and sends it in one `MIGRATE`, blocking both nodes for tens to hundreds of ms. Find them first (`redis-cli --bigkeys`, `MEMORY USAGE`) and split them.
+- **Small batches.** `--cluster-pipeline` = keys per `MIGRATE` call (default 10). Smaller = shorter individual stalls, longer total time.
+- **Spread and schedule.** Move slots in waves off-peak; watch `latency` / `LATENCY LATEST` and per-slot metrics (`CLUSTER SLOT-STATS`, Redis 8.4+; Valkey 8.0+) and pause if p99 degrades.
+- **Client readiness.** Clients must handle MOVED/ASK/TRYAGAIN efficiently (refresh topology on MOVED, not on every ASK).
+- **Use atomic slot migration where available** (Redis 8.4+ `CLUSTER MIGRATION IMPORT …`, Valkey 9.0+): the target streams the slot's data and subsequent writes in the background, then ownership switches in one step.
+- `cluster-require-full-coverage no` is unrelated to resharding: it lets nodes keep serving their slots when *some* slots have no live owner (availability over consistency).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **MOVED vs ASK** | Understands MOVED is permanent cache update, ASK is temporary with ASKING flag |
-| **CRC16 hash tags** | Knows { } for multi-key ops within same slot |
-| **MIGRATE blocking** | Understands single-threaded Redis blocks during key migration |
-| **Reshard throttling** | Can pipeline migrations to bound event loop pauses |
+| **Hash tags** | Knows only `{…}` is hashed and the hot-slot trade-off |
+| **MOVED vs ASK** | ASK only for keys not on the source; `ASKING`; no map update |
+| **Migration cost** | `MIGRATE` blocks both ends; big keys dominate p99 |
+| **Current tooling** | `--cluster rebalance`, per-slot stats, atomic slot migration in 8.4+ / Valkey 9 |
+
+**What they probe next:** "What happens to a Lua script or transaction mid-migration?" → `TRYAGAIN`/ASK-related errors when its keys are split across nodes; atomic slot migration avoids this.
 
 ---
 
@@ -588,90 +450,70 @@ Solutions:
 
 **Q:** "Your Redis cache reaches its maxmemory limit. Walk through the eviction policies. How does the approximated LRU work? How do you choose between allkeys-lru and volatile-ttl for a social media feed cache?"
 
-**What They're Really Testing:** Whether you understand Redis's eviction mechanics — not true LRU, but approximated sampling-based eviction, and how expiry interacts with eviction.
+**What They're Really Testing:** Sampled eviction, LFU, how expiry interacts with eviction, and choosing a policy from the access pattern.
+
+!!! tip "30-second answer"
+    At `maxmemory`, each write triggers eviction per `maxmemory-policy`. Redis doesn't keep an LRU list: it **samples** `maxmemory-samples` keys (default 5) and evicts the best candidate from a small **eviction pool**, which is close to true LRU with 10 samples. **LFU** (4.0+) uses a probabilistic 8-bit counter with decay and is usually better for skewed popularity (viral posts). Expired keys are removed lazily on access plus by an adaptive background sampler. For a feed cache: `allkeys-lfu` (or `allkeys-lru`), not `volatile-ttl`, unless you trust your TTLs more than observed access.
 
 ### Answer
 
-**Eviction Policies Comparison:**
+**Policies:**
 
-```yaml
-Policy              | Scope        | When Used
---------------------|--------------|-----------------------------------------------
-noeviction          | All keys     | Redis as DB (don't evict, return OOM errors)
-allkeys-lru         | All keys     | Generic cache (most popular)
-allkeys-lfu         | All keys     | Cache with access frequency patterns
-allkeys-random      | All keys     | Equal-value cache items
-volatile-lru        | TTL keys     | Cache + persistent keys in same instance
-volatile-lfu        | TTL keys     | As above, but frequency-based
-volatile-ttl        | TTL keys     | Evict shortest TTL first
-volatile-random     | TTL keys     | Random eviction from TTL keys
+| Policy | Candidates | Use when |
+|---|---|---|
+| `noeviction` (default) | none: writes fail with OOM | Redis as a primary store / queue |
+| `allkeys-lru` | all keys | General cache, recency matters |
+| `allkeys-lfu` | all keys | Skewed popularity; resists one-off scans |
+| `allkeys-random` | all keys | Uniform access |
+| `volatile-lru` / `volatile-lfu` / `volatile-random` | keys with a TTL | Mixed cache + must-keep data (better: separate instances) |
+| `volatile-ttl` | keys with a TTL | Evict soonest-to-expire first |
+| `allkeys-lrm` / `volatile-lrm` (**8.6+**) | as named | Least Recently **Modified**: reads don't refresh the key's age, so read-hot but stale data can go |
 
-# Formula: allkeys-lru usually best for caches
-# volatile-ttl only if you have good expiry estimates
-# volatile-lru if mixing cache + DB in same instance (avoid!)
-```
+Gotcha: with a `volatile-*` policy and no keys with TTL, Redis behaves like `noeviction`.
 
-**Approximated LRU (Not True LRU):**
+**Approximated LRU:**
 
 ```
-True LRU: maintains sorted linked list of all keys by access time
-  Memory: O(N) pointers (Redis has 1M+ keys!)
-  Insertion/Update: O(1) (move to head)
-  Eviction: O(1) (remove from tail)
-  Problem: 1M keys × 2 pointers = 16MB just for the LRU list
-
-Redis's approach (approximated LRU):
-  - Maintains last access time (24-bit field in robj)
-  - On eviction: sample N keys (default 5) from the keyspace
-  - Evict the OLDEST among the sample
-  - Sampling every time = O(1) per eviction (no sorted structure!)
-
-  maxmemory-samples 10
-  # Larger sample = more accurate LRU = more CPU per eviction
-  
-  Accuracy with maxmemory-samples=5: ~90% of what true LRU would choose
-  With maxmemory-samples=10: ~95% accuracy
-  With maxmemory-samples=20: ~98% accuracy (rarely needed)
+Each object has a 24-bit LRU clock field (seconds resolution, in the robj header).
+On eviction:
+  1. Sample maxmemory-samples keys (default 5) from the relevant dict.
+  2. Insert them into a 16-entry eviction pool ordered by idle time
+     (the pool persists across evictions, so good candidates accumulate).
+  3. Evict the best candidate in the pool.
+No linked list → no 16 bytes of prev/next pointers per key, O(1) per eviction.
+maxmemory-samples 10 is very close to true LRU (Redis docs' simulation) for slightly more CPU.
 ```
 
-**Expiry Internals:**
+**LFU (4.0+):** the same 24 bits hold an 8-bit **logarithmic counter** (increment probability falls as the counter grows, tuned by `lfu-log-factor`) and a 16-bit last-decrement time (counter decays every `lfu-decay-time` minutes). Distinguishes "hot for an hour" from "touched once by a batch job".
+
+**Expiry:**
 
 ```
-SET key value EX 3600  # Set with TTL
-
-internal: setExpire(key, currentTime + 3600000)
-
-Expiry removal strategies:
-  1. Lazy: key accessed → check if expired → delete if expired
-     Guarantees: no expired key is ever returned to client
-  
-  2. Active (timed loop):
-     While: expired keys sample rate < 25% AND < 16 samples:
-       Sample: 20 random keys from the TTL pool
-       Delete: all expired
-       If >25% were expired → repeat (thundering herd possible)
-       Time limit: <25% of CPU per cycle
-       Runs: 10 times per second (hz=10)
-     
-     Why this matters:
-       - Without active expiry, expired keys linger until accessed
-       - With active expiry: bounded deletion overhead
-       - Problem: 50%+ keys expired → active loop runs all the time!
-
-For social media feed cache:
-  allkeys-lru over volatile-ttl:
-    - volatile-ttl depends on you setting GOOD TTLs
-    - allkeys-lru naturally keeps popular items regardless of TTL
-    - Social feed: some items go viral, some die → LRU adapts automatically
+1. Lazy:   on access, if the key is past its TTL → delete and act as missing.
+           An expired key is never returned.
+2. Active: hz times per second (default 10), sample ~20 keys from the expires dict,
+           delete the expired ones, and repeat while more than ~10% of the sample
+           was expired, within a CPU-time budget (~25% of a cycle).
+           active-expire-effort (1–10, Redis 6+) trades CPU for less memory held by
+           expired keys.
+Replicas don't expire keys themselves; the master sends DELs (replicas hide logically
+expired keys from reads since 3.2).
 ```
+
+If many keys expire at the same moment (e.g. a bulk load with one fixed TTL), the active cycle keeps re-running and memory is held by dead keys until it catches up: **add jitter to TTLs**.
+
+**Feed cache choice:** `allkeys-lfu`. Popularity is highly skewed and changes; LFU keeps viral items and drops one-hit items without depending on TTL quality. `volatile-ttl` only helps if TTLs genuinely encode value.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Sampled LRU vs true LRU** | Can explain sampling trade-off: memory vs accuracy |
-| **Active expiry loop** | Understands the sampling loop and CPU guarantees |
-| **allkeys-lru over volatile-ttl** | For caches, LRU adapts to access patterns, TTL is guesswork |
+| **Sampled LRU** | Sampling + eviction pool, `maxmemory-samples` trade-off |
+| **LFU** | Log counter + decay; why it beats LRU for skewed access |
+| **Expiry mechanics** | Lazy + adaptive active cycle; TTL jitter |
+| **Policy choice** | Driven by access pattern; knows `noeviction` is the default |
+
+**What they probe next:** "Writes start failing with OOM even though you set allkeys-lru" → memory is in non-evictable places (client output buffers, replication backlog, Lua/Function memory) or eviction can't keep up with the write rate; check `INFO memory` and `evicted_keys`.
 
 ---
 
@@ -679,111 +521,96 @@ For social media feed cache:
 
 **Q:** "You need to atomically debit a wallet balance and log the transaction. Compare MULTI/EXEC transactions vs Lua scripting in Redis. How do you ensure that your Lua script doesn't block the event loop for too long?"
 
-**What They're Really Testing:** Whether you understand Redis's scripting model — Lua sandbox, EVAL vs EVALSHA, script replication, and the single-threaded performance implications.
+**What They're Really Testing:** Atomicity semantics of MULTI/EXEC vs scripts, optimistic locking with WATCH, script limits, and how scripts replicate.
+
+!!! tip "30-second answer"
+    `MULTI/EXEC` queues commands and runs them back-to-back with nothing interleaved, but has **no conditional logic and no rollback**; check-then-act needs `WATCH` (optimistic CAS, retry on conflict). A **Lua script** (or a **Function**, 7.0+) runs atomically and can branch, so "check balance, debit, append ledger" is one round-trip. Scripts block the single command thread: keep them O(small), and know that after `busy-reply-threshold` (5 s) Redis only *starts answering BUSY*; it doesn't stop the script. Since 7.0 scripts replicate as their **effects** (the resulting writes), so non-determinism like `TIME` is fine.
 
 ### Answer
 
-**MULTI/EXEC (Optimistic, No Rollback):**
+**MULTI/EXEC semantics:**
 
 ```bash
-# MULTI/EXEC: commands are queued and executed atomically
-# BUT: no conditional logic! Cannot check-then-set.
-
 MULTI
-DECRBY wallet:100 50     # Debit $50
-INCR transaction:count   # Log transaction
-EXEC                     # EXEC may fail mid-way (no rollback!)
-
-# Problem: cannot check balance before debit!
-# Redis transactions DON'T ROLLBACK on errors!
-# If DECRBY succeeds but INCR fails → money is lost!
+DECRBY wallet:100 50
+RPUSH ledger:100 "debit:50"
+EXEC
 ```
 
-**Lua Scripting (Preferred for Conditional Logic):**
+- Errors **at queue time** (unknown command, wrong arity) → `EXEC` aborts the whole transaction (since 2.6.5).
+- Errors **at run time** (e.g. `WRONGTYPE`) → that command fails, **the others still run**. No rollback.
+- You can't read a value inside the transaction and branch on it.
+
+**Check-and-set with WATCH (optimistic locking):**
+
+```python
+def debit(r, wallet, amount):
+    with r.pipeline() as p:
+        while True:
+            try:
+                p.watch(wallet)                     # abort EXEC if wallet changes
+                balance = int(p.get(wallet) or 0)
+                if balance < amount:
+                    p.unwatch()
+                    raise ValueError("INSUFFICIENT_FUNDS")
+                p.multi()
+                p.decrby(wallet, amount)
+                p.rpush(f"{wallet}:ledger", f"debit:{amount}")
+                p.execute()
+                return balance - amount
+            except redis.WatchError:
+                continue                            # someone else wrote; retry
+```
+
+Works, but under contention retries pile up and it costs 2+ round-trips. A script is simpler.
+
+**Lua (one round-trip, atomic, can branch):**
 
 ```lua
--- Atomic debit + audit with Lua
--- EVAL "script" 2 wallet:100 ledger:today 50
-
-local wallet_key = KEYS[1]        -- "wallet:100"
-local ledger_key = KEYS[2]        -- "ledger:today"
-local amount = tonumber(ARGV[1])  -- 50
-
-local balance = redis.call("GET", wallet_key)
-balance = tonumber(balance or 0)
-
+-- EVAL <script> 2 {wallet:100}:bal {wallet:100}:ledger 50
+local balance = tonumber(redis.call("GET", KEYS[1]) or "0")
+local amount  = tonumber(ARGV[1])
 if balance < amount then
     return redis.error_reply("INSUFFICIENT_FUNDS")
 end
-
-redis.call("DECRBY", wallet_key, amount)
-redis.call("RPUSH", ledger_key, string.format(
-    "tx:wallet_debit:%s:%d", wallet_key, amount
-))
-
-return { balance - amount, "SUCCESS" }
+redis.call("DECRBY", KEYS[1], amount)
+redis.call("RPUSH", KEYS[2], "debit:" .. amount)
+return balance - amount
 ```
 
-**Script Caching (EVALSHA):**
+Rules: pass **every key via `KEYS`** (Cluster routing and ACL checks depend on it), and in Cluster all keys must hash to one slot (hence the `{wallet:100}` tag). Note: a script error *after* some writes does **not** roll back the earlier writes either; validate first, write last.
 
-```bash
-# EVAL: send full script every time (wasteful)
-EVAL "return redis.call('GET', KEYS[1])" 1 user:100
+**Caching:** `SCRIPT LOAD` returns the SHA1; `EVALSHA <sha>` avoids resending the body; on `NOSCRIPT` (after restart/failover/`SCRIPT FLUSH`) fall back to `EVAL`. Client libraries do this automatically. `EVAL_RO`/`EVALSHA_RO` (7.0) can run on replicas.
 
-# EVALSHA: send SHA1 hash, Redis caches script
-SCRIPT LOAD "return redis.call('GET', KEYS[1])"
-# → returns: "4e6d1b3fc8d5c12b9c4c5d6e7f8a9b0c1d2e3f4a"
+**Blocking and limits:**
 
-EVALSHA 4e6d1b3fc8d5c12b9c4c5d6e7f8a9b0c1d2e3f4a 1 user:100
-
-# If script not cached: NOSCRIPT error → fall back to EVAL
+```
+Scripts run on the main thread; nothing else executes meanwhile.
+busy-reply-threshold 5000   (was lua-time-limit before 7.0)
+  After 5 s Redis does NOT kill the script; it starts replying BUSY to other clients.
+  SCRIPT KILL      works only if the script hasn't written yet.
+  SHUTDOWN NOSAVE  is the only way out once it has written (to keep atomicity).
 ```
 
-**Event Loop Blocking (Script Duration):**
+So: bound the work (`COUNT` limits, no unbounded `KEYS`/`SMEMBERS` loops), and do bulk processing from the client in batches (`SCAN` + pipelines).
 
-```lua
--- WARNING: Lua scripts ARE BLOCKING!
--- Redis is single-threaded: script runs → nothing else runs!
--- Default max: lua-time-limit 5000 (5 seconds)
+**Replication of scripts:**
 
--- BAD: O(N) loop over 1M items
-for i = 0, 1000000 do
-    redis.call("GET", "key:" .. i)  -- Blocks for 10+ seconds!
-end
-
--- GOOD: incremental processing with Lua side effects
--- (Redis doesn't support yielding mid-script)
--- Instead: process in batches outside Redis
-```
-
-**Script Replication:**
-
-```bash
-# Lua scripts are REPLICATED to replicas AS-TEXT
-# Replicas run the SAME Lua script, not just the resulting writes
-# This means: script must be DETERMINISTIC!
-
-# DANGEROUS: non-deterministic script
-# redis.log() and TIME() return different values on each run!
-redis.call("SET", "last_updated", redis.call("TIME")[1])
-
-# SAFE: use Redis commands that are deterministic
-redis.call("SET", "last_updated", ARGV[1])
-
-# Script flags (Redis 7+):
-# no-writes: script only reads (can run on replicas)
-# allow-oom: script can run even when OOM
-# allow-cross-slot-keys: bypass slot restriction
-```
+- Before Redis 5, scripts were replicated **verbatim** and had to be deterministic.
+- 5.0 made **effects replication** the default; **7.0 removed verbatim replication**. Replicas and the AOF receive the resulting `DECRBY`/`RPUSH` wrapped in `MULTI/EXEC`, so calling `TIME` or using randomness in a script is safe.
+- Shebang flags (7.0+): `#!lua flags=no-writes,allow-stale` etc. (`no-writes`, `allow-oom`, `allow-stale`, `no-cluster`, `allow-cross-slot-keys`).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Script vs MULTI** | Knows Lua enables conditionals, MULTI doesn't |
-| **Blocking concern** | Understands scripts BLOCK the event loop — must be fast |
-| **Determinism** | Knows scripts are replicated as-is, must be deterministic |
-| **EVALSHA** | Cached scripts save bandwidth |
+| **MULTI semantics** | Queue-time vs run-time errors; no rollback; WATCH for CAS |
+| **Script atomicity** | Atomic, branches, but partial writes stay on error |
+| **Blocking** | `busy-reply-threshold` only triggers BUSY; SCRIPT KILL vs SHUTDOWN NOSAVE |
+| **Replication** | Effects replication (verbatim removed in 7.0) |
+| **Cluster** | All keys via KEYS, same slot |
+
+**What they probe next:** "Scripts or Functions?" → see [Q12](#12-redis-7-features-acls-functions).
 
 ---
 
@@ -791,174 +618,111 @@ redis.call("SET", "last_updated", ARGV[1])
 
 **Q:** "Design a real-time event processing pipeline using Redis Streams for 100K events/second. Compare consumer groups with Kafka consumer groups. How do you handle back-pressure and dead-letter processing?"
 
-**What They're Really Testing:** Whether you understand Redis Streams' data model — radix tree storage, consumer group protocol, and the pending entries list (PEL).
+**What They're Really Testing:** The stream data model, the Pending Entries List (PEL), reclaiming stuck messages, and when Streams are the wrong tool.
+
+!!! tip "30-second answer"
+    A stream is an append-only log keyed by `<ms>-<seq>` IDs, stored as listpacks indexed by a radix tree. A **consumer group** tracks a last-delivered ID plus a **PEL** of delivered-but-unacked entries per consumer; `XACK` removes them. Unlike Kafka, messages in one group are handed out **per message** to any consumer (not per partition), so there is no ordering per key and no partitioning: one stream lives on one shard. Scale by sharding across N stream keys. Handle crashed consumers with `XAUTOCLAIM` (or `XREADGROUP … CLAIM` in 8.4+), use the delivery counter for dead-lettering, and cap memory with `MAXLEN ~` / `MINID`.
 
 ### Answer
 
-**Stream Data Structure:**
+**Data model:**
 
 ```
-Stream: order-events  (radix tree compressed)
+XADD orders * order_id ORD-123 action created amount 99.99
+→ 1728492012345-0          <milliseconds>-<sequence>  (sequence is a 64-bit counter, not 16-bit)
 
-Entry format:
-  1728492012345-0 → { "order_id": "ORD-123", "action": "created", "amount": 99.99 }
-  1728492012346-0 → { "order_id": "ORD-456", "action": "updated", "amount": 199.99 }
-
-ID format: <millisecondsTime>-<sequenceNumber>
-  Time-based: 1728492012345 = Unix timestamp in milliseconds
-  Sequence: 0-65535 per millisecond (auto-increment)
-
-Radix tree storage:
-  - Common prefixes share storage (saves memory)
-  - Example: all "1728492012..." entries share the first 10 characters
-  - 100M entries with 50-byte payloads → ~5GB (vs ~15GB uncompressed)
+Storage: radix tree keyed by entry ID → each node points to a listpack holding many entries.
+Entries in a listpack store field names as deltas against the node's "master entry", so
+repeated field names cost almost nothing. Memory is roughly proportional to payload.
 ```
 
-**Consumer Group Protocol:**
+**Consumer group mechanics:**
 
-```
-Consumer group: "order-processors"
+```bash
+XGROUP CREATE orders processors $ MKSTREAM          # $ = only new entries; 0 = from the start
 
-Pending Entries List (PEL):
-  ┌──────┬────────────┬─────────────┬───────────┐
-  │ ID   │ Consumer   │ Delivered   │ Retry     │
-  ├──────┼────────────┼─────────────┼───────────┤
-  │ 1-0  │ processor1 │ 12:34:56    │ 2 times   │
-  │ 2-0  │ processor2 │ 12:35:00    │ 0 times   │
-  │ 3-0  │ processor1 │ 12:35:02    │ 1 time    │
-  └──────┴────────────┴─────────────┴───────────┘
+XREADGROUP GROUP processors c1 COUNT 100 BLOCK 2000 STREAMS orders >
+#   ">" = entries never delivered to this group; they enter c1's PEL
+XREADGROUP GROUP processors c1 STREAMS orders 0
+#   "0" = re-read c1's OWN pending entries (e.g. after c1 restarts)
 
-  XREADGROUP GROUP order-processors processor1 COUNT 10 BLOCK 2000 STREAMS order-events >
-  # ^ Carat: read new entries (never-before-delivered)
-  # ">": returns only entries not yet delivered to any consumer
-
-  XACK order-events order-processors 1728492012345-0
-  # Acknowledge: remove from PEL
-
-  XREADGROUP GROUP order-processors processor1 COUNT 10 STREAMS order-events 0
-  # "0": read PEL entries (pending, unacknowledged)
-
-  XPENDING order-events order-processors
-  # Summary of pending entries
-
-  XCLAIM order-events order-processors processor2 60000 1728492012345-0
-  # Claim: transfer pending entry to another consumer (after 60s idle)
+XACK orders processors 1728492012345-0              # remove from PEL
+XPENDING orders processors - + 10                   # id, consumer, idle ms, delivery count
+XAUTOCLAIM orders processors c2 60000 0-0 COUNT 100 # 6.2+: take over entries idle > 60 s
+XINFO GROUPS orders                                 # 7.0+: includes 'lag' and 'entries-read'
 ```
 
-**100K Events/Second Pipeline:**
+Newer additions worth knowing: **8.2** `XACKDEL` (ack and delete in one step) and `XDELEX` with `KEEPREF/DELREF/ACKED` options for how deletion treats other groups' PELs; **8.4** `XREADGROUP … CLAIM <min-idle>` returns idle pending entries and new ones in one call; **8.6** idempotent `XADD` (`IDMP`/`IDMPAUTO`); **8.8** `XNACK` to release pending entries explicitly.
+
+**Consumer with retries and dead-lettering (redis-py):**
 
 ```python
 import redis
-import time
 
-r = redis.Redis(host='localhost', port=6379)
+r = redis.Redis(decode_responses=True)
+STREAM, GROUP, DLQ = "orders", "processors", "orders:dlq"
+MAX_DELIVERIES, CLAIM_IDLE_MS = 5, 60_000
 
-STREAM = "order-events"
-GROUP = "order-processors"
-
-# Create stream group (idempotent)
 try:
-    r.xgroup_create(STREAM, GROUP, id='0', mkstream=True)
-except redis.ResponseError:
-    pass
+    r.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
+except redis.ResponseError as e:
+    if "BUSYGROUP" not in str(e):
+        raise
 
-# Producer: batch for throughput
-def produce_events(events):
-    """Batch produce for 100K events/sec"""
-    pipeline = r.pipeline(transaction=False)
-    for event in events:
-        pipeline.xadd(STREAM, event, maxlen=1000000, approximate=True)
-    pipeline.execute()
-    # ~50K writes/sec per pipeline
-    # Use multiple connections for 100K/s
+def handle(consumer, msg_id, fields):
+    try:
+        process(fields)                                  # must be idempotent: delivery is at-least-once
+        r.xack(STREAM, GROUP, msg_id)
+    except Exception as exc:
+        # Leave it pending; it will be reclaimed after CLAIM_IDLE_MS.
+        log_failure(msg_id, exc)
 
-# Consumer: with dead-letter handling
-def consume_events(consumer_name, max_retries=3):
+def consume(consumer):
     while True:
-        try:
-            # Read new entries
-            results = r.xreadgroup(
-                GROUP, consumer_name,
-                {STREAM: '>'},
-                count=100, block=2000
-            )
+        # 1. Reclaim entries other consumers (or we) left pending for too long.
+        _, claimed, _ = r.xautoclaim(STREAM, GROUP, consumer, CLAIM_IDLE_MS, "0-0", count=100)
+        for msg_id, fields in claimed:
+            deliveries = r.xpending_range(STREAM, GROUP, msg_id, msg_id, 1)[0]["times_delivered"]
+            if deliveries > MAX_DELIVERIES:
+                r.xadd(DLQ, {"id": msg_id, **fields})
+                r.xack(STREAM, GROUP, msg_id)            # poison message: park it, stop retrying
+            else:
+                handle(consumer, msg_id, fields)
 
-            if not results:
-                continue
-
-            for stream_name, entries in results:
-                for msg_id, data in entries:
-                    try:
-                        process_event(data)
-                        r.xack(STREAM, GROUP, msg_id)
-                    except Exception as e:
-                        # Check retry count
-                        pending = r.xpending_range(
-                            STREAM, GROUP,
-                            min=msg_id, max=msg_id,
-                            count=1
-                        )
-                        if pending and pending[0]['times_redisplyed'] >= max_retries:
-                            # Move to dead-letter stream
-                            r.xadd(f"{STREAM}:dead", {
-                                'original_id': msg_id,
-                                'error': str(e),
-                                'data': str(data)
-                            })
-                            r.xack(STREAM, GROUP, msg_id)
-                        else:
-                            # Will be retried automatically via PEL
-                            print(f"Retry later: {msg_id}")
-
-            # Also check for pending entries (automatically retried)
-            pending = r.xpending_range(
-                STREAM, GROUP,
-                min='-', max='+',
-                count=100
-            )
-            for entry in pending:
-                if time.time() - entry['time_since_delivered'] > 60000:
-                    r.xclaim(STREAM, GROUP, consumer_name, 60000, entry['id'])
-
-        except redis.ConnectionError:
-            time.sleep(1)
+        # 2. Read new entries.
+        for _, entries in r.xreadgroup(GROUP, consumer, {STREAM: ">"}, count=100, block=2000) or []:
+            for msg_id, fields in entries:
+                handle(consumer, msg_id, fields)
 ```
 
-**Back-Pressure and Capacity:**
+**Throughput and back-pressure:**
 
-```yaml
-Stream maxlen: 
-  XADD my_stream MAXLEN ~ 1000000 * ...
-  # Tilde: approximate trimming (saves CPU)
-  # 1M entries × 200 bytes = ~200MB per stream
+- 100K events/s is reachable on one shard with pipelined `XADD`s, but leaves little headroom; shard by key (`orders:{0..N-1}`) and run one consumer group per shard for linear scaling and per-key ordering.
+- **Memory is the back-pressure signal.** Cap with `XADD … MAXLEN ~ 1000000` (the `~` trims whole listpack nodes, much cheaper) or `MINID ~ <id>` for time-based retention. Trimming deletes entries even if a group hasn't read them, so alert on group `lag` (from `XINFO GROUPS`) well before the cap.
+- Producers should slow down or shed load when lag grows; Redis won't push back on its own (other than OOM at `maxmemory`).
 
-Consumer lag detection:
-  XLEN stream - min(XINFO CONSUMERS stream group name:entries)
-  
-  Alert if lag > 100K → consumer can't keep up
+**Redis Streams vs Kafka:**
 
-Comparison with Kafka:
-  Redis Streams:
-    - All in memory (limited by RAM)
-    - No partitioning (single stream is a single shard)
-    - PEL-based retry (no offset management)
-    - Ideal for: 10-100K events/s, bounded memory, fast recovery
-  
-  Kafka:
-    - Disk-backed (unlimited)
-    - Partitioned for parallelism
-    - Offset-based consumption
-    - Ideal for: 100K+ events/s, long retention, large fan-out
-```
+| | Redis Streams | Kafka |
+|---|---|---|
+| Storage | RAM (persisted via RDB/AOF) | Disk, cheap long retention, tiered storage |
+| Parallelism unit | Message (any consumer in the group) | Partition (one consumer per partition per group) |
+| Ordering | Per stream; lost across consumers in a group | Per partition |
+| Ack model | Per-message PEL + XACK | Committed offset per partition |
+| Replay | By ID range | By offset/timestamp |
+| Durability | Async replication; can lose acked writes on failover | `acks=all` + `min.insync.replicas` |
+| Fit | Low-latency job queues, modest retention, already running Redis | High volume, long retention, many consumer groups, ecosystem |
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Radix tree storage** | Understands stream compression via shared prefix |
-| **PEL mechanics** | Knows PEL tracks pending entries, XACK removes them |
-| **Dead-letter pattern** | Implements retry exhaustion → move to dead-letter stream |
-| **Stream vs Kafka** | Can articulate when to use each (in-memory vs disk, single-shard vs partitioned) |
+| **PEL mechanics** | `>` vs `0`, XACK, XAUTOCLAIM, delivery count |
+| **Failure handling** | Idempotent consumers, poison-message DLQ, reclaim after idle |
+| **Capacity** | MAXLEN/MINID trimming, lag monitoring, sharding across keys |
+| **Kafka comparison** | Per-message vs per-partition assignment; RAM vs disk; durability |
+
+**What they probe next:** "Exactly-once?" → no; at-least-once delivery plus idempotent processing (dedupe key in the consumer's DB, or `XADD IDMP` for producer-side dedupe in 8.6+).
 
 ---
 
@@ -966,115 +730,69 @@ Comparison with Kafka:
 
 **Q:** "Your Redis instance shows used_memory: 8GB but used_memory_rss: 14GB. That's 75% fragmentation. Diagnose the causes and fix them without restarting the instance. How would you prevent this in the future?"
 
-**What They're Really Testing:** Whether you understand Redis's memory allocator (jemalloc) behavior and fragmentation patterns — and the difference between internal, external, and slab fragmentation.
+**What They're Really Testing:** How jemalloc fragments, how active defrag actually works, and sizing `maxmemory` against RSS.
+
+!!! tip "30-second answer"
+    `mem_fragmentation_ratio = RSS / used_memory = 1.75`. The usual cause is a **past peak**: when keys are deleted, jemalloc frees *regions* inside slabs, but a slab (and its pages) can only go back to the OS when **every** region in it is free, so scattered survivors pin lots of pages. Fix online with **active defrag** (`activedefrag yes`), which *moves* live allocations out of sparse slabs so whole slabs can be released. If that's too slow, fail over to a freshly synced replica (a full sync rebuilds memory compactly). Prevent it by leaving RSS headroom above `maxmemory` and avoiding big churn of mixed-size values.
 
 ### Answer
 
-**Fragmentation Diagnosis:**
-
-```
-MEMORY INFO (Redis 4+):
-  used_memory: 8,000,000,000     (8GB - what Redis asked for)
-  used_memory_rss: 14,000,000,000 (14GB - actual RSS from OS)
-
-  mem_fragmentation_ratio: 1.75   (bad! > 1.5 needs attention)
-  
-  used_memory_peak: 12,000,000,000 (earlier peak was 12GB!)
-  !!! This is the most likely cause!
-
-  mem_allocator: jemalloc-5.2.1
-
-Three types of fragmentation:
-  1. External fragmentation: jemalloc can't fit a new allocation into existing free space
-  2. Internal fragmentation: allocation is larger than requested (size class rounding)
-  3. Slab fragmentation: jemalloc's slab allocator leaves gaps
-```
-
-**Root Causes:**
-
-```yaml
-1. Peak memory usage (MOST COMMON):
-   - Earlier peak: 12GB → keys expired/set to lower TTLs
-   - jemalloc pages that held 12GB of data are now partly free
-   - But OS won't reclaim them (jemalloc holds onto them)
-   - Solution: memory defrag or restart
-
-2. Uneven key-size distribution:
-   - Mix of 10B and 10KB keys
-   - jemalloc's size classes: 8, 16, 32, 48, 64, 80, 96, 112, 128, ...
-   - Small keys fill small classes, large keys fill large classes
-   - When small keys expire: small-size-class pages freed (holes in large pages)
-
-3. Jemalloc page size:
-   - Default page size: 4KB
-   - Each 4KB page serves ONE size class
-   - If 4000 bytes used out of 4096: 96 bytes wasted (2.3% internal fragmentation)
-   - Over 1M pages: 96MB wasted
-```
-
-**Fix Without Restarting:**
+**Diagnose:**
 
 ```bash
-# 1. Activate defragmentation (Redis 4+)
+INFO memory
+# used_memory:            8.0G   bytes Redis allocated
+# used_memory_rss:       14.0G   resident pages per the OS
+# used_memory_peak:      12.0G   ← dataset was much bigger earlier: prime suspect
+# mem_fragmentation_ratio: 1.75  (RSS / used_memory; also includes non-allocator overhead)
+# allocator_frag_ratio / allocator_frag_bytes   ← true allocator (external) fragmentation
+# allocator_rss_ratio                            ← pages jemalloc retains but isn't using
+# mem_allocator: jemalloc-5.x
+MEMORY DOCTOR
+```
+
+Read the ratio carefully:
+
+- **> 1.5 with a high `used_memory_peak`** → post-peak fragmentation (this case).
+- **< 1.0** → part of Redis is **swapped out**: a latency emergency, not "good".
+- On small instances (< ~100 MB) the ratio is noisy; look at absolute bytes.
+
+**Kinds of waste:**
+
+1. **Internal**: allocations rounded up to jemalloc size classes (8, 16, 32, 48, 64, 80, 96, 112, 128, …). A 65-byte value uses 80 bytes.
+2. **External**: small allocations live in **slabs** dedicated to one size class. After mass deletion, each slab may hold a few live regions, so its pages stay resident. Mixed value sizes and churn make this worse.
+3. **Retained/dirty pages**: freed pages jemalloc hasn't returned yet. `jemalloc-bg-thread yes` (default since 6.0) purges them in the background; `MEMORY PURGE` forces it.
+
+**Fix without a restart:**
+
+```bash
 CONFIG SET activedefrag yes
-CONFIG SET active-defrag-threshold-lower 10
-CONFIG SET active-defrag-threshold-upper 100
-CONFIG SET active-defrag-cycle-min 25
-CONFIG SET active-defrag-cycle-max 75
-CONFIG SET active-defrag-ignore-bytes 100mb
-
-# What this does:
-# Jemalloc's madvise(MADV_DONTNEED) on pages with low utilization
-# Returns free pages to OS
-# May take 10-30 minutes for 75% fragmentation
-# Risk: slight latency increase during defrag (25-75% of one CPU core)
-
-# 2. Check fragmentation reduction:
-redis-cli INFO memory | grep mem_fragmentation_ratio
-# Should decrease over minutes
-
-# 3. If defrag doesn't work (jemalloc fragmentation too deep):
-#   → schedule restart during low traffic
-#   → Redis reloads dataset fresh → zero fragmentation
+# Defaults (Redis 7+): threshold-lower 10 (%), threshold-upper 100 (%),
+# active-defrag-ignore-bytes 100mb, cycle-min 1 (% CPU), cycle-max 25 (% CPU)
+CONFIG SET active-defrag-cycle-max 50        # optional: defrag faster, at more CPU cost
 ```
 
-**Preventative Measures:**
+How it works: Redis scans the keyspace and, for each allocation that jemalloc reports lives in an under-utilised slab, **reallocates it** (copy to a fuller slab, update the pointer, free the old one). Freed slabs can then be returned to the OS. Requires Redis built with its bundled jemalloc (the default on Linux). It costs main-thread CPU, so watch latency while it runs; between `cycle-min` and `cycle-max` the effort scales with how fragmented the instance is.
 
-```yaml
-1. Use consistent key sizes:
-   - Pad small values to common sizes
-   - Or combine related data into hashes (one key, multiple fields)
-   
-2. Monitor fragmentation trends:
-   - mem_fragmentation_ratio > 1.5 → investigate
-   - mem_fragmentation_ratio > 2.0 → urgent defrag needed
-   
-3. Restart periodically:
-   - Schedule monthly restarts during maintenance windows
-   - Use failover (replica promotion) for zero downtime
-   
-4. Jemalloc tuning (Linux):
-   # /etc/redis/redis.conf
-   # Jemalloc background thread for purging
-   # Enable: jemalloc background thread
-   export MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
-   
-5. Maxmemory with eviction:
-   - Set maxmemory to 75% of physical RAM (leaves room for fragmentation)
-   - If dataset = 8GB, set maxmemory 12GB → 4GB fragmentation headroom
-   
-   maxmemory 12gb
-   maxmemory-policy allkeys-lru
-```
+If defrag can't keep up or the ratio stays high: promote a replica that has just done a full sync (its memory is laid out fresh), then resync the old master. With Sentinel/Cluster this is a zero-downtime operation.
+
+**Prevent:**
+
+- **Size `maxmemory` against RSS, not RAM.** `maxmemory` caps `used_memory`, not RSS. Leave headroom for fragmentation, fork COW, client buffers and the replication buffer: commonly `maxmemory` ≈ 60–75% of the node's RAM.
+- **Avoid big peaks**: bulk-delete gradually (`UNLINK`, `SCAN`-based deletes, lazyfree options), and spread expirations with TTL jitter.
+- **Keep values similar in size** where you control the schema; prefer compact encodings (small hashes) for small objects.
+- **Monitor** `allocator_frag_ratio` and `allocator_frag_bytes` with alerts, and keep `activedefrag yes` on for churny workloads.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Peak memory causation** | Knows fragmentation is usually from PEAK memory, not current |
-| **Active defrag** | Can enable and tune active-defrag parameters |
-| **Jemalloc behavior** | Understands size classes and page allocation |
-| **Prevention** | Suggests maxmemory headroom, consistent key sizes, periodic restarts |
+| **Root cause** | Peak + slab pinning, not "jemalloc is bad" |
+| **Active defrag mechanism** | Relocates live allocations; doesn't just `madvise` |
+| **Ratio literacy** | < 1 means swap; allocator_* metrics are more precise |
+| **Prevention** | `maxmemory` vs RSS headroom, gradual deletes, replica-based reset |
+
+**What they probe next:** "Why does memory not drop after `FLUSHALL`?" → allocator retention and the lazyfree thread; it returns over time or after `MEMORY PURGE`.
 
 ---
 
@@ -1082,146 +800,119 @@ redis-cli INFO memory | grep mem_fragmentation_ratio
 
 **Q:** "Design a distributed lock for a shared resource that must have mutual exclusion even if the lock holder crashes. Is Redis's SET NX EX sufficient? What about Redlock? Can you prove correctness of your lock under network partitions?"
 
-**What They're Really Testing:** Whether you understand the distributed locking problem — the failure modes of single-instance locks, Martin Kleppmann's critique of Redlock, and the fencing token solution.
+**What They're Really Testing:** Whether you separate **efficiency** locks from **correctness** locks, know Kleppmann's critique, and reach for fencing tokens.
+
+!!! tip "30-second answer"
+    `SET key <random-token> NX PX <ttl>` + compare-and-delete release is a fine lock **for efficiency** (avoid duplicate work). It is **not safe for correctness**: async replication can lose the lock on failover, and any client can be paused (GC, VM stall) past its TTL and keep acting. Redlock (majority of N independent masters) fixes the failover case but still assumes bounded pauses, network delay and clock drift. For correctness, the **resource** must reject stale holders using a **fencing token** from a consensus-backed store (etcd revision, ZooKeeper zxid/sequence) or use the database's own concurrency control.
 
 ### Answer
 
-**Simple Lock (Single Redis Instance):**
+**Single-instance lock:**
 
 ```bash
-# Lock: acquire
-SET lock:resource_id <my_token> NX EX 30
-# Returns OK → lock acquired
-# Returns (nil) → someone else has the lock
-
-# Unlock: must verify ownership (use Lua)
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("DEL", KEYS[1])
-else
-    return 0
-end
-
-# Problem 1: Single point of failure
-#   Master has lock → master crashes → replica has NO lock data (async replication!)
-#   Another client acquires the same lock → mutual exclusion broken!
-
-# Problem 2: Clock drift
-#   Lock holder's clock is 5 seconds behind
-#   Thinks lock expires in 25s, but actually expired in 20s
-#   Another client acquires lock while first client still holds it
-
-# Problem 3: GC pause
-#   Client acquires lock
-#   GC pause: 40 seconds (longer than 30s TTL)
-#   Lock expires, another client acquires it
-#   First client resumes, thinks it still has the lock → double access!
+SET lock:invoice:42 <uuid> NX PX 30000     # acquire; nil → someone else holds it
 ```
 
-**Redlock Algorithm (5 Independent Redis Nodes):**
+```lua
+-- release: delete only if we still own it (a bare DEL could remove someone else's lock)
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+```
+
+Redis 8.4+ can do the compare-and-delete natively: `DELEX lock:invoice:42 IFEQ <uuid>`.
+
+**Failure modes:**
+
+| Problem | What happens |
+|---|---|
+| Failover | Master grants the lock, dies before replicating; promoted replica has no lock → second client acquires it |
+| Process pause | Holder stalls (GC, swap, VM migration) longer than the TTL, lock expires, B acquires, A resumes and writes |
+| Clock jump on the Redis server | TTL expires early if the server's clock jumps forward (Redis uses wall-clock time for expiry) |
+| Long operations | Work outlasts the TTL; needs a watchdog that extends the TTL (with an ownership check) |
+
+**Redlock (N = 5 independent masters, no replication between them):**
 
 ```python
-import time
+import time, uuid
 import redis
 
+RELEASE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+"""
+
 class Redlock:
-    def __init__(self, redis_nodes):
-        # 5 independent Redis nodes (no replication!)
-        self.nodes = [redis.Redis(host=n) for n in redis_nodes]
-        self.quorum = len(self.nodes) // 2 + 1  # 3/5 majority
+    def __init__(self, hosts, drift_factor=0.01):
+        # short socket timeouts so one dead node doesn't eat the lock's validity
+        self.nodes = [redis.Redis(host=h, socket_timeout=0.05) for h in hosts]
+        self.quorum = len(self.nodes) // 2 + 1
+        self.drift_factor = drift_factor
 
-    def acquire(self, resource, ttl_ms=30000):
+    def acquire(self, resource, ttl_ms=30_000):
         token = str(uuid.uuid4())
-        start_time = time.monotonic() * 1000
-
-        # Phase 1: Try to lock on ALL nodes
-        locked = 0
+        start = time.monotonic()
+        acquired = 0
         for node in self.nodes:
             try:
-                if node.set(f"lock:{resource}", token,
-                            nx=True, px=ttl_ms, timeout=500):
-                    locked += 1
-            except (redis.TimeoutError, redis.ConnectionError):
-                continue
-
-        # Phase 2: Check if majority acquired
-        elapsed = time.monotonic() * 1000 - start_time
-        if locked >= self.quorum and elapsed < ttl_ms:
-            # Valid lock!
-            # TTL remaining = original_ttl - elapsed_time
-            return token
-        else:
-            # Lock failed → release on ALL nodes
-            self.release(resource, token)
-            return None
+                if node.set(f"lock:{resource}", token, nx=True, px=ttl_ms):
+                    acquired += 1
+            except redis.RedisError:
+                pass
+        elapsed_ms = (time.monotonic() - start) * 1000
+        drift_ms = ttl_ms * self.drift_factor + 2
+        validity_ms = ttl_ms - elapsed_ms - drift_ms
+        if acquired >= self.quorum and validity_ms > 0:
+            return token, validity_ms        # caller must finish within validity_ms
+        self.release(resource, token)        # failed: undo partial acquisitions
+        return None, 0
 
     def release(self, resource, token):
-        # Release on ALL nodes (not just majority)
         for node in self.nodes:
             try:
-                # Lua script for safe release
-                node.eval("""
-                    if redis.call("GET", KEYS[1]) == ARGV[1] then
-                        return redis.call("DEL", KEYS[1])
-                    else
-                        return 0
-                    end
-                """, 1, f"lock:{resource}", token)
-            except:
+                node.eval(RELEASE, 1, f"lock:{resource}", token)
+            except redis.RedisError:
                 pass
 ```
 
-**Critique of Redlock (Martin Kleppmann, 2016):**
+**Kleppmann's critique (2016) and antirez's reply:**
+
+- Redlock's safety depends on timing assumptions: bounded network delay, bounded process pauses, bounded clock drift. A distributed system can violate all three.
+- Even a perfect lock service can't stop a paused client from acting after its lease expires. Only the **resource** can, if each write carries a **monotonically increasing fencing token** and the resource rejects anything older than the highest token it has seen.
+- Redlock doesn't produce such a token. antirez argued the timing assumptions are reasonable in practice and that random tokens can be checked by the resource with compare-and-set; the consensus remains: **for correctness, use fencing**.
+
+**Fencing token flow:**
 
 ```
-Martin Kleppmann's argument:
-  Redlock makes assumptions about:
-  1. Synchronous network → "bounded delays"
-  2. Synchronous clocks → "bounded clock drift"
-  3. Nobody pauses → "no GC pauses"
+etcd:      acquire via a lease + transaction; token = the key's create/mod revision (monotonic)
+ZooKeeper: ephemeral sequential znode; token = sequence number (or zxid)
 
-  Problems:
-  - GC pause > TTL: clock is irrelevant, the problem is PAUSES
-  - Network delays: can't bound in asynchronous network
-  - Clock drift: NTP can make large adjustments
-
-  Solution: FENCING TOKENS
-  - Lock service returns a monotonically increasing token
-  - Token = fencing token (like ZooKeeper's zxid)
-  - Resource checks: "has this token been exceeded?"
-  - Even if lock is compromised, resource rejects stale tokens
+Client A gets token 33 → pauses
+Lock expires → Client B gets token 34 → writes to storage with 34
+Client A resumes → writes with 33 → storage: "33 < 34 seen" → REJECT
 ```
 
-**Fencing Token Implementation:**
+A single Redis `INCR` can hand out increasing numbers, but after an async-replication failover the counter can go **backwards**, so it isn't a safe fencing source without extra care.
 
-```python
-# Alternative to Redlock: use ZooKeeper or etcd for fencing tokens
+**Practical guidance:**
 
-# ZooKeeper: sequential znode → unique monotonically increasing id
-#   /locks/myresource/lock-0000000001
-#   /locks/myresource/lock-0000000002
-
-# etcd: revision number → fencing token
-#   key: /locks/myresource
-#   create_revision: 42 (fencing token!)
-
-# Client acquires lock, gets fencing token = 42
-# Client sends request to storage with token
-# Storage checks: "last processed token was 41"
-#   token 42 > 41 → accept (legitimate)
-#   token 41 < 42 → reject (stale/zombie)
-
-# Redis CANNOT provide monotonically increasing fencing tokens!
-# (Redis Cluster doesn't support linearizable operations by default)
-```
+| Need | Use |
+|---|---|
+| Avoid duplicate work, occasional double-run is OK | Single-instance `SET NX PX` + safe release |
+| Mutual exclusion that protects data | Fencing tokens from etcd/ZooKeeper, or DB-level locking (`SELECT … FOR UPDATE`, conditional writes, unique constraints) |
+| Redlock | Rarely the right answer: more ops cost than one Redis, still not fenced |
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **SET NX EX limitations** | Knows single-node lock fails under master failure |
-| **Redlock critique** | Understands Kleppmann's arguments about GC pauses and async networks |
-| **Fencing tokens** | Proposes fencing tokens as the REAL solution to distributed locking |
-| **Practical advice** | Recommends ZooKeeper/etcd for true distributed locks with fencing |
+| **Efficiency vs correctness** | States which kind of lock is needed first |
+| **Safe release** | Token check (Lua or `DELEX IFEQ`), never bare DEL |
+| **Redlock details** | Validity time = TTL − elapsed − drift; independent masters |
+| **Fencing** | Resource-side rejection with monotonic tokens from a consensus store |
+
+**What they probe next:** "How do you extend a lock for long jobs?" → watchdog that renews with a compare-and-`PEXPIRE` script while the owner is alive; still needs fencing because the watchdog can stall too.
 
 ---
 
@@ -1229,184 +920,103 @@ Martin Kleppmann's argument:
 
 **Q:** "A popular API endpoint's cache key expires. 10,000 requests hit your Redis cache simultaneously, all miss, and all hit the database. The database falls over. Design a cache strategy to prevent this. Compare cache-aside, read-through, and refresh-ahead."
 
-**What They're Really Testing:** Whether you understand production caching patterns — thundering herd prevention, staleness vs availability trade-offs, and probabilistic early expiration.
+**What They're Really Testing:** Stampede prevention (coalescing, locks, early refresh), serving stale data deliberately, and naming write patterns correctly.
+
+!!! tip "30-second answer"
+    Make sure only **one** request recomputes a hot key and everyone else gets either the old value or waits briefly. Layers: (1) **request coalescing** in each app instance (singleflight), (2) a **short Redis lock** (`SET NX PX`) so one instance across the fleet recomputes, (3) **stale-while-revalidate**: keep a soft TTL inside the value and a longer hard TTL, serve stale while one worker refreshes, (4) **probabilistic early refresh (XFetch)** so hot keys are refreshed before they expire, and (5) **TTL jitter** so many keys don't expire together. Protect the database with a concurrency limit regardless.
 
 ### Answer
 
-**Thundering Herd Analysis:**
+**Why it falls over:** 10K concurrent misses × a 100 ms query against a pool of ~100 connections queue for ~10 s; requests time out and retry, which adds more load. The cache miss turns into a database outage.
 
-```
-Timeline:
-  t=0: Cache key expires
-  t=0.001: Request 1: cache miss → DB query (takes 100ms)
-  t=0.002: Request 2: cache miss → DB query (takes 100ms)
-  t=0.003: Request 3: cache miss → DB query (takes 100ms)
-  ...
-  t=0.010: Request 10,000: cache miss → DB query (takes 100ms)
-  
-  Result: 10,000 simultaneous DB queries
-  DB connection pool exhausted: 100 connections × 100ms = 10s queue
-  DB CPU: 1000% → query timeout
-  Result: CASCADING FAILURE (cache miss → DB overload → all requests fail)
-```
-
-**Solution 1: Mutex Lock (Cache-Aside + Lock)**
+**1. Lock-based recompute (cache-aside + mutex):**
 
 ```python
+import time, uuid
 import redis
-import threading
 
-def get_cached_or_compute(key, compute_func, ttl=300):
-    """Cache-aside with mutex lock for thundering herd prevention"""
+r = redis.Redis()
+RELEASE = "if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0"
 
-    value = redis_cache.get(key)
+def get_or_compute(key, compute, ttl=300, lock_ttl_ms=5000, wait_s=2.0):
+    value = r.get(key)
     if value is not None:
         return value
 
-    # Mutex lock: only one process computes
-    lock_key = f"lock:{key}"
-    lock_token = str(uuid.uuid4())
-
-    # Try to acquire lock with 5s TTL (should be > computation time)
-    if redis_cache.set(lock_key, lock_token, nx=True, ex=5):
+    token = str(uuid.uuid4())
+    if r.set(f"lock:{key}", token, nx=True, px=lock_ttl_ms):
         try:
-            # Double-check: another process might have set it while we waited
-            value = redis_cache.get(key)
-            if value is not None:
-                return value
-
-            # Compute the value (DB query, expensive computation)
-            value = compute_func()
-            redis_cache.setex(key, ttl, value)
+            value = r.get(key)                    # double-check after winning the lock
+            if value is None:
+                value = compute()
+                r.set(key, value, ex=ttl)
             return value
         finally:
-            # Release lock
-            redis_cache.delete(lock_key)
-    else:
-        # Lock not acquired: wait for the computing process
-        timeout = 5  # Should match lock TTL
-        poll_interval = 0.005  # 5ms polling
+            r.eval(RELEASE, 1, f"lock:{key}", token)   # never delete someone else's lock
 
-        while timeout > 0:
-            value = redis_cache.get(key)
-            if value is not None:
-                return value
-            time.sleep(poll_interval)
-            timeout -= poll_interval
-
-        # Timeout: lock holder crashed
-        # Force compute (or raise error)
-        return get_cached_or_compute(key, compute_func, ttl)
-```
-
-**Solution 2: Probabilistic Early Expiration (Refresh-Ahead)**
-
-```python
-# Instead of waiting until TTL expires, proactively refresh BEFORE
-# Probabilistic: early-expire based on a random factor
-
-def get_with_early_recompute(key, compute_func, ttl=300, beta=1.0):
-    """
-    XFetch algorithm (by Voldemort):
-    - p(early refresh) proportional to how close we are to expiry
-    - Randomness prevents all processes refreshing simultaneously
-    """
-    value, expiry_str = redis_cache.hmget(key, ['value', 'expiry'])
-    if value is None:
-        # Cache miss: compute and set
-        value = compute_func()
-        redis_cache.hmset(key, {'value': value, 'expiry': time.time() + ttl})
-        return value
-
-    expiry = float(expiry_str)
-    now = time.time()
-    ttl_remaining = expiry - now
-
-    if ttl_remaining <= 0:
-        # Expired: compute synchronously
-        value = compute_func()
-        redis_cache.hmset(key, {'value': value, 'expiry': time.time() + ttl})
-        return value
-
-    # Probabilistic early recompute: higher probability closer to expiry
-    # Formula: p = exp(beta * ttl_remaining / ttl) when ttl_remaining < threshold
-    threshold = ttl * 0.5  # Start early recompute at 50% of TTL
-
-    if ttl_remaining < threshold:
-        # Probability of early refresh increases as we approach expiry
-        # At 10% TTL remaining: 90% probability of early refresh
-        # At 1% TTL remaining: 99% probability
-        if random.random() < (1 - ttl_remaining / threshold):
-            # Early refresh in background
-            threading.Thread(target=lambda: redis_cache.hmset(
-                key,
-                {'value': compute_func(), 'expiry': time.time() + ttl}
-            )).start()
-
-    return value  # Return STALE value while refresh happens!
-```
-
-**Solution 3: Write-Through + Invalidation Queue**
-
-```python
-# For high-write, high-read systems:
-# 1. Always write to cache first (write-through)
-# 2. DB write happens asynchronously
-# 3. Cache always has latest value
-
-class WriteThroughCache:
-    def __init__(self, redis_client, db_client, queue):
-        self.cache = redis_client
-        self.db = db_client
-        self.queue = queue
-
-    def get(self, key):
-        value = self.cache.get(key)
+    deadline = time.monotonic() + wait_s          # losers poll briefly for the winner's result
+    while time.monotonic() < deadline:
+        time.sleep(0.02)
+        value = r.get(key)
         if value is not None:
             return value
-
-        # Cache miss → rare with write-through
-        # Recompute from DB (only happens on initial load or eviction)
-        value = self.db.query(key)
-        self.cache.setex(key, 300, value)
-        return value
-
-    def set(self, key, value):
-        # Write to cache FIRST (immediate consistency)
-        self.cache.setex(key, 300, value)
-
-        # Queue DB write (async, eventual consistency)
-        self.queue.publish({'action': 'write', 'key': key, 'value': value})
-
-    def invalidate(self, key):
-        # Don't delete! Write the new value directly
-        # Deletion causes thundering herd!
-        # Instead: compute new value and write to cache
-        new_value = self.db.query(key)
-        self.cache.setex(key, 300, new_value)
+    raise TimeoutError(f"cache fill for {key} timed out")   # fail fast, don't stampede the DB
 ```
 
-**Strategy Comparison:**
+Weakness: losers wait (latency) and the lock is a single point of slowness. Pair it with stale serving.
 
-```yaml
-Strategy           | Thundering Herd | Staleness | Complexity | Use When
--------------------|-----------------|-----------|------------|-----------------------
-Cache-Aside        | ❌ Vulnerable   | Low       | Low        | Low traffic
-Cache-Aside + Lock | ✅ Protected    | Low       | Medium     | Moderate traffic
-Read-Through       | ✅ Protected    | Low-Med   | Medium     | Standard pattern
-Write-Through      | ✅ Protected    | Zero (write) | High    | High write concurrency
-Refresh-Ahead      | ✅ Protected    | Medium    | High       | Predictable access patterns
-Probabilistic      | ✅ Best         | Low-Med   | Medium     | Read-heavy, hot keys
+**2. Probabilistic early expiration (XFetch):** from *Vattani, Chierichetti & Lowenstein, "Optimal Probabilistic Cache Stampede Prevention", VLDB 2015*. Store the value, how long it took to compute (`delta`), and its logical expiry. Each reader recomputes early with probability that rises sharply near expiry:
+
+```python
+import math, random, time, json
+
+def xfetch(key, compute, ttl=300, beta=1.0):
+    raw = r.get(key)
+    if raw is not None:
+        entry = json.loads(raw)
+        # recompute if  now - delta * beta * ln(rand) >= expiry   (ln(rand) ≤ 0)
+        if time.time() - entry["delta"] * beta * math.log(random.random()) < entry["expiry"]:
+            return entry["value"]
+
+    start = time.time()
+    value = compute()
+    delta = time.time() - start
+    entry = {"value": value, "delta": delta, "expiry": time.time() + ttl}
+    # hard TTL a bit longer than the logical one so readers can still see it while refreshing
+    r.set(key, json.dumps(entry), ex=int(ttl + max(60, 10 * delta)))
+    return value
 ```
+
+Why it works: expensive computations (large `delta`) start refreshing earlier; with many readers, typically one of them refreshes shortly before expiry, and the rest keep hitting the cache. `beta > 1` refreshes earlier.
+
+**3. Stale-while-revalidate:** soft TTL in the payload, hard TTL on the key. Past the soft TTL, one request (guarded by `SET NX`) refreshes in the background while all requests get the stale value. Best user latency; requires that slightly stale data is acceptable.
+
+**4. Refresh-ahead / pre-warming:** a background job refreshes known hot keys before expiry. Simple and predictable for a small, known hot set; wasteful for long tails.
+
+**Naming the patterns correctly:**
+
+| Pattern | Reads | Writes | Stampede protection |
+|---|---|---|---|
+| Cache-aside | App reads cache, on miss reads DB and fills | App writes DB, then deletes/updates cache | None by itself |
+| Read-through | Cache library loads from DB on miss | — | Only if the library coalesces loads per key |
+| Write-through | — | Write cache and DB **synchronously** in the write path | Keys are pre-populated, fewer misses |
+| Write-behind (write-back) | — | Write cache, flush DB **asynchronously** | Same, but risks losing writes if the cache dies |
+| Refresh-ahead / XFetch / SWR | Refresh before or during expiry | — | Yes |
+
+On invalidation, prefer **delete** over writing the new value from the write path (writing races with concurrent readers filling an older value); use versioned values or CDC-driven invalidation when ordering matters. If a delete on a very hot key would itself cause a stampede, rely on the lock/SWR machinery above.
+
+**Also:** TTL jitter (`ttl * random.uniform(0.9, 1.1)`), client-side caching with server-assisted invalidation (`CLIENT TRACKING`, Redis 6+) for the hottest keys, and a DB-side bulkhead (bounded concurrency + load shedding).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Mutex pattern** | Knows SET NX to serialize computation |
-| **Probabilistic refresh** | Understands XFetch formula and why randomness is critical |
-| **Write-through** | Knows write-through prevents invalidation storms |
-| **Staleness trade-off** | Accepts controlled staleness for protection against cascading failures |
+| **Layered defense** | Coalescing + lock + stale serving + jitter, not one trick |
+| **Lock hygiene** | Token-checked release, bounded wait, no recursive retry storm |
+| **XFetch** | Correct formula and attribution; why `delta` matters |
+| **Terminology** | Distinguishes write-through from write-behind; read-through needs coalescing |
+
+**What they probe next:** "Hot key that's too hot for one shard even when cached?" → local in-process cache with short TTL, key replication (`key:{n}` copies read randomly), or client-side caching.
 
 ---
 
@@ -1414,167 +1024,114 @@ Probabilistic      | ✅ Best         | Low-Med   | Medium     | Read-heavy, hot
 
 **Q:** "Your Redis instance serves 5 microservices. Each should only access its own keys. How does Redis 7's ACL system work? What about Redis Functions vs Lua scripts? Design an ACL policy for a multi-tenant API gateway backed by Redis."
 
-**What They're Really Testing:** Whether you understand Redis 7's modern features — ACL-based access control, and Redis Functions as a managed alternative to Lua scripting.
+**What They're Really Testing:** ACL design (users, key patterns, categories, selectors), Functions vs EVAL, and awareness of what changed in Redis 7.x/8.x and Valkey.
+
+!!! tip "30-second answer"
+    ACLs (6.0+) give each service a user with a password, allowed **commands/categories**, and allowed **key patterns**; 7.0 added **read/write-specific key patterns** (`%R~`, `%W~`) and **selectors** (extra permission sets). Turn off or lock down the `default` user. **Functions** (7.0+) are named, versioned libraries stored in Redis itself (persisted in RDB/AOF and replicated), invoked with `FCALL`; they solve the "every client ships its own script" problem but share Lua's blocking and key rules. ACLs are not tenant resource isolation: there are no per-user memory, CPU or connection limits, so noisy tenants still need separate instances.
 
 ### Answer
 
-**Redis ACL System (Redis 6+, Enhanced in 7):**
+**Per-service users:**
 
 ```bash
-# Redis 7 ACL = authentication + authorization
-# Users, passwords, commands permissions, key permissions
+ACL SETUSER payments on >long-random-secret ~payments:* &payments:* +@all -@dangerous
+#           │        │  │                   │           │           │     └ remove admin/risky commands
+#           │        │  │                   │           │           └ start from all categories
+#           │        │  │                   │           └ Pub/Sub channel pattern
+#           │        │  │                   └ key pattern
+#           │        │  └ password (stored as SHA-256)
+#           │        └ enabled
+#           └ username
 
-# Create users for each microservice:
-ACL SET USER payment-service on >payment-p@ssword123 ~payment:* +@all -@dangerous
-#  │                      │    │                     │         │       │
-#  │                      │    │                     │         │       └── Deny dangerous commands
-#  │                      │    │                     │         └────────── Allow all other command categories
-#  │                      │    │                     └──────────────────── Key pattern: payment:*
-#  │                      │    └────────────────────────────────────────── Password
-#  │                      └─────────────────────────────────────────────── Enable user (on)
-#  └────────────────────────────────────────────────────────────────────── Username
-
-ACL SET USER ordering-service on >ordering-p@ss ~order:* +@all -FLUSHALL -CONFIG -SHUTDOWN
-
-ACL SET USER monitoring-service on >monitor-p@ss ~* +@read +@connection +INFO
-# Monitoring only: READ + INFO, no writes
-
-ACL SET USER admin on >admin-super-s3cret ~* +@all
-
-# Verify:
-ACL LIST
-# 1) "user payment-service on #3a2b... ~payment:* +@all -@dangerous"
-# 2) "user admin on #d4e5... ~* +@all"
+ACL SETUSER orders on >secret2 ~orders:* &orders:* +@all -@dangerous
+ACL SETUSER analytics on >secret3 %R~orders:* %R~payments:* +@read +@connection   # read-only on others' keys
+ACL SETUSER monitoring on >secret4 nocommands +info +ping +latency|latest +slowlog|get
+ACL SETUSER default off                                                           # no anonymous access
+ACL SAVE                                                                          # with an aclfile configured
 ```
 
-**Command Categories for ACL:**
+Useful categories: `@read`, `@write`, `@keyspace`, `@string`, `@hash`, `@list`, `@set`, `@sortedset`, `@stream`, `@pubsub`, `@scripting`, `@admin`, `@dangerous` (e.g. `FLUSHALL`, `CONFIG`, `DEBUG`, `KEYS`, `SHUTDOWN`), `@fast`, `@slow`, `@connection`. Redis 8 adds module categories such as `@search`, `@json`, `@timeseries`, `@bloom`. `ACL CAT <category>` lists the commands; categories change between versions, so audit with `ACL DRYRUN <user> <command> [args]` (7.0+).
 
-```yaml
-# Categories (much easier than listing individual commands):
-  +@all            # Allow everything
-  -@dangerous      # Block: FLUSHALL, FLUSHDB, CONFIG, SHUTDOWN, DEBUG, SCRIPT KILL
-  +@read           # GET, MGET, HGET, SMEMBERS, etc.
-  +@write          # SET, SETEX, HSET, SADD, etc.
-  +@admin          # CONFIG GET/SET, SHUTDOWN, SLAVEOF
-  +@fast           # O(1) commands
-  +@slow           # O(N) or slower commands
-  +@string         # String commands only
-  +@list           # List commands only
-  +@set            # Set commands only
-  +@sortedset      # Sorted set commands only
-  +@hash           # Hash commands only
-  +@stream         # Stream commands only
-  +@connection     # PING, AUTH, SELECT, etc.
-  +@keyspace       # DEL, EXISTS, EXPIRE, KEYS, SCAN, etc.
-  +@transaction    # MULTI, EXEC, DISCARD
-  +@scripting      # EVAL, EVALSHA, SCRIPT LOAD
-  +@pubsub         # PUBLISH, SUBSCRIBE, PSUBSCRIBE
-```
+**Gotchas:**
 
-**Redis Functions (Redis 7, Replaces Lua Scripting):**
+- Key patterns are checked against a command's **key arguments** only. Commands without key arguments (`SCAN`, `RANDOMKEY`, `DBSIZE`, and `FLUSHDB` if allowed) still see or touch the whole keyspace, so `+@all ~payments:*` lets a tenant enumerate other tenants' key names. Remove them explicitly (`-scan -randomkey`) when tenants share an instance.
+- Scripts and Functions are checked per `redis.call()` against the caller's permissions, so a tenant can't escape its key pattern via Lua, provided keys are passed correctly.
+- `ACL LOG` shows denied commands and failed authentications: wire it into security monitoring.
+
+**Functions vs EVAL:**
 
 ```lua
--- Lua scripts: loaded per-application, managed by applications
--- Problem: scripts scattered across codebases, no central management
+#!lua name=paylib
 
--- Redis Functions: server-side library of functions
--- Loaded ONCE into Redis, invoked by name
--- Managed via FUNCTION commands
+redis.register_function('debit_wallet', function(keys, args)
+    local balance = tonumber(redis.call('GET', keys[1]) or '0')
+    local amount  = tonumber(args[1])
+    if balance < amount then
+        return redis.error_reply('INSUFFICIENT_FUNDS')
+    end
+    redis.call('DECRBY', keys[1], amount)
+    redis.call('RPUSH', keys[2], 'debit:' .. keys[1] .. ':' .. amount)
+    return balance - amount
+end)
 
--- #1. Define function library
--- redis-cli FUNCTION LOAD "#!lua name=mylib\n
-
-#!lua name=payment_functions version=1
-
--- Register functions
 redis.register_function{
-    function_name = 'debit_wallet',
-    callback = function(keys, args)
-        local wallet_key = keys[1]
-        local amount = tonumber(args[1])
-        local balance = redis.call('GET', wallet_key)
-        balance = tonumber(balance or 0)
-
-        if balance < amount then
-            return redis.error_reply('INSUFFICIENT_FUNDS')
-        end
-
-        redis.call('DECRBY', wallet_key, amount)
-        redis.call('RPUSH', 'audit_log', 'debit:' .. wallet_key .. ':' .. amount)
-        return balance - amount
-    end,
-    flags = {'no-writes'}  -- Can run on replicas
+    function_name = 'get_balance',
+    callback = function(keys, args) return redis.call('GET', keys[1]) end,
+    flags = { 'no-writes' }          -- only read-only functions may use this flag; enables FCALL_RO on replicas
 }
-
--- #2. Invoke function (from any client)
-FCALL debit_wallet 1 wallet:100 50
--- Returns: 50 (new balance)
-
--- Advantage over EVAL:
--- 1. Loaded once (no EVALSHA/NOSCRIPT issues)
--- 2. Atomic updates (version) - can't accidentally run stale script
--- 3. Centralized in Redis (not scattered across clients)
--- 4. ACL-controlled (can allow FCALL but deny EVAL)
 ```
 
-**Multi-Tenant API Gateway ACL Design:**
+```bash
+redis-cli -x FUNCTION LOAD REPLACE < paylib.lua
+FCALL debit_wallet 2 {w:100}:bal {w:100}:audit 50     # → 50
+FCALL_RO get_balance 1 {w:100}:bal
 
-```yaml
-# Scenario: Redis-backed API gateway serving 5 teams
-# Each team has their own key prefix
-# Admin team has full access
-
-# ── Users ──
-ACL SET USER team-payments on >p@ssw0rd_pay ~payments:* +@all -@dangerous
-ACL SET USER team-orders on >p@ssw0rd_ord ~orders:* +@all -@dangerous
-ACL SET USER team-users on >p@ssw0rd_usr ~users:* +@all -@dangerous  
-ACL SET USER team-analytics on >p@ssw0rd_anl ~analytics:* +@read +@keyspace
-ACL SET USER team-admin on >s3cr3t_adm ~* +@all
-
-# ── Functions (team-specific) ──
-# Team-payments can only call their functions
-ACL SET USER team-payments on >p@ssw0rd_pay ~payments:* +@all -@dangerous +fcall|debit_wallet +fcall|credit_wallet
-
-# ── Default deny ──
-ACL SETUSER default off -@all
-
-# ── Connection limits (Redis 7) ──
-# Prevent one team from consuming all connections
-ACL SETUSER team-payments on >p@ssw0rd_pay ~payments:* +@all -@dangerous +fcall|debit_wallet
-ACL SETUSER team-payments reset-connections 50
+# Allow a tenant to call only this function (first-argument match on FCALL):
+ACL SETUSER payments -fcall +fcall|debit_wallet
 ```
 
-**Redis 7 Additional Features:**
+| | `EVAL`/`EVALSHA` | Functions (7.0+) |
+|---|---|---|
+| Where code lives | Client sends it; server cache is volatile | Server-side library, persisted and replicated |
+| Invocation | SHA1 of body | Library + function name |
+| Deployment | Each client app, `NOSCRIPT` handling | `FUNCTION LOAD [REPLACE]`, `FUNCTION DUMP/RESTORE` |
+| Execution model | Atomic, blocking, keys via `KEYS` | Same |
 
-```yaml
-# 1. ACL LOG (audit trail)
-ACL LOG
-# Track failed authentication attempts (security monitoring)
+Both are still supported; Functions are the better choice for shared server-side logic.
 
-# 2. Sharded Pub/Sub
-# Previously: PUBLISH only on all nodes
-# Now: SSPUBLISH to specific shard
-# Scales horizontally (no cross-node broadcast)
+**Other Redis 6/7 features worth knowing:**
 
-# 3. Client-side caching (tracking)
-# Server tracks which keys clients are caching
-# On key update: server sends INVALIDATION message to clients
-# Clients don't need TTL-based polling
+- **Client-side caching** (6.0): `CLIENT TRACKING` with RESP3 push invalidations (or broadcast mode by prefix).
+- **Threaded I/O** (6.0, rewritten in 8.0): `io-threads` offloads socket reads/writes and parsing; command execution stays single-threaded.
+- **Sharded Pub/Sub** (7.0): `SPUBLISH`/`SSUBSCRIBE` route by channel slot instead of broadcasting to every cluster node.
+- **Multi-part AOF** (7.0), **`WAITAOF`** (7.2), **hash field expiration** (7.4: `HEXPIRE`, `HPEXPIRE`, `HTTL`, `HPERSIST`; 8.0 added `HGETEX`, `HSETEX`, `HGETDEL`).
 
-# 4. Redis Functions (as above)
-# 5. Better replication (repl-diskless-sync improved)
-# 6. Command tips for better cluster routing
-```
+### Redis 8.x and Valkey: what changed
+
+| Release | What matters in an interview |
+|---|---|
+| **Redis 7.4** (2024) | License moved from BSD to **RSALv2/SSPLv1** (source-available, not OSI open source); hash field expiration |
+| **Valkey 7.2.5 / 8.0** (2024) | Linux Foundation fork under **BSD-3**, backed by AWS, Google, Oracle and others; Valkey 8 added a new multi-threaded I/O design and memory-efficiency work; managed offerings (ElastiCache, Memorystore) adopted it |
+| **Redis 8.0** (May 2025) | Adds **AGPLv3** as a third license option; Query Engine (search, vector search), JSON, time series, Bloom/Cuckoo/CMS/Top-k/t-digest built in; **vector sets** (beta: `VADD`, `VSIM`); new I/O threading |
+| **Redis 8.2** (Aug 2025) | `XACKDEL`/`XDELEX`; per-slot and key-size metrics; new `BITOP` operators |
+| **Redis 8.4** (Nov 2025) | **Atomic slot migration** (`CLUSTER MIGRATION`), `CLUSTER SLOT-STATS`, compare-and-set/delete on strings (`SET … IFEQ`, `DELEX`, `DIGEST`), `MSETEX`, `XREADGROUP CLAIM`, hybrid search (`FT.HYBRID`) |
+| **Redis 8.6** (Feb 2026) | LRM eviction policies, `HOTKEYS`, idempotent `XADD`, lower memory for big hashes/sorted sets |
+| **Redis 8.8 / 8.10** (2026) | Array data type, `INCREX` rate-limiter counter, `XNACK`; compact hashes with shared field names, `BACKUP` |
+| **Valkey 9.x** (2025–26) | Atomic slot migration, hash field expiration, multiple logical databases in cluster mode |
+
+How to talk about the choice: AGPLv3 matters if you modify Redis and offer it as a network service; RSAL/SSPL restrict offering it as a competing managed service. Most companies using Redis internally are unaffected by any of the three; cloud users mostly get Valkey or the provider's managed Redis. Valkey and Redis remain broadly protocol-compatible for core commands, but newer features (Redis 8 Query Engine and data types, Valkey-specific cluster features) are not interchangeable, so pin to one when you depend on them.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **ACL granularity** | Knows key patterns, command categories, and user management |
-| **Functions vs EVAL** | Understands central management advantage of Functions |
-| **Multi-tenant isolation** | Can design ACLs that prevent cross-tenant access |
-| **New features** | Knows Redis 7 highlights: ACL LOG, sharded pub/sub, client caching |
+| **ACL design** | Correct `ACL SETUSER` syntax, key + channel patterns, `%R~`/`%W~`, default user off |
+| **Limits of ACLs** | No per-user resource limits; keyless commands span all keys |
+| **Functions vs EVAL** | Persisted, replicated, named; same blocking and key rules |
+| **Ecosystem awareness** | Redis 8 licensing (AGPL option), Valkey fork, what's built in now |
+
+**What they probe next:** "Would you use Redis as your vector database?" → vector sets or the Query Engine are fine for small-to-medium, latency-sensitive workloads that fit in RAM; for billion-scale or disk-based indexes, a dedicated vector store or Postgres + pgvector may be cheaper.
 
 ---
 
-> *All 12 questions cover the full breadth of Redis internals, data structures, persistence, clustering, and operational excellence — from memory optimization to distributed locking and ACL security.*
+> *Version references were checked against Redis release notes up to 8.10 (July 2026) and Valkey 9.x.*
