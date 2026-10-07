@@ -1,6 +1,6 @@
 # 🏗️ Software Design Patterns — Principal Engineer Deep-Dive
 
-> *12 patterns with production-grade implementations, interview questions, and principal engineer–level analysis. Covers creational, structural, and behavioral patterns — not just what they are, but when and why to use them in real systems.*
+> *12 GoF patterns (Factory Method and Abstract Factory share a section) plus a selection framework, each with a pattern card (intent, structure, when not to use it), a runnable implementation and the trade-offs a staff interviewer probes. Code is Python 3.10+ unless marked; examples that call real SDKs (Stripe, boto3, psycopg2) need those packages.*
 
 ---
 
@@ -26,6 +26,12 @@
 **Q:** "Your payment processing system needs to support multiple payment gateways (Stripe, PayPal, Square) with different rate limits, retry logic, and error handling. The system should support adding new gateways without modifying existing code. Design this using the Strategy pattern. What are the alternatives? When would you NOT use Strategy?"
 
 **What They're Really Testing:** Whether you understand Strategy as a way to apply the Open/Closed principle in production, and can identify when simpler approaches (like first-class functions) replace the need for the pattern entirely.
+
+!!! abstract "Pattern card"
+    **Intent (GoF):** define a family of algorithms, encapsulate each one, and make them interchangeable, so the algorithm can vary independently of the clients that use it.<br>
+    **Structure:** a *Context* holds a reference to a *Strategy* interface; *ConcreteStrategies* implement it; the client (or a config/registry) picks which one the context uses.<br>
+    **Use when:** several variants of one behaviour exist and must be chosen at runtime or added without editing the caller.<br>
+    **Don't use when:** there are two stable variants (an `if` is clearer), or the variants are plain functions; in Python, Go, Java 8+ and Kotlin a function or lambda *is* a strategy, no class hierarchy needed.
 
 ### Answer
 
@@ -66,108 +72,116 @@ class PaymentResult:
     success: bool
     transaction_id: Optional[str] = None
     error_message: Optional[str] = None
-    raw_response: dict = None
+    raw_response: Optional[dict] = None
+    gateway_used: Optional[str] = None
+    retriable: bool = False        # True only if the charge certainly didn't happen
 
 class PaymentGatewayStrategy(ABC):
     """Interface for all payment gateway strategies."""
 
+    # Money is an integer in minor units (cents). int(19.99 * 100) == 1998,
+    # so never multiply floats to get cents.
     @abstractmethod
-    def charge(self, amount: float, currency: str,
+    def charge(self, amount_cents: int, currency: str,
                source: dict) -> PaymentResult:
         """Charge a payment source."""
-        pass
 
     @abstractmethod
     def refund(self, transaction_id: str,
-               amount: Optional[float] = None) -> PaymentResult:
-        """Refund a transaction."""
-        pass
+               amount_cents: Optional[int] = None) -> PaymentResult:
+        """Refund a transaction (full refund if amount is None)."""
 
     @abstractmethod
     def get_rate_limit(self) -> int:
-        """Returns max requests per second for this gateway."""
-        pass
+        """Max requests/second we allow ourselves for this gateway (from config)."""
 
     @abstractmethod
     def is_available(self) -> bool:
         """Health check for this gateway."""
-        pass
 
 # ── CONCRETE STRATEGIES ─────────────────────────────────────
 
 class StripeStrategy(PaymentGatewayStrategy):
-    def __init__(self, api_key: str, webhook_secret: str):
-        self.client = StripeClient(api_key)
+    def __init__(self, api_key: str, webhook_secret: str, rate_limit: int):
+        self.client = stripe.StripeClient(api_key)
         self.webhook_secret = webhook_secret
+        self.rate_limit = rate_limit
         self._circuit_breaker = CircuitBreaker(
             failure_threshold=5,
             reset_timeout=30,
         )
 
-    def charge(self, amount: float, currency: str,
+    def charge(self, amount_cents: int, currency: str,
                source: dict) -> PaymentResult:
         try:
             # Wrap in circuit breaker
             return self._circuit_breaker.call(
-                self._do_charge, amount, currency, source
+                self._do_charge, amount_cents, currency, source
             )
         except CircuitBreakerOpen:
             return PaymentResult(
                 success=False,
                 error_message="Stripe circuit breaker open",
+                retriable=True,      # we never called Stripe: safe to try another gateway
             )
 
-    def _do_charge(self, amount: float, currency: str,
+    def _do_charge(self, amount_cents: int, currency: str,
                    source: dict) -> PaymentResult:
         try:
-            intent = self.client.payment_intents.create(
-                amount=int(amount * 100),  # Stripe uses cents
-                currency=currency.lower(),
-                payment_method=source['payment_method_id'],
-                confirm=True,
-                idempotency_key=source.get('idempotency_key'),
+            intent = self.client.v1.payment_intents.create(   # stripe-python >= 12.5
+                params={
+                    "amount": amount_cents,
+                    "currency": currency.lower(),
+                    "payment_method": source['payment_method_id'],
+                    "confirm": True,
+                },
+                options={"idempotency_key": source['idempotency_key']},
             )
             return PaymentResult(
                 success=True,
                 transaction_id=intent.id,
                 raw_response=intent.to_dict(),
             )
-        except stripe.error.CardError as e:
+        except stripe.CardError as e:
+            # A decline is a final answer from the bank: do NOT fail over.
             return PaymentResult(
                 success=False,
                 error_message=f"Card declined: {e.user_message}",
             )
-        except stripe.error.RateLimitError:
+        except stripe.RateLimitError:
             # Backoff and retry handled by caller
             raise
 
     def refund(self, transaction_id: str,
-               amount: Optional[float] = None) -> PaymentResult:
+               amount_cents: Optional[int] = None) -> PaymentResult:
+        params = {"payment_intent": transaction_id}
+        if amount_cents is not None:
+            params["amount"] = amount_cents      # omit for a full refund
         try:
-            refund = self.client.refunds.create(
-                payment_intent=transaction_id,
-                amount=int(amount * 100) if amount else None,
-            )
+            refund = self.client.v1.refunds.create(params=params)
             return PaymentResult(success=True, transaction_id=refund.id)
-        except Exception as e:
+        except stripe.StripeError as e:
             return PaymentResult(success=False, error_message=str(e))
 
     def get_rate_limit(self) -> int:
-        return 100  # Stripe: 100 req/s
+        # Stripe documents ~100 ops/s global in live mode and lower
+        # per-endpoint limits; use YOUR account's limits, from config.
+        return self.rate_limit
 
     def is_available(self) -> bool:
         try:
-            self.client.balance.retrieve()
+            self.client.v1.balance.retrieve()
             return True
         except Exception:
             return False
 
 
 class PayPalStrategy(PaymentGatewayStrategy):
-    def __init__(self, client_id: str, client_secret: str):
-        self.client = PayPalClient(client_id, client_secret)
+    def __init__(self, client_id: str, client_secret: str, rate_limit: int):
+        self.client = PayPalClient(client_id, client_secret)   # illustrative wrapper
+        self.rate_limit = rate_limit
 
-    def charge(self, amount: float, currency: str,
+    def charge(self, amount_cents: int, currency: str,
                source: dict) -> PaymentResult:
         try:
             order = self.client.order.create({
@@ -175,7 +189,7 @@ class PayPalStrategy(PaymentGatewayStrategy):
                 'purchase_units': [{
                     'amount': {
                         'currency_code': currency,
-                        'value': str(amount),
+                        'value': f"{amount_cents // 100}.{amount_cents % 100:02d}",  # "19.99"
                     }
                 }],
             })
@@ -192,18 +206,18 @@ class PayPalStrategy(PaymentGatewayStrategy):
             )
 
     def refund(self, transaction_id: str,
-               amount: Optional[float] = None) -> PaymentResult:
+               amount_cents: Optional[int] = None) -> PaymentResult:
         try:
             refund = self.client.payment.refund(
                 transaction_id,
-                amount=str(amount) if amount else None,
+                amount_cents=amount_cents,
             )
             return PaymentResult(success=True, transaction_id=refund.id)
         except Exception as e:
             return PaymentResult(success=False, error_message=str(e))
 
     def get_rate_limit(self) -> int:
-        return 50  # PayPal: 50 req/s
+        return self.rate_limit
 
     def is_available(self) -> bool:
         try:
@@ -214,8 +228,9 @@ class PayPalStrategy(PaymentGatewayStrategy):
 
 
 class SquareStrategy(PaymentGatewayStrategy):
-    """Similar implementation for Square..."""
-    pass
+    """Same shape as above: charge/refund/get_rate_limit/is_available.
+    (Elided; as written with only `pass` it would be abstract and
+    raise TypeError on instantiation.)"""
 
 # ── CONTEXT (uses strategies) ───────────────────────────────
 
@@ -231,33 +246,36 @@ class PaymentProcessor:
             'stripe': StripeStrategy(
                 api_key=os.environ['STRIPE_API_KEY'],
                 webhook_secret=os.environ['STRIPE_WEBHOOK_SECRET'],
+                rate_limit=int(os.environ.get('STRIPE_RPS', '80')),
             ),
             'paypal': PayPalStrategy(
                 client_id=os.environ['PAYPAL_CLIENT_ID'],
                 client_secret=os.environ['PAYPAL_CLIENT_SECRET'],
+                rate_limit=int(os.environ.get('PAYPAL_RPS', '40')),
             ),
             'square': SquareStrategy(
                 access_token=os.environ['SQUARE_ACCESS_TOKEN'],
             ),
         }
 
-    def process_payment(self, amount: float, currency: str,
-                        source: dict, preferred: str = None) -> PaymentResult:
+    def process_payment(self, amount_cents: int, currency: str,
+                        source: dict, preferred: Optional[str] = None) -> PaymentResult:
         """
         Process a payment, automatically selecting the best gateway.
 
         Selection criteria:
           1. Use preferred gateway if available and healthy
-          2. Fall back to next available gateway
+          2. Fall back ONLY if the failure proves no charge happened
           3. Consider rate limits and current load
         """
         if preferred and preferred in self.gateways:
             gateway = self.gateways[preferred]
             if gateway.is_available():
-                result = gateway.charge(amount, currency, source)
+                result = gateway.charge(amount_cents, currency, source)
                 if result.success:
                     return self._enrich_result(result, preferred)
-                # Fall through to fallback
+                if not result.retriable:
+                    return result   # declined, or outcome unknown: don't double-charge
 
         # Fallback: try other gateways
         for name, gateway in self.gateways.items():
@@ -268,9 +286,11 @@ class PaymentProcessor:
             if self._is_rate_limited(gateway):
                 continue
 
-            result = gateway.charge(amount, currency, source)
+            result = gateway.charge(amount_cents, currency, source)
             if result.success:
                 return self._enrich_result(result, name)
+            if not result.retriable:
+                return result
 
         return PaymentResult(
             success=False,
@@ -279,7 +299,7 @@ class PaymentProcessor:
 
     def _is_rate_limited(self, gateway: PaymentGatewayStrategy) -> bool:
         """Check if gateway is approaching its rate limit."""
-        current_rate = self._get_current_rate(gateway)
+        current_rate = self._get_current_rate(gateway)   # e.g. sliding-window counter
         return current_rate > gateway.get_rate_limit() * 0.8
 
     def _enrich_result(self, result: PaymentResult,
@@ -335,12 +355,13 @@ def charge(gateway, amount, currency, source):
 
 ```yaml
 Strategy is overkill when:
-  1. You have only 2 variations (use if/else or ternary)
-  2. The algorithm never changes at runtime
+  1. You have only 2 stable variations (use if/else)
+  2. The algorithm never changes at runtime and nobody else adds variants
   3. The algorithm is a simple one-liner
-  4. You're using a language with first-class functions
-     (use function passing instead)
-  5. The strategies share 90%+ code (use Template Method instead)
+  4. Variants are stateless and your language has first-class functions
+     (pass a function; it is still the Strategy pattern, minus the classes)
+  5. The strategies share 90%+ code (factor the shared part out, or use
+     Template Method for a fixed skeleton)
 
 Use Strategy when:
   1. You need to switch algorithms at runtime
@@ -357,6 +378,7 @@ Use Strategy when:
 | **Fallback logic** | Implements automatic fallback when primary gateway fails |
 | **Function alternative** | Knows that first-class functions can replace Strategy in simpler cases |
 | **Circuit breaker** | Adds infrastructure concerns (rate limits, health checks) to the pattern |
+| **Payment safety** | Fails over only when the first gateway certainly didn't charge; money in integer minor units |
 
 ---
 
@@ -366,326 +388,166 @@ Use Strategy when:
 
 **What They're Really Testing:** Whether you understand the Observer pattern's strengths (decoupling) and weaknesses (memory leaks, notification storms, subscriber failure propagation) from production experience.
 
+!!! abstract "Pattern card"
+    **Intent (GoF):** define a one-to-many dependency so that when one object (the *subject*) changes state, all its dependents (*observers*) are notified automatically.<br>
+    **Structure:** *Subject* keeps a list of *Observer*s and offers `attach`/`detach`/`notify`; each *ConcreteObserver* implements `update(event)`. An **event bus** (pub/sub) adds a broker between them, so publishers and subscribers don't reference each other at all.<br>
+    **Use when:** several independent reactions follow one change, and the source shouldn't know about them (UI updates, domain events inside a service, cache invalidation).<br>
+    **Don't use when:** the order of reactions matters or the caller needs their result (call them explicitly); or the reactions cross process boundaries and must survive crashes. In-process observers lose events on restart, so use a durable broker (Kafka, SQS) with an outbox.
+
 ### Answer
 
-**Observer Pattern — Basic Structure:**
+**Push vs pull:**
+
+| Model | Subject sends | Pros | Cons |
+|-------|---------------|------|------|
+| **Push** | The data (`OrderShipped{order_id, tracking_no}`) | One hop; observers don't call back | Payload may be large or irrelevant to some observers; schema becomes a contract |
+| **Pull** | Only "X changed" (`PriceChanged{product_id}`) | Small events; observer fetches exactly what it needs, always fresh | N observers × 1 read each: a notification can trigger a thundering herd on the source |
+
+At 10K events/s, push with a *self-contained* event is usually right; pull is useful when the data is large or sensitive and only some observers need it.
+
+**Production-grade in-process Event Bus (runs as-is):**
 
 ```python
-# ── OBSERVABLE (Subject) ───────────────────────────────────
-from abc import ABC, abstractmethod
-from typing import Any, Callable
-import weakref
 import asyncio
 import logging
+import weakref
+from collections import defaultdict
+from typing import Any, Awaitable, Callable
 
-class Observable:
-    """
-    Observable subject that maintains a list of observers.
-    Uses weak references to prevent memory leaks.
-    """
+Handler = Callable[[Any], Awaitable[None]]
 
-    def __init__(self):
-        # Weak set — observers can be garbage collected
-        self._observers: set[weakref.ref] = set()
-        self._lock = asyncio.Lock()
-
-    def attach(self, observer: 'Observer'):
-        """Subscribe an observer. Uses weak reference."""
-        self._observers.add(weakref.ref(observer))
-
-    def detach(self, observer: 'Observer'):
-        """Unsubscribe an observer."""
-        self._observers.discard(weakref.ref(observer))
-
-    async def notify(self, event: Any):
-        """Notify all observers of an event."""
-        dead_refs = []
-        async with self._lock:
-            for ref in self._observers:
-                observer = ref()
-                if observer is None:
-                    dead_refs.append(ref)
-                    continue
-                try:
-                    await observer.update(self, event)
-                except Exception as e:
-                    # Isolate observer failures — one failing observer
-                    # should NOT affect other observers
-                    logging.error(f"Observer failed: {e}")
-
-        # Clean up dead references
-        for ref in dead_refs:
-            self._observers.discard(ref)
-
-
-class Observer(ABC):
-    """Observer interface."""
-
-    @abstractmethod
-    async def update(self, subject: Observable, event: Any):
-        """Receive notification from subject."""
-        pass
-```
-
-**Production-Grade Observer with Push and Pull Models:**
-
-```python
-# ── PUSH MODEL: Subject pushes event data to observers ─────
-# Simple, but can overload observers with irrelevant data.
-
-class PushNotificationObserver(Observer):
-    async def update(self, subject: Observable, event: Any):
-        """Receive pushed event data."""
-        if event.type == 'order.shipped':
-            await self.send_push_notification(
-                user_id=event.user_id,
-                message=f"Your order {event.order_id} has shipped!"
-            )
-
-# ── PULL MODEL: Observer fetches what it needs ─────────────
-# More efficient — observers control what they consume.
-
-class PullNotificationObserver(Observer):
-    """
-    Observer uses PULL model: receives only a notification
-    that SOMETHING changed, then fetches relevant data.
-    """
-
-    async def update(self, subject: Observable, event: Any):
-        """
-        Subject only sends minimal info: "something changed".
-        Observer pulls the data it actually needs.
-        """
-        # Only interested in price changes
-        if event.type != 'price.changed':
-            return
-
-        # Pull the actual data we need
-        affected_products = await self.get_watched_product_ids()
-        for product_id in affected_products:
-            new_price = await self.fetch_price(product_id)
-            if self.should_notify(product_id, new_price):
-                await self.send_price_alert(product_id, new_price)
-
-    async def get_watched_product_ids(self) -> list[int]:
-        # Observer pulls its own watchlist
-        return await db.fetch(
-            "SELECT product_id FROM user_watchlists WHERE user_id = $1",
-            self.user_id,
-        )
-
-    async def fetch_price(self, product_id: int) -> float:
-        # Pull specific data from subject
-        return await price_service.get_price(product_id)
-```
-
-**Event Bus — Decoupled Observer:**
-
-```python
-# ── EVENT BUS: Decoupled Observer ───────────────────────────
-# In production, direct Subject-Observer coupling is rare.
-# Instead, use an event bus (pub-sub) for complete decoupling.
 
 class EventBus:
+    """In-process pub/sub. Publishers don't know who listens.
+
+    - Handler failures are isolated and logged.
+    - Each handler gets a timeout so one slow subscriber can't stall publish().
+    - subscribe() returns an unsubscribe function: the caller owns cleanup.
+    - subscribe_weak() holds bound methods weakly, so a forgotten subscriber
+      can still be garbage-collected.
     """
-    Central event bus. Publishers and subscribers are fully
-    decoupled — they don't know about each other.
-    """
 
-    def __init__(self):
-        # {event_type: [list of handlers]}
-        self._handlers: dict[str, list[Callable]] = {}
-        self._lock = asyncio.Lock()
+    def __init__(self, handler_timeout: float = 5.0):
+        self._handlers: dict[str, list] = defaultdict(list)  # entries: callable or WeakMethod
+        self._timeout = handler_timeout
 
-    def subscribe(self, event_type: str, handler: Callable):
-        """Subscribe a handler to an event type."""
-        with self._lock:
-            if event_type not in self._handlers:
-                self._handlers[event_type] = []
-            self._handlers[event_type].append(handler)
+    def subscribe(self, event_type: str, handler: Handler) -> Callable[[], None]:
+        self._handlers[event_type].append(handler)
+        return lambda: self._remove(event_type, handler)
 
-    def unsubscribe(self, event_type: str, handler: Callable):
-        """Unsubscribe a handler."""
-        with self._lock:
-            if event_type in self._handlers:
-                self._handlers[event_type].remove(handler)
+    def subscribe_weak(self, event_type: str, bound_method: Handler) -> None:
+        # weakref.ref(obj.method) would die immediately: a bound method is a
+        # temporary object. WeakMethod tracks the instance instead.
+        self._handlers[event_type].append(weakref.WeakMethod(bound_method))
 
-    async def publish(self, event_type: str, event_data: Any):
-        """Publish an event to all subscribers."""
-        handlers = self._handlers.get(event_type, []).copy()  # Thread-safe copy
-        for handler in handlers:
-            try:
-                await handler(event_data)
-            except Exception as e:
-                # Isolate failures
-                logging.error(f"Handler {handler.__name__} failed: {e}")
+    def _remove(self, event_type: str, entry) -> None:
+        try:
+            self._handlers[event_type].remove(entry)
+        except ValueError:
+            pass
 
-    def subscribe_weak(self, event_type: str, handler: Callable):
-        """
-        Subscribe with weak reference to prevent memory leaks.
-        If the handler's owner object is garbage collected,
-        the subscription is automatically removed.
-        """
-        weak_handler = weakref.ref(handler)
+    def _live_handlers(self, event_type: str) -> list[Handler]:
+        live = []
+        for entry in list(self._handlers[event_type]):   # copy: handlers may unsubscribe
+            if isinstance(entry, weakref.WeakMethod):
+                fn = entry()
+                if fn is None:                             # owner was collected
+                    self._remove(event_type, entry)
+                    continue
+                live.append(fn)
+            else:
+                live.append(entry)
+        return live
 
-        def wrapper(event_data):
-            actual_handler = weak_handler()
-            if actual_handler:
-                return actual_handler(event_data)
-            # Auto-unsubscribe
-            self.unsubscribe(event_type, wrapper)
-
-        self.subscribe(event_type, wrapper)
-
-
-# ── USAGE ──────────────────────────────────────────────────
-
-event_bus = EventBus()
-
-# Subscribe (Observer)
-class OrderNotifier:
-    def __init__(self):
-        # Subscribe with bound method
-        event_bus.subscribe('order.created', self.on_order_created)
-        event_bus.subscribe('order.shipped', self.on_order_shipped)
-
-    async def on_order_created(self, event):
-        await email_service.send_confirmation(event['order_id'])
-
-    async def on_order_shipped(self, event):
-        await sms_service.send_tracking(
-            event['user_phone'],
-            event['tracking_number'],
+    async def publish(self, event_type: str, event: Any) -> None:
+        handlers = self._live_handlers(event_type)
+        results = await asyncio.gather(
+            *(asyncio.wait_for(h(event), self._timeout) for h in handlers),
+            return_exceptions=True,                        # isolate failures
         )
+        for h, r in zip(handlers, results):
+            if isinstance(r, BaseException):
+                logging.error("handler %s failed: %r", getattr(h, "__qualname__", h), r)
+```
 
-    def __del__(self):
-        # Clean up — unsubscribe to prevent memory leaks
-        event_bus.unsubscribe('order.created', self.on_order_created)
-        event_bus.unsubscribe('order.shipped', self.on_order_shipped)
+```python
+# ── USAGE ──────────────────────────────────────────────────
+class OrderNotifier:
+    def __init__(self, bus: EventBus):
+        self._unsubscribe = [
+            bus.subscribe("order.created", self.on_created),
+            bus.subscribe("order.shipped", self.on_shipped),
+        ]
 
-# Publish (Subject)
+    async def on_created(self, event):
+        await email_service.send_confirmation(event["order_id"])
+
+    async def on_shipped(self, event):
+        await sms_service.send_tracking(event["user_phone"], event["tracking_number"])
+
+    def close(self):
+        """Explicit lifecycle. Don't rely on __del__: the bus holds a strong
+        reference to these bound methods, so __del__ would never run."""
+        for unsubscribe in self._unsubscribe:
+            unsubscribe()
+
+
 class OrderService:
+    def __init__(self, db, bus: EventBus):
+        self.db, self.bus = db, bus
+
     async def create_order(self, order_data):
         order = await self.db.create_order(order_data)
-        # Publish event — no knowledge of who's listening
-        await event_bus.publish('order.created', {
-            'order_id': order.id,
-            'user_id': order.user_id,
-            'amount': order.amount,
-        })
+        # Publisher has no idea who listens.
+        await self.bus.publish("order.created", {"order_id": order.id, "user_id": order.user_id})
         return order
 ```
 
-**Observer Anti-Patterns & Pitfalls:**
+**Observer pitfalls and fixes:**
+
+1. **Lapsed listener (memory leak).** The subject's list holds a strong reference to every bound method, and a bound method holds its object. A component that subscribes and is "thrown away" stays alive and keeps receiving events. Fix: explicit `unsubscribe` tied to the component's lifecycle (the function returned by `subscribe`), or `WeakMethod`. A plain `weakref.ref(obj.method)` is a classic bug: the bound method is a temporary, so the reference is dead immediately.
+2. **Failure propagation.** One observer raising must not stop the others or fail the publisher. `gather(..., return_exceptions=True)` isolates it.
+3. **Slow observers.** Synchronous notification makes the publisher as slow as the slowest observer. Bound each handler with a timeout, or hand events to a queue and let observers consume at their own pace.
+4. **Notification storms.** 1,000 price updates × 1,000 observers = 1,000,000 handler calls. Coalesce bursts:
 
 ```python
-# 🔴 ANTI-PATTERN 1: Notification Storm
-class PriceUpdateObservable(Observable):
-    async def update_price(self, product_id, new_price):
-        # This triggers ALL observers — potentially 1000s!
-        # Each observer might make DB calls, API calls, etc.
-        await self.notify(PriceChanged(product_id, new_price))
-
-# PROBLEM: Cascade of notifications
-#   Price update → notify 1000 observers
-#   Each observer makes an API call
-#   API latency: 100ms
-#   Total: 1000 × 100ms = 100 seconds of processing!
-#   Eventual timeout, cascading failures
-
-# ✅ FIX: Batch notifications
-class BatchPriceUpdateObservable(Observable):
-    def __init__(self):
-        super().__init__()
-        self._pending_updates = []
-        self._flush_task = asyncio.create_task(self._periodic_flush())
-
-    def update_price(self, product_id, new_price):
-        self._pending_updates.append((product_id, new_price))
-
-    async def _periodic_flush(self):
-        while True:
-            await asyncio.sleep(0.1)  # 100ms batch window
-            if self._pending_updates:
-                batch = self._pending_updates.copy()
-                self._pending_updates.clear()
-                await self.notify(BatchPriceChanged(batch))
+import asyncio
 
 
-# 🔴 ANTI-PATTERN 2: Memory Leak (forgetting to unsubscribe)
-class LeakyComponent:
-    def __init__(self, event_bus):
-        # Subscribe but NEVER unsubscribe
-        event_bus.subscribe('data.updated', self.on_data_updated)
+class PriceChangeBatcher:
+    """Coalesces bursts: 1,000 price updates in 100 ms become ONE notification
+    with the latest price per product."""
 
-    def on_data_updated(self, event):
-        print(f"Data updated: {event}")
+    def __init__(self, bus, window_s: float = 0.1):
+        self.bus, self.window_s = bus, window_s
+        self._pending: dict[str, int] = {}
+        self._flush_task: asyncio.Task | None = None
 
-    # ❌ No __del__ to unsubscribe!
-    # When LeakyComponent is garbage collected:
-    #   - event_bus still holds a reference to on_data_updated
-    #   - on_data_updated holds a reference to self (bound method)
-    #   → LeakyComponent is NEVER garbage collected!
-    #   → MEMORY LEAK
+    def price_changed(self, product_id: str, price_cents: int) -> None:
+        self._pending[product_id] = price_cents          # last write wins per product
+        if self._flush_task is None:                     # start a window on first change
+            self._flush_task = asyncio.get_running_loop().create_task(self._flush_later())
 
-# ✅ FIX: Use weakref or explicit cleanup
-class CleanComponent:
-    def __init__(self, event_bus):
-        # Subscribe with weak reference
-        event_bus.subscribe_weak('data.updated', self.on_data_updated)
-        # OR: store the handler for later cleanup
-        self._handler = self.on_data_updated
-        event_bus.subscribe('data.updated', self._handler)
-
-    def cleanup(self):
-        """Explicit cleanup — call when component is destroyed."""
-        event_bus.unsubscribe('data.updated', self._handler)
-
-
-# 🔴 ANTI-PATTERN 3: Synchronous notification in async system
-class SyncObservable(Observable):
-    def notify(self, event):
-        # SYNCHRONOUS — blocks the publisher!
-        for observer in self._observers:
-            observer.update(self, event)  # Blocks until done!
-        # If one observer takes 5 seconds, publisher is blocked 5 seconds
-
-# ✅ FIX: Async notification with timeout
-class AsyncObservable(Observable):
-    async def notify(self, event):
-        async with self._lock:
-            tasks = []
-            for ref in self._observers:
-                observer = ref()
-                if observer:
-                    task = asyncio.create_task(
-                        self._safe_notify(observer, event)
-                    )
-                    tasks.append(task)
-            # Fire and forget — don't wait for all
-            # (or wait with timeout: asyncio.wait(tasks, timeout=5))
-
-    async def _safe_notify(self, observer, event, timeout=5):
-        try:
-            await asyncio.wait_for(
-                observer.update(self, event),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            logging.warning(f"Observer {observer} timed out")
-        except Exception as e:
-            logging.error(f"Observer {observer} failed: {e}")
+    async def _flush_later(self) -> None:
+        await asyncio.sleep(self.window_s)
+        batch, self._pending, self._flush_task = self._pending, {}, None
+        await self.bus.publish("prices.changed", batch)
 ```
+
+5. **Fire-and-forget tasks.** `asyncio.create_task(...)` without keeping a reference can be garbage-collected before it finishes, and its exceptions disappear. Keep task references (or use `asyncio.TaskGroup`) and log failures.
+6. **Re-entrancy and ordering.** An observer that publishes during `publish()` can cause cascades or infinite loops; observers must not rely on being called in any order.
+
+**Scaling to 10K events/s across services:** in-process observers don't survive restarts or scale out. Publish domain events to Kafka (via a transactional outbox), give each notification channel (email, SMS, push) its own consumer group, partition by `user_id` for per-user ordering, and send failures to a retry topic and then a DLQ. That's still the Observer pattern; the broker is the subject's subscriber list, made durable.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Push vs pull** | Explains both models and when to use each |
-| **Memory leaks** | Identifies the leak-via-subscription problem and proposes weakref solution |
-| **Isolation** | Ensures one failing observer doesn't affect others |
-| **Event bus** | Mentions decoupled pub-sub as the production alternative to direct Subject-Observer |
-| **Thundering herd** | Identifies notification storms and proposes batching |
+| **Memory leaks** | Identifies the lapsed-listener problem; explicit unsubscribe or `WeakMethod` (not `weakref.ref` on a bound method) |
+| **Isolation** | Ensures one failing or slow observer doesn't affect others |
+| **Event bus** | Mentions decoupled pub-sub, and a durable broker once events cross processes |
+| **Thundering herd** | Identifies notification storms and proposes batching/coalescing |
 
 ---
 
@@ -694,6 +556,13 @@ class AsyncObservable(Observable):
 **Q:** "Design a document processing system that handles PDF, Word, HTML, and Markdown documents. Documents need different parsers, renderers, and exporters. Walk through both Factory Method and Abstract Factory patterns. When would you choose one over the other? When is a factory just unnecessary complexity?"
 
 **What They're Really Testing:** Whether you understand factories as a way to manage object creation when constructors aren't enough, and can distinguish between genuine creation complexity and over-engineering.
+
+!!! abstract "Pattern card"
+    **Factory Method (GoF):** define an interface for creating an object, but let **subclasses** decide which class to instantiate. Structure: a *Creator* with an overridable `create_x()` method, used by the creator's own logic; *ConcreteCreators* override it.<br>
+    **Abstract Factory (GoF):** provide an interface for creating **families** of related objects without naming their concrete classes. Structure: an *AbstractFactory* with one `create_*` per product; each *ConcreteFactory* returns a matching set.<br>
+    **Simple factory** (not a GoF pattern, but what most people mean by "factory"): one function that maps an input (file extension, config value) to a class.<br>
+    **Use when:** callers must not depend on concrete classes, the choice depends on runtime input, or several products must stay consistent with each other.<br>
+    **Don't use when:** a constructor call or a dict of classes does the job; a factory with one product and no logic is indirection without benefit.
 
 ### Answer
 
@@ -715,8 +584,10 @@ class Document(ABC):
 
     def __init__(self, path: str):
         self.path = path
-        self.content = self._parse(path)  # Factory method call
-        self._renderer = self._create_renderer()  # Factory method
+        # Calling overridable methods from a constructor works in Python, but in
+        # Java/C#/C++ it's a known hazard: the subclass's fields aren't set yet.
+        self.content = self._parse(path)          # hook for subclasses
+        self._renderer = self._create_renderer()  # the Factory Method
 
     @abstractmethod
     def _parse(self, path: str):
@@ -756,8 +627,10 @@ class WordDocument(Document):
         return WordRenderer()
 
 
-# ── FACTORY METHOD WITH PARAMETER ───────────────────────────
-# Alternative: a static factory method that decides based on input
+# ── SIMPLE (PARAMETERIZED) FACTORY ─────────────────────────
+# Not GoF Factory Method: one function decides the class from input.
+# This is what "factory" means in most codebases.
+from pathlib import Path
 
 class DocumentFactory:
     """Factory method that creates the right document type."""
@@ -844,7 +717,7 @@ class LightButton(Button):
         return "[ Light Button ]"
 
     def on_click(self, handler):
-        print("Light button clicked")
+        handler()
 
 class LightTextField(TextField):
     def render(self):
@@ -875,9 +748,15 @@ class DarkButton(Button):
     def render(self):
         return "[ Dark Button ]"
 
+    def on_click(self, handler):      # every abstract method must be implemented,
+        handler()                     # or instantiation raises TypeError
+
 class DarkTextField(TextField):
     def render(self):
         return "[ Dark Text Field ]"
+
+    def set_text(self, text):
+        print(f"Dark text field: {text}")
 
 class DarkCheckbox(Checkbox):
     def render(self):
@@ -927,7 +806,7 @@ Factory Method:
   - Creates ONE product type
   - Subclass decides which class to instantiate
   - Uses inheritance
-  - Example: Document._parse()
+  - Example: Document._create_renderer()
 
 Abstract Factory:
   - Creates a FAMILY of related products
@@ -995,6 +874,7 @@ class YAMLParser: ...
 | **Abstract Factory** | Creates product families that must be consistent |
 | **When to skip** | Knows when a simple dict of callables replaces a factory |
 | **Registrable pattern** | Proposes decorator-based registration as a Pythonic alternative |
+| **Naming precision** | Doesn't call every `create()` function "Factory Method"; knows the simple-factory distinction |
 
 ---
 
@@ -1003,6 +883,13 @@ class YAMLParser: ...
 **Q:** "Singleton is often called an anti-pattern. Defend it: when is Singleton actually the right choice in production? Then critique it: why is it problematic for testing and dependency management? Show me a thread-safe Singleton implementation and a Dependency Injection alternative."
 
 **What They're Really Testing:** Whether you understand the Singleton debate at a nuanced level — not "Singleton is always bad" or "Singleton is always good" — but when it genuinely helps and when it hurts.
+
+!!! abstract "Pattern card"
+    **Intent (GoF):** ensure a class has only one instance and provide a global point of access to it.<br>
+    **Structure:** a private/guarded constructor, a static `instance()` accessor, lazy or eager creation (thread-safe if lazy).<br>
+    **The two halves are separable:** "exactly one instance" is often legitimate (a connection pool, a metrics registry); "global access" is the part that hurts, because it hides dependencies and couples tests. Keep the first, drop the second: create one instance at startup and **inject** it.<br>
+    **Remember the scope:** a singleton is one per *process* (per class loader in Java). With 4 Gunicorn workers × 10 pods you have 40 "singletons", so size the pool for that (40 × 20 connections = 800 DB connections).<br>
+    **Don't use when:** you want convenience access to a service, or the object holds mutable state that tests need to reset.
 
 ### Answer
 
@@ -1048,6 +935,9 @@ import threading
 class ThreadSafeSingleton:
     """
     Thread-safe Singleton with double-checked locking.
+    The unlocked first check is a fast path; the second check under the lock
+    is what makes it correct. (In Java, DCL is only correct if the field is
+    `volatile`; the idiomatic Java answer is an enum or a holder class.)
     """
     _instance = None
     _lock = threading.Lock()
@@ -1120,8 +1010,9 @@ Singleton is acceptable when:
      - Metrics registry
 
 Key criteria: Does the system have a GENUINE need for exactly one instance?
-  - Connection pool: YES — you can't have 50 pools to the same DB
-  - Logger: YES — you want all logs in one place
+  - Connection pool: YES, one per process; 50 pools in one process would
+    exhaust the database's connection limit
+  - Logging config / metrics registry: YES, one per process
   - UserService: NO — there's no reason you can't have two UserService instances
 ```
 
@@ -1204,6 +1095,8 @@ from dependency_injector import containers, providers
 class AppContainer(containers.DeclarativeContainer):
     config = providers.Configuration()
 
+    # DatabasePool here is a plain class taking a url (not the metaclass one above):
+    # the CONTAINER enforces "one instance", the class itself stays testable.
     db = providers.Singleton(DatabasePool, url=config.database_url)
     # ^ Singleton scope: one instance per app
     #   But replaceable in tests!
@@ -1240,7 +1133,8 @@ def test_get_user():
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Thread safety** | Implements thread-safe singleton with double-checked locking |
+| **Thread safety** | Implements thread-safe singleton with double-checked locking; knows Java needs `volatile` (or an enum/holder) |
+| **Scope** | Knows "single" means per process/class loader, and what that means for pools across pods |
 | **When singleton works** | Identifies genuine single-instance needs (pools, config) |
 | **Testing critique** | Shows how singleton makes testing impossible and DI makes it easy |
 | **DI container** | Proposes DI framework with singleton scope for app-wide dependencies |
@@ -1253,233 +1147,187 @@ def test_get_user():
 
 **What They're Really Testing:** Whether you understand the Builder pattern's primary use case — constructing complex objects with many optional parameters — and can distinguish it from simple named parameters.
 
+!!! abstract "Pattern card"
+    **Intent (GoF):** separate the construction of a complex object from its representation, so the same construction process can create different representations. In everyday use (Bloch's *Effective Java* builder) it means building an **immutable** object step by step, with validation in `build()`.<br>
+    **Structure:** a *Builder* with fluent setters that return `this`/`self` and a `build()` that validates and returns the *Product*; optionally a *Director* that runs a standard sequence of steps.<br>
+    **Use when:** many optional parameters in a language without named arguments (Java, Go uses functional options instead), cross-field validation, immutable results, or incremental/conditional construction (query builders, test-data builders).<br>
+    **Don't use when:** the language has keyword arguments and defaults (Python, Kotlin) and there are no cross-field rules; a dataclass or record is enough.
+
 ### Answer
 
 **The Telescoping Constructor Problem:**
 
+Telescoping constructors are a Java/C++ problem: `new Query("users", null, null, "name", 10, 20, null, null, null, false)` is unreadable and easy to get wrong, and overloads multiply (`Query(table)`, `Query(table, select)`, …). Python's keyword arguments already solve readability:
+
 ```python
-# ── THE PROBLEM: Telescoping constructors ───────────────────
-class Query:
-    """A database query with many optional parameters."""
-
-    def __init__(self, table: str, select: list = None,
-                 where: dict = None, order_by: str = None,
-                 limit: int = None, offset: int = None,
-                 join: list = None, group_by: list = None,
-                 having: dict = None, distinct: bool = False):
-        self.table = table
-        self.select = select or ['*']
-        self.where = where or {}
-        self.order_by = order_by
-        self.limit = limit
-        self.offset = offset
-        self.join = join or []
-        self.group_by = group_by or []
-        self.having = having or {}
-        self.distinct = distinct
-
-# Usage — hard to read, easy to make mistakes:
-query = Query(
-    table='users',
-    select=['id', 'name', 'email'],
-    where={'status': 'active', 'age__gt': 18},
-    order_by='name',
-    limit=10,
-    offset=20,
-    join=[('orders', 'users.id = orders.user_id')],
-)
-
-# What if I miss an argument? What's the 6th positional arg?
-# Hard to read, easy to swap arguments!
+query = Query(table="users", select=["id", "name"], order_by="name", limit=10, offset=20)
 ```
 
-**Builder Pattern Solution:**
+So in Python, a builder earns its keep for other reasons: building **incrementally** (adding filters only when a request parameter is present), **validating** cross-field rules once at the end, and producing an **immutable** result.
+
+**Java — the canonical builder (runs with `java HttpRequestDemo.java`, Java 17+):**
+
+```java
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class HttpRequestDemo {
+    // Immutable product: final fields, no setters, defensive copy of the map.
+    record HttpRequest(String method, String url, Map<String, String> headers,
+                       Duration timeout, int maxRetries) {
+
+        static Builder builder(String url) { return new Builder(url); }
+
+        static final class Builder {
+            private final String url;                        // required: constructor arg
+            private String method = "GET";                   // optional: defaults
+            private final Map<String, String> headers = new LinkedHashMap<>();
+            private Duration timeout = Duration.ofSeconds(5);
+            private int maxRetries = 0;
+
+            private Builder(String url) { this.url = url; }
+
+            Builder method(String m) { this.method = m; return this; }
+            Builder header(String k, String v) { headers.put(k, v); return this; }
+            Builder timeout(Duration t) { this.timeout = t; return this; }
+            Builder maxRetries(int n) { this.maxRetries = n; return this; }
+
+            HttpRequest build() {
+                if (maxRetries > 0 && method.equals("POST") && !headers.containsKey("Idempotency-Key")) {
+                    throw new IllegalStateException("retried POST needs an Idempotency-Key");
+                }
+                return new HttpRequest(method, url, Map.copyOf(headers), timeout, maxRetries);
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        HttpRequest req = HttpRequest.builder("https://api.example.com/charges")
+                .method("POST")
+                .header("Idempotency-Key", "k-123")
+                .timeout(Duration.ofSeconds(2))
+                .maxRetries(3)
+                .build();
+        System.out.println(req);
+    }
+}
+```
+
+**Python — a SQL query builder (runs as-is):**
 
 ```python
-# ── BUILDER ─────────────────────────────────────────────────
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+_OPS = {"=", "!=", "<", "<=", ">", ">=", "IN"}
+
+
+def _ident(name: str) -> str:
+    """Identifiers can't be bound parameters, so whitelist their shape."""
+    if not _IDENT.match(name):
+        raise ValueError(f"bad identifier: {name!r}")
+    return name
+
+
+@dataclass(frozen=True)
+class Query:
+    """The product: immutable once built."""
+    sql: str
+    params: tuple
+
+
+@dataclass
 class QueryBuilder:
-    """
-    Builds SQL queries step by step.
-    Each method returns self — enables method chaining.
-    """
+    _table: str | None = None
+    _columns: list[str] = field(default_factory=lambda: ["*"])
+    _joins: list[str] = field(default_factory=list)
+    _where: list[tuple[str, str, object]] = field(default_factory=list)
+    _order_by: list[str] = field(default_factory=list)
+    _limit: int | None = None
+    _offset: int | None = None
 
-    def __init__(self):
-        self._table = None
-        self._select = ['*']
-        self._where = {}
-        self._order_by = None
-        self._limit = None
-        self._offset = None
-        self._joins = []
-        self._group_by = []
-        self._having = {}
-        self._distinct = False
-        self._params = []  # Parameterized query params
-
-    def table(self, table_name: str):
-        """Set the table to query."""
-        self._table = table_name
+    def table(self, name: str) -> QueryBuilder:
+        self._table = _ident(name)
         return self
 
-    def select(self, *columns: str):
-        """Select specific columns."""
-        self._select = list(columns) if columns else ['*']
+    def select(self, *columns: str) -> QueryBuilder:
+        self._columns = [_ident(c) for c in columns] or ["*"]
         return self
 
-    def where(self, condition: str, *params):
-        """Add a WHERE condition."""
-        if isinstance(condition, dict):
-            self._where.update(condition)
-        else:
-            # Raw condition: where("age > %s", 18)
-            self._where[condition] = True
-            self._params.extend(params)
+    def join(self, table: str, left: str, right: str, kind: str = "INNER") -> QueryBuilder:
+        if kind not in {"INNER", "LEFT"}:
+            raise ValueError(kind)
+        self._joins.append(f"{kind} JOIN {_ident(table)} ON {_ident(left)} = {_ident(right)}")
         return self
 
-    def order_by(self, column: str, direction: str = 'ASC'):
-        """Add ORDER BY clause."""
-        self._order_by = f"{column} {direction}"
+    def where(self, column: str, op: str, value: object) -> QueryBuilder:
+        if op not in _OPS:
+            raise ValueError(f"bad operator: {op}")
+        self._where.append((_ident(column), op, value))
         return self
 
-    def limit(self, n: int):
-        """Add LIMIT clause."""
-        self._limit = n
+    def order_by(self, column: str, descending: bool = False) -> QueryBuilder:
+        self._order_by.append(f"{_ident(column)} {'DESC' if descending else 'ASC'}")
         return self
 
-    def offset(self, n: int):
-        """Add OFFSET clause."""
-        self._offset = n
+    def limit(self, n: int) -> QueryBuilder:
+        self._limit = int(n)
         return self
 
-    def join(self, table: str, on: str, join_type: str = 'INNER'):
-        """Add a JOIN clause."""
-        self._joins.append(f"{join_type} JOIN {table} ON {on}")
+    def offset(self, n: int) -> QueryBuilder:
+        self._offset = int(n)
         return self
 
-    def group_by(self, *columns: str):
-        """Add GROUP BY clause."""
-        self._group_by = list(columns)
-        return self
-
-    def having(self, condition: str):
-        """Add HAVING condition."""
-        self._having[condition] = True
-        return self
-
-    def distinct(self):
-        """Add DISTINCT modifier."""
-        self._distinct = True
-        return self
-
-    def build(self) -> 'Query':
-        """
-        Build the final Query object.
-        Validates that required fields are set.
-        """
+    def build(self) -> Query:
+        """Validate cross-field rules, then produce the immutable product.
+        Pure: calling build() twice gives the same result."""
         if not self._table:
-            raise ValueError("Table name is required")
+            raise ValueError("table() is required")
+        if self._offset is not None and self._limit is None:
+            raise ValueError("offset() requires limit()")
 
-        return Query(
-            table=self._table,
-            select=self._select,
-            where=self._where,
-            order_by=self._order_by,
-            limit=self._limit,
-            offset=self._offset,
-            joins=self._joins,
-            group_by=self._group_by,
-            having=self._having,
-            distinct=self._distinct,
-        )
-
-    def build_sql(self) -> tuple[str, list]:
-        """Build the SQL string directly."""
-        parts = []
-
-        # SELECT clause
-        select_clause = "SELECT "
-        if self._distinct:
-            select_clause += "DISTINCT "
-        select_clause += ", ".join(self._select)
-        parts.append(select_clause)
-
-        # FROM clause
-        parts.append(f"FROM {self._table}")
-
-        # JOIN clauses
-        parts.extend(self._joins)
-
-        # WHERE clause
+        parts = [f"SELECT {', '.join(self._columns)}", f"FROM {self._table}", *self._joins]
+        params: list[object] = []
         if self._where:
-            conditions = []
-            for key, value in self._where.items():
-                if key.endswith('__gt'):
-                    conditions.append(f"{key[:-4]} > %s")
-                    self._params.append(value)
-                elif key.endswith('__lt'):
-                    conditions.append(f"{key[:-4]} < %s")
-                    self._params.append(value)
-                elif isinstance(value, list):
-                    placeholders = ", ".join(["%s"] * len(value))
-                    conditions.append(f"{key} IN ({placeholders})")
-                    self._params.extend(value)
+            clauses = []
+            for column, op, value in self._where:
+                if op == "IN":
+                    values = list(value)
+                    clauses.append(f"{column} IN ({', '.join(['%s'] * len(values))})")
+                    params.extend(values)
                 else:
-                    conditions.append(f"{key} = %s")
-                    self._params.append(value)
-            parts.append(f"WHERE {' AND '.join(conditions)}")
-
-        # GROUP BY
-        if self._group_by:
-            parts.append(f"GROUP BY {', '.join(self._group_by)}")
-
-        # HAVING
-        if self._having:
-            parts.append(f"HAVING {' AND '.join(self._having.keys())}")
-
-        # ORDER BY
+                    clauses.append(f"{column} {op} %s")
+                    params.append(value)
+            parts.append("WHERE " + " AND ".join(clauses))
         if self._order_by:
-            parts.append(f"ORDER BY {self._order_by}")
-
-        # LIMIT
+            parts.append("ORDER BY " + ", ".join(self._order_by))
         if self._limit is not None:
             parts.append(f"LIMIT {self._limit}")
-
-        # OFFSET
         if self._offset is not None:
             parts.append(f"OFFSET {self._offset}")
-
-        return " ".join(parts), self._params
+        return Query(" ".join(parts), tuple(params))
 
 
 # ── USAGE ───────────────────────────────────────────────────
+filters = {"status": "active", "min_age": 18}       # e.g. from query-string params
 
-# Clear, readable method chaining:
-query = (
-    QueryBuilder()
-    .table('users')
-    .select('id', 'name', 'email')
-    .where('status', 'active')
-    .where('age__gt', 18)
-    .order_by('name')
-    .limit(10)
-    .offset(20)
-    .join('orders', 'users.id = orders.user_id')
-    .build()
-)
+builder = QueryBuilder().table("users").select("users.id", "users.name")
+if "status" in filters:                              # conditional construction:
+    builder.where("users.status", "=", filters["status"])   # the real reason to use a builder
+if "min_age" in filters:
+    builder.where("users.age", ">", filters["min_age"])
+query = builder.order_by("users.name").limit(10).build()
 
-# Alternative: build SQL directly
-sql, params = (
-    QueryBuilder()
-    .table('users')
-    .select('id', 'name')
-    .where('status', 'active')
-    .order_by('created_at', 'DESC')
-    .limit(100)
-    .build_sql()
-)
-# sql == "SELECT id, name FROM users WHERE status = %s ORDER BY created_at DESC LIMIT 100"
-# params == ['active']
+# query.sql    == "SELECT users.id, users.name FROM users WHERE users.status = %s
+#                  AND users.age > %s ORDER BY users.name ASC LIMIT 10"
+# query.params == ("active", 18)
 ```
+
+Two bugs to avoid in query builders: string-formatting **values** into SQL (always bind parameters) and accepting **identifiers** (table, column, sort direction) unchecked; identifiers can't be bound, so whitelist them. And keep `build()` free of side effects, so calling it twice doesn't duplicate parameters. In production, use SQLAlchemy Core, jOOQ or squirrel (Go) rather than writing your own.
 
 **When Builder Is Over-Engineering:**
 
@@ -1526,15 +1374,18 @@ class Address:
 
 ```yaml
 Use Builder when:
-  1. Construction has 5+ optional parameters
+  1. Construction has many optional parameters and no named arguments (Java)
   2. Some parameters depend on each other
      (e.g., offset requires limit)
   3. The object is IMMUTABLE after construction
   4. Construction has VALIDATION logic
      (e.g., table name is required, offset requires limit)
-  5. You want method CHAINING for readability
+  5. The object is assembled incrementally or conditionally
   6. The same construction process creates different
      representations (e.g., SQL string vs Query object)
+
+Go idiom instead of builders: functional options
+  NewServer(addr, WithTimeout(5*time.Second), WithTLS(cfg))
 
 Skip Builder when:
   1. Simple case: named parameters or dataclass work
@@ -1548,7 +1399,8 @@ Skip Builder when:
 |-----------|----------------------|
 | **Telescoping problem** | Explains the pain of constructors with many optional parameters |
 | **Method chaining** | Implements fluent interface with `return self` |
-| **Build vs build_sql** | Shows how same builder creates different representations |
+| **Validation + immutability** | Cross-field checks in `build()`; product is immutable |
+| **Safety** | Values bound as parameters; identifiers whitelisted |
 | **Over-engineering** | Identifies when named parameters or dataclass replace builder |
 
 ---
@@ -1559,188 +1411,84 @@ Skip Builder when:
 
 **What They're Really Testing:** Whether you understand Adapter as an interface compatibility pattern, and can distinguish it from Facade (simplification) and Proxy (control).
 
+!!! abstract "Pattern card"
+    **Intent (GoF):** convert the interface of a class into another interface that clients expect, so classes with incompatible interfaces can work together.<br>
+    **Structure:** the *Client* depends on a *Target* interface; the *Adapter* implements Target and holds an *Adaptee*, translating calls, parameters, units, errors and return shapes. Prefer an **object adapter** (composition) over a class adapter (multiple inheritance).<br>
+    **Use when:** you integrate a third-party SDK or a legacy component you can't change, or you're swapping providers behind a stable interface. At service scale the same idea is DDD's **anti-corruption layer**.<br>
+    **Don't use when:** you own both sides (change one of them), or the interfaces differ so much in *semantics* (sync vs async, different consistency) that a thin translation would hide real behaviour differences.
+
 ### Answer
 
-**The Problem — Incompatible Interfaces:**
+**Adapter (runs as-is):**
 
 ```python
-# ── OLD INTERFACE (can't modify) ───────────────────────────
-class OldPaymentGateway:
-    """Legacy payment gateway. Used everywhere."""
-
-    def process_payment(self, amount: float, currency: str,
-                        card_number: str, expiry: str, cvv: str) -> dict:
-        """Process payment with raw card details."""
-        return {
-            'success': True,
-            'transaction_id': 'TX_12345',
-            'amount': amount,
-            'currency': currency,
-        }
-
-    def refund_payment(self, transaction_id: str) -> dict:
-        """Refund a previous payment."""
-        return {'success': True, 'transaction_id': transaction_id}
+from abc import ABC, abstractmethod
+from decimal import Decimal
 
 
-# ── NEW INTERFACE (also can't modify) ──────────────────────
+# ── TARGET: the interface existing code depends on (can't change) ──
+class PaymentGateway(ABC):
+    @abstractmethod
+    def process_payment(self, amount: Decimal, currency: str, card_token: str) -> dict: ...
+
+    @abstractmethod
+    def refund_payment(self, transaction_id: str) -> dict: ...
+
+
+# ── ADAPTEE: the new provider's SDK (can't change) ──────────
 class NewPaymentGateway:
-    """Modern payment gateway. Different interface."""
-
-    def create_payment_intent(self, amount_cents: int,
-                               currency: str) -> str:
-        """Create a payment intent. Returns intent ID."""
+    def create_payment_intent(self, amount_cents: int, currency: str) -> str:
         return "pi_67890"
 
-    def confirm_payment_intent(self, intent_id: str,
-                                payment_method_id: str) -> dict:
-        """Confirm a payment intent with a payment method."""
-        return {
-            'id': intent_id,
-            'status': 'succeeded',
-            'amount': amount_cents,
-        }
+    def confirm_payment_intent(self, intent_id: str, payment_method_id: str) -> dict:
+        return {"id": intent_id, "status": "succeeded"}
 
-    def create_refund(self, payment_intent_id: str,
-                      amount_cents: int = None) -> dict:
-        """Create a refund."""
-        return {'id': 'ref_12345', 'status': 'succeeded'}
-```
-
-**Adapter Pattern Solution:**
-
-```python
-# ── TARGET INTERFACE (what old code expects) ───────────────
-class PaymentGateway(ABC):
-    """Abstract interface that old code depends on."""
-
-    @abstractmethod
-    def process_payment(self, amount: float, currency: str,
-                        card_number: str, expiry: str,
-                        cvv: str) -> dict:
-        pass
-
-    @abstractmethod
-    def refund_payment(self, transaction_id: str) -> dict:
-        pass
+    def create_refund(self, payment_intent_id: str, amount_cents: int | None = None) -> dict:
+        return {"id": "re_12345", "status": "succeeded"}
 
 
-# ── ADAPTER: Makes NewPaymentGateway work like OldPaymentGateway ──
+# ── ADAPTER: implements the target, delegates to the adaptee ──
 class NewPaymentAdapter(PaymentGateway):
-    """
-    Adapter that translates the OLD interface calls
-    to the NEW interface.
+    def __init__(self, gateway: NewPaymentGateway):
+        self._gateway = gateway          # object adapter: composition, not inheritance
 
-    This allows the system to switch from OldPaymentGateway
-    to NewPaymentGateway WITHOUT changing any client code.
-    """
-
-    def __init__(self, new_gateway: NewPaymentGateway):
-        self.gateway = new_gateway
-        # Payment method storage (in production, use a vault)
-        self._payment_methods: dict[str, str] = {}
-
-    def process_payment(self, amount: float, currency: str,
-                        card_number: str, expiry: str,
-                        cvv: str) -> dict:
-        """
-        Translate old process_payment call to new interface.
-
-        1. Create payment method from card details
-        2. Create payment intent
-        3. Confirm payment intent
-        """
-        # Step 1: Create payment method (new interface)
-        payment_method_id = self._tokenize_card(card_number, expiry, cvv)
-        self._payment_methods[card_number[-4:]] = payment_method_id
-
-        # Step 2: Create intent (new interface uses cents)
-        amount_cents = int(amount * 100)
-        intent_id = self.gateway.create_payment_intent(
-            amount_cents, currency
-        )
-
-        # Step 3: Confirm intent
-        result = self.gateway.confirm_payment_intent(
-            intent_id, payment_method_id
-        )
-
-        # Step 4: Translate result back to old format
-        return {
-            'success': result['status'] == 'succeeded',
-            'transaction_id': result['id'],
-            'amount': amount,
-            'currency': currency,
+    def process_payment(self, amount: Decimal, currency: str, card_token: str) -> dict:
+        amount_cents = int((amount * 100).to_integral_value())   # Decimal, not float math
+        intent_id = self._gateway.create_payment_intent(amount_cents, currency.lower())
+        result = self._gateway.confirm_payment_intent(intent_id, card_token)
+        return {                                       # translate back to the old shape
+            "success": result["status"] == "succeeded",
+            "transaction_id": result["id"],            # the intent id IS our transaction id
+            "amount": amount,
+            "currency": currency,
         }
 
     def refund_payment(self, transaction_id: str) -> dict:
-        """
-        Translate old refund call to new interface.
-        """
-        # Old format: "TX_12345"
-        # New format: "pi_67890"
-        # We need to extract the payment intent ID
-        intent_id = self._extract_intent_id(transaction_id)
-
-        result = self.gateway.create_refund(intent_id)
-
-        return {
-            'success': result['status'] == 'succeeded',
-            'transaction_id': result['id'],
-        }
-
-    def _tokenize_card(self, card_number: str, expiry: str,
-                       cvv: str) -> str:
-        """Tokenize card details into a payment method ID."""
-        # In production: call payment gateway's tokenization API
-        # Never store raw card numbers!
-        return f"pm_{hash(card_number)}"
-
-    def _extract_intent_id(self, transaction_id: str) -> str:
-        """Extract payment intent ID from old transaction ID."""
-        # Map old IDs to new IDs (stored during process_payment)
-        return transaction_id.replace("TX_", "pi_")
+        result = self._gateway.create_refund(transaction_id)
+        return {"success": result["status"] == "succeeded", "transaction_id": result["id"]}
 
 
-# ── CLIENT CODE (unchanged!) ───────────────────────────────
-
+# ── CLIENT: unchanged, depends only on the target interface ──
 class CheckoutService:
-    """
-    Client code that uses the old interface.
-    Works with OldPaymentGateway OR NewPaymentAdapter —
-    both implement the same interface.
-    """
+    def __init__(self, payments: PaymentGateway):
+        self.payments = payments
 
-    def __init__(self, payment_processor: PaymentGateway):
-        self.payment = payment_processor  # Can be old or new!
-
-    def checkout(self, cart_total: float, card_info: dict) -> dict:
-        return self.payment.process_payment(
-            amount=cart_total,
-            currency='USD',
-            card_number=card_info['number'],
-            expiry=card_info['expiry'],
-            cvv=card_info['cvv'],
-        )
+    def checkout(self, cart_total: Decimal, card_token: str) -> dict:
+        return self.payments.process_payment(cart_total, "USD", card_token)
 
 
-# ── USAGE ──────────────────────────────────────────────────
-
-# Old system:
-# old_gateway = OldPaymentGateway()
-# checkout = CheckoutService(old_gateway)
-
-# New system (with adapter):
-new_gateway = NewPaymentGateway()
-adapter = NewPaymentAdapter(new_gateway)
-checkout = CheckoutService(adapter)  # Same CheckoutService, no changes!
-
-result = checkout.checkout(99.99, {
-    'number': '4111111111111111',
-    'expiry': '12/25',
-    'cvv': '123',
-})
+checkout = CheckoutService(NewPaymentAdapter(NewPaymentGateway()))
+checkout.checkout(Decimal("19.99"), "pm_card_visa")
+# {'success': True, 'transaction_id': 'pi_67890', 'amount': Decimal('19.99'), 'currency': 'USD'}
 ```
+
+What the adapter really translates, and where bugs hide:
+
+- **Units and types:** dollars as `Decimal` ↔ integer cents. `int(19.99 * 100)` is `1998` because of float rounding, which is why money never goes through floats.
+- **Identifiers:** return the provider's ID as the transaction ID (or store a mapping table). Rewriting ID prefixes (`TX_` → `pi_`) only works by coincidence.
+- **Errors:** map the adaptee's exceptions to the ones the client already handles (declined vs retriable vs unknown outcome). Leaking `NewSdkError` to callers breaks the abstraction.
+- **Behavioural gaps:** a one-call API adapted to a two-step flow (create + confirm intent) can fail *between* the steps; the adapter needs idempotency keys and a reconciliation path.
+- **Compliance:** if the old interface passes raw card numbers, the adapter has to tokenize them, which puts it (and everything upstream) in PCI DSS scope. Here the legacy interface already takes a token.
 
 **Adapter vs Facade vs Proxy:**
 
@@ -1765,9 +1513,9 @@ KEY DIFFERENCE:
   Facade changes the COMPLEXITY (complex → simple)
   Proxy changes the ACCESS (direct → controlled)
 
-  Adapter: \"Make this API look like that API\"
-  Facade: \"Give me a simple way to use this complex system\"
-  Proxy: \"I'm standing in front of the real object\"
+  Adapter: "Make this API look like that API"
+  Facade:  "Give me a simple way to use this complex system"
+  Proxy:   "I'm standing in front of the real object, with the same interface"
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -1777,7 +1525,7 @@ KEY DIFFERENCE:
 | **Interface translation** | Adapter converts old interface calls to new ones without changing client code |
 | **Adapter vs Facade** | Clearly distinguishes between interface conversion (Adapter) and simplification (Facade) |
 | **Object vs class adapter** | Uses object adapter (composition) over class adapter (inheritance) for flexibility |
-| **Idiomatic translation** | Translates data formats (cents vs dollars, TX_ vs pi_) correctly |
+| **Idiomatic translation** | Translates units, IDs and errors correctly (cents vs dollars, provider IDs, exception mapping) |
 
 ---
 
@@ -1787,43 +1535,50 @@ KEY DIFFERENCE:
 
 **What They're Really Testing:** Whether you understand Decorator as a way to add responsibilities to objects dynamically, and can distinguish it from Chain of Responsibility (where handlers decide whether to pass the request).
 
+!!! abstract "Pattern card"
+    **Intent (GoF):** attach additional responsibilities to an object dynamically; a flexible alternative to subclassing for extending behaviour.<br>
+    **Structure:** *Component* interface; *ConcreteComponent* does the real work; *Decorator* implements the same interface, holds a Component, and adds behaviour before and/or after delegating. Decorators nest, so behaviours combine without a subclass per combination (`LoggedCachedAuthedHandler`).<br>
+    **Use when:** cross-cutting behaviour (logging, metrics, caching, retries, auth) must be combined per instance or per route.<br>
+    **Don't use when:** order-dependence would surprise people and isn't documented, or the "decorator" changes the contract (different return type, swallowed errors); that breaks substitutability. Python's `@decorator` syntax wraps *functions* and is a related but separate language feature.
+
 ### Answer
 
-**Decorator Pattern for HTTP Middleware:**
+**Decorator pattern for HTTP middleware (runs as-is with PyJWT and a Redis-like client):**
 
 ```python
-# ── COMPONENT INTERFACE ────────────────────────────────────
+import gzip
+import logging
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+
+import jwt  # PyJWT
+
 
 @dataclass
 class Request:
     method: str
     path: str
-    headers: dict
-    body: Optional[bytes] = None
-    user: Optional[dict] = None
+    headers: dict = field(default_factory=dict)
+    body: bytes = b""
     client_ip: str = ""
+    user: Optional[dict] = None
+
 
 @dataclass
 class Response:
     status_code: int
-    headers: dict
-    body: bytes
+    headers: dict = field(default_factory=dict)
+    body: bytes = b""
 
-class HttpHandler(ABC):
-    """Base component: handles an HTTP request."""
 
+class HttpHandler(ABC):                       # Component
     @abstractmethod
-    async def handle(self, request: Request) -> Response:
-        pass
+    async def handle(self, request: Request) -> Response: ...
 
 
-# ── CONCRETE COMPONENT: Base handler ────────────────────────
-class BaseHttpHandler(HttpHandler):
-    """The actual request handler — sends request to the app."""
-
+class AppHandler(HttpHandler):                # ConcreteComponent
     def __init__(self, app):
         self.app = app
 
@@ -1831,286 +1586,145 @@ class BaseHttpHandler(HttpHandler):
         return await self.app.dispatch(request)
 
 
-# ── DECORATOR BASE ─────────────────────────────────────────
-class Middleware(HttpHandler):
-    """
-    Base Decorator: wraps another handler.
-    Subclasses add behavior before/after calling wrapped handler.
-    """
-
+class Middleware(HttpHandler):                # Decorator: same interface, wraps one
     def __init__(self, wrapped: HttpHandler):
         self._wrapped = wrapped
 
-    @abstractmethod
-    async def handle(self, request: Request) -> Response:
-        pass
 
-
-# ── CONCRETE DECORATORS ────────────────────────────────────
-
-class AuthenticationMiddleware(Middleware):
-    """Decorator: adds authentication."""
-
-    def __init__(self, wrapped: HttpHandler, jwt_secret: str):
-        super().__init__(wrapped)
-        self.jwt_secret = jwt_secret
-
-    async def handle(self, request: Request) -> Response:
-        # BEFORE: Authenticate the request
-        auth_header = request.headers.get('Authorization', '')
-        if not auth_header.startswith('Bearer '):
-            return Response(
-                status_code=401,
-                headers={'Content-Type': 'application/json'},
-                body=b'{"error": "Missing or invalid token"}',
-            )
-
-        token = auth_header[7:]  # Remove 'Bearer '
-        try:
-            payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
-            request.user = payload
-        except jwt.ExpiredSignatureError:
-            return Response(
-                status_code=401,
-                headers={'Content-Type': 'application/json'},
-                body=b'{"error": "Token expired"}',
-            )
-        except jwt.InvalidTokenError:
-            return Response(
-                status_code=401,
-                headers={'Content-Type': 'application/json'},
-                body=b'{"error": "Invalid token"}',
-            )
-
-        # Call the next handler in the chain
-        return await self._wrapped.handle(request)
-
-
-class RateLimitingMiddleware(Middleware):
-    """Decorator: adds rate limiting."""
-
-    def __init__(self, wrapped: HttpHandler,
-                 redis_client, max_requests: int = 100,
-                 window_seconds: int = 60):
-        super().__init__(wrapped)
-        self.redis = redis_client
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-
-    async def handle(self, request: Request) -> Response:
-        # BEFORE: Check rate limit
-        client_ip = request.client_ip
-        key = f"ratelimit:{client_ip}"
-
-        current = await self.redis.incr(key)
-        if current == 1:
-            await self.redis.expire(key, self.window_seconds)
-
-        if current > self.max_requests:
-            return Response(
-                status_code=429,
-                headers={
-                    'Content-Type': 'application/json',
-                    'X-RateLimit-Limit': str(self.max_requests),
-                    'X-RateLimit-Remaining': '0',
-                    'Retry-After': str(self.window_seconds),
-                },
-                body=b'{"error": "Rate limit exceeded"}',
-            )
-
-        # Add rate limit headers to the response
-        response = await self._wrapped.handle(request)
-
-        # AFTER: Add rate limit info
-        response.headers['X-RateLimit-Limit'] = str(self.max_requests)
-        response.headers['X-RateLimit-Remaining'] = str(
-            self.max_requests - current
-        )
-
-        return response
+def _json_error(status: int, message: str, **headers) -> Response:
+    return Response(status, {"Content-Type": "application/json", **headers},
+                    f'{{"error": "{message}"}}'.encode())
 
 
 class LoggingMiddleware(Middleware):
-    """Decorator: adds request/response logging."""
-
-    def __init__(self, wrapped: HttpHandler, logger):
+    def __init__(self, wrapped, logger):
         super().__init__(wrapped)
         self.logger = logger
 
-    async def handle(self, request: Request) -> Response:
-        # BEFORE: Log the request
-        start_time = time.time()
-        self.logger.info(
-            f"→ {request.method} {request.path} from {request.client_ip}"
-        )
-
-        # Call the next handler
-        response = await self._wrapped.handle(request)
-
-        # AFTER: Log the response with timing
-        duration_ms = (time.time() - start_time) * 1000
-        self.logger.info(
-            f"← {response.status_code} {request.path} "
-            f"({duration_ms:.0f}ms)"
-        )
-
-        # Add timing header
-        response.headers['X-Response-Time'] = f"{duration_ms:.0f}ms"
+    async def handle(self, request):
+        start = time.perf_counter()
+        response = await self._wrapped.handle(request)           # always delegates
+        ms = (time.perf_counter() - start) * 1000
+        self.logger.info("%s %s -> %s (%.0f ms)", request.method, request.path,
+                         response.status_code, ms)
         return response
 
 
-class CachingMiddleware(Middleware):
-    """Decorator: adds response caching."""
+class RateLimitMiddleware(Middleware):
+    """Fixed window per client IP. Runs BEFORE auth so credential-stuffing
+    attempts are throttled too."""
 
-    def __init__(self, wrapped: HttpHandler,
-                 cache_client, ttl_seconds: int = 300):
+    def __init__(self, wrapped, redis, limit: int, window_s: int = 60):
         super().__init__(wrapped)
-        self.cache = cache_client
-        self.ttl = ttl_seconds
+        self.redis, self.limit, self.window_s = redis, limit, window_s
 
-    async def handle(self, request: Request) -> Response:
-        # Only cache GET requests
-        if request.method != 'GET':
-            return await self._wrapped.handle(request)
-
-        # Check cache
-        cache_key = f"http:{request.method}:{request.path}"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            return Response(
-                status_code=200,
-                headers={'Content-Type': 'application/json',
-                         'X-Cache': 'HIT'},
-                body=cached,
-            )
-
-        # Cache miss — get from next handler
+    async def handle(self, request):
+        key = f"ratelimit:{request.client_ip}:{int(time.time()) // self.window_s}"
+        count = await self.redis.incr(key)
+        if count == 1:
+            await self.redis.expire(key, self.window_s)
+        if count > self.limit:
+            return _json_error(429, "rate limit exceeded", **{"Retry-After": str(self.window_s)})
         response = await self._wrapped.handle(request)
+        response.headers["RateLimit-Remaining"] = str(max(0, self.limit - count))
+        return response
 
-        # Cache the response (only 200 OK)
+
+class AuthMiddleware(Middleware):
+    def __init__(self, wrapped, jwt_secret: str):
+        super().__init__(wrapped)
+        self.jwt_secret = jwt_secret
+
+    async def handle(self, request):
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return _json_error(401, "missing token")
+        try:
+            request.user = jwt.decode(header.removeprefix("Bearer "), self.jwt_secret,
+                                      algorithms=["HS256"])  # pin the algorithm
+        except jwt.ExpiredSignatureError:
+            return _json_error(401, "token expired")
+        except jwt.InvalidTokenError:
+            return _json_error(401, "invalid token")
+        return await self._wrapped.handle(request)
+
+
+class CacheMiddleware(Middleware):
+    def __init__(self, wrapped, cache, ttl_s: int = 300):
+        super().__init__(wrapped)
+        self.cache, self.ttl_s = cache, ttl_s
+
+    async def handle(self, request):
+        if request.method != "GET":
+            return await self._wrapped.handle(request)
+        # The key MUST include whatever varies the response. Behind auth that
+        # includes the user, or user A's data is served to user B.
+        user_id = (request.user or {}).get("sub", "anon")
+        key = f"http:{user_id}:{request.path}"
+        cached = await self.cache.get(key)
+        if cached is not None:
+            return Response(200, {"Content-Type": "application/json", "X-Cache": "HIT"}, cached)
+        response = await self._wrapped.handle(request)
         if response.status_code == 200:
-            await self.cache.setex(
-                cache_key, self.ttl, response.body
-            )
-
-        response.headers['X-Cache'] = 'MISS'
+            await self.cache.setex(key, self.ttl_s, response.body)   # uncompressed body
+        response.headers["X-Cache"] = "MISS"
         return response
 
 
 class CompressionMiddleware(Middleware):
-    """Decorator: adds response compression."""
-
-    async def handle(self, request: Request) -> Response:
-        # BEFORE: Check if client accepts compression
-        accept_encoding = request.headers.get('Accept-Encoding', '')
-
+    async def handle(self, request):
         response = await self._wrapped.handle(request)
-
-        # AFTER: Compress if client accepts gzip
-        if 'gzip' in accept_encoding and len(response.body) > 1024:
-            compressed = gzip.compress(response.body)
-            response.body = compressed
-            response.headers['Content-Encoding'] = 'gzip'
-            response.headers['Content-Length'] = str(len(compressed))
-
+        if "gzip" in request.headers.get("Accept-Encoding", "") and len(response.body) > 1024:
+            response.body = gzip.compress(response.body)
+            response.headers["Content-Encoding"] = "gzip"
+            response.headers["Vary"] = "Accept-Encoding"
+            response.headers["Content-Length"] = str(len(response.body))
         return response
 
 
-# ── USAGE: Building middleware stacks ──────────────────────
-
-# Per-route middleware configuration:
-# Public routes: just rate limiting + logging
-# Protected routes: auth + rate limiting + logging + caching
-# Admin routes: auth + rate limiting + logging + audit
-
-def build_middleware_stack(app, route_config: dict) -> dict[str, HttpHandler]:
-    """Build a middleware stack for each route type."""
-    stacks = {}
-
-    for route_type, config in route_config.items():
-        # Start with base handler
-        handler: HttpHandler = BaseHttpHandler(app)
-
-        # Wrap with middleware in REVERSE order (outermost first)
-        # The order matters: auth before rate limit? Or rate limit before auth?
-        # Typically: log → auth → rate limit → cache → handler
-
-        if config.get('compression'):
-            handler = CompressionMiddleware(handler)
-
-        if config.get('caching'):
-            handler = CachingMiddleware(handler, redis_client)
-
-        if config.get('rate_limiting'):
-            handler = RateLimitingMiddleware(handler, redis_client)
-
-        if config.get('auth'):
-            handler = AuthenticationMiddleware(handler, jwt_secret)
-
-        if config.get('logging'):
-            handler = LoggingMiddleware(handler, logger)
-
-        stacks[route_type] = handler
-
-    return stacks
+def build_stack(app, cfg: dict, *, redis, cache, jwt_secret, logger) -> HttpHandler:
+    """Wrap from the inside out. The LAST wrapper applied runs FIRST.
+    Resulting request order: logging → compression → rate limit → auth → cache → app."""
+    handler: HttpHandler = AppHandler(app)
+    if cfg.get("cache"):
+        handler = CacheMiddleware(handler, cache)
+    if cfg.get("auth"):
+        handler = AuthMiddleware(handler, jwt_secret)
+    if cfg.get("rate_limit"):
+        handler = RateLimitMiddleware(handler, redis, limit=cfg["rate_limit"])
+    if cfg.get("compression"):
+        handler = CompressionMiddleware(handler)     # outside the cache: cache stores raw bodies
+    return LoggingMiddleware(handler, logger)
 
 
-# Configuration:
-route_config = {
-    'public': {
-        'logging': True,
-        'rate_limiting': True,
-        'rate_limit': 20,  # 20 req/min for public
-        'caching': True,
-        'compression': True,
-    },
-    'protected': {
-        'auth': True,
-        'logging': True,
-        'rate_limiting': True,
-        'rate_limit': 100,  # 100 req/min for authenticated
-        'caching': True,
-        'compression': True,
-    },
-    'admin': {
-        'auth': True,
-        'logging': True,
-        'rate_limiting': True,
-        'rate_limit': 500,
-        'compression': True,
-        # No caching for admin — always fresh data
-    },
+ROUTES = {
+    "public":    {"rate_limit": 20,  "cache": True, "compression": True},
+    "protected": {"rate_limit": 100, "auth": True, "cache": True, "compression": True},
+    "admin":     {"rate_limit": 500, "auth": True, "compression": True},   # never cached
 }
-
-middleware_stacks = build_middleware_stack(app, route_config)
 ```
+
+**Ordering is the design.** Each choice above has a reason:
+
+| Order decision | Why |
+|----------------|-----|
+| Logging outermost | Sees every request, including ones rejected by rate limit or auth |
+| Rate limit before auth | Throttles brute-force and credential-stuffing attempts before spending CPU on token checks |
+| Cache *inside* auth | Only authenticated requests reach the cache, and the key can include the user |
+| Compression *outside* cache | The cache stores raw bodies; otherwise a cache hit returns gzip bytes without a `Content-Encoding` header, or serves gzip to clients that didn't ask for it |
+
+The most expensive bug in middleware like this is a cache key of just `method:path` behind auth: `/me` cached for Alice is served to Bob. Cache keys must include everything the response varies on (user, tenant, `Accept-Encoding`, query string), or mark personalised responses `Cache-Control: private` and skip shared caching.
 
 **Decorator vs Chain of Responsibility:**
 
-```yaml
-Decorator:
-  - ALL handlers always run (before and/or after)
-  - Each handler adds behavior around the next
-  - Handlers don't decide whether to pass the request
-  - Use: adding cross-cutting concerns (logging, auth, timing)
+| | Decorator | Chain of Responsibility |
+|---|---|---|
+| Intent | *Add* behaviour around a call | *Find* the handler that deals with a request |
+| Typical flow | Every layer runs and delegates to the next; can act before and after | Each handler either handles the request (and stops) or passes it on |
+| Short-circuiting | Allowed (auth returns 401) but not the point | The point: the first matching handler wins |
+| Examples | Logging, metrics, caching, retry wrappers, Java I/O streams | Event bubbling in UIs, approval chains, exception handlers, routing fallbacks |
 
-Chain of Responsibility:
-  - EACH handler decides whether to process or pass
-  - A request may stop at any handler in the chain
-  - Handlers can short-circuit the chain
-  - Use: routing, fallback handlers, multi-step validation
-
-DIFFERENCES:
-  - Decorator: wraps (all layers execute)
-  - Chain: passes (request stops at first matching handler)
-
-  Decorator: Authentication → RateLimit → Logging → Handler
-    (ALL execute: authenticate, rate-limit, log, then handle)
-
-  Chain: Validation → Auth → Cache → Handler
-    (Validation passes if valid → Auth passes if authorized →
-     Cache returns if hit → Handler only if all pass)
-```
+HTTP middleware stacks (Express, ASP.NET Core, Go `http.Handler` wrappers, Starlette) are a hybrid: structurally decorators (same interface, wrapping), and any layer may short-circuit like a chain. Saying that explicitly is a better answer than forcing a strict distinction.
 
 ### 🔍 Staff-Level Evaluation
 
@@ -2118,7 +1732,8 @@ DIFFERENCES:
 |-----------|----------------------|
 | **Before/after** | Adds behavior both before and after calling wrapped handler |
 | **Middleware stack** | Builds ordered middleware stacks per route with different configurations |
-| **vs Chain of Responsibility** | Explains Decorator runs all layers; Chain stops at first match |
+| **vs Chain of Responsibility** | Distinguishes intent (add behaviour vs find a handler); recognises middleware as a hybrid |
+| **Ordering & cache safety** | Justifies the order; cache keys include user and encoding |
 | **Production awareness** | Adds concrete middleware: JWT auth, rate limiting, caching, compression |
 
 ---
@@ -2128,6 +1743,12 @@ DIFFERENCES:
 **Q:** "You're onboarding a new team member who needs to place orders in your complex e-commerce system. The order process touches 7 services with 15+ steps. Design a Facade that simplifies this. How do you test a Facade? How is Facade different from just a 'god class'?"
 
 **What They're Really Testing:** Whether you understand Facade as a simplification layer, and can distinguish it from a god class that centralizes too much logic.
+
+!!! abstract "Pattern card"
+    **Intent (GoF):** provide a unified, higher-level interface to a set of interfaces in a subsystem, making the subsystem easier to use.<br>
+    **Structure:** a *Facade* that knows which subsystem classes to call and in what order; *subsystem classes* do the real work and don't know the facade exists. Clients may still use the subsystem directly when they need to.<br>
+    **Use when:** many clients repeat the same multi-step sequence, or you want a stable entry point while the subsystem changes behind it. In layered/DDD code, an *application service* is a facade; at system scale, a BFF or gateway aggregation endpoint is one.<br>
+    **Don't use when:** it starts accumulating business rules (that's a god class), or it hides choices that clients legitimately need to make.
 
 ### Answer
 
@@ -2199,150 +1820,104 @@ class ClientCode:
 # - Hard to test (mock 7 services)
 ```
 
-**Facade Pattern Solution:**
+**Facade Pattern Solution (runs as-is with stub subsystems):**
 
 ```python
-# ── FACADE: Simplified interface ────────────────────────────
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class PriceSummary:
+    subtotal: int          # cents
+    discount: int
+    tax: int
+    shipping: int
+
+    @property
+    def total(self) -> int:
+        return self.subtotal - self.discount + self.tax + self.shipping
+
+
+@dataclass(frozen=True)
+class OrderResult:
+    success: bool
+    order_id: Optional[str] = None
+    total: Optional[int] = None
+    error: Optional[str] = None
+
+
+class OutOfStock(Exception): ...
+
+
 class OrderFacade:
-    """
-    Facade that simplifies the order placement process.
-    Client only needs to call ONE method.
-    """
+    """One entry point for 'place an order'. It sequences subsystem calls and
+    owns the compensation order; the business rules stay in the subsystems."""
 
-    def __init__(self, inventory, pricing, promotion, tax,
-                 shipping, payment, order, notification,
-                 analytics, loyalty, cache):
-        self.inventory = inventory
-        self.pricing = pricing
-        self.promotion = promotion
-        self.tax = tax
-        self.shipping = shipping
-        self.payment = payment
-        self.order = order
-        self.notification = notification
-        self.analytics = analytics
-        self.loyalty = loyalty
-        self.cache = cache
+    def __init__(self, inventory, pricing, payment, orders, events):
+        self.inventory, self.pricing, self.payment = inventory, pricing, payment
+        self.orders, self.events = orders, events
 
-    async def place_order(self, user_id: str, items: list,
-                          payment_info: dict,
-                          shipping_address: dict) -> OrderResult:
-        """
-        Simplified interface: place an order.
-        Client doesn't need to know the 14 steps.
-        Doesn't need to know about 7 services.
-        """
+    async def place_order(self, user_id: str, items: list[dict],
+                          payment_token: str, address: dict) -> OrderResult:
+        undo = []                                   # compensations, run in reverse
         try:
-            # Validate & calculate
-            await self._validate_inventory(items)
-            price_summary = await self._calculate_pricing(
-                items, user_id, shipping_address
-            )
+            price = await self._price(user_id, items, address)
 
-            # Authorize payment
-            auth = await self.payment.authorize(
-                user_id, price_summary.total, payment_info
-            )
+            reservation = await self.inventory.reserve(items)        # raises OutOfStock
+            undo.append(lambda: self.inventory.release(reservation))
 
-            # Reserve & create
-            await self._reserve_inventory(items)
-            order = await self.order.create(
-                user_id, items, price_summary, shipping_address
-            )
+            auth = await self.payment.authorize(user_id, price.total, payment_token)
+            undo.append(lambda: self.payment.void(auth["id"]))
 
-            # Finalize
-            await self.payment.capture(auth['id'], price_summary.total)
-            await self.shipping.schedule(
-                order['id'], items, shipping_address
-            )
+            order = await self.orders.create(user_id, items, price, address,
+                                             reservation, auth["id"])
+            undo.append(lambda: self.orders.cancel(order["id"]))
 
-            # Post-processing (async — don't block the response)
-            asyncio.ensure_future(self._post_process(
-                user_id, order['id'], price_summary.total
-            ))
+            await self.payment.capture(auth["id"], price.total)      # pivot: no undo after this
+            undo.clear()
 
-            return OrderResult(
-                success=True,
-                order_id=order['id'],
-                total=price_summary.total,
-                message="Order placed successfully",
-            )
+            # Side effects that may lag (email, loyalty, analytics) go out as an
+            # event, ideally via an outbox, not as fire-and-forget tasks that
+            # vanish if the process dies.
+            await self.events.publish("order.placed", {"order_id": order["id"],
+                                                       "user_id": user_id,
+                                                       "total": price.total})
+            return OrderResult(True, order["id"], price.total)
 
         except Exception as e:
-            # Compensation logic is HERE, not in client code
-            await self._compensate(order_id=order.get('id'))
-            return OrderResult(
-                success=False,
-                error=str(e),
-            )
+            for compensate in reversed(undo):
+                try:
+                    await compensate()
+                except Exception:
+                    logging.exception("compensation failed; needs reconciliation")
+            return OrderResult(False, error=str(e))
 
-    async def _validate_inventory(self, items: list):
-        """Subsystem validation — hidden from client."""
-        for item in items:
-            if not await self.inventory.is_available(item['id'], item['qty']):
-                raise InventoryError(f"Item {item['id']} not available")
-
-    async def _calculate_pricing(self, items: list, user_id: str,
-                                  shipping_address: dict) -> PriceSummary:
-        """Complex pricing calculation — hidden from client."""
-        subtotal = sum(
-            await self.pricing.get_price(item['id']) * item['qty']
-            for item in items
-        )
-        promo = await self.promotion.get_applicable_promotions(user_id, items)
-        discount = await self.promotion.calculate_discount(promo, subtotal)
-        tax = await self.tax.calculate_tax(shipping_address, subtotal - discount)
-        shipping = await self.shipping.calculate_cost(items, shipping_address)
-        return PriceSummary(
-            subtotal=subtotal,
-            discount=discount,
-            tax=tax,
-            shipping=shipping,
-            total=subtotal - discount + tax + shipping,
-        )
-
-    async def _reserve_inventory(self, items: list):
-        """Bulk inventory reservation — hidden from client."""
-        for item in items:
-            await self.inventory.reserve(item['id'], item['qty'])
-
-    async def _post_process(self, user_id: str, order_id: str, total: float):
-        """Post-order tasks — fire and forget."""
-        await asyncio.gather(
-            self.notification.send_order_confirmation(user_id, order_id),
-            self.analytics.track_order(user_id, order_id, total),
-            self.loyalty.add_points(user_id, total),
-            self.cache.invalidate(f"user:{user_id}:cart"),
-            return_exceptions=True,  # Don't fail if one task fails
-        )
-
-    async def _compensate(self, order_id: str = None):
-        """Compensation logic — hidden from client."""
-        if order_id:
-            await self.order.cancel(order_id)
-        # Log failure for monitoring
-        logging.error("Order placement failed, compensations executed")
+    async def _price(self, user_id, items, address) -> PriceSummary:
+        prices = await asyncio.gather(*(self.pricing.get_price(i["id"]) for i in items))
+        subtotal = sum(p * i["qty"] for p, i in zip(prices, items))
+        discount = await self.pricing.discount_for(user_id, items, subtotal)
+        tax = await self.pricing.tax_for(address, subtotal - discount)
+        shipping = await self.pricing.shipping_for(items, address)
+        return PriceSummary(subtotal, discount, tax, shipping)
 
 
 # ── CLIENT CODE ────────────────────────────────────────────
-
-# Client only needs to know about OrderFacade!
-async def handle_checkout(request):
-    facade = OrderFacade(
-        inventory=inventory_service,
-        pricing=pricing_service,
-        # ... inject all 11 dependencies
-    )
-
-    result = await facade.place_order(
-        user_id=request.user_id,
-        items=request.cart_items,
-        payment_info=request.payment,
-        shipping_address=request.shipping_address,
-    )
-
-    return jsonify(result.to_dict())
+async def handle_checkout(request, facade: OrderFacade):   # facade built once, injected
+    result = await facade.place_order(request.user_id, request.cart_items,
+                                      request.payment_token, request.shipping_address)
+    return result
 ```
+
+Notes for the interview:
+
+- The facade owns **sequencing and compensation** (reserve → authorize → create → capture, undone in reverse on failure), which the 14-step client code above got wrong or skipped. Pricing rules, stock rules and fraud rules stay in their subsystems.
+- **Capture is the pivot.** After it succeeds nothing is undone; before it, everything can be. A capture *timeout* is an unknown outcome: void-and-cancel could be wrong, so production code checks the payment status before compensating.
+- When the subsystems are separate services, this facade **is** a saga orchestrator; durability across crashes then matters (see [Saga Pattern](INTERVIEW_QUESTIONS.md#9-saga-pattern-choreography-vs-orchestration)).
+- Testing: unit-test the facade with stubbed subsystems: the success path, a failure at each step, and the compensation order. The subsystems keep their own tests.
+- Eleven constructor parameters is a smell: group them (a `PricingService` facade in front of price, promotion, tax and shipping, as done above) or split the facade by use case.
 
 **Facade vs God Class:**
 
@@ -2386,277 +1961,176 @@ KEY DISTINCTION:
 
 **What They're Really Testing:** Whether you understand Command as a way to parameterize, queue, log, and undo operations, and can design for edge cases like irreversible commands.
 
+!!! abstract "Pattern card"
+    **Intent (GoF):** encapsulate a request as an object, so you can parameterize clients with requests, queue or log them, and support undo.<br>
+    **Structure:** *Command* interface (`execute`, optionally `undo`); *ConcreteCommands* hold the *Receiver* and the arguments, plus whatever state undo needs; the *Invoker* (history, queue, button) triggers commands without knowing what they do; the *Client* creates them.<br>
+    **Use when:** you need undo/redo, macros, queuing, scheduling, retries or an audit log of operations. Job queues, CQRS commands and event-sourced command handlers are the same idea at service scale.<br>
+    **Don't use when:** a callback or lambda would do (no undo, no queuing, no logging); a class per operation is then ceremony.
+
 ### Answer
 
-**Command Pattern for Undoable Text Editor:**
+**Command Pattern for an Undoable Text Editor (runs as-is):**
 
 ```python
-# ── COMMAND INTERFACE ──────────────────────────────────────
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections import deque
+
 
 class Command(ABC):
-    """Represents an operation that can be executed and undone."""
+    reversible = True
+    barrier = False      # irreversible AND later undos would be unsafe (send, publish, pay)
 
     @abstractmethod
-    def execute(self):
-        """Execute the command."""
-        pass
+    def execute(self) -> None: ...
 
-    @abstractmethod
-    def undo(self):
-        """Undo the command."""
-        pass
-
-    @abstractmethod
-    def is_reversible(self) -> bool:
-        """Can this command be undone?"""
-        pass
+    def undo(self) -> None:
+        raise NotImplementedError(f"{type(self).__name__} cannot be undone")
 
 
-# ── RECEIVER: The text editor state ────────────────────────
-@dataclass
-class EditorState:
-    """Immutable snapshot of editor state for undo/redo."""
-    content: str
-    cursor_position: int
-    selection: tuple[int, int] | None = None
-
-
-class TextEditor:
-    """Receiver — the actual object that performs operations."""
-
+class TextEditor:                                  # Receiver
     def __init__(self):
         self.content = ""
-        self.cursor_position = 0
 
-    def insert(self, position: int, text: str):
-        """Insert text at position."""
-        self.content = self.content[:position] + text + self.content[position:]
-        self.cursor_position = position + len(text)
+    def insert(self, pos: int, text: str) -> None:
+        self.content = self.content[:pos] + text + self.content[pos:]
 
-    def delete(self, position: int, length: int) -> str:
-        """Delete text and return the deleted text (for undo)."""
-        deleted = self.content[position:position + length]
-        self.content = self.content[:position] + self.content[position + length:]
-        self.cursor_position = position
-        return deleted
+    def delete(self, pos: int, length: int) -> str:
+        removed = self.content[pos:pos + length]
+        self.content = self.content[:pos] + self.content[pos + length:]
+        return removed
 
-    def replace(self, position: int, length: int, new_text: str) -> str:
-        """Replace text and return the replaced text (for undo)."""
-        replaced = self.content[position:position + length]
-        self.content = self.content[:position] + new_text + self.content[position + length:]
-        self.cursor_position = position + len(new_text)
-        return replaced
-
-
-# ── CONCRETE COMMANDS ──────────────────────────────────────
 
 class InsertCommand(Command):
-    """Inserts text. Can be undone by deleting the same text."""
-
-    def __init__(self, editor: TextEditor, position: int, text: str):
-        self.editor = editor
-        self.position = position
-        self.text = text
+    def __init__(self, editor: TextEditor, pos: int, text: str):
+        self.editor, self.pos, self.text = editor, pos, text
 
     def execute(self):
-        self.editor.insert(self.position, self.text)
+        self.editor.insert(self.pos, self.text)
 
     def undo(self):
-        # Undo insert = delete the same text
-        self.editor.delete(self.position, len(self.text))
-
-    def is_reversible(self):
-        return True
+        self.editor.delete(self.pos, len(self.text))
 
 
 class DeleteCommand(Command):
-    """Deletes text. Can be undone by re-inserting the deleted text."""
-
-    def __init__(self, editor: TextEditor, position: int, length: int):
-        self.editor = editor
-        self.position = position
-        self.length = length
-        self._deleted_text = None  # Store for undo
+    def __init__(self, editor: TextEditor, pos: int, length: int):
+        self.editor, self.pos, self.length = editor, pos, length
+        self._removed = ""                         # state captured for undo
 
     def execute(self):
-        self._deleted_text = self.editor.delete(self.position, self.length)
+        self._removed = self.editor.delete(self.pos, self.length)
 
     def undo(self):
-        # Undo delete = re-insert the deleted text
-        if self._deleted_text:
-            self.editor.insert(self.position, self._deleted_text)
-
-    def is_reversible(self):
-        return True
-
-
-class ReplaceCommand(Command):
-    """Replaces text. Can be undone by reversing the replacement."""
-
-    def __init__(self, editor: TextEditor, position: int,
-                 length: int, new_text: str):
-        self.editor = editor
-        self.position = position
-        self.length = length
-        self.new_text = new_text
-        self._replaced_text = None
-
-    def execute(self):
-        self._replaced_text = self.editor.replace(
-            self.position, self.length, self.new_text
-        )
-
-    def undo(self):
-        # Undo replace = replace new text with old text
-        if self._replaced_text:
-            self.editor.replace(
-                self.position, len(self.new_text), self._replaced_text
-            )
-
-    def is_reversible(self):
-        return True
+        self.editor.insert(self.pos, self._removed)
 
 
 class SaveCommand(Command):
-    """Saves the file. Can NOT be undone (already written to disk)."""
+    reversible = False   # the file on disk can't be "unwritten", but the buffer's
+                         # undo history is still valid, so it's not a barrier
 
-    def __init__(self, editor: TextEditor, file_path: str):
-        self.editor = editor
-        self.file_path = file_path
+    def __init__(self, editor: TextEditor, path: str):
+        self.editor, self.path = editor, path
 
     def execute(self):
-        with open(self.file_path, 'w') as f:
+        with open(self.path, "w") as f:
             f.write(self.editor.content)
-        print(f"Saved to {self.file_path}")
+
+
+class MacroCommand(Command):                       # Composite of commands
+    def __init__(self, commands: list[Command]):
+        self.commands = list(commands)
+        self.reversible = all(c.reversible for c in self.commands)
+        self.barrier = any(c.barrier for c in self.commands)
+
+    def execute(self):
+        for c in self.commands:
+            c.execute()
 
     def undo(self):
-        raise NotImplementedError("Save cannot be undone")
-
-    def is_reversible(self):
-        return False
+        for c in reversed(self.commands):          # undo in reverse order
+            c.undo()
 
 
-# ── INVOKER: Command history with undo/redo ───────────────
-class CommandHistory:
-    """Manages command execution with undo/redo capability."""
-
+class CommandHistory:                              # Invoker
     def __init__(self, max_history: int = 1000):
-        self._undo_stack: list[Command] = []
-        self._redo_stack: list[Command] = []
-        self._max_history = max_history
-        self._macro_recording = False
-        self._macro_commands: list[Command] = []
+        self._undo: deque[Command] = deque(maxlen=max_history)   # O(1) trimming
+        self._redo: list[Command] = []
+        self._recording: list[Command] | None = None
 
-    def execute(self, command: Command):
-        """Execute a command and add to history."""
-        command.execute()
-        self._undo_stack.append(command)
-        self._redo_stack.clear()  # New action invalidates redo
-
-        # Keep history bounded
-        if len(self._undo_stack) > self._max_history:
-            self._undo_stack.pop(0)
+    def execute(self, cmd: Command) -> None:
+        cmd.execute()
+        if self._recording is not None:
+            self._recording.append(cmd)
+        if cmd.reversible:
+            self._undo.append(cmd)
+            self._redo.clear()                     # a new edit invalidates redo
+        elif cmd.barrier:
+            self._undo.clear()                     # e.g. after "send", undoing earlier
+            self._redo.clear()                     # edits would diverge from what was sent
 
     def undo(self) -> bool:
-        """Undo the last command. Returns False if nothing to undo."""
-        if not self._undo_stack:
+        if not self._undo:
             return False
-
-        command = self._undo_stack.pop()
-        if not command.is_reversible():
-            print(f"Warning: {type(command).__name__} cannot be undone")
-            return False
-
-        command.undo()
-        self._redo_stack.append(command)
+        cmd = self._undo.pop()
+        cmd.undo()
+        self._redo.append(cmd)
         return True
 
     def redo(self) -> bool:
-        """Redo the last undone command."""
-        if not self._redo_stack:
+        if not self._redo:
             return False
-
-        command = self._redo_stack.pop()
-        command.execute()
-        self._undo_stack.append(command)
+        cmd = self._redo.pop()
+        cmd.execute()
+        self._undo.append(cmd)
         return True
 
-    def start_macro(self):
-        """Start recording commands into a macro."""
-        self._macro_recording = True
-        self._macro_commands = []
+    def start_macro(self) -> None:
+        self._recording = []
 
-    def stop_macro(self) -> Command:
-        """Stop recording and return the macro as a command."""
-        self._macro_recording = False
-        macro = MacroCommand(self._macro_commands)
-        self._macro_commands = []
+    def stop_macro(self) -> MacroCommand:
+        macro, self._recording = MacroCommand(self._recording or []), None
         return macro
 
 
-class MacroCommand(Command):
-    """A command composed of multiple sub-commands (macro)."""
-
-    def __init__(self, commands: list[Command]):
-        self.commands = commands
-
-    def execute(self):
-        for cmd in self.commands:
-            cmd.execute()
-
-    def undo(self):
-        # Undo in REVERSE order
-        for cmd in reversed(self.commands):
-            if cmd.is_reversible():
-                cmd.undo()
-
-    def is_reversible(self):
-        return all(cmd.is_reversible() for cmd in self.commands)
-
-
 # ── USAGE ──────────────────────────────────────────────────
+if __name__ == "__main__":
+    editor, history = TextEditor(), CommandHistory()
 
-# Editor setup
-editor = TextEditor()
-history = CommandHistory()
+    history.execute(InsertCommand(editor, 0, "Hello, World!"))
+    history.execute(DeleteCommand(editor, 5, 7))
+    print(editor.content)            # Hello!
+    history.undo()
+    print(editor.content)            # Hello, World!
+    history.redo()
+    print(editor.content)            # Hello!
 
-# Normal editing
-history.execute(InsertCommand(editor, 0, "Hello, World!"))
-print(editor.content)  # "Hello, World!"
+    history.start_macro()
+    history.execute(InsertCommand(editor, 0, "> "))
+    history.execute(InsertCommand(editor, len(editor.content), " <"))
+    wrap = history.stop_macro()
+    print(editor.content)            # > Hello! <
 
-history.execute(DeleteCommand(editor, 5, 7))
-print(editor.content)  # "Hello!"
-
-# Undo
-history.undo()
-print(editor.content)  # "Hello, World!"
-
-# Redo
-history.redo()
-print(editor.content)  # "Hello!"
-
-# Macro recording
-history.start_macro()
-history.execute(InsertCommand(editor, 0, "Start: "))
-history.execute(InsertCommand(editor, len(editor.content), " End"))
-macro = history.stop_macro()
-
-# Execute macro as a single command
-history.execute(macro)
-print(editor.content)  # "Start: Hello! End"
-
-# Undo entire macro (undoes all commands in reverse)
-history.undo()
-print(editor.content)  # "Hello!"
+    history.undo(); history.undo()   # undo the two recorded steps individually
+    print(editor.content)            # Hello!
+    history.execute(wrap)            # replay the macro as ONE command
+    print(editor.content)            # > Hello! <
+    history.undo()                   # ...and undo it as one step
+    print(editor.content)            # Hello!
 ```
+
+Design points:
+
+- **Undo needs captured state.** `DeleteCommand` stores the removed text at execute time; it can't be recomputed later. The alternative is the **Memento** pattern: snapshot editor state before each command. That's simpler but costs memory; real editors combine both.
+- **Irreversible commands.** Some commands simply aren't undoable (save to disk), so they stay out of the undo stack. Others make earlier undos unsafe (send, publish, pay) and act as a **barrier** that clears history. Undoing something already sent needs a *new* compensating command (send a correction), which is exactly the saga idea.
+- **Macros** are a Composite of commands: recorded while executing, replayed and undone as one unit, in reverse order.
+- **Bounded history** via `deque(maxlen=…)`; `list.pop(0)` is O(n) per trim.
+- **Collaborative editing** breaks simple position-based undo (someone else's edit shifts positions); that's where operational transforms or CRDTs come in.
 
 **Command Queue for Async Processing:**
 
 ```python
 # ── COMMAND QUEUE (for async/remote execution) ────────────
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -2718,14 +2192,18 @@ class CommandQueue:
 
             queued.status = "running"
             try:
-                queued.command.execute()
+                # Commands that do blocking I/O shouldn't run on the event loop:
+                await asyncio.to_thread(queued.command.execute)
                 queued.status = "completed"
                 logging.info(f"{name}: {queued.command_type} completed")
 
             except Exception as e:
                 queued.retry_count += 1
                 if queued.retry_count < queued.max_retries:
-                    # Re-enqueue with exponential backoff
+                    # Retrying is only safe for IDEMPOTENT commands.
+                    # Sleeping here blocks this worker; production queues
+                    # schedule a delayed redelivery instead (SQS visibility
+                    # timeout, a retry topic with a delay).
                     await asyncio.sleep(2 ** queued.retry_count)
                     await self._queue.put(queued)
                 else:
@@ -2754,288 +2232,179 @@ class CommandQueue:
 
 **What They're Really Testing:** Whether you understand State as a way to make state-dependent behavior explicit and extensible, and can distinguish it from Strategy (different algorithms, same interface vs different behaviors, same interface).
 
+!!! abstract "Pattern card"
+    **Intent (GoF):** allow an object to alter its behaviour when its internal state changes; the object will appear to change its class.<br>
+    **Structure:** a *Context* holds a reference to the current *State* object and delegates every state-dependent call to it; each *ConcreteState* implements the behaviour for that state and decides the transition. Replaces scattered `if state == …` checks in every method.<br>
+    **Use when:** behaviour differs substantially per state, and states have their own entry actions and rules (order lifecycle, connection handling, protocol parsers, vending machines).<br>
+    **Don't use when:** behaviour is mostly the same and only the allowed transitions differ. An **enum plus a transition table** is shorter, easier to review, and easy to persist (which you need when the state lives in a database).
+
 ### Answer
 
-**State Pattern for Vending Machine:**
+**State Pattern for a vending machine (runs as-is):**
+
+The question's "Selecting" and "Processing Payment" are merged into `HasMoneyState` for a coin machine, where payment is just the balance check. A card machine would add a real `AwaitingPaymentState`, because authorization is asynchronous and can time out.
 
 ```python
-# ── CONTEXT ────────────────────────────────────────────────
-class VendingMachine:
-    """
-    Context: maintains current state and delegates behavior.
-    """
-
-    def __init__(self):
-        self.balance = 0.0
-        self.selected_item = None
-        self.inventory = {}  # {item_id: {'price': float, 'quantity': int}}
-
-        # All possible states
-        self.idle_state = IdleState(self)
-        self.selecting_state = SelectingState(self)
-        self.processing_payment_state = ProcessingPaymentState(self)
-        self.dispensing_state = DispensingState(self)
-        self.out_of_stock_state = OutOfStockState(self)
-        self.maintenance_state = MaintenanceState(self)
-
-        # Start in idle state
-        self.current_state = self.idle_state
-        self._reset_context()
-
-    def _reset_context(self):
-        """Reset context variables (not state)."""
-        self.balance = 0.0
-        self.selected_item = None
-
-    # ── Delegate to current state ──────────────────────────
-    def insert_money(self, amount: float):
-        self.current_state.insert_money(amount)
-
-    def select_item(self, item_id: str):
-        self.current_state.select_item(item_id)
-
-    def dispense(self):
-        self.current_state.dispense()
-
-    def cancel(self):
-        self.current_state.cancel()
-
-    def refill(self, inventory: dict):
-        self.current_state.refill(inventory)
-
-    def enter_maintenance(self):
-        self.current_state = self.maintenance_state
-
-    def exit_maintenance(self):
-        self.current_state = self.idle_state
-
-    def change_state(self, new_state: 'VendingMachineState'):
-        """Transition to a new state."""
-        print(f"State: {self.current_state.__class__.__name__} → "
-              f"{new_state.__class__.__name__}")
-        self.current_state = new_state
+from __future__ import annotations
 
 
-# ── STATE INTERFACE ────────────────────────────────────────
-from abc import ABC, abstractmethod
-
-class VendingMachineState(ABC):
-    """Interface for all vending machine states."""
+class VendingState:
+    """Base state: every action is rejected unless a state overrides it.
+    This keeps each concrete state down to the transitions it allows."""
 
     def __init__(self, machine: VendingMachine):
-        self.machine = machine
+        self.m = machine
 
-    @abstractmethod
-    def insert_money(self, amount: float):
-        """Insert money into the machine."""
-        pass
+    def insert_money(self, cents: int):  self._reject("insert money")
+    def select_item(self, item_id: str): self._reject("select an item")
+    def cancel(self):                    self._reject("cancel")
+    def refill(self, stock: dict):       self._reject("refill")
+    def enter_maintenance(self):         self._reject("enter maintenance")
+    def exit_maintenance(self):          self._reject("exit maintenance")
 
-    @abstractmethod
-    def select_item(self, item_id: str):
-        """Select an item to purchase."""
-        pass
-
-    @abstractmethod
-    def dispense(self):
-        """Dispense the selected item."""
-        pass
-
-    @abstractmethod
-    def cancel(self):
-        """Cancel the current transaction and refund."""
-        pass
-
-    @abstractmethod
-    def refill(self, inventory: dict):
-        """Refill the machine's inventory."""
-        pass
+    def _reject(self, action: str):
+        print(f"[{type(self).__name__}] can't {action} now")
 
 
-# ── CONCRETE STATES ────────────────────────────────────────
+class IdleState(VendingState):
+    def insert_money(self, cents):
+        self.m.balance += cents
+        self.m.transition(self.m.has_money)
 
-class IdleState(VendingMachineState):
-    """Machine is waiting for a customer."""
-
-    def insert_money(self, amount: float):
-        self.machine.balance += amount
-        print(f"Inserted ${amount:.2f}. Balance: ${self.machine.balance:.2f}")
-        self.machine.change_state(self.machine.selecting_state)
-
-    def select_item(self, item_id: str):
-        print("Please insert money first")
-
-    def dispense(self):
-        print("Please insert money and select an item first")
-
-    def cancel(self):
-        print("Nothing to cancel")
-
-    def refill(self, inventory: dict):
-        self.machine.inventory.update(inventory)
-        print(f"Refilled inventory with {len(inventory)} items")
-        if not self.machine.inventory:
-            self.machine.change_state(self.machine.out_of_stock_state)
+    def enter_maintenance(self):
+        self.m.transition(self.m.maintenance)
 
 
-class SelectingState(VendingMachineState):
-    """Customer has inserted money and is selecting an item."""
+class HasMoneyState(VendingState):
+    def insert_money(self, cents):
+        self.m.balance += cents
 
-    def insert_money(self, amount: float):
-        self.machine.balance += amount
-        print(f"Inserted ${amount:.2f}. Balance: ${self.machine.balance:.2f}")
-
-    def select_item(self, item_id: str):
-        if item_id not in self.machine.inventory:
-            print(f"Item {item_id} not found")
-            return
-
-        item = self.machine.inventory[item_id]
-        if item['quantity'] <= 0:
-            print(f"Item {item_id} is out of stock")
-            return
-
-        if item['price'] > self.machine.balance:
-            print(f"Price: ${item['price']:.2f}. "
-                  f"Insufficient balance: ${self.machine.balance:.2f}")
-            return
-
-        self.machine.selected_item = item_id
-        print(f"Selected {item_id} — ${item['price']:.2f}")
-        self.machine.change_state(self.machine.processing_payment_state)
-
-    def dispense(self):
-        print("Please select an item first")
-
-    def cancel(self):
-        print(f"Refunding ${self.machine.balance:.2f}")
-        self.machine.balance = 0.0
-        self.machine.change_state(self.machine.idle_state)
-
-    def refill(self, inventory: dict):
-        print("Cannot refill during active transaction")
-
-
-class ProcessingPaymentState(VendingMachineState):
-    """Payment is being processed."""
-
-    def insert_money(self, amount: float):
-        self.machine.balance += amount
-        print(f"Inserted ${amount:.2f}. Balance: ${self.machine.balance:.2f}")
-
-    def select_item(self, item_id: str):
-        print(f"Already selected {self.machine.selected_item}. "
-              f"Dispensing in progress")
-
-    def dispense(self):
-        item = self.machine.inventory[self.machine.selected_item]
-        change = self.machine.balance - item['price']
-
-        # Process payment
-        print(f"Charging ${item['price']:.2f}")
-        self.machine.inventory[self.machine.selected_item]['quantity'] -= 1
-        self.machine.balance = 0.0
-
-        print(f"Dispensing {self.machine.selected_item}...")
-        self.machine.change_state(self.machine.dispensing_state)
-
-        if change > 0:
-            print(f"Returning change: ${change:.2f}")
-
-    def cancel(self):
-        print(f"Cancelling. Refunding ${self.machine.balance:.2f}")
-        self.machine.balance = 0.0
-        self.machine.selected_item = None
-        self.machine.change_state(self.machine.idle_state)
-
-    def refill(self, inventory: dict):
-        print("Cannot refill during active transaction")
-
-
-class DispensingState(VendingMachineState):
-    """Item is being dispensed (possibly with change)."""
-
-    def insert_money(self, amount: float):
-        print("Please wait, dispensing in progress")
-
-    def select_item(self, item_id: str):
-        print("Please wait, dispensing in progress")
-
-    def dispense(self):
-        print("Already dispensing")
-
-    def cancel(self):
-        print("Too late, item is being dispensed")
-
-    def refill(self, inventory: dict):
-        print("Cannot refill during active transaction")
-
-    def on_dispense_complete(self):
-        """Called when dispense is done (simulated by timer)."""
-        self.machine.selected_item = None
-
-        # Check if machine is out of stock
-        all_empty = all(
-            item['quantity'] <= 0
-            for item in self.machine.inventory.values()
-        )
-        if all_empty:
-            self.machine.change_state(self.machine.out_of_stock_state)
+    def select_item(self, item_id):
+        item = self.m.inventory.get(item_id)
+        if not item or item["qty"] == 0:
+            print(f"{item_id} unavailable")
+        elif item["price"] > self.m.balance:
+            print(f"insert {item['price'] - self.m.balance} more cents")
         else:
-            self.machine.change_state(self.machine.idle_state)
-
-
-class OutOfStockState(VendingMachineState):
-    """All items are sold out."""
-
-    def insert_money(self, amount: float):
-        print("Machine is out of stock. Money returned.")
-        # Return the money immediately
-
-    def select_item(self, item_id: str):
-        print("Machine is out of stock")
-
-    def dispense(self):
-        print("Machine is out of stock")
+            self.m.selected = item_id
+            self.m.transition(self.m.dispensing)
+            self.m.dispensing.dispense()          # automatic transition, no user action
 
     def cancel(self):
-        print("Nothing to cancel")
-
-    def refill(self, inventory: dict):
-        self.machine.inventory.update(inventory)
-        print(f"Refilled! {len(inventory)} items added.")
-        self.machine.change_state(self.machine.idle_state)
+        self.m.refund(self.m.balance)
+        self.m.transition(self.m.idle)
 
 
-class MaintenanceState(VendingMachineState):
-    """Maintenance mode — technician can access internals."""
-
-    def insert_money(self, amount: float):
-        print("Machine is in maintenance mode")
-
-    def select_item(self, item_id: str):
-        print("Machine is in maintenance mode")
-
+class DispensingState(VendingState):
     def dispense(self):
-        print("Machine is in maintenance mode")
+        item = self.m.inventory[self.m.selected]
+        item["qty"] -= 1
+        change = self.m.balance - item["price"]
+        print(f"dispensing {self.m.selected}")
+        self.m.balance, self.m.selected = 0, None
+        if change:
+            self.m.refund(change)
+        self.m.transition(self.m.sold_out if self.m.is_empty() else self.m.idle)
 
-    def cancel(self):
-        print("Machine is in maintenance mode")
 
-    def refill(self, inventory: dict):
-        self.machine.inventory.update(inventory)
-        print(f"Refilled! {len(inventory)} items.")
+class SoldOutState(VendingState):
+    def insert_money(self, cents):
+        self.m.refund(cents)                      # give the coins straight back
+
+    def enter_maintenance(self):
+        self.m.transition(self.m.maintenance)
+
+
+class MaintenanceState(VendingState):
+    def refill(self, stock):
+        for item_id, item in stock.items():
+            self.m.inventory.setdefault(item_id, {"price": item["price"], "qty": 0})
+            self.m.inventory[item_id]["qty"] += item["qty"]
 
     def exit_maintenance(self):
-        """Technician exits maintenance mode."""
-        all_empty = all(
-            item['quantity'] <= 0
-            for item in self.machine.inventory.values()
-        )
-        if all_empty:
-            self.machine.change_state(self.machine.out_of_stock_state)
-        else:
-            self.machine.change_state(self.machine.idle_state)
+        self.m.transition(self.m.sold_out if self.m.is_empty() else self.m.idle)
+
+
+class VendingMachine:
+    """Context: holds data and the current state, delegates every action."""
+
+    def __init__(self):
+        self.balance = 0                          # cents, never floats
+        self.selected: str | None = None
+        self.inventory: dict[str, dict] = {}
+        self.idle, self.has_money = IdleState(self), HasMoneyState(self)
+        self.dispensing, self.sold_out = DispensingState(self), SoldOutState(self)
+        self.maintenance = MaintenanceState(self)
+        self.state: VendingState = self.sold_out  # empty machine starts sold out
+
+    def transition(self, new: VendingState):
+        print(f"  {type(self.state).__name__} -> {type(new).__name__}")
+        self.state = new
+
+    def refund(self, cents: int):
+        print(f"returning {cents} cents")
+
+    def is_empty(self) -> bool:
+        return all(i["qty"] == 0 for i in self.inventory.values())
+
+    # Public API: pure delegation
+    def insert_money(self, cents):  self.state.insert_money(cents)
+    def select_item(self, item_id): self.state.select_item(item_id)
+    def cancel(self):               self.state.cancel()
+    def refill(self, stock):        self.state.refill(stock)
+    def enter_maintenance(self):    self.state.enter_maintenance()
+    def exit_maintenance(self):     self.state.exit_maintenance()
+
+
+# ── USAGE ──────────────────────────────────────────────────
+vm = VendingMachine()
+vm.enter_maintenance()
+vm.refill({"cola": {"price": 150, "qty": 1}})
+vm.exit_maintenance()                 #   MaintenanceState -> IdleState
+vm.select_item("cola")                # [IdleState] can't select an item now
+vm.insert_money(100)                  #   IdleState -> HasMoneyState
+vm.select_item("cola")                # insert 50 more cents
+vm.insert_money(100)
+vm.select_item("cola")                # dispensing cola, returning 50 cents,
+                                      #   DispensingState -> SoldOutState
+vm.insert_money(25)                   # returning 25 cents
 ```
+
+Things worth pointing out:
+
+- The base class **rejects everything by default**, so each state lists only the transitions it allows, and invalid actions get one consistent error path.
+- **Automatic transitions** (dispensing finishes, then Idle or SoldOut) happen inside the state, not because the caller remembered to call `dispense()`. A state machine that waits for a call nobody makes is stuck forever.
+- **Money is integer cents.** Floats give change like `0.30000000000000004`.
+- **Maintenance is a state with guarded entry**, not a back door that overwrites `current_state` mid-transaction and loses the customer's balance.
+
+**The lighter alternative: enum + transition table**
+
+```python
+from enum import Enum, auto
+
+class S(Enum):
+    IDLE = auto(); HAS_MONEY = auto(); DISPENSING = auto(); SOLD_OUT = auto(); MAINTENANCE = auto()
+
+TRANSITIONS = {                                  # (state, event) -> next state
+    (S.IDLE, "coin"): S.HAS_MONEY,
+    (S.HAS_MONEY, "coin"): S.HAS_MONEY,
+    (S.HAS_MONEY, "select_ok"): S.DISPENSING,
+    (S.HAS_MONEY, "cancel"): S.IDLE,
+    (S.DISPENSING, "done"): S.IDLE,
+    (S.DISPENSING, "done_empty"): S.SOLD_OUT,
+    (S.IDLE, "service"): S.MAINTENANCE,
+    (S.SOLD_OUT, "service"): S.MAINTENANCE,
+    (S.MAINTENANCE, "close"): S.IDLE,
+}
+
+def next_state(state: S, event: str) -> S:
+    try:
+        return TRANSITIONS[(state, event)]
+    except KeyError:
+        raise ValueError(f"illegal transition: {state.name} on {event!r}") from None
+```
+
+Choose the table when the states mostly gate *which events are legal* (order status, ticket workflow) and the state is stored in a database row. Choose State classes when each state has substantial behaviour of its own. Mature options: Spring Statemachine, XState (TypeScript), `python-statemachine`, or a durable workflow engine for long-running states.
 
 **State vs Strategy:**
 
@@ -3049,7 +2418,8 @@ Strategy Pattern:
 State Pattern:
   - Different BEHAVIORS based on internal state
   - State transitions are AUTOMATIC (triggered by events)
-  - States know about other states (transitions)
+  - States usually know their successor states (or the context
+    owns a transition table)
   - Example: VendingMachineState (Idle → Selecting → Payment → Dispensing)
 
 When they look similar:
@@ -3073,6 +2443,7 @@ KEY DIFFERENCE:
 | **Invalid transition handling** | Handles out-of-order calls (e.g., dispense when idle) gracefully |
 | **State vs Strategy** | Explains difference: Strategy = caller chooses algorithm, State = events drive transitions |
 | **Maintenance state** | Includes a maintenance state that can only be entered/exited by authorized action |
+| **Alternatives** | Knows when an enum + transition table beats a class per state |
 
 ---
 
@@ -3081,6 +2452,12 @@ KEY DIFFERENCE:
 **Q:** "Your data pipeline processes files from different sources (S3, FTP, Local) through the same stages: download → validate → transform → load. 80% of the code is the same, 20% varies per source. Design this using Template Method. What are the hook methods? When would you prefer Strategy over Template Method?"
 
 **What They're Really Testing:** Whether you understand Template Method as a way to reuse common algorithm structure while allowing subclasses to override specific steps, and can identify when Strategy or composition is a better fit.
+
+!!! abstract "Pattern card"
+    **Intent (GoF):** define the skeleton of an algorithm in a base-class method, deferring some steps to subclasses, so subclasses can redefine certain steps without changing the algorithm's structure.<br>
+    **Structure:** an *AbstractClass* with a (non-overridable) `template_method()` that calls *primitive operations* (abstract, must override) and *hooks* (default no-op, may override); *ConcreteClasses* fill in the steps. "Don't call us, we'll call you."<br>
+    **Use when:** several variants share a fixed sequence and differ in a few steps, and the variation is along **one** axis (frameworks: `unittest.TestCase.setUp`, Spring's `JdbcTemplate`, servlet `doGet`).<br>
+    **Don't use when:** variation is along several independent axes (source × format × sink): inheritance multiplies subclasses (`S3CsvPostgresPipeline`, `FtpXmlPostgresPipeline` …). Compose strategies instead.
 
 ### Answer
 
@@ -3112,12 +2489,11 @@ class DataPipeline(ABC):
     # ── TEMPLATE METHOD ───────────────────────────────────
     def run(self, source_path: str, destination: str) -> dict:
         """
-        Template method: defines the algorithm skeleton.
-        Steps:
-          1. Download (abstract — subclass provides)
-          2. Validate (abstract — subclass provides)
-          3. Transform (abstract or default)
-          4. Load (abstract — subclass provides)
+        Template method: defines the algorithm skeleton. Not meant to be
+        overridden (Java would mark it `final`).
+          pre_process (hook) → connect → download → validate
+          → transform (default: pass-through) → load → post_process (hook)
+          on error: handle_error (hook); always: cleanup (hook)
         """
         context = PipelineContext(
             source_path=source_path,
@@ -3233,22 +2609,16 @@ class DataPipeline(ABC):
 class S3DataPipeline(DataPipeline):
     """Pipeline that reads from AWS S3."""
 
-    def __init__(self, bucket: str, aws_access_key: str,
-                 aws_secret_key: str, region: str = 'us-east-1'):
+    def __init__(self, bucket: str, region: str = 'us-east-1'):
         self.bucket = bucket
-        self.access_key = aws_access_key
-        self.secret_key = aws_secret_key
         self.region = region
         self.s3_client = None
 
     def _connect(self):
         import boto3
-        self.s3_client = boto3.client(
-            's3',
-            aws_access_key_id=self.access_key,
-            aws_secret_access_key=self.secret_key,
-            region_name=self.region,
-        )
+        # No keys in code: boto3's default credential chain picks up the
+        # IAM role (EKS Pod Identity / IRSA, instance profile) or SSO session.
+        self.s3_client = boto3.client('s3', region_name=self.region)
         logging.info(f"Connected to S3 bucket: {self.bucket}")
 
     def _download(self, source_path: str) -> bytes:
@@ -3287,15 +2657,15 @@ class S3DataPipeline(DataPipeline):
         # Load to database
         import psycopg2
         conn = psycopg2.connect(destination)
-        cursor = conn.cursor()
-
-        for row in transformed_data['rows']:
-            cursor.execute(
-                "INSERT INTO data (columns) VALUES (...)",
-                row,
-            )
-
-        conn.commit()
+        try:
+            with conn, conn.cursor() as cur:      # `with conn` = one transaction
+                cur.executemany(
+                    "INSERT INTO s3_data (id, date, amount) "
+                    "VALUES (%(id)s, %(date)s, %(amount)s)",
+                    transformed_data['rows'],
+                )
+        finally:
+            conn.close()                          # psycopg2's `with` doesn't close
         return len(transformed_data['rows'])
 
     def _cleanup(self, context: PipelineContext):
@@ -3313,9 +2683,10 @@ class FTPDataPipeline(DataPipeline):
         self.ftp = None
 
     def _connect(self):
-        from ftplib import FTP
-        self.ftp = FTP(self.host)
+        from ftplib import FTP_TLS
+        self.ftp = FTP_TLS(self.host)          # plain FTP sends the password in clear text
         self.ftp.login(self.username, self.password)
+        self.ftp.prot_p()                      # encrypt the data channel too
         logging.info(f"Connected to FTP: {self.host}")
 
     def _download(self, source_path: str) -> bytes:
@@ -3327,7 +2698,7 @@ class FTPDataPipeline(DataPipeline):
     def _validate(self, raw_data: bytes) -> dict:
         # XML validation for FTP sources
         import xml.etree.ElementTree as ET
-        root = ET.fromstring(raw_data)
+        root = ET.fromstring(raw_data)   # untrusted XML: prefer defusedxml
         return {
             'format': 'xml',
             'root_tag': root.tag,
@@ -3340,15 +2711,14 @@ class FTPDataPipeline(DataPipeline):
         # Load to the same database but different table
         import psycopg2
         conn = psycopg2.connect(destination)
-        cursor = conn.cursor()
-
-        for row in transformed_data['rows']:
-            cursor.execute(
-                "INSERT INTO ftp_data (columns) VALUES (...)",
-                row,
-            )
-
-        conn.commit()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO ftp_data (id, payload) VALUES (%(id)s, %(payload)s)",
+                    transformed_data['rows'],
+                )
+        finally:
+            conn.close()
         return len(transformed_data['rows'])
 
     def _cleanup(self, context: PipelineContext):
@@ -3386,6 +2756,36 @@ EXAMPLE:
   Strategy:         PaymentProcessor (charge with Stripe vs PayPal)
                    The entire charging algorithm is different
 ```
+
+**The composition alternative (what most modern pipelines do):**
+
+```python
+from dataclasses import dataclass
+from typing import Callable, Iterable, Protocol
+
+class Source(Protocol):
+    def read(self, path: str) -> bytes: ...
+
+class Sink(Protocol):
+    def write(self, rows: list[dict]) -> int: ...
+
+@dataclass
+class Pipeline:
+    source: Source                                     # S3Source, FtpSource, LocalSource
+    parse: Callable[[bytes], list[dict]]               # parse_csv, parse_xml
+    sink: Sink                                         # PostgresSink, BigQuerySink
+    transforms: Iterable[Callable[[list[dict]], list[dict]]] = ()
+
+    def run(self, path: str) -> int:                   # the skeleton still lives in ONE place
+        rows = self.parse(self.source.read(path))
+        for transform in self.transforms:
+            rows = transform(rows)
+        return self.sink.write(rows)
+
+# Pipeline(S3Source(bucket), parse_xml, PostgresSink(dsn)) — no new subclass needed
+```
+
+The fixed sequence is still there (that's the Template Method's real value), but each axis varies independently and is testable on its own. Rule of thumb: Template Method for frameworks and one axis of variation; composition of strategies once a second axis appears.
 
 ### 🔍 Staff-Level Evaluation
 
@@ -3582,6 +2982,21 @@ GOD CLASS MISUSE (disguised as Facade):
 # A simple if/else that everyone understands is better
 # than a perfect Abstract Factory that no one can maintain.
 ```
+
+**Other patterns interviewers bring up (one line each):**
+
+| Pattern | Intent | Typical production use | Watch out for |
+|---------|--------|------------------------|---------------|
+| **Proxy** | Stand-in with the *same* interface that controls access | Lazy loading (ORM relations), remote stubs (gRPC clients), caching or auth proxies | Hidden latency: a "field access" that is really a network call (N+1 queries) |
+| **Composite** | Treat a tree of objects and single objects uniformly | UI trees, file systems, org charts, `MacroCommand` above | Operations that don't make sense on leaves |
+| **Chain of Responsibility** | Pass a request along handlers until one handles it | Approval workflows, exception handlers, validation pipelines | Requests that fall off the end silently |
+| **Iterator / Generator** | Traverse without exposing the structure | Python generators, Java streams, paginated API clients | Holding cursors/connections open while iterating |
+| **Repository** | Collection-like interface over persistence for an aggregate | DDD domain layer, keeping SQL out of business logic | Generic `Repository<T>` with 40 query methods: a leaky DAO |
+| **Unit of Work** | Track changes and commit them in one transaction | SQLAlchemy `Session`, EF Core `DbContext`, Hibernate session | Long-lived sessions holding stale data and locks |
+| **Specification** | Business rules as composable predicate objects | Eligibility and filtering rules reused across query and validation | Over-abstraction for two simple filters |
+| **Dependency Injection** | Objects receive their collaborators instead of creating them | Every testable codebase; Spring, Guice, FastAPI `Depends` | Container magic that hides the wiring; prefer constructor injection |
+
+Distributed-systems patterns (circuit breaker, bulkhead, outbox, saga, CQRS, strangler fig) are covered in [Software Architecture Q&A](INTERVIEW_QUESTIONS.md).
 
 ### 🔍 Staff-Level Evaluation
 

@@ -1,6 +1,6 @@
 # 🧠 Operating Systems — Staff-Level Interview Questions
 
-> *12 questions covering memory management, process scheduling, I/O models, file systems, and kernel internals — every question expects production-scale reasoning.*
+> *12 questions covering memory management, process scheduling, I/O models, file systems, and kernel internals. Each answer leads with the 30-second version, then the mechanism, then trade-offs and what the interviewer probes next. Linux-focused; current as of October 2026 (Linux 6.x, Kubernetes 1.3x).*
 
 ---
 
@@ -29,67 +29,56 @@
 
 ### Answer
 
-**The Math Problem:**
-- 64-bit VA space = 2^64 bytes = 16 exabytes
-- 4KB pages = 2^12 bytes/page
-- Flat page table would need: 2^64 / 2^12 = 2^52 entries
-- Each entry = 8 bytes → 2^52 × 8 = 2^55 bytes = **32 petabytes** per process
-- Impossible.
+!!! tip "30-second answer"
+    A flat table needs one entry per virtual page: 2^52 entries × 8 bytes = 32 PB per process, so it's impossible. x86-64 actually uses 48-bit virtual addresses (57 with 5-level paging) and translates through a **radix tree**: four levels of 512-entry tables, each table exactly one 4 KB page, 9 address bits per level. Unused regions simply have no lower-level tables, so cost scales with what is mapped, not with the address-space size. The price is a multi-step walk on a TLB miss, which is why the TLB, paging-structure caches and huge pages matter.
 
-**4-Level Page Table Solution:**
+**The math problem:**
 
-```
-VA Bits: [47:39] | [38:30] | [29:21] | [20:12] | [11:0]
-            L4        L3        L2        L1      offset
-```
+- Full 64-bit space with 4 KB pages: 2^64 / 2^12 = 2^52 entries × 8 B = 2^55 B = **32 PB** per process.
+- Even x86-64's real 48-bit space would need 2^36 entries × 8 B = **512 GB** per process for a flat table.
+
+**4-level page table (x86-64):**
 
 ```
-                    ┌──────────┐
-                    │ L4 Table │ ← 512 entries (9 bits)
-                    │  (1 page)│
-                    └────┬─────┘
-                         │ index
-                    ┌────▼─────┐
-                    │ L3 Table │ ← only allocated for used regions
-                    │  (1 page)│
-                    └────┬─────┘
-                    ┌────▼─────┐
-                    │ L2 Table │ ← only allocated where needed
-                    │  (1 page)│
-                    └────┬─────┘
-                    ┌────▼─────┐
-                    │ L1 Table │ ← maps to physical pages
-                    │  (1 page)│
-                    └────┬─────┘
-                         │
-                    ┌────▼─────┐
-                    │ Physical │
-                    │   Page   │
-                    └──────────┘
+48-bit virtual address
+ [47:39]   [38:30]   [29:21]   [20:12]   [11:0]
+  PGD idx   PUD idx   PMD idx   PTE idx   offset
+  (L4)      (L3)      (L2)      (L1)
+
+CR3 → PGD (512 entries) → PUD → PMD → PTE → physical page + offset
+         each table = 512 × 8 B = 4 KB = one page
+         each PTE maps 4 KB; each PMD entry covers 2 MB; each PUD entry covers 1 GB
 ```
 
-**Sparse Address Space Efficiency:**
-- Each level table is exactly 1 page (4KB)
-- 512 entries × 8 bytes = 4KB (fits perfectly)
-- If a region is unmapped, the intermediate table pointer is NULL → entire subtree consumes zero memory
-- A process using 1GB of heap in a single contiguous region needs only:
-  - 1 × L4 table
-  - 1 × L3 table
-  - 8 × L2 tables (each covers 1GB/512 = 2MB)
-  - ~512 × L1 tables
-  - Total overhead: ~2MB for page tables, not 32PB
+Bits 63:48 must copy bit 47 ("canonical" addresses), which splits the space into a user half and a kernel half.
 
-**Five-Level Page Tables (Ice Lake+):**
-- Intel/AMD added a 5th level (57-bit VA) for systems with >64TB physical RAM
-- Adds [56:48] level, making 512 × 512 × 512 × 512 × 512 mapping
+**Sparse address space efficiency** (1 GB of heap in one contiguous, aligned region):
+
+| Level | Tables needed | Why |
+|---|---|---|
+| PGD | 1 | Root |
+| PUD | 1 | One entry covers the 1 GB |
+| PMD | 1 | 512 entries × 2 MB = 1 GB |
+| PTE | 512 | Each maps 2 MB (512 × 4 KB pages) |
+| **Total** | ~515 pages ≈ **2 MB** | ~0.2% overhead, vs 512 GB flat |
+
+With 2 MB huge pages the PTE level disappears for that region: 3 tables total.
+
+**5-level paging:** adds a P4D level (bits 56:48) for a 57-bit (128 PB) virtual space and up to 4 PB physical. Enabled on CPUs that support it (Intel since Ice Lake server, AMD Zen 4); 4-level paging limits virtual space to 256 TB and Linux to 64 TB of physical RAM.
+
+**What they probe next:**
+
+- **TLB miss cost:** a walk is up to 4 dependent memory accesses. Upper-level entries are usually in paging-structure caches and the data cache, so a typical walk costs tens of ns; when entries miss all caches it costs hundreds.
+- **Page faults:** a minor fault (page in memory, mapping missing) costs ~1 µs or less; a major fault (read from disk) costs the I/O latency.
+- **Virtualization:** nested (two-dimensional) paging means a guest TLB miss can need up to 24 memory accesses, another argument for huge pages in VMs.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Scale intuition** | Can immediately compute why flat page tables don't work |
-| **Sparse efficiency** | Explains that unused regions consume zero page table memory |
-| **TLB miss cost** | Understands that 4-level walk = 4 DRAM accesses (~40ns) without TLB |
+| **Sparse efficiency** | Explains that unused regions consume zero page table memory; counts tables correctly |
+| **TLB miss cost** | Knows a walk is up to 4 dependent accesses, usually partly cached |
 | **Page size trade-offs** | Knows 4KB vs 2MB vs 1GB pages and when to use each |
 
 ---
@@ -102,57 +91,58 @@ VA Bits: [47:39] | [38:30] | [29:21] | [20:12] | [11:0]
 
 ### Answer
 
-**Root Cause Diagnosis:**
+!!! tip "30-second answer"
+    The TLB covers only a few MB with 4 KB pages, while Redis does pointer-chasing lookups over a 12 GB heap, so most accesses miss and pay a page walk. Huge pages (2 MB) give ~500× more coverage per entry. **But for Redis specifically, the textbook fix backfires:** Redis forks for RDB/AOF persistence and relies on copy-on-write, and with Transparent Huge Pages every 4 KB write after the fork copies a whole 2 MB page, causing latency spikes and memory blow-up. Redis therefore disables THP for itself (`disable-thp yes`, the default). The right answer is to measure first, keep THP off (or `madvise`) for Redis, and attack the working set (sharding, smaller instances, better data structures); use huge pages for workloads that don't fork: JVM heaps, PostgreSQL shared buffers, DPDK, in-memory engines.
 
-```
-Single Redis process:
-- Working set: ~12GB (all data in memory)
-- Page size: 4KB
-- Pages accessed per operation: ~1M in worst case (BGSAVE + read workload)
-- TLB entries (modern x86):
-  - L1 DTLB: 64 entries
-  - L2 TLB: 1536 entries
-- TLB coverage at 4KB: 64 × 4KB = 256KB (L1) + 1536 × 4KB = 6MB (L2)
-- Total TLB covers: ~6MB of 12GB = 0.05% of working set
-```
-
-Every Redis operation touches pointers scattered across the 12GB heap. With only 6MB of TLB coverage, virtually every memory access misses the TLB and requires a 4-level page table walk (4 DRAM accesses = ~40ns per miss).
-
-**Solution: Huge Pages (2MB)**
+**Diagnosis — confirm it's really the TLB:**
 
 ```bash
-# Enable Transparent Huge Pages (THP) — but be careful
-echo always > /sys/kernel/mm/transparent_hugepage/enabled
-
-# Or use explicit huge pages for Redis
-echo 6000 > /proc/sys/vm/nr_hugepages  # 6000 × 2MB = 12GB
+perf stat -e dTLB-loads,dTLB-load-misses,dtlb_load_misses.walk_active -p $(pidof redis-server) -- sleep 10
+# walk_active cycles / total cycles ≈ fraction of time spent walking page tables
+cat /sys/kernel/mm/transparent_hugepage/enabled     # [always] madvise never
+grep AnonHugePages /proc/$(pidof redis-server)/smaps_rollup
 ```
 
-**New TLB Coverage with 2MB Pages:**
+**The numbers (Skylake-class x86; newer cores are larger but the shape holds):**
 
 ```
-- L1 DTLB: 64 × 2MB = 128MB
-- L2 TLB: 1536 × 2MB = 3GB
-- Total TLB coverage: ~3GB of 12GB = 25% (vs 0.05%)
+Working set: ~12 GB, random access
+L1 DTLB:  64 entries × 4 KB   = 256 KB
+L2 STLB: 1536 entries × 4 KB  =   6 MB
+Coverage: 6 MB / 12 GB ≈ 0.05% → nearly every random access misses the TLB
+
+With 2 MB pages:
+L1 DTLB:  32 entries × 2 MB   =  64 MB
+L2 STLB: 1536 entries × 2 MB  =   3 GB   (STLB shared by 4 KB and 2 MB entries)
+Coverage: 3 GB / 12 GB ≈ 25%, and each miss needs one fewer level to walk
 ```
 
-**Redis-Specific Guidance:**
-- Redis < 4.0 had issues with THP because copy-on-write on fork() would fragment huge pages
-- Redis 4.0+ uses `THP` correctly with `fork()` using `madvise` mode
-- For Redis ≥ 6.0, explicit 2MB huge pages via libc `malloc` arena = 30-40% throughput improvement
+**Huge page options:**
 
-**Trade-Off:**
-- Huge pages increase internal fragmentation (wasted memory within the last page)
-- For Redis with 12GB, worst case = 12GB / 2MB × 2MB/2 = 6MB waste → negligible
+| Option | How | Trade-offs |
+|---|---|---|
+| THP `always` | Kernel backs eligible anonymous memory with 2 MB pages automatically; `khugepaged` collapses pages in the background | No app change. Risks: compaction stalls on allocation, RSS bloat (a 2 MB page is charged even if 4 KB is used), fork + COW copying 2 MB at a time |
+| THP `madvise` | Only regions the app marks with `madvise(MADV_HUGEPAGE)` | Common distro default; apps opt in (JVM `-XX:+UseTransparentHugePages`) |
+| hugetlbfs (`vm.nr_hugepages`) | Pre-reserved pool, app maps explicitly (`MAP_HUGETLB`, PostgreSQL `huge_pages=on`) | Predictable, no compaction; memory is reserved even if unused, needs config |
+| 1 GB pages | hugetlbfs at boot | For very large, static heaps (databases, VMs) |
+
+```bash
+# Explicit pool for a database that supports it (not Redis): 6000 × 2 MB = 12 GB
+sysctl -w vm.nr_hugepages=6000
+```
+
+**For Redis:** keep THP at `madvise` or `never` (Redis warns at startup otherwise), and if TLB misses really dominate, reduce the per-instance working set (cluster sharding, several smaller instances per host) or make lookups more cache-friendly (smaller encodings such as listpacks for small hashes/sets). Also check `vm.overcommit_memory=1`, which Redis needs so `fork()` for BGSAVE doesn't fail (Q12).
+
+**What they probe next:** "Why does fork + THP hurt?" After fork, parent and child share pages read-only; the first write to a shared page copies it. With THP that copy is 2 MB instead of 4 KB, so a write-heavy Redis during BGSAVE can duplicate most of its memory and stall on each copy. "What about multi-size THP?" Since Linux 6.8, anonymous memory can use intermediate "mTHP" sizes (e.g. 64 KB) that some CPUs (ARM contiguous PTEs, AMD) coalesce in the TLB, a middle ground between 4 KB and 2 MB.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Quantitative** | Actual TLB entry counts, coverage calculations |
-| **Redis expertise** | Knows about fork()+THP fragmentation issue historically |
-| **Fractional vs explicit** | Understands THP madvise/always/never modes |
-| **Trade-off** | Mentions compaction overhead and swap size constraints |
+| **Redis expertise** | Knows fork + COW + THP is the trap and that Redis disables THP for itself |
+| **THP vs explicit** | Understands THP always/madvise/never and hugetlbfs |
+| **Trade-off** | Mentions compaction stalls, RSS bloat, measuring with perf before changing |
 
 ---
 
@@ -164,93 +154,80 @@ echo 6000 > /proc/sys/vm/nr_hugepages  # 6000 × 2MB = 12GB
 
 ### Answer
 
-**CFS Core Idea: "Perfect multitasking is impossible, so approximate it."**
+!!! tip "30-second answer"
+    Linux's fair scheduler gives each runnable thread CPU time in proportion to its **weight** (derived from nice). It tracks **virtual runtime**: real runtime scaled by `1024 / weight`, so heavier threads accumulate vruntime more slowly. Each CPU has its own runqueue, a red-black tree ordered by vruntime, and load balancing moves threads between CPUs, so 8 equal threads on 4 cores settle at 2 per core, each getting ~50% of a core. **Currency check:** since **Linux 6.6 (2023)** the pick-next algorithm is **EEVDF** (Earliest Eligible Virtual Deadline First), not classic CFS. Weights and vruntime remain; EEVDF picks among threads that are owed CPU time the one with the earliest virtual deadline, which gives better latency control. Since 6.12, **sched_ext** also lets you load a scheduler written in BPF.
 
-If we had 4 CPUs and 8 threads, ideal scheduling would give each thread exactly 50% of a CPU. CFS models this using **virtual runtime (vruntime)**.
-
-```
-vruntime = actual_runtime × (weight₀ / weight_thread)
-         = actual_runtime × (1024 / weight)
-```
-
-Where `weight` for `nice=0` is 1024 (the baseline).
-
-**Data Structure: Red-Black Tree (per-CPU runqueue)**
+**Virtual runtime:**
 
 ```
-      ┌──────────────────────────┐
-      │     CFS Runqueue         │
-      │     (RB-Tree keyed       │
-      │      by vruntime)        │
-      │                          │
-      │        ┌───┐            │
-      │        │min│◄──── pick   │
-      │        │vrun│   first    │
-      │       ┌┴───┴┐           │
-      │   ┌───┤     ├───┐       │
-      │  ┌┴┐ ┌┴┐   ┌┴┐ ┌┴┐     │
-      │  │ │ │ │   │ │ │ │      │
-      └──┴─┴─┴─┴───┴─┴─┴─┘────┘
+vruntime += delta_exec × (1024 / weight)      (weight of nice 0 = 1024)
 ```
 
-**Scheduling Decision (simplified code):**
+**Classic CFS (up to Linux 6.5):** always run the leftmost (smallest vruntime) task in the per-CPU red-black tree. The running task is taken out of the tree; on preemption or sleep it is re-inserted with its updated vruntime. A task waking from sleep has its vruntime raised to near the queue's `min_vruntime`, so sleeping doesn't bank unlimited credit.
 
 ```c
-// Every tick (~1ms on typical config)
-void scheduler_tick(struct task_struct *p) {
-    // 1. Update p's actual runtime
-    p->se.sum_exec_runtime += delta;
-
-    // 2. Calculate vruntime delta
-    u64 delta_vruntime = calc_delta_fair(delta, &p->se);
-    p->se.vruntime += delta_vruntime;
-
-    // 3. Re-insert into red-black tree
-    //    (might change position if vruntime increased enough)
-    rb_erase(&p->se.run_node, &rq->cfs.tasks_timeline);
-    rb_insert(&p->se.run_node, &rq->cfs.tasks_timeline);
+/* Simplified CFS logic, not real kernel code */
+void update_curr(struct cfs_rq *rq) {            /* on tick, wakeup, preemption */
+    u64 delta = now() - rq->curr->exec_start;
+    rq->curr->vruntime += delta * NICE_0_WEIGHT / rq->curr->weight;
+    if (should_preempt(rq))                       /* curr ran past its fair slice */
+        resched_curr(rq);
 }
 
-void schedule() {
-    struct task_struct *next;
-    struct rb_node *leftmost;
-
-    // Pick the thread with minimum vruntime
-    leftmost = rb_first(&rq->cfs.tasks_timeline);
-    next = rb_entry(leftmost, struct task_struct, se.run_node);
-
-    // Context switch to 'next'
-    context_switch(rq->curr, next);
+struct task *pick_next(struct cfs_rq *rq) {
+    if (rq->curr) rb_insert(&rq->tree, rq->curr); /* put previous back, keyed by vruntime */
+    struct task *next = rb_first_cached(&rq->tree); /* leftmost = O(1), cached */
+    rb_erase(&rq->tree, next);                    /* running task lives outside the tree */
+    return next;
 }
 ```
 
-**Nice Value Effect:**
+**EEVDF (Linux 6.6+):**
 
-| nice | weight | Relative share |
-|------|--------|----------------|
-| -20  | 88761  | 88761/1024 ≈ 86.7× of nice=0 |
-| -10  | 9548   | 9548/1024 ≈ 9.3× |
-| 0    | 1024   | Baseline |
-| 10   | 110    | 1024/110 ≈ 9.3% of nice=0 |
-| 19   | 15     | 1024/15 ≈ 1.5% of nice=0 |
+| Concept | Meaning |
+|---|---|
+| **Lag** | How much CPU time a task is owed compared to the ideal fair share. Lag ≥ 0 means the task is **eligible** |
+| **Virtual deadline** | Eligible time + `slice / weight`. A task asking for a shorter slice gets an earlier deadline |
+| **Pick rule** | Among eligible tasks, run the one with the earliest virtual deadline |
+| **Why it replaced CFS** | CFS needed a pile of heuristics (wakeup granularity, latency tunables) to give interactive tasks low latency; EEVDF expresses latency needs directly via slice length while keeping proportional fairness |
 
-A `nice -20` thread doesn't get 86.7× more CPU — it gets **proportionally weighted** CPU. If two threads (nice=0 and nice=-20) compete on one CPU:
-- nice=-20 gets: 88761/(88761+1024) = 98.9% CPU
-- nice=0 gets: 1024/(88761+1024) = 1.1% CPU
+The old CFS tunables (`sched_latency_ns`, `sched_min_granularity_ns`, `sched_wakeup_granularity_ns`) are gone in EEVDF kernels; the main knob is the base slice (`/sys/kernel/debug/sched/base_slice_ns`).
 
-**Load Balancing:**
-- CFS runs `load_balance()` every ~1ms or when a CPU goes idle
-- Pulls tasks from the busiest runqueue using `find_busiest_group()` and `find_busiest_queue()`
-- Uses a multi-level domain hierarchy: SMT → CORE → MC → NUMA → NUMA-other
+**Nice values:** each nice step is roughly a 1.25× weight change (≈10% CPU difference between two competing tasks).
+
+| nice | weight | Share vs one nice-0 task on the same CPU |
+|------|--------|------------------------------------------|
+| -20  | 88761  | 88761 / (88761 + 1024) ≈ 98.9% |
+| -10  | 9548   | ≈ 90.3% |
+| 0    | 1024   | 50% |
+| 10   | 110    | ≈ 9.7% |
+| 19   | 15     | ≈ 1.4% |
+
+Weights only matter when threads **compete** for the same CPU. A nice-19 thread on an idle core still gets 100%.
+
+**4 cores, 8 CPU-bound threads:**
+
+- Load balancing spreads them 2 per core. Balancing runs periodically per **scheduling domain** (SMT siblings → cores sharing a cache → package → NUMA nodes), more often at lower levels, plus "newidle" balancing when a CPU is about to go idle.
+- On each core the two threads alternate; each gets ~50% of a core.
+- Moving a thread across NUMA nodes is expensive (its memory stays behind), so balancing across NUMA is deliberately conservative; automatic NUMA balancing may migrate pages instead.
+
+**Other scheduling classes** (checked in priority order): `SCHED_DEADLINE` (EDF with runtime/period budgets), `SCHED_FIFO`/`SCHED_RR` (real-time, fixed priorities; can starve everything else), then the fair class (`SCHED_NORMAL`, `SCHED_BATCH`), `SCHED_IDLE`, and `sched_ext` (BPF schedulers, Linux 6.12+, used for experimentation and workload-specific policies).
+
+**What they probe next:**
+
+- **Containers:** cgroup CPU **weight** uses the same proportional mechanism between groups; CPU **quota** (`cpu.max`) is a hard cap that throttles even on an idle machine (Q11).
+- **Latency:** run-queue latency, not CPU utilisation, is what users feel. Measure it with `runqlat` (bcc/bpftrace) or `perf sched latency`.
+- **Thread pools:** more CPU-bound threads than cores only adds switching and cache pollution.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **vruntime** | Explains the weighted fair queuing concept clearly |
-| **RB-tree** | Knows why O(log n) is acceptable (< 1K threads) and EEVDF in newer kernels |
+| **Data structures** | Per-CPU RB-tree with cached leftmost; running task outside the tree |
+| **Currency** | Knows EEVDF replaced CFS's pick logic in 6.6 and what sched_ext is |
 | **Nice math** | Can calculate proportional shares for different nice values |
-| **Load balancing** | Mentions pull vs push, domain hierarchy, active vs idle balancing |
+| **Load balancing** | Scheduling domains, newidle balancing, NUMA caution |
 
 ---
 
@@ -262,66 +239,50 @@ A `nice -20` thread doesn't get 86.7× more CPU — it gets **proportionally wei
 
 ### Answer
 
-**Components of Context Switch Cost:**
+!!! tip "30-second answer"
+    The **direct** cost (enter the kernel, pick the next task, save and restore registers including FPU/SIMD state, switch stacks and, between processes, the page-table root) is on the order of **1–3 µs** on modern Linux with security mitigations. The **indirect** cost is usually bigger and harder to see: the next task runs with cold caches, branch predictors and TLB entries, which can cost tens of µs of slower execution. Thread switches inside one process skip the address-space change. **PCID** means switching CR3 no longer has to flush the TLB. Measure with `perf bench sched pipe` for the direct cost and with `perf stat` / `runqlat` in production.
 
-```
-1. Mode switch (user→kernel)         ~100ns
-2. Save registers (FPU/SIMD state)   ~200ns  (XSAVE takes longer with AVX-512)
-3. Switch kernel stack                ~10ns
-4. Switch page table (CR3 write)     ~50ns   ← This TLB flushes everything!
-5. Schedule() decision                ~100ns  (RB-tree lookup)
-6. Restore registers (XRSTOR)        ~200ns
-7. Mode switch (kernel→user)         ~100ns
-8. TLB/cache warmup                  ~1-10µs (cold cache, worst-case)
+**Components:**
 
-Total direct cost:       ~760ns (without cache effects)
-Total effective cost:    ~1-10µs (with TLB/cache miss penalty)
-```
+| Component | Notes |
+|---|---|
+| Kernel entry/exit | A syscall or interrupt. Spectre/Meltdown mitigations (KPTI, retpolines, IBRS) made this noticeably more expensive since 2018 |
+| Scheduler decision | Pick next task; cheap |
+| Save/restore registers | General-purpose registers are cheap; XSAVE/XRSTOR of AVX-512 state is several KB. Linux saves FPU state eagerly |
+| Address-space switch (process → process) | Write CR3. With **PCID** (used by Linux since 4.14), TLB entries are tagged per address space and survive the switch; without PCID the non-global TLB is flushed |
+| Indirect: cache, TLB and branch-predictor warm-up | Depends on working-set size; for a few MB of working set it can dominate everything above |
 
-**Why Context Switching Is Expensive — The TLB Angle:**
+**Measuring:**
 
-```c
-// Process A runs → TLB full of A's mappings
-// Context switch to B:
-write_cr3(B's_page_table);
+```bash
+# Direct cost: two processes ping-pong over a pipe (each round trip = 2 switches)
+perf bench sched pipe -l 1000000
+taskset -c 0 perf bench sched pipe -l 1000000   # pin both to one CPU to force switches
 
-// On next A's memory access: TLB has NOTHING for A
-// Every address → 4-level page table walk → 4 DRAM accesses
-// If A's working set is 4MB and 4KB pages:
-//   ~1000 TLB misses × ~40ns each = ~40µs of page walks
-//   Before: those were cached in TLB (~1ns per translation)
+# Rate in production
+perf stat -e context-switches,cpu-migrations -p <pid> -- sleep 10
+pidstat -w 1                    # voluntary (blocked) vs involuntary (preempted) per task
+
+# Run-queue latency: time from runnable to running (eBPF)
+runqlat 10 1                    # bcc tools; or: bpftrace -e 'tracepoint:sched:sched_switch ...'
 ```
 
-**L1/L2 Cache Devastation:**
-- L1 cache: 32KB — completely contaminated after switch
-- L2 cache: 1MB — mostly contaminated
-- L3 cache: typically shared (LLC), but if A runs on different core: cold
-- Cache miss: L1 ~4ns, L2 ~12ns, L3 ~40ns, DRAM ~100ns
-
-**Measuring in Production:**
-
-```c
-// Use perf to measure context switch cost directly
-// perf stat -e context-switches,cpu-migrations,cycles ./workload
-
-// Or trace context switches with eBPF:
-// bpftrace -e 'kprobe:finish_task_switch { @start = nsecs; }
-//              kretprobe:finish_task_switch { @latency = hist(nsecs - @start); }'
-```
+High **involuntary** switches mean CPU contention (too many runnable threads, or cgroup throttling). High **voluntary** switches mean threads block a lot (locks, I/O).
 
 **Practical implications:**
-- Thread pool with N threads on M CPUs: keep N ≈ M (no over-subscription)
-- Async I/O (io_uring) eliminates context switches entirely for I/O workloads
-- Busy-wait spinning (spinlock) can outperform mutex if wait time < context switch cost (~1µs)
+
+- CPU-bound pools: about one thread per core. I/O-bound work: use async I/O or lightweight tasks (goroutines, virtual threads) so blocking doesn't cost a kernel thread switch.
+- Spinning beats sleeping only if the expected wait is shorter than a switch; modern mutexes (futex-based, Go's and Java's locks) spin briefly before sleeping.
+- io_uring reduces **syscalls** (batching, and SQPOLL mode lets a kernel thread poll the queue), which removes kernel entries and some wakeups. It doesn't make context switching disappear.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **TLB awareness** | The CR3 write + TLB flush is the dominant cost |
-| **Measurement** | Can use perf/eBPF to measure, not just theoretical |
-| **Cache hierarchy** | Breaks down L1/L2/L3/DRAM for each component |
-| **practical** | Knows when context switching is worth avoiding |
+| **Direct vs indirect** | Separates the µs-level direct cost from cache/TLB warm-up |
+| **TLB awareness** | Knows PCID avoids TLB flushes; thread switches don't change CR3 |
+| **Measurement** | `perf bench sched pipe`, voluntary vs involuntary switches, runqlat |
+| **Practical** | Knows when context switching is worth avoiding and how |
 
 ---
 
@@ -333,133 +294,109 @@ write_cr3(B's_page_table);
 
 ### Answer
 
-**Evolution of I/O Models:**
+!!! tip "30-second answer"
+    `select`/`poll` pass the whole fd set on every call and the kernel scans it: O(n) per call, hopeless at 100K connections. `epoll` (and BSD/macOS `kqueue`) keep the interest set **in the kernel** and return only ready fds, so cost scales with activity, not with connections. But they are **readiness** APIs: after "fd is readable" you still make a `read()` syscall per fd. `io_uring` (Linux 5.1, 2019) is a **completion** API: you put operations into a shared-memory submission ring and collect results from a completion ring, batching many operations per syscall (or none, with polling), and it covers files too. Trade-off: io_uring has had many kernel security bugs, so it is **blocked by default** in Docker's seccomp profile and disabled at Google, Android and ChromeOS; check your platform before betting on it.
 
-| Model | Year | Complexity | Syscalls per event | Copy |
+**Evolution:**
+
+| API | Since | Model | Cost per wait call | Notes |
 |-------|------|-----------|-------------------|------|
-| `select` | 1983 | O(n) | 1 | Kernel→userspace (all fds) |
-| `poll` | 1997 | O(n) | 1 | Kernel→userspace (all fds) |
-| `epoll` | 2002 | O(1) | 1 + 1 setup | Kernel→userspace (ready fds) |
-| `io_uring` | 2019 | O(0)* | 0 (shared ring) | Zero-copy (shared memory) |
+| `select` | 4.2BSD (1983) | Readiness | O(n) scan + copy of fd bitmaps | Limited to `FD_SETSIZE` (1024) fds |
+| `poll` | SVR3 (1986); Linux 2.1 | Readiness | O(n) scan + copy of the array | No fd limit |
+| `epoll` | Linux 2.5.44 (2002) | Readiness | O(ready) | Interest set registered once with `epoll_ctl` |
+| `kqueue` | FreeBSD 4.1 (2000), macOS | Readiness (+ events for files, processes, signals, timers) | O(ready) | Registration changes can be batched into the same `kevent()` call |
+| IOCP | Windows NT | Completion | — | Completion model that io_uring resembles |
+| `io_uring` | Linux 5.1 (2019) | Completion | Many ops per `io_uring_enter`, or zero syscalls with SQPOLL | Sockets and files, plus open/stat/etc. |
 
-*For submission, not completion notification.
-
-**epoll Internals:**
+**epoll internals:**
 
 ```
-                    ┌──────────────┐
-                    │   epoll      │
-                    │  instance    │
-                    │              │
-                    │  RB-Tree     │ ← O(log n) add/remove monitored fds
-                    │  (all fds)   │
-                    │              │
-                    │  Ready List  │ ← Double-linked list of ready fds
-                    │  (ready fds) │     O(1) epoll_wait return
-                    └──────┬───────┘
-                           │
-              ┌────────────┼────────────┐
-              │            │            │
-         ┌────▼───┐  ┌────▼───┐  ┌────▼───┐
-         │ socket │  │ socket │  │ socket │
-         │   fd   │  │   fd   │  │   fd   │
-         └────────┘  └────────┘  └────────┘
+epoll instance (struct eventpoll)
+ ├── red-black tree of epitems   ← every monitored fd; epoll_ctl add/mod/del O(log n)
+ ├── ready list (rdllist)        ← fds with pending events
+ └── wait queue                  ← threads blocked in epoll_wait
+
+When a socket gets data, its wakeup callback (ep_poll_callback) appends the
+epitem to the ready list. epoll_wait just drains the ready list: no scan.
 ```
+
+Key details interviewers probe:
+
+- **Level- vs edge-triggered:** level-triggered reports an fd as long as it is readable; edge-triggered (`EPOLLET`) reports only transitions, so you must read until `EAGAIN` or you'll stall that connection.
+- **Thundering herd:** several threads waiting on one epoll fd or one listen socket can all wake. Fix with `EPOLLEXCLUSIVE` or `SO_REUSEPORT` (one listen socket per thread, kernel distributes connections).
+- Readiness APIs require **non-blocking** fds and only work for things that have a meaningful "ready" state: regular files are always "ready", so epoll can't make disk reads async.
+
+**The readiness-model loop:**
 
 ```c
-// epoll data structures (kernel)
-struct eventpoll {
-    struct rb_root_cached rbr;    // RB-Tree — all monitored fds
-    struct list_head rdllist;      // Ready list — fds with events
-    wait_queue_head_t wq;          // Wait queue — blocked epoll_wait callers
-};
-
-struct epitem {
-    struct rb_node rbn;            // RB-Tree node
-    struct list_head rdllink;      // Ready list link
-    struct epoll_filefd ffd;       // The fd being monitored
-    struct eventpoll *ep;          // Back-pointer to owning epoll
-    struct epoll_event event;      // The events of interest
-};
-```
-
-**The Problem with epoll:**
-
-```c
-// Every event still requires system calls:
-void event_loop() {
-    struct epoll_event events[1024];
-    while (1) {
-        int n = epoll_wait(epfd, events, 1024, -1);  // 1 syscall
-        for (int i = 0; i < n; i++) {
-            if (events[i].events & EPOLLIN) {
-                read(events[i].data.fd, buf, 4096);    // 1+ syscalls per event
-                process(buf);                           // application logic
-            }
-        }
+struct epoll_event events[1024];
+for (;;) {
+    int n = epoll_wait(epfd, events, 1024, -1);      /* 1 syscall */
+    for (int i = 0; i < n; i++) {
+        int fd = events[i].data.fd;
+        ssize_t r;
+        while ((r = read(fd, buf, sizeof buf)) > 0)   /* 1+ syscalls per ready fd */
+            process(fd, buf, r);
+        /* r == -1 && errno == EAGAIN → drained; r == 0 → peer closed */
     }
 }
 ```
 
-Each `read()` is a separate syscall → user→kernel→user transition (~100ns each).
-
-**io_uring — The Paradigm Shift:**
+**io_uring — the completion model:**
 
 ```
-                   Submission Queue (SQ)          Completion Queue (CQ)
-                   ┌──────────────────┐           ┌──────────────────┐
-User writes ───────►│  SQE  │  SQE    │           │  CQE  │  CQE    │
-to SQ ring          ├──────┼────────┤           ├──────┼────────┤
-                   │  SQE  │  SQE    │           │  CQE  │  CQE    │
-                   ├──────┼────────┤           ├──────┼────────┤
-                   │ ...  │         │           │ ...  │         │
-                   └──────────┬───────┘           └──────────┬───────┘
-                              │                              │
-                              │ kernel                       │
-                              │ processes                    │
-                              │ in batches                   │
-                              ▼                              ▼
-                        Kernel processes           User reads
-                        SQ entries →               completed
-                        I/O operations              CQ entries
+ user space                         kernel
+ ┌─────────────────────┐            ┌──────────────────────────┐
+ │ Submission Queue    │──(mmap)───►│ consumes SQEs: read,     │
+ │ SQE SQE SQE ...     │            │ recv, send, accept, ...  │
+ └─────────────────────┘            └────────────┬─────────────┘
+ ┌─────────────────────┐                         │
+ │ Completion Queue    │◄──(mmap)────────────────┘ posts CQEs
+ │ CQE CQE ...         │   (result + user_data)
+ └─────────────────────┘
+ Both rings live in memory shared by kernel and process: submitting and
+ reaping are plain memory writes/reads. A syscall (io_uring_enter) is needed
+ only to tell the kernel there is work or to wait, unless SQPOLL is on.
 ```
 
 ```c
-// io_uring — zero syscall per I/O operation
+#include <liburing.h>
+
 struct io_uring ring;
-io_uring_queue_init(4096, &ring, 0);    // 2 syscalls (mmap + setup)
+io_uring_queue_init(4096, &ring, 0);                 /* io_uring_setup + mmap the rings */
 
-// Submit 100 read operations with NO syscalls:
-struct io_uring_sqe *sqe;
-for (int i = 0; i < 100; i++) {
-    sqe = io_uring_get_sqe(&ring);                 // Get next SQE (user-space)
-    io_uring_prep_read(sqe, fds[i], bufs[i], 4096, 0);  // Fill SQE (user-space)
+for (int i = 0; i < 100; i++) {                      /* queue 100 reads, no syscalls */
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe, fds[i], bufs[i], 4096, 0);
+    io_uring_sqe_set_data64(sqe, i);                 /* tag to match the completion */
 }
-io_uring_submit(&ring);   // 1 syscall for 100 operations ← HUGE WIN
+io_uring_submit(&ring);                              /* ONE syscall for 100 operations */
 
-// Reap completions:
 struct io_uring_cqe *cqe;
-while (1 - io_uring_peek_cqe(&ring, &cqe)) {   // No syscall if events ready
-    // process(cqe);
+io_uring_wait_cqe(&ring, &cqe);                      /* block for at least one */
+do {
+    handle(cqe->user_data, cqe->res);                /* res = bytes read or -errno */
     io_uring_cqe_seen(&ring, cqe);
-}
+} while (io_uring_peek_cqe(&ring, &cqe) == 0);       /* 0 = got one; -EAGAIN = empty */
 ```
 
-**Why io_uring Is a Paradigm Shift:**
-1. **Batched submission/reaping** — one syscall amortizes 100s of operations
-2. **Zero-copy** — SQ/CQ rings are shared memory between kernel and userspace
-3. **Asynchronous deep** — `read()` doesn't block even for page cache misses (kernel handles it)
-4. **No O_NONBLOCK required** — io_uring handles blocking internally
-5. **File system operations** — `openat()`, `statx()`, `rename()` all async (epoll can't do this)
+**Why io_uring was a paradigm shift:**
+
+1. **Batching:** one `io_uring_enter` submits and reaps many operations; with `IORING_SETUP_SQPOLL` a kernel thread polls the submission ring, so the hot path needs no syscalls (at the cost of a busy core).
+2. **Real async for files:** buffered and direct file I/O complete asynchronously (blocking cases are handed to kernel worker threads), which epoll can't do.
+3. **Fewer copies and lookups:** registered buffers and files avoid per-op setup; **zero-copy send** (`IORING_OP_SEND_ZC`, 6.0) and later zero-copy receive avoid data copies. Note: the **rings** are shared memory, but ordinary reads still copy data into your buffer.
+4. **Network features:** multishot `accept`/`recv` (one SQE produces many completions) and provided-buffer rings let a server avoid allocating a buffer per idle connection.
+
+**Practical choice for 100K connections:** epoll (via your runtime: Netty, Go's netpoller, Tokio, libuv) is mature and fast; io_uring pays off when syscall overhead dominates (many small operations), when mixing network and file I/O, or with storage-heavy engines. Check that your kernel and container seccomp profile allow it (`kernel.io_uring_disabled` sysctl, Linux 6.6+), and that you can absorb its security update cadence.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Data structures** | RB-tree + ready list for epoll; shared ring buffers for io_uring |
-| **Syscall cost awareness** | Knows each syscall is ~100ns, batch = free |
-| **io_uring depth** | Understands SQ/CQ ring semantics, IORING_SETUP_IOPOLL |
-| **Practical limitations** | Knows epoll still used when io_uring overkill (simple servers) |
+| **Data structures** | RB-tree + ready list for epoll; shared SQ/CQ rings for io_uring |
+| **Readiness vs completion** | Explains why epoll can't do async disk I/O and io_uring can |
+| **io_uring depth** | Batching, SQPOLL, registered buffers, multishot, zero-copy send |
+| **Practical limitations** | Security track record, seccomp blocking, epoll still the default in most runtimes |
 
 ---
 
@@ -471,115 +408,83 @@ while (1 - io_uring_peek_cqe(&ring, &cqe)) {   // No syscall if events ready
 
 ### Answer
 
-**The Full Stack:**
+!!! tip "30-second answer"
+    `malloc(512)` in glibc is almost always served in user space: first the per-thread **tcache**, then the arena's bins, then by splitting the arena's **top chunk**. Only when the arena runs out does glibc call `brk` (main arena) or `mmap` (other arenas, and any request above the **mmap threshold**, 128 KB by default and adjusted dynamically). Even then, the kernel only reserves **virtual** address space: physical pages are allocated lazily on first touch by the page-fault handler, from the buddy allocator. Fragmentation shows up as RSS that never shrinks after frees (holes in the heap) and as per-thread arena bloat; jemalloc/tcmalloc/mimalloc or `MALLOC_ARENA_MAX` are the usual fixes.
+
+**The full stack:**
 
 ```
 malloc(512)
     │
     ▼
-┌─────────────────────────────────┐
-│   glibc malloc (ptmalloc3)      │
-│   • Thread-local cache (tcache) │  ← Service from here if hot
-│   • Fastbins (16-96 bytes)      │
-│   • Small bins                   │
-│   • Unsorted bin                 │
-│   • Large bins (LIFO best-fit)  │
-└────────────────┬────────────────┘
-                 │ arena lock (if cross-thread)
-                 ▼
-┌─────────────────────────────────┐
-│   brk() / sbrk()   or   mmap()  │
-│                                 │
-│   < 128KB: sbrk (heap growth)  │
-│   ≥ 128KB: mmap (anonymous)     │
-└────────────────┬────────────────┘
-                 ▼
-┌─────────────────────────────────┐
-│   Kernel Page Allocator         │
-│   (Buddy System — 2^n pages)    │
-│   • Zone Normal / DMA           │
-│   • Watermark: min/low/high    │
-│   • Compaction / reclaim        │
-└────────────────┬────────────────┘
-                 ▼
-              Physical RAM
+glibc malloc (ptmalloc2)
+  1. tcache (per thread, no lock): 64 size classes up to 1032 B, 7 chunks each
+  2. arena bins (arena lock): fastbins (small sizes), smallbins (< 1 KB),
+     unsorted bin (recently freed), largebins (sorted, best fit)
+  3. split the arena's "top" chunk
+  4. grow the arena: brk() for the main arena, mmap'd heaps for other arenas
+  (requests ≥ mmap threshold go straight to mmap)
+    │  system call only reserves virtual address space (VMA)
+    ▼
+first write to the page → page fault → kernel allocates a physical page
+    │
+    ▼
+buddy allocator: free lists of 2^order contiguous pages per zone;
+watermarks (min/low/high) trigger kswapd reclaim and compaction
+    │
+    ▼
+physical RAM (zeroed page mapped into the process)
 ```
 
-**Detailed Path for `malloc(512)`:**
+**Path for `malloc(512)`:**
 
-```c
-void *p = malloc(512);
+1. Round up to a chunk size: 512 + 8 B header, aligned to 16 → **528 B** chunk.
+2. **tcache** bin for 528 B non-empty? Pop and return (the common fast path).
+3. Otherwise lock the thread's **arena**. Exact-size **smallbin** match? Return it (and refill tcache from that bin).
+4. Process the **unsorted bin** (recently freed chunks): exact fit returns, others get sorted into small/large bins.
+5. Search larger bins; split a bigger chunk if found.
+6. Split the **top chunk**. If it's too small, extend the heap with `brk` (or a new mmap'd heap for non-main arenas).
 
-// Step 1: tcache (per-thread cache, since glibc 2.26+)
-//   - 64 bins × up to 7 entries each
-//   - Lock-free (!) — uses TLS pointer
-//   - If tcache[bin_for(512)] is not empty:
-//       return pop(tcache[bin_for(512)]);
-//   - Otherwise: fall through
+**brk vs mmap:**
 
-// Step 2: Check fastbin (16-96 bytes, LIFO)
-//   512 bytes → too large for fastbin
-
-// Step 3: Check small bin (exact size match)
-//   - If matching chunk found: return it
-//   - Otherwise: consolidate adjacent free chunks (coalescing)
-
-// Step 4: Check unsorted bin
-//   - Recent free() chunks land here first
-//   - If exact match found: return
-//   - Otherwise: sort into small/large bins
-
-// Step 5: Check large bins (best-fit search)
-//   - O(n) search for smallest chunk ≥ 512 bytes
-
-// Step 6: Extend heap via sbrk(512 + overhead)
-//   - Kernel finds free physical pages
-//   - Maps them into process address space
-//   - Splits into desired chunk
-//   - Returns pointer
-```
-
-**sbrk vs mmap Decision:**
-
-| Factor | sbrk (heap) | mmap (anonymous) |
+| Factor | brk heap / arena | Direct mmap |
 |--------|-------------|------------------|
-| Threshold | < 128KB | ≥ 128KB (or mmap_threshold) |
-| Reclaim | Can't return to OS (contiguous) | `munmap` immediately releases |
-| Fragmentation | Internal + external | None (each mmap is independent) |
-| TLB | Nearby allocations share pages | Each mmap is at random address |
-| Cost | O(1) | O(n) page table manipulation |
+| Used for | Requests below the threshold | Requests ≥ `M_MMAP_THRESHOLD` (128 KB default; raised dynamically up to 32 MB on 64-bit when mmapped chunks are freed) |
+| Returning memory | Top of heap is trimmed back with `brk` past `M_TRIM_THRESHOLD`; free pages inside the heap can be released with `madvise(MADV_DONTNEED)` via `malloc_trim()` | `munmap` on free releases immediately |
+| Fragmentation | Holes between live chunks keep pages resident | Page-granular: rounds up to 4 KB, no sharing between allocations |
+| Cost | Mostly user space | Syscall + page faults on use + `munmap` (TLB shootdown across CPUs) each time |
 
-**Fragmentation Patterns:**
+**Fragmentation patterns:**
 
 ```
-Before (after alloc/free cycles):
-│████░░░░████░░░░████░░░░│  ← External fragmentation
-│  FFFF  │  FFFF  │  FFFF │  ← Free chunks too small to use
-└────────────────────────┘
+External fragmentation in the heap (after many alloc/free cycles):
+│ live │ free │ live │ free │ live │ free │ live │  ← plenty free in total,
+                                                     but no single hole fits a
+                                                     large request; and the heap
+                                                     can't shrink below the
+                                                     highest live chunk
 
 Internal fragmentation:
-│  malloc(1) → 4KB page → 4095 bytes wasted │  ← Internal fragmentation
-
-Chunk header overhead:
-│ 8-byte header │ 512-byte payload │ 8-byte canary │
-                                                 ↑ Glibc uses this for
-                                                   consolidation info
+  malloc(1) → minimum 32 B chunk on 64-bit (8 B header + alignment)
+  malloc(130 KB) via mmap → rounded up to 33 pages
 ```
 
-**Production Mitigations:**
-- `jemalloc` / `tcmalloc` — arena-based, reduces fragmentation, better multi-threaded perf
-- `MALLOC_ARENA_MAX=4` — limit glibc arenas to reduce VMA count
-- Huge pages — 2MB reduces page-level fragmentation
-- Memory pools for fixed-size allocations (no fragmentation at all)
+**Production patterns and mitigations:**
+
+- **Arena bloat:** glibc creates up to 8 × cores arenas on 64-bit; many threads with alloc/free churn can make RSS much larger than live data. `MALLOC_ARENA_MAX=2` or `4` is a classic fix for JVMs and Go-cgo-heavy services with native leaks that aren't leaks.
+- **Alternative allocators:** jemalloc (size classes, per-thread caches, background purging; used by Redis, Rust historically), tcmalloc (per-CPU caches), mimalloc. Choose by measuring RSS and p99 latency.
+- **Slab/pool allocators** for fixed-size objects avoid fragmentation entirely.
+- **Diagnose:** `pmap -x`, `/proc/<pid>/smaps_rollup`, `malloc_info()`, and heap profilers (jemalloc `prof`, heaptrack).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Stack depth** | Traces through tcache → bins → brk/mmap → buddy → physical |
-| **Thresholds** | Knows 128KB mmap threshold, tcache bin count |
-| **Fragmentation** | Distinguishes internal vs external, can draw it |
-| **Tooling** | Can use `pmap`, `/proc/self/smaps`, `malloc_stats()` to diagnose |
+| **Stack depth** | Traces tcache → bins → top chunk → brk/mmap → page fault → buddy |
+| **Lazy allocation** | Knows brk/mmap reserve virtual memory; physical pages come on first touch |
+| **Thresholds** | Knows the 128KB dynamic mmap threshold, tcache sizes, arena count |
+| **Fragmentation** | Distinguishes internal vs external, explains RSS that won't shrink |
+| **Tooling** | Can use `pmap`, `/proc/self/smaps`, `malloc_info()` to diagnose |
 
 ---
 
@@ -591,146 +496,89 @@ Chunk header overhead:
 
 ### Answer
 
-**The Path of a `pread()`:**
+!!! tip "30-second answer"
+    `pread()` goes through the VFS to the **page cache**, an in-memory cache of file contents indexed per file (an xarray keyed by page offset). On a hit the kernel **copies** the data into the user buffer; on a miss the filesystem maps the file offset to disk blocks and the block layer (blk-mq) sends the request to the NVMe driver, with readahead fetching more for sequential reads. Writes land in the page cache as dirty pages and are written back later by flusher threads. **O_DIRECT** bypasses the page cache: DMA goes straight to the (aligned) user buffer. InnoDB uses it because it has its own buffer pool and double caching wastes RAM; PostgreSQL historically relies on the page cache instead.
+
+**The path of a `pread()`:**
 
 ```
-pread(fd, buf, 4096, offset)
-
-    │
-    ▼
-┌─────────────────────┐
-│   VFS Layer          │
-│ (virtual file system)│
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   Page Cache         │ ◄── Check if page is already cached
-│   (radix tree /      │
-│    xarray keyed by   │
-│    inode + offset)   │
-│                      │
-│   ┌──────────┐      │
-│   │ 4KB page │      │  ← Hit: copy to user buffer, zero-copy!
-│   │  (cached)│      │     No disk I/O needed
-│   └──────────┘      │
-│                      │
-│   ┌──────────┐      │
-│   │ 4KB page │      │  ← Miss: need I/O
-│   │ (empty)  │      │
-│   └──────────┘      │
-└─────────┬───────────┘
-          │ (page miss)
-          ▼
-┌─────────────────────┐
-│   File System        │  ← ext4, xfs, btrfs
-│   (extents / inodes) │
-│                      │
-│   Maps file offset   │
-│   → logical block # │
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   Block Layer        │
-│   (I/O scheduler)    │
-│                      │
-│   • Merge adjacent   │
-│   • Sort elevator    │
-│   • Plug/unplug      │
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   Device Driver      │
-│   (NVMe / AHCI)     │
-│                      │
-│   • DMA setup        │
-│   • Interrupt or     │
-│     polling           │
-└─────────┬───────────┘
-          │
-          ▼
-         ╔══════╗
-         ║ Disk ║  ← Actual I/O (~10μs NVMe, ~5ms HDD)
-         ╚══════╝
+pread(fd, buf, 16384, offset)
+  │
+  ▼
+VFS: file → inode → address_space
+  │
+  ▼
+Page cache lookup (xarray indexed by file page offset; pages grouped into folios)
+  ├─ hit:  copy_to_user() into buf → done (one memory copy, no I/O)
+  └─ miss: allocate pages, lock them, start I/O; readahead may fetch more
+  │
+  ▼
+Filesystem (ext4/XFS): file offset → extent → disk block numbers
+  │
+  ▼
+Block layer (blk-mq): per-CPU software queues → hardware queues;
+  I/O scheduler is usually "none" for NVMe, mq-deadline/BFQ for slower devices;
+  plugging merges adjacent requests
+  │
+  ▼
+NVMe driver: submission/completion queues, DMA into the page cache pages,
+  completion via interrupt (or polling)
+  │
+  ▼
+Device: ~10s of µs for NVMe flash random reads, ~5-10 ms for HDD seeks
+  │
+  ▼
+Pages marked up to date, waiting reader woken, data copied into buf
 ```
 
-**Page Cache Anatomy:**
-
-```c
-struct address_space {  // embedded in every inode
-    struct xarray i_pages;          // Page cache (radix tree replacement)
-    struct rb_root_cached i_mmap;   // Memory-mapped pages
-    const struct address_space_operations *a_ops;
-    unsigned long nrpages;          // Total cached pages
-};
-
-struct page {
-    unsigned long flags;            // PG_dirty, PG_uptodate, PG_locked...
-    struct address_space *mapping;  // Backing address_space
-    pgoff_t index;                  // Page index within the file
-    void *private;                  // Filesystem-specific data
-    // ... union with LRU lists, swap entries...
-};
-```
-
-**The Page Cache as a Read/Write Buffer:**
+**Write path and dirty page tunables:**
 
 ```
-         Application
-         read()/write()
-             │
-             ▼
-      ┌──────────────┐
-      │  Page Cache   │ ◄── Writes go here first (write-back cache)
-      │  (dirty pages) │
-      └──────┬───────┘
-             │ pdflush/flusher threads
-             │ (controlled by /proc/sys/vm/dirty_*)
-             ▼
-      ┌──────────────┐
-      │   Disk I/O    │
-      └──────────────┘
+write() → copy into page cache, mark dirty → return (fast)
+        → per-device flusher threads write back later (pdflush was replaced in 2.6.32)
+        → fsync() forces dirty pages and metadata to stable storage
 ```
 
-**Key tunables:**
-- `dirty_background_ratio` (default 10%) — start writing in background
-- `dirty_ratio` (default 20%) — force synchronous writes (processes block!)
-- `dirty_expire_centisecs` (default 3000 = 30s) — max age of dirty page
-- `dirty_writeback_centisecs` (default 500 = 5s) — flusher wake interval
+| Tunable | Default | Effect |
+|---|---|---|
+| `vm.dirty_background_ratio` | 10% | Above this, background writeback starts |
+| `vm.dirty_ratio` | 20% | Above this, **writing processes are throttled** in `balance_dirty_pages()` and effectively write synchronously |
+| `vm.dirty_expire_centisecs` | 3000 (30 s) | Dirty data older than this gets written back |
+| `vm.dirty_writeback_centisecs` | 500 (5 s) | Flusher wake-up interval |
+
+On machines with lots of RAM, percentage-based limits allow many GB of dirty data, causing long write stalls; use `dirty_background_bytes` / `dirty_bytes` instead.
+
+**Reading 10 GB through the page cache:** a big sequential scan can evict hotter data. Linux's LRU (split into active/inactive lists, and the newer multi-gen LRU, MGLRU, default on many distros since 6.1) resists this somewhat; applications can also use `posix_fadvise(POSIX_FADV_SEQUENTIAL / DONTNEED)`.
 
 **Direct I/O (O_DIRECT):**
 
 ```c
-// MySQL uses O_DIRECT for InnoDB data files
-fd = open("ibdata1", O_RDWR | O_DIRECT);
-
-pread(fd, buf, 4096, offset);
+int fd = open("ibdata1", O_RDWR | O_DIRECT);
+/* buffer, offset and length must be aligned to the logical block size (often 512 B or 4 KB) */
+void *buf;
+posix_memalign(&buf, 4096, 16384);
+pread(fd, buf, 16384, offset);   /* DMA straight into buf; page cache skipped */
 ```
 
-With direct I/O:
-```
-pread() → VFS → File System → Block Layer → Disk
-                        ↑
-                   SKIPS page cache!
-```
+**Why databases differ:**
 
-**Why databases use direct I/O:** Double buffering — if MySQL maintains its own buffer pool (InnoDB buffer pool), the page cache just duplicates data. MySQL knows its access patterns better (e.g., sequential scan eviction policy vs LRU).
+| | InnoDB (MySQL) | PostgreSQL |
+|---|---|---|
+| Data files | `innodb_flush_method=O_DIRECT` (default on Linux in MySQL 8.4) | Buffered I/O through the page cache |
+| Caching | Large buffer pool (often 50–75% of RAM) | Modest `shared_buffers` (~25% of RAM) + OS page cache: double buffering accepted |
+| Async I/O | Own I/O threads, Linux native AIO | **PostgreSQL 18** (2025) added asynchronous I/O (`io_method = worker` default, or `io_uring`) |
+| Why | Knows its access pattern, avoids double caching, predictable memory | Simpler, portable, benefits from kernel readahead and writeback |
 
-**Trade-off:**
-- Page cache = OS manages caching for all processes (simple)
-- Direct I/O = app manages caching (more control, more complexity)
-- MySQL: uses O_DIRECT for data files, page cache for logs (sequential writes benefit from write-back)
+**What they probe next:** "Is `write()` durable?" No: only after `fsync`/`fdatasync` returns success. And if `fsync` reports an error, the dirty pages may already have been dropped, so retrying `fsync` can falsely succeed; PostgreSQL now panics on fsync failure for this reason (the 2018 "fsyncgate" discussion).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Full path** | VFS → page cache → FS → block → driver → disk |
-| **Dirty page mechanics** | Explains flusher threads, dirty ratios, blocking behavior |
-| **Database expertise** | Knows why DBs use O_DIRECT (no double buffering) |
-| **xarray** | Knows radix tree → xarray change in recent kernels |
+| **Full path** | VFS → page cache → FS → blk-mq → driver → device, and the copy on hit |
+| **Dirty page mechanics** | Explains flusher threads, dirty ratios, writer throttling |
+| **Database expertise** | Knows why InnoDB uses O_DIRECT and Postgres doesn't; fsync semantics |
+| **Kernel currency** | xarray/folios, blk-mq, MGLRU |
 
 ---
 
@@ -742,100 +590,63 @@ pread() → VFS → File System → Block Layer → Disk
 
 ### Answer
 
-**Quick Comparison:**
+!!! tip "30-second answer"
+    At real scale, an image host stores blobs in **object storage** (S3, GCS, Ceph, or a Haystack-style blob store), not as one file per image on a local filesystem, because billions of small files make inode and directory metadata the bottleneck. For the local disks underneath (or a smaller self-hosted setup), pick **XFS**: allocation groups give parallel allocation and it scales to huge filesystems and files (it's the RHEL default). ext4 is a fine, simpler choice; both use extents and delayed allocation. btrfs earns its complexity only if you need checksummed data, snapshots or transparent compression on the host itself, and its RAID 5/6 is still not recommended for production.
+
+**Quick comparison:**
 
 | Feature | ext4 | XFS | btrfs |
 |---------|------|-----|-------|
-| Allocator | extents (4KB+ contiguous) | B+ tree extents | Copy-on-Write B-tree |
-| Journal | Journal (metadata) | Log (metadata) | No journal (COW) |
-| Max fs size | 1 exabyte | 8 exabytes | 16 exabytes |
-| Max file size | 16 TB | 8 exabytes | 16 exabytes |
-| Subvolumes | No | No | Yes |
-| Snapshots | No | No | Yes (COW) |
-| Checksums | Metadata only | Metadata only | Data + metadata (CRC32C) |
-| Defrag | Offline | Online (xfs_fsr) | Online (btrfs filesystem defrag) |
-| RAID | No (mdadm) | No (mdadm/LVM) | RAID0/1/5/6/10 native |
-| Dedup | No | No | Yes (offline) |
-| Compression | No | No | Yes (zlib/lzo/zstd) |
+| Allocation | Extents, delayed allocation, flex block groups | Extents in B+trees, delayed allocation, **allocation groups** | Copy-on-write B-trees |
+| Crash consistency | Journal (metadata by default; `data=ordered`) | Metadata log | COW + checksummed trees (no journal needed) |
+| Max fs / file size | 1 EiB / 16 TiB (4 KB blocks) | 8 EiB / 8 EiB | 16 EiB / 16 EiB |
+| Checksums | Metadata (`metadata_csum`) | Metadata (v5 format) | Data + metadata |
+| Snapshots | No | No (but **reflinks**: `cp --reflink`) | Yes (subvolumes) |
+| Dedup | No | Yes, via reflink-based `FIDEDUPERANGE` (offline tools) | Yes (offline, e.g. duperemove) |
+| Compression | No | No | zstd / lzo / zlib |
+| Online defrag | Yes (`e4defrag`) | Yes (`xfs_fsr`) | Yes |
+| Shrink | Offline | **Effectively no** (only a limited, experimental shrink of free space at the end) | Online |
+| RAID | Via mdadm/LVM | Via mdadm/LVM | Native 0/1/10 fine; **5/6 not production-ready** |
 
-**Image Hosting Workload Profile:**
-- Large files (500KB–10MB per image)
-- Write-once, read-many (90:10 read ratio)
-- No overwrites (immutable images)
-- Snapshots for backup
-- Possible dedup if users upload the same image
+**Image hosting workload:** files of 100 KB–10 MB, write once, read many, never modified, huge count, heavy read concurrency, backups needed.
 
-**XFS — The Pick for Image Hosting:**
+**Why XFS fits the local layer:**
 
 ```
-XFS Allocation Groups (AG):
-┌─────────────────────────────────────┐
-│ AG 0    │ AG 1    │ AG 2    │ AG 3  │
-│ (4GB)   │ (4GB)   │ (4GB)   │ (4GB) │
-├─────────┼─────────┼─────────┼─────────┤
-│ S  B  I  │ S  B  I  │ S  B  I  │ S  B  I │
-│ u  l  n  │ u  l  n  │ u  l  n  │ u  l  n │
-│ p  o  o  │ p  o  o  │ p  o  o  │ p  o  o │
-│ e  c  d  │ e  c  d  │ e  c  d  │ e  c  d │
-│ r  k  e  │ r  k  e  │ r  k  e  │ r  k  e │
-│ b     s  │ b     s  │ b     s  │ b     s  │
-│ l        │ l        │ l        │ l        │
-│ o        │ o        │ o        │ o        │
-│ c        │ c        │ c        │ c        │
-│ k        │ k        │ k        │ k        │
-└─────────┴─────────┴─────────┴─────────┘
-Key: S=Superblock, B=B+Tree, I=Inode
+XFS filesystem
+┌──────────────┬──────────────┬──────────────┬──────────────┐
+│    AG 0      │    AG 1      │    AG 2      │    AG 3      │
+│ own free-    │ own free-    │ own free-    │ own free-    │
+│ space B+trees│ space B+trees│ space B+trees│ space B+trees│
+│ own inode    │ own inode    │ own inode    │ own inode    │
+│ B+tree       │ B+tree       │ B+tree       │ B+tree       │
+└──────────────┴──────────────┴──────────────┴──────────────┘
+Each allocation group is an independent allocator with its own locks,
+so concurrent writers in different directories rarely contend.
 ```
 
-**Why XFS Wins Here:**
+1. **Parallel allocation** through allocation groups.
+2. **Extents + delayed allocation** (ext4 has both too): blocks are chosen at writeback time, when the final size is known, so a 10 MB image usually lands in one or a few contiguous extents.
+3. **Scales** to very large filesystems and directories with B+tree indexes.
 
-1. **Parallel allocation** — Allocation groups = independent allocators. 8 concurrent image uploads don't contend.
+**btrfs when the host needs it:**
 
-2. **Extent-based allocation** — A 10MB image file is stored as a single extent (or a few). No fragmentation. Fast sequential reads.
-
-3. **Delayed allocation** — XFS buffers writes up to 30s before allocating blocks. This lets it see the final file size and allocate a single contiguous extent.
-
-```c
-// XFS delayed allocation example:
-write(fd, image_data_1, 5MB);    // XFS: "hmm, I'll wait"
-write(fd, image_data_2, 5MB);    // XFS: "10MB total, got it"
-// 30s later OR fsync():
-// XFS allocates ONE 10MB extent contiguous on disk
-// This is MUCH faster than writing 2 extents separated by other writes
+```bash
+btrfs subvolume snapshot -r /images /snapshots/images-$(date +%Y%m%d)  # instant, COW-shared
+mount -o compress=zstd /dev/sdb /images   # JPEG/PNG/WebP are already compressed;
+                                          # btrfs detects incompressible data and skips it
 ```
 
-4. **Efficient metadata** — B+ tree extents mean O(log n) lookup even for 100TB filesystems. ext4 uses HTree for directories (hash table with overflow B-tree).
-
-**btrfs — Better for Some Cases:**
-
-```c
-// If you need snapshots and compression:
-btrfs subvolume snapshot /images /backups/$(date +%Y%m%d)
-// Instant! ~0 seconds, uses COW to share unchanged blocks
-// Only tracks blocks that differ from previous snapshot
-
-// Compression (zstd is fast enough for images):
-mount -o compress=zstd /dev/sdb /images
-// Compresses images transparently
-// PNG/JPEG already compressed → minimal gain (~5% savings)
-```
-
-**ext4 — When You Need Simplicity:**
-- Most battle-tested (since 2008)
-- Every distro supports it
-- fsck is reliable
-- Best for embedded/boot partitions
-
-**Verdict for Image Hosting:** XFS. For workloads where files are large, mostly append/read, and concurrent, XFS's allocation groups and delayed allocation crush ext4. btrfs is only worth the complexity if you need native snapshots/compression.
+**The staff-level point: avoid one-file-per-image at scale.** Facebook's Haystack paper (2010) showed that reading a photo from a regular filesystem cost several disk operations just for directory and inode metadata. Their fix: pack many images into large append-only files and keep an in-memory index (`image id → file, offset, size`), so each read is one disk operation. Object stores do the equivalent internally. With a CDN in front (Q9 in Networks), the origin's filesystem mostly serves cache misses anyway.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Allocation awareness** | Explains how delayed allocation creates contiguous extents |
-| **Parallelism** | Knows XFS AGs = no lock contention on parallel writes |
-| **COW** | Understands snapshot mechanics for btrfs |
-| **Real trade-offs** | Doesn't choose btrfs for everything — knows where each excels |
+| **Allocation awareness** | Explains extents and delayed allocation (and that ext4 has it too) |
+| **Parallelism** | Knows XFS AGs reduce lock contention on parallel writes |
+| **COW** | Understands snapshot/reflink mechanics, btrfs RAID5/6 caveat |
+| **Real trade-offs** | Recognises the metadata problem of billions of small files; object storage / Haystack |
 
 ---
 
@@ -847,133 +658,142 @@ mount -o compress=zstd /dev/sdb /images
 
 ### Answer
 
-**IPC Comparison:**
+!!! tip "30-second answer"
+    For the hot path, a **single-producer/single-consumer ring buffer in shared memory** (`shm_open` + `mmap`, or a file in hugetlbfs/tmpfs) with acquire/release atomics: no syscalls, no kernel copies, latency dominated by moving a cache line between cores (~100 ns on one socket). The consumer must busy-poll (burning a core) or fall back to an `eventfd`/futex wakeup, which brings back µs latency. Use a Unix domain socket for the control plane and anything that isn't latency-critical, because it gives you framing, backpressure and crash detection for free. Also ask the design question: a **pre-trade** risk check that can block an order belongs **inside** the C++ engine; a Go service is better suited to post-trade/aggregate risk fed asynchronously.
 
-| Mechanism | Latency | Throughput | Complexity | Use Case |
-|-----------|---------|-----------|------------|----------|
-| Pipe | ~3-5µs | ~500MB/s | Trivial | Parent-child, small messages |
-| Unix socket | ~5-10µs | ~1GB/s | Low | Network-style, cross-language |
-| Shared memory | ~100ns | ~100GB/s | High | HFT, massive data |
-| Message queue | ~50-200µs | ~100MB/s | Medium | Async, durable messaging |
+**IPC comparison** (same host; orders of magnitude, measure on your hardware):
 
-**Shared Memory Design for HFT:**
+| Mechanism | One-way latency | Copies | Notes |
+|-----------|---------|-----------|------------|
+| Pipe | Several µs (with wakeup) | 2 (user → kernel → user) | Byte stream, unidirectional, parent/child or named (FIFO) |
+| Unix domain socket | Several µs | 2 | Bidirectional, message boundaries with `SOCK_SEQPACKET`, can pass fds and credentials; no TCP/IP stack involved |
+| POSIX message queue | Several µs | 2 | Kernel-managed, message priorities, bounded |
+| Shared memory + polling | ~100 ns (cache-line transfer between cores) | 0 kernel copies | You build synchronization, framing and recovery yourself |
+| Network broker (Kafka, NATS) | 100s of µs to ms | Many | Durable, cross-host, decoupled; not for a µs budget |
+
+**Shared memory ring buffer layout:**
 
 ```
-┌─────────────────── Shared Memory Segment (mmap) ───────────────────┐
-│                                                                    │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │                   Ring Buffer Header                         │  │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │  │
-│  │  │ read_pos │  │ write_pos│  │  magic   │  │  flags   │   │  │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │                    Ring Buffer (Slots)                       │  │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐           ┌────────┐     │  │
-│  │  │slot 0  │ │slot 1  │ │slot 2  │    ...     │slot N  │     │  │
-│  │  │ 128B   │ │ 128B   │ │ 128B   │           │ 128B   │     │  │
-│  │  └────────┘ └────────┘ └────────┘           └────────┘     │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+┌─────────────── shared memory segment (mmap, MAP_SHARED) ───────────────┐
+│ cache line 0: head (written only by producer)                          │
+│ cache line 1: tail (written only by consumer)    ← separate lines:     │
+│ cache line 2: capacity, version, ...               no false sharing    │
+├────────────────────────────────────────────────────────────────────────┤
+│ slot 0 │ slot 1 │ slot 2 │ ...                              │ slot N-1 │
+│ 40-byte fixed-layout Order records, N = power of two                    │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-```c
-// C++ Trading Engine — Producer
-struct RingBufferHeader {
-    volatile uint64_t read_pos __attribute__((aligned(64)));
-    volatile uint64_t write_pos __attribute__((aligned(64)));
-    uint64_t capacity;
+```cpp
+// C++ trading engine — producer (single producer, single consumer)
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+
+struct alignas(64) Cursor { std::atomic<uint64_t> v{0}; };
+
+struct RingHeader {
+    Cursor head;               // next slot the producer writes (only producer stores)
+    Cursor tail;               // next slot the consumer reads (only consumer stores)
+    uint64_t capacity;         // power of two
 };
 
-struct Order {
-    int64_t order_id;
+struct Order {                 // fixed layout, no pointers: both languages must agree
+    int64_t  order_id;
     uint32_t symbol;
-    uint64_t price;
+    uint32_t _pad0;
+    uint64_t price;            // fixed-point
     uint64_t quantity;
-    uint8_t side;       // 0=buy, 1=sell
-    uint8_t order_type; // 0=market, 1=limit
+    uint8_t  side;             // 0 = buy, 1 = sell
+    uint8_t  order_type;       // 0 = market, 1 = limit
+    uint8_t  _pad1[6];
 };
+static_assert(sizeof(Order) == 40, "layout must match the Go struct");
+static_assert(std::atomic<uint64_t>::is_always_lock_free, "needs lock-free 64-bit atomics");
 
 class ShmPublisher {
-    RingBufferHeader *hdr_;
-    char *slots_;
-    int shm_fd_;
-
+    RingHeader* hdr_;
+    Order* slots_;
 public:
-    bool publish(const Order &order) {
-        uint64_t pos = hdr_->write_pos;
-        uint64_t next = (pos + 1) & (hdr_->capacity - 1);
+    ShmPublisher(RingHeader* h, Order* s) : hdr_(h), slots_(s) {}
 
-        // Spin if full (busy-wait — acceptable for HFT with low latency)
-        while (next == hdr_->read_pos) {
-            _mm_pause();  // PAUSE instruction — yield to hyperthread
-        }
-
-        // Copy order to slot (atomic 128-byte write)
-        memcpy(slots_ + pos * sizeof(Order), &order, sizeof(Order));
-
-        // Memory barrier — ensure write is visible to reader
-        __sync_synchronize();
-
-        // Advance write position (atomic)
-        hdr_->write_pos = next;
+    bool try_publish(const Order& o) {
+        uint64_t head = hdr_->head.v.load(std::memory_order_relaxed);   // we own head
+        uint64_t tail = hdr_->tail.v.load(std::memory_order_acquire);   // consumer's progress
+        if (head - tail == hdr_->capacity) return false;                // full: caller decides
+        std::memcpy(&slots_[head & (hdr_->capacity - 1)], &o, sizeof o);
+        hdr_->head.v.store(head + 1, std::memory_order_release);        // publish the slot
         return true;
     }
 };
 ```
 
 ```go
-// Go Risk Manager — Consumer
-func (c *ShmConsumer) consume(ctx context.Context) {
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        default:
-            pos := atomic.LoadUint64(&c.hdr.read_pos)
-            writePos := atomic.LoadUint64(&c.hdr.write_pos)
+// Go risk service — consumer
+type Order struct { // must match the C++ layout byte for byte (40 bytes)
+	OrderID   int64
+	Symbol    uint32
+	_         uint32
+	Price     uint64
+	Quantity  uint64
+	Side      uint8
+	OrderType uint8
+	_         [6]uint8
+}
 
-            if pos == writePos {
-                // No data — yield to OS
-                runtime.Gosched()
-                continue
-            }
+// Mirrors the C++ RingHeader: head and tail on separate 64-byte cache lines.
+type ringHeader struct {
+	head     atomic.Uint64
+	_        [56]byte
+	tail     atomic.Uint64
+	_        [56]byte
+	capacity uint64
+}
 
-            // Read order directly from shared memory (zero copy!)
-            order := (*Order)(unsafe.Pointer(
-                &c.slots[pos*c.orderSize],
-            ))
+type ShmConsumer struct {
+	hdr   *ringHeader // points into the mmap'ed segment
+	slots []Order     // unsafe.Slice over the segment after the header
+}
 
-            c.riskCheck(order)
-
-            // Advance read position
-            atomic.StoreUint64(&c.hdr.read_pos, (pos+1)&(c.capacity-1))
-        }
-    }
+func (c *ShmConsumer) Run(ctx context.Context, handle func(Order)) {
+	mask := c.hdr.capacity - 1
+	for ctx.Err() == nil {
+		tail := c.hdr.tail.Load() // we own tail
+		head := c.hdr.head.Load() // pairs with the producer's release store
+		if tail == head {
+			runtime.Gosched() // or spin with backoff, or block on an eventfd
+			continue
+		}
+		o := c.slots[tail&mask]    // copy the record out before releasing the slot
+		c.hdr.tail.Store(tail + 1) // hand the slot back to the producer
+		handle(o)
+	}
 }
 ```
 
-**Why Not Pipes/Sockets for HFT:**
-- Pipe: each message = copy from user→kernel→user = 2 context switches
-- Socket: same as pipe + protocol overhead (TCP headers, ACKs)
-- Both: limited by scheduler — if consumer isn't scheduled, message is delayed
+Why it's correct: the producer writes the slot, then publishes `head` with a **release** store; the consumer **acquires** `head` before reading the slot, so it sees the full record. The consumer copies the record out before advancing `tail`, so the producer never overwrites a slot that is still being read. Each cursor has exactly one writer, so no CAS is needed. (Go's `sync/atomic` operations are sequentially consistent, which is stronger than needed and compatible.) `volatile` is **not** a substitute: it gives neither atomicity nor ordering in C++.
 
-**Risks of Shared Memory:**
-1. **Crash recovery** — if producer crashes with unknown write_pos, consumer sees garbage
-2. **Cross-language GC** — no Go pointers in shared memory (Go GC can't track them)
-3. **NUMA locality** — shared memory page could be on remote NUMA node (~150ns vs ~50ns local)
-4. **Security** — no isolation, both processes must be trusted
+**Why not pipes or sockets for the hot path:** each message is two copies through the kernel plus a syscall on each side, and if the consumer is asleep, a wakeup and context switch (µs, with scheduler jitter in the tail).
+
+**Risks of shared memory:**
+
+1. **Crash recovery:** a crashed peer leaves the segment in an unknown state. Add a version/epoch field and heartbeats; restart both sides cleanly.
+2. **Layout drift:** C++ and Go structs must match exactly (padding, endianness); generate both from one schema or `static_assert` sizes on both sides.
+3. **No Go pointers** in shared memory; the Go GC doesn't know about it.
+4. **NUMA:** put the segment and both pinned threads on the same socket; cross-socket cache-line transfers cost noticeably more.
+5. **Go runtime jitter:** GC assists and scheduling can delay the consumer; lock the polling goroutine to an OS thread (`runtime.LockOSThread`) and pin that thread.
+6. **Security:** both processes can corrupt each other; only for mutually trusted processes.
+
+Production-grade options instead of rolling your own: Aeron IPC, the LMAX Disruptor pattern, Chronicle Queue.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Quantitative latency** | Provides actual latency numbers, not just "shm is faster" |
-| **Memory ordering** | Explains volatile + memory barriers, not just mutex |
-| **NUMA awareness** | Knows to pin memory and threads to same NUMA node |
-| **Crash safety** | Acknowledges shared memory fragility vs socket reliability |
+| **Quantitative latency** | Order-of-magnitude numbers and where they come from (copies, syscalls, wakeups, cache lines) |
+| **Memory ordering** | Acquire/release on head/tail; knows `volatile` isn't enough |
+| **NUMA awareness** | Pins memory and threads to the same NUMA node |
+| **Design judgment** | Pre-trade risk in-process; shm only for the hot path; crash safety |
 
 ---
 
@@ -981,151 +801,122 @@ func (c *ShmConsumer) consume(ctx context.Context) {
 
 **Q:** "You're debugging a production crash in a Go service that embeds a C library via cgo. The library uses `SIGALRM` for timeouts, but it's causing random `EINTR` errors on system calls. What's happening and how do you fix it?"
 
-**What They're Really Testing:** Deep understanding of signal delivery, interrupted syscalls, and reentrancy — with a mutlilingual twist.
+**What They're Really Testing:** Deep understanding of signal delivery, interrupted syscalls, and reentrancy — with a multilingual twist.
 
 ### Answer
 
-**Root Cause:**
+!!! tip "30-second answer"
+    A process-directed signal like `SIGALRM` is delivered to **any** thread that doesn't block it. If that thread is in a blocking syscall and the handler wasn't installed with `SA_RESTART` (or the syscall is one that never restarts, like `epoll_wait`, `poll`, `nanosleep`), the syscall fails with **EINTR**. In a Go program there are many threads, so the C library's alarm interrupts syscalls in unrelated threads, and C code that doesn't retry on EINTR fails "randomly". Separately, if the C library installs its handler **without `SA_ONSTACK`**, Go crashes when the signal lands on a Go thread. Fix: stop using process-wide signals for timeouts (per-call timeouts, `timerfd`, or POSIX timers with `SIGEV_THREAD`), make C code retry EINTR, and if a handler must exist, install it with `SA_RESTART | SA_ONSTACK`.
+
+**What happens:**
 
 ```c
-// C library uses SIGALRM for timeouts:
+// The C library's timeout mechanism
 void set_timeout_ms(int ms) {
-    struct itimerval it;
-    it.it_value.tv_sec = ms / 1000;
+    struct itimerval it = {0};
+    it.it_value.tv_sec  = ms / 1000;
     it.it_value.tv_usec = (ms % 1000) * 1000;
-    setitimer(ITIMER_REAL, &it, NULL);
-    signal(SIGALRM, timeout_handler);
+    signal(SIGALRM, timeout_handler);   // process-wide disposition
+    setitimer(ITIMER_REAL, &it, NULL);  // one timer per PROCESS, not per thread
 }
 ```
 
-When SIGALRM fires during a system call like `read()` or `epoll_wait()`:
-
 ```
-Thread executing:   read(fd, buf, 1024)
-                         │
-                    SIGALRM arrives
-                         │
-                         ▼
-                    Kernel delivers signal
-                         │
-                         ▼
-                    read() returns -1
-                    errno = EINTR
-                    (Interrupted system call)
+Go process: ~10+ OS threads (GOMAXPROCS Ps, sysmon, threads blocked in cgo/syscalls)
+
+Thread 7 (C code): read(fd, ...) blocking
+Thread 3 (Go):     running goroutines
+                  SIGALRM fires → kernel picks ANY thread not blocking it
+                  → if thread 7: read() returns -1, errno = EINTR
+                    (unless SA_RESTART and read is restartable)
 ```
 
-**Why This Breaks Go:**
-- Go's runtime uses `epoll` for network I/O, `futex` for goroutine scheduling
-- If a C signal handler fires on a Go thread:
-  1. The `epoll_wait` in Go's network poller returns `EINTR`
-  2. Go's runtime assumes no errors from kernel
-  3. Go doesn't automatically restart interrupted syscalls (unlike BSD's `SA_RESTART`)
-  4. Leading to `EINTR` propagating as an opaque error to Go code
-  5. Worse: a SIGALRM during GC could corrupt Go runtime state if it fires between write barrier operations
+Problems this design causes in a multithreaded process:
 
-**The Fix — Signal Masking + Dedicated Signal Thread:**
+1. **EINTR in C code:** C code that treats `-1/EINTR` as a fatal error breaks. Some calls are never restarted even with `SA_RESTART` (see `signal(7)`): `epoll_wait`, `poll`, `select`, `nanosleep`, socket calls with timeouts set.
+2. **One timer per process:** two threads calling `set_timeout_ms` overwrite each other's alarm.
+3. **Handler on the wrong stack:** Go runs signal handlers on an alternate signal stack because goroutine stacks are small. A non-Go handler installed without `SA_ONSTACK` makes the Go runtime abort ("non-Go code set up signal handler without SA_ONSTACK flag").
+4. **Go side:** Go installs its own handlers with `SA_RESTART`, and since Go 1.14 the runtime itself sends `SIGURG` to threads for **asynchronous preemption**. The standard library retries EINTR internally, but C code in the same process may also see interrupted calls. (`GODEBUG=asyncpreemptoff=1` is a diagnostic, not a fix.)
 
-```go
-// Go side — channel-based signal handling
-func main() {
-    sigs := make(chan os.Signal, 1)
-    signal.Notify(sigs, syscall.SIGALRM)
+**The fix — remove signal-based timeouts from the library:**
 
-    go func() {
-        for {
-            sig := <-sigs
-            if sig == syscall.SIGALRM {
-                // Handle timeout in Go goroutine
-                log.Printf("SIGALRM received, resetting connection")
-            }
-        }
-    }()
+```c
+// Per-operation timeout without signals: wait for readiness with a timeout
+#include <errno.h>
+#include <poll.h>
+#include <unistd.h>
 
-    // Block SIGALRM on all threads — let the signal goroutine handle it
-    signal.Ignore(syscall.SIGALRM)
+ssize_t read_with_timeout(int fd, void *buf, size_t n, int timeout_ms) {
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    int r;
+    do {
+        r = poll(&p, 1, timeout_ms);       /* simplification: restarts with the full timeout */
+    } while (r == -1 && errno == EINTR);
+    if (r == 0) { errno = ETIMEDOUT; return -1; }
+    if (r == -1) return -1;
+    ssize_t got;
+    do { got = read(fd, buf, n); } while (got == -1 && errno == EINTR);
+    return got;
 }
 ```
 
 ```c
-// C side — use dedicated timer thread instead of SIGALRM:
-#include <pthread.h>
-#include <timerfd.h>
-
-int timer_fd;
+// Or a dedicated timer thread using timerfd (Linux): timers become readable fds
+#include <stdint.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
 
 void *timer_thread(void *arg) {
-    struct itimerspec ts;
-    ts.it_value.tv_sec = 0;
-    ts.it_value.tv_nsec = 100 * 1000000;  // 100ms
-    ts.it_interval = ts.it_value;
-
-    timerfd_settime(timer_fd, 0, &ts, NULL);
-
-    uint64_t expirations;
-    while (1) {
-        read(timer_fd, &expirations, sizeof(expirations));
-        // Handle timeout — runs in dedicated thread, no signal issues
-        handle_timeout();
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    struct itimerspec ts = {
+        .it_value    = { .tv_sec = 0, .tv_nsec = 100 * 1000000 },   /* first expiry: 100 ms */
+        .it_interval = { .tv_sec = 0, .tv_nsec = 100 * 1000000 },   /* then every 100 ms */
+    };
+    timerfd_settime(tfd, 0, &ts, NULL);
+    for (;;) {
+        uint64_t expirations;
+        if (read(tfd, &expirations, sizeof expirations) == sizeof expirations)
+            handle_timeout(expirations);    /* normal thread context: any function allowed */
     }
     return NULL;
 }
 ```
 
-**Async-Signal-Safe Functions (the safe list):**
+If you can't change the library: install its handler yourself with `sigaction` and `SA_RESTART | SA_ONSTACK`, and wrap its blocking calls in EINTR retry loops. On the Go side, don't fight the runtime: `signal.Notify` is for Go code that wants to **receive** signals; `signal.Ignore(SIGALRM)` sets the disposition to ignore for the whole process (which would also disable the C library's handler), and neither masks signals per thread.
+
+**Async-signal-safe functions:** a handler can interrupt the program **anywhere**, including inside `malloc` while it holds the arena lock. Only functions listed in `signal-safety(7)` may be called from a handler.
+
+| Safe (examples) | Unsafe (examples) |
+|---|---|
+| `write`, `read`, `_exit`, `sigaction`, `sem_post`, `kill`, `clock_gettime` | `malloc`/`free`, `printf` and stdio, `pthread_mutex_lock`, logging libraries, anything in the Go runtime |
+
+Also save and restore `errno` in the handler, and only touch variables of type `volatile sig_atomic_t` (or lock-free atomics).
+
+**Safer patterns for real signal handling:**
 
 ```c
-// Only these can be called from a signal handler:
-// write()  — write to pipe/self-pipe trick
-// read()   — read from self-pipe
-// sigaction() — change signal disposition
-// sem_post()  — wake up waiting thread
-// _exit() — immediate termination
+// Self-pipe trick: the handler only writes a byte; the event loop does the work
+static int sigpipe_fds[2];                 /* both ends O_NONBLOCK | O_CLOEXEC (pipe2) */
 
-// NEVER do this in a signal handler:
-// malloc() — not reentrant (uses global lock)
-// free()   — same
-// printf() — uses stdio buffers (global lock)
-// pthread_mutex_lock() — if held by interrupted thread → deadlock!
-// any Go runtime function — Go signal handling is different
+static void handler(int sig) {
+    int saved = errno;
+    unsigned char b = (unsigned char)sig;
+    (void)write(sigpipe_fds[1], &b, 1);    /* async-signal-safe; drops if pipe is full */
+    errno = saved;
+}
+/* Register sigpipe_fds[0] with epoll; when readable, drain it and handle signals normally. */
 ```
 
-**Safer Pattern — The Self-Pipe Trick:**
-
-```c
-static int sigpipe[2];
-
-void handler(int sig) {
-    write(sigpipe[1], "", 1);  // Signal → write to pipe
-}
-
-// Main event loop polls both epoll AND sigpipe:
-struct epoll_event events[1024];
-
-epoll_ctl(epfd, EPOLL_CTL_ADD, sigpipe[0], &ev);
-
-while (1) {
-    int n = epoll_wait(epfd, events, 1024, -1);
-    for (int i = 0; i < n; i++) {
-        if (events[i].data.fd == sigpipe[0]) {
-            // It's a signal! Handle safely outside signal context
-            char buf[64];
-            read(sigpipe[0], buf, sizeof(buf));
-            handle_signal();
-        } else {
-            handle_io(events[i]);
-        }
-    }
-}
-```
+Linux alternatives: `signalfd` (block the signal in **all** threads with `pthread_sigmask`, then read signals from an fd) or a dedicated thread in `sigwait()`. Both need the signal blocked everywhere, which you control in C programs but not easily in Go's runtime threads; in Go, use `signal.Notify` and a goroutine.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **EINTR** | Knows that interrupted syscalls cause `EINTR` |
-| **Go+C interaction** | Understands Go runtime's sensitivity to signals on m=1 GOMAXPROCS threads |
-| **Async safety** | Lists async-signal-safe functions, knows why malloc is unsafe |
-| **Fix** | Proposes timerfd/epoll-based approach or self-pipe trick |
+| **EINTR** | Knows which syscalls restart with SA_RESTART and which never do |
+| **Go+C interaction** | Process-directed signals hit any thread; SA_ONSTACK requirement; Go's SIGURG preemption |
+| **Async safety** | Lists async-signal-safe functions, knows why malloc is unsafe, saves errno |
+| **Fix** | Removes signal-based timeouts (poll timeout, timerfd); self-pipe / signalfd for real signals |
 
 ---
 
@@ -1137,159 +928,109 @@ while (1) {
 
 ### Answer
 
-**Two Pillars of Container Isolation:**
+!!! tip "30-second answer"
+    **Namespaces** control what a process can **see** (PIDs, network stack, mounts, hostname, IPC, users, cgroup tree, time). **cgroups** control what it can **use** (CPU, memory, I/O, PIDs). With **cgroup v2** (the unified hierarchy, required by Kubernetes 1.35's kubelet by default), memory isolation comes from `memory.max` (hard cap, OOM inside the cgroup), `memory.high` (throttle and reclaim before the cap), and `memory.min`/`memory.low` (protection from other cgroups' pressure). CPU has two separate knobs: `cpu.weight` shares CPU proportionally **only under contention**, while `cpu.max` is a hard quota per period that throttles even on an idle machine; `cpu.max.burst` (Linux 5.14) lets a group bank unused quota for short bursts. Namespaces and cgroups are not a security boundary on their own: add seccomp, capabilities dropping, LSMs (AppArmor/SELinux), user namespaces, or a sandbox (gVisor, Kata, Firecracker).
+
+**Two pillars of container isolation:**
+
+| Namespaces (what you can see) | Isolates |
+|---|---|
+| PID | Process IDs; container's first process is PID 1 (must reap zombies and handle signals) |
+| Network | Interfaces, routes, iptables/nftables, ports |
+| Mount | Mount table (with pivot_root into the image's rootfs) |
+| UTS | Hostname |
+| IPC | System V IPC, POSIX message queues |
+| User | UID/GID mapping: root in the container maps to an unprivileged host UID. Kubernetes: `hostUsers: false`, GA in 1.36 |
+| Cgroup | View of the cgroup tree |
+| Time | `CLOCK_MONOTONIC`/`BOOTTIME` offsets (Linux 5.6) |
+
+| cgroup v2 controllers (what you can use) | Key files |
+|---|---|
+| cpu | `cpu.weight`, `cpu.max`, `cpu.max.burst`, `cpu.stat`, `cpu.pressure` |
+| memory | `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `memory.oom.group`, `memory.events`, `memory.pressure` |
+| io (was `blkio` in v1) | `io.max`, `io.weight`, `io.latency` |
+| cpuset | `cpuset.cpus`, `cpuset.mems` |
+| pids | `pids.max` (fork-bomb protection) |
+
+**cgroup v1 vs v2:** v1 had a separate hierarchy per controller, which made combined policies (e.g. writeback I/O attributed to the right memory cgroup) impossible. v2 has one tree, a single writer per subtree (systemd or the container runtime), and features v1 lacks: PSI pressure files, `memory.high`, `memory.oom.group`, proper writeback accounting. Kubernetes 1.35 deprecated cgroup v1: the kubelet refuses to start on v1 nodes unless `failCgroupV1: false` is set.
+
+**Memory controller:**
 
 ```
-Container
-┌─────────────────────────────────┐
-│  Namespace Isolation            │  ← What you can SEE
-│  ┌───────────────────────────┐  │
-│  │ PID Namespace (pid)       │  │  Container sees only its own processes
-│  │ Network Namespace (net)   │  │  Own IP stack, interfaces, ports
-│  │ Mount Namespace (mnt)     │  │  Own filesystem mount table
-│  │ UTS Namespace (uts)       │  │  Own hostname
-│  │ IPC Namespace (ipc)      │  │  Own System V IPC / POSIX queues
-│  │ User Namespace (user)    │  │  UID/GID mapping (container root != host root)
-│  │ Cgroup Namespace         │  │  Own /proc/self/cgroup view
-│  └───────────────────────────┘  │
-├─────────────────────────────────┤
-│  cgroup Resource Control         │  ← What you can USE
-│  ┌───────────────────────────┐  │
-│  │ cpu cgroup                 │  │  CPU shares, quota, period, burst
-│  │ memory cgroup              │  │  Hard/soft limits, swap, OOM priority
-│  │ blkio cgroup               │  │  Block I/O throttling
-│  │ cpuset cgroup             │  │  CPU pinning, NUMA node affinity
-│  │ pids cgroup               │  │  Max process count
-│  └───────────────────────────┘  │
-└─────────────────────────────────┘
+memory.max  = 4G      hard limit: allocation beyond it triggers reclaim inside the
+                      cgroup, then the OOM killer scoped to this cgroup
+memory.high = 3.5G    throttle: above it, allocating tasks are slowed and forced to
+                      reclaim; never OOM-kills by itself
+memory.low  = 1G      best-effort protection from reclaim caused by OTHER cgroups
+memory.min  = 512M    hard protection from reclaim
+memory.swap.max = 0   no swap for this group
+memory.oom.group = 1  on OOM, kill every process in the cgroup together
 ```
 
-**Memory cgroup (v2) — Deep Dive:**
+**How it prevents starvation:**
 
 ```
-memory.max = 2GB   ← Hard limit — OOM kill if exceeded
-memory.high = 1.8GB ← Soft limit — reclaim aggressively above this
-memory.low = 1GB   ← Guaranteed minimum (protected under memory pressure)
-memory.min = 512MB ← Hard guarantee (can't be reclaimed by others)
-memory.swap.max = 1GB
-memory.oom.group = 1 ← Kill entire cgroup on OOM, not just one process
+Host 16 GB. Container A: max 4G. Container B: max 4G, low 2G.
+
+A leaks memory:
+  A's usage reaches memory.high → A's own allocations get throttled and reclaim
+                                  A's page cache (A slows down, B unaffected)
+  A reaches memory.max          → reclaim within A fails → OOM killer picks a
+                                  process in A (or all of A with oom.group)
+  B never pays for A's leak.
+
+Host-wide pressure (sum of usage close to RAM):
+  kswapd / direct reclaim scans all cgroups, but skips B's memory below
+  memory.low (and never touches memory below memory.min).
 ```
 
-**How Memory Pressure Works:**
+Important: the cgroup charge includes **page cache** and kernel memory (slab, socket buffers) attributed to the group, not just process RSS (Q12).
+
+**CPU controller:**
 
 ```
-Memory Pressure Scenario:
-
-Total RAM: 16GB
-Container A: memory.max = 4GB, using 3.8GB
-Container B: memory.max = 4GB, using 3.0GB
-Host processes: using 6GB
-Free: 3.2GB
-
-Suddenly: Host + A + B allocate more → total demand = 17GB
-    │
-    ▼
-Kernel's reclaim daemon (kswapd) wakes up
-    │
-    ▼
-Checks memory.high for each cgroup:
-    A: 3.8GB > 4GB × 0.90 = 3.6GB → reclaim A aggressively
-    B: 3.0GB < 3.6GB → don't touch B
-    Host: no cgroup → global reclaim
-
-But wait — if A hits 4GB:
-    → OOM killer called
-    → memory.oom.group = 1
-    → Kills ALL processes in A (not just the allocating one)
-    → Prevents partial failures and zombie state
+cpu.weight = 200                    # 1–10000, default 100. Proportional share, ONLY under contention
+cpu.max    = "400000 100000"        # quota period (µs): 400 ms of CPU per 100 ms = 4 CPUs max
+cpu.max.burst = 200000              # may bank up to 200 ms of unused quota (must be ≤ quota)
 ```
 
-**Memory Reclaim Hierarchy (v2):**
-
 ```
-┌───────────────────────┐
-│       Root            │  memory.max = max (unlimited)
-│                       │
-├───────────────────────┤
-│   /system.slice       │  memory.max = 8GB
-├───────────────────────┤
-│   /docker             │  memory.max = max
-│  ┌─────────────────┐  │
-│  │ container_A     │  │  memory.max = 4GB, memory.swap.max = 0
-│  └─────────────────┘  │
-│  ┌─────────────────┐  │
-│  │ container_B     │  │  memory.max = 4GB, memory.swap.max = 1GB
-│  └─────────────────┘  │
-└───────────────────────┘
+Burst accounting (100 ms periods, quota 400 ms, burst 200 ms):
+Period 1: uses 200 ms   → 200 ms unused → bank = min(200, 200) = 200 ms
+Period 2: uses 550 ms   → 400 quota + 150 from bank → bank = 50 ms, no throttling
+Period 3: uses 500 ms   → 400 quota + 50 bank, then THROTTLED for the rest of the period
 ```
 
-**CPU cgroup — Shares, Quota, Burst:**
+**The quota trap:** a multi-threaded app with `cpu.max = 2 CPUs` can burn its 200 ms of quota in the first 25 ms of a period on 8 threads, then sit throttled for 75 ms, even on an idle node. That shows up as p99 latency spikes with low average CPU. Many teams therefore set Kubernetes CPU **requests** (→ `cpu.weight`) but no CPU **limits** for latency-sensitive services, and fix runtimes to see the right CPU count (Go 1.25 sets `GOMAXPROCS` from the cgroup CPU limit; the JVM has been container-aware for years).
 
-```c
-// Configuration:
-// Container A gets 4 CPUs worth of time
-// Container B gets 2 CPUs worth of time
-// Both can burst up to 8 CPUs if idle
-
-// cpu.weight: relative shares (1-10000, default 100)
-container_A: cpu.weight = 200   // Gets 2× the CPU of default
-container_B: cpu.weight = 100   // Baseline
-
-// cpu.max: [quota period] [burst]
-container_A: cpu.max = "400000 100000 600000"
-//   4 CPUs  │  100ms   │ up to 6 CPUs burst
-//            │  period  │
-```
-
-**CPU Burst Mechanism (kernel 5.14+):**
-
-```
-Time (100ms periods):
-Period 1: A uses 5 CPUs (5 × 100ms = 500ms CPU time)
-          → quota = 400ms → exceeded by 100ms
-          → uses 100ms from burst bucket
-          → burst bucket: 600ms → 500ms remaining
-
-Period 2: A uses 2 CPUs (2 × 100ms = 200ms CPU time)
-          → quota = 400ms → 200ms under
-          → refill burst bucket: 500ms + 200ms → capped at 600ms
-
-Period 3: A is idle
-          → burst bucket refills to 600ms
-
-Benefits:
-- Latency-sensitive apps get burst when cluster is underutilized
-- No need to over-provision (reserve 8 CPUs when average is 2)
-- Burst bucket prevents sustained overload
-```
-
-**Production Monitoring:**
+**Production monitoring (cgroup v2 paths):**
 
 ```bash
-# Check memory pressure
-cat /sys/fs/cgroup/memory/docker/<container_id>/memory.pressure
-some avg10=2.35 avg60=1.88 avg300=0.56 total=1234567
-full avg10=0.89 avg60=0.45 avg300=0.12 total=456789
-
-# some = at least one task stalled
-# full = all tasks stalled
-# >5% avg10 → investigate, >20% avg10 → urgent
-
-# Check CPU throttling
-cat /sys/fs/cgroup/cpu/docker/<container_id>/cpu.stat
-nr_periods 1000
-nr_throttled 45        # 4.5% of periods experienced throttling
-throttled_usec 1500000  # 1.5s total throttled time
+CG=/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/.../cri-containerd-<id>.scope
+cat $CG/memory.pressure
+#   some avg10=2.35 avg60=1.88 avg300=0.56 total=1234567
+#   full avg10=0.89 avg60=0.45 avg300=0.12 total=456789
+#   some = % of time at least one task stalled on memory; full = all tasks stalled
+cat $CG/memory.events        # high, max, oom, oom_kill counters
+cat $CG/cpu.stat
+#   nr_periods 1000
+#   nr_throttled 45          ← 4.5% of periods throttled
+#   throttled_usec 1500000   ← 1.5 s total
 ```
+
+PSI (pressure stall information) is the best saturation signal: a sustained non-zero `full` means the workload is losing real time to memory pressure. What threshold to alert on depends on the workload; establish a baseline. Tools like systemd-oomd act on PSI before the kernel OOM killer has to.
+
+**eBPF in this picture:** eBPF programs can be attached per cgroup (socket filtering, device access control in cgroup v2, which replaced the v1 devices controller), and observability tools (bcc, bpftrace, Cilium/Tetragon, Pixie) use eBPF to attribute syscalls, network flows and latency to containers without changing the apps.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Namespace vs cgroup** | Clearly separates what you see vs what you can use |
-| **Memory reclaim** | Explains soft vs hard limits, reclaim hierarchy, OOM behavior |
-| **CPU burst** | Understands burst bucket mechanics (recent kernel feature) |
-| **Production monitoring** | Knows to check memory.pressure, cpu.stat metrics |
+| **Namespace vs cgroup** | Clearly separates what you see vs what you can use; knows it's not a full security boundary |
+| **Memory reclaim** | memory.max vs high vs low/min, page cache counted, OOM scoped to the cgroup |
+| **CPU** | Weight vs quota, burst accounting, throttling trap on idle nodes |
+| **Currency** | cgroup v2 required by recent Kubernetes, user namespaces, PSI |
+| **Production monitoring** | memory.pressure, memory.events, cpu.stat |
 
 ---
 
@@ -1301,150 +1042,83 @@ throttled_usec 1500000  # 1.5s total throttled time
 
 ### Answer
 
-**Mystery Solved — What Happened:**
+!!! tip "30-second answer"
+    The limit applies to the container's **cgroup**, which is charged for **all** its processes plus page cache, tmpfs/`emptyDir: Medium: Memory`, and kernel memory such as page tables and socket buffers. One process's RSS in `top` is not that number. Redis at 3.5 GB plus a balloon touching 1 GB is already over 4 GB, so the cgroup hit `memory.max`, reclaim couldn't free enough (anonymous memory without swap can't be reclaimed), and the OOM killer ran **inside that cgroup**. It picks the process with the highest badness (mostly memory size), so the big Redis process dies, not the small newcomer. On cgroup v2, Kubernetes 1.28+ sets `memory.oom.group=1`, so the **whole container** is killed. Overcommit (`vm.overcommit_memory`) decides whether `malloc`/`mmap` succeeds up front; it doesn't change cgroup limits.
+
+**Where the cgroup charge comes from:**
 
 ```
-Process memory accounting is NOT just RSS:
+Container cgroup charge (memory.current) ≈
+    anonymous memory of ALL processes       (Redis heap ~3.0 GB + balloon 1.0 GB)
+  + page cache for files read/written       (reclaimable, if clean)
+  + shmem / tmpfs (incl. memory-backed emptyDir)  (NOT reclaimable without swap)
+  + kernel memory charged to the group      (page tables, slab, socket buffers)
 
-RSS (Resident Set Size) = 3.5GB
-  ├── Anonymous pages (heap, stack)  = 2.0GB
-  ├── File-backed pages (code, mmap) = 1.0GB
-  └── Shared pages (shared libraries) = 0.5GB ← Counted in RSS!
-
-But the balloon process:
-  malloc(1GB) + memset(memset to actually touch pages)
-  → 1GB of anonymous pages
-
-Total anonymous memory = 2.0GB + 1.0GB = 3.0GB
-Plus kernel overhead:
-  - Page tables = ~400MB
-  - dentry/inode cache = ~200MB
-  - slab = ~300MB
-  ↓
-Total memory pressure ≈ 3.9GB → close to 4GB limit → OOM kill
-```
-
-**Memory Overcommit Modes:**
-
-```
-/proc/sys/vm/overcommit_memory
-
-0 = Heuristic overcommit (default)
-    - Allow until "obviously" too much
-    - Uses: total_ram × overcommit_ratio (default 50%)
-    - So on 16GB RAM: 16GB + 16GB × 50% = 24GB virtual allowed
-
-1 = Always overcommit
-    - "I know what I'm doing"
-    - Allows any malloc(), even if absurd
-    - OOM kill when memory actually runs out
-    - Used by databases that manage their own memory (e.g., Oracle HugePages)
-
-2 = No overcommit (strict)
-    - Commit limit = (RAM + swap) × overcommit_ratio / 100
-    - malloc() returns NULL if limit would be exceeded
-    - Preferred for safety-critical systems
-    - Prevents OOM kills entirely
-```
-
-**OOM Killer Score Calculation:**
-
-```c
-// Each process has oom_score_adj and oom_score
-// oom_score = system_heuristic + oom_score_adj
-
-// System heuristic considers:
-//
-// 1. Total memory used (resident + swap)
-//    more memory → higher score → more likely to be killed
-//
-// 2. Runtime (processes that just started are preferred over long-lived)
-//    oom_score_adj = -1000 for root/init process
-//
-// 3. Process children (killing a parent reclaims all children's memory too)
-//    oom_score is inherited from parent
-//
-// 4. OOM_SCORE_ADJ_MIN / MAX = -1000 (OOM disabled) to +1000 (always killed)
-
-// Practical example:
-// Redis (using 3.5GB RSS, running 30 days):
-//   oom_score ≈ 950 + oom_score_adj
-
-// Balloon process (using 1GB RSS, running 5 seconds):
-//   oom_score ≈ 400 + oom_score_adj
-
-// Kubernetes ballon process has oom_score_adj = -997!
-//   → oom_score ≈ 400 + (-997) = -597
-//   → Almost immune
-
-// Redis has default oom_score_adj = 0
-//   → oom_score ≈ 950
-//   → Most likely to be killed
-```
-
-**How Kubernetes Sets OOM Score:**
-
-```yaml
-# Kubernetes applies this to pods:
-apiVersion: v1
-kind: Pod
-spec:
-  containers:
-  - name: redis
-    resources:
-      limits:
-        memory: 4Gi
-      requests:
-        memory: 2Gi
+Redis RSS 3.5 GB = anon ~3.0 GB + file-backed pages; shared library pages are
+counted in each process's RSS but charged to the cgroup only once.
 ```
 
 ```bash
-# Kubernetes sets:
-# oom_score_adj for guaranteed pods (limits = requests):
-#   -997 (almost protected)
-# oom_score_adj for burstable pods (limits > requests):
-#   range from -996 to 0 based on memory usage/limit ratio
-# oom_score_adj for best-effort pods (no limits):
-#   1000 (first to be killed)
+cat /sys/fs/cgroup/<container>/memory.current        # what the limit is compared against
+cat /sys/fs/cgroup/<container>/memory.stat           # anon, file, shmem, slab, sock, ...
+cat /sys/fs/cgroup/<container>/memory.events         # oom, oom_kill counters
+dmesg | grep -i -A20 "memory cgroup out of memory"   # who was killed and why
 ```
 
-**Preventing Unnecessary OOM Kills:**
+Note the different thresholds: the **kernel** OOM-kills at `memory.max`; the **kubelet** evicts pods when the **node** runs low, based on "working set" (`usage − inactive_file`), which is also what `kubectl top` shows.
 
-1. **Set memory limits correctly** — request = limit (Guaranteed QoS) for critical services
+**Memory overcommit modes (`vm.overcommit_memory`):**
 
-2. **Use `memory.min` (cgroup v2)**:
+| Mode | Behaviour | When |
+|---|---|---|
+| **0** (default) heuristic | Refuses only obviously impossible single allocations; otherwise allows overcommitting. `overcommit_ratio` is **not** used in this mode | General purpose |
+| **1** always | Never refuses; failures surface later as OOM kills | **Redis** recommends it so `fork()` for BGSAVE succeeds even though the child could, in theory, touch all of the parent's memory |
+| **2** strict | `CommitLimit = swap + RAM × overcommit_ratio/100` (or `overcommit_kbytes`); `malloc`/`mmap` return failure beyond it | Systems that prefer allocation failures to OOM kills. Rarely right for container hosts: JVMs, Go and others reserve large virtual ranges they never touch |
 
-```bash
-# Reserve 500MB for critical daemon
-echo 500M > /sys/fs/cgroup/redis/memory.min
-# Now even under global pressure, Redis keeps 500MB
+Even mode 2 doesn't prevent cgroup OOM kills: the cgroup limit is a separate mechanism.
+
+**OOM killer scoring (modern kernels):**
+
+```
+badness(p) = RSS(p) + swap(p) + page_table_bytes(p)          (in pages)
+           + oom_score_adj(p) × (allowed_memory / 1000)
+allowed_memory = the cgroup limit for a cgroup OOM, or RAM + swap for a global OOM
+
+/proc/<pid>/oom_score     → badness normalized to 0..1000 (+ adj)
+/proc/<pid>/oom_score_adj → -1000 (never kill) .. +1000 (kill first); inherited by children
 ```
 
-3. **Disable overcommit for critical services:**
+Older heuristics (process runtime, number of children, a bonus for root processes) were removed; today it is essentially "biggest memory user, adjusted by `oom_score_adj`".
 
-```bash
-sysctl vm.overcommit_memory=2
-sysctl vm.overcommit_ratio=100  # Commit limit = 100% of (RAM + swap)
-```
+**How Kubernetes sets `oom_score_adj` (per container, by QoS class):**
 
-4. **Reduce memory fragmentation:**
+| QoS class | Condition | oom_score_adj |
+|---|---|---|
+| Guaranteed | requests = limits for every container (CPU and memory) | **-997** |
+| Burstable | some requests set, not Guaranteed | `min(max(2, 1000 − 1000 × memory_request / node_capacity), 999)`: the larger the request relative to the node, the more protected |
+| BestEffort | no requests or limits | **1000** |
 
-```bash
-# Check memory fragmentation
-cat /sys/kernel/debug/extfrag/unusable_index
+These matter for **node-level** (global) OOMs. Inside one container, every process has the same `oom_score_adj`, so size decides.
 
-# Compact memory
-echo 1 > /proc/sys/vm/compact_memory
-```
+**Preventing unnecessary OOM kills:**
+
+1. **Size limits from measurement:** request = limit for memory on critical services (Guaranteed QoS), with headroom for page cache, fork-time COW (Redis BGSAVE can need close to 2× under heavy writes), and tmpfs.
+2. **Don't run sidecar-like helpers in the same container**: give them their own container and limit so they can't push the main process over.
+3. **Make runtimes cgroup-aware:** JVM `-XX:MaxRAMPercentage`, Go `GOMEMLIMIT` (soft limit that makes the GC work harder before the hard limit).
+4. **Protect critical daemons on the node:** kubelet `system-reserved`/`kube-reserved`, and `memory.min` for system slices.
+5. **Alert on pressure before kills:** `memory.events` `high` counter, PSI `memory.pressure`.
+6. If you truly want only the offending process killed (e.g. a supervisor with worker processes), kubelet's `singleProcessOOMKill: true` (1.32+) restores per-process kills on cgroup v2.
+
+Fragmentation is a separate, rarer cause: a high-order (contiguous) kernel allocation can fail even with free memory. Check `/proc/buddyinfo` (`/sys/kernel/debug/extfrag/unusable_index` with debugfs) and trigger compaction with `echo 1 > /proc/sys/vm/compact_memory`.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **RSS ≠ all** | Explains page tables, slab, dentry cache as kernel memory consumers |
-| **oom_score** | Understands heuristic + adj, not random killing |
-| **Kubernetes integration** | Knows QoS classes map to oom_score_adj ranges |
-| **Mitigation** | Suggests memory.min, overcommit=2, proper resource limits |
+| **RSS ≠ all** | Explains cgroup charge (all processes, page cache, shmem, kernel memory) vs one process's RSS |
+| **oom_score** | Knows badness = memory size + adj, scoped to the cgroup; old heuristics gone |
+| **Kubernetes integration** | QoS → oom_score_adj, memory.oom.group since 1.28, eviction vs OOM kill |
+| **Mitigation** | Right-sized limits, GOMEMLIMIT/MaxRAMPercentage, overcommit=1 for Redis, PSI alerts |
 
 ---
 

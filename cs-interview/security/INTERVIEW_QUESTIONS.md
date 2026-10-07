@@ -1,23 +1,27 @@
 # 🔒 Security (Backend) — Staff-Level Interview Questions
 
-> *10 questions covering OWASP, JWT, OAuth2, encryption, and secrets management — every question expects principal engineer-level depth.*
+> *10 questions covering tokens, OAuth/OIDC, injection, encryption, secrets, abuse protection, authentication, browser security, supply chain and SSRF. Each answer leads with the 30-second version, then the mechanism, then trade-offs and what the interviewer probes next. Current as of October 2026 (OWASP Top 10:2025, RFC 9700, NIST SP 800-63B-4).*
 
 ---
 
-### OWASP Top 10 (2021) Mapping
+### OWASP Top 10 (2025) Mapping
 
-| Question # | Topic | OWASP Category | Rating |
-|-----------|-------|----------------|--------|
-| 1 | JWT Internals | A07:2021 — Identification & Auth Failures | ★★★★★ |
-| 2 | OAuth2 & OIDC | A07:2021 — Identification & Auth Failures | ★★★★★ |
-| 3 | SQL Injection | A03:2021 — Injection | ★★★★★ |
-| 4 | Encryption | A02:2021 — Cryptographic Failures | ★★★★★ |
-| 5 | Secrets Mgmt | A05:2021 — Security Misconfiguration | ★★★★☆ |
-| 6 | Rate Limiting | A01:2021 — Broken Access Control | ★★★★☆ |
-| 7 | Auth Methods | A07:2021 — Identification & Auth Failures | ★★★★★ |
-| 8 | CORS/CSRF | A01:2021 — Broken Access Control | ★★★★☆ |
-| 9 | Supply Chain | A06:2021 — Vulnerable Components | ★★★★★ |
-| 10 | SSRF | A10:2021 — SSRF | ★★★★★ |
+The OWASP Top 10 was revised in 2025. Changes from 2021 worth knowing: **Software Supply Chain Failures** (A03) replaces "Vulnerable and Outdated Components" and widens it; **SSRF** (A10:2021) was folded into **Broken Access Control**; **Mishandling of Exceptional Conditions** (A10) is new; Security Misconfiguration rose to A02.
+
+| Question # | Topic | OWASP Top 10:2025 category |
+|-----------|-------|----------------|
+| 1 | JWT Internals | A07:2025 — Authentication Failures; A04:2025 — Cryptographic Failures |
+| 2 | OAuth2 & OIDC | A07:2025 — Authentication Failures; A01:2025 — Broken Access Control |
+| 3 | SQL Injection | A05:2025 — Injection |
+| 4 | Encryption | A04:2025 — Cryptographic Failures |
+| 5 | Secrets Mgmt | A02:2025 — Security Misconfiguration; A04:2025 — Cryptographic Failures |
+| 6 | Rate Limiting | A06:2025 — Insecure Design (resource consumption is also OWASP **API** Top 10 API4:2023) |
+| 7 | Auth Methods | A07:2025 — Authentication Failures |
+| 8 | CORS/CSRF | A01:2025 — Broken Access Control; A02:2025 — Security Misconfiguration |
+| 9 | Supply Chain | A03:2025 — Software Supply Chain Failures; A08:2025 — Software or Data Integrity Failures |
+| 10 | SSRF | A01:2025 — Broken Access Control |
+
+The full 2025 list: A01 Broken Access Control, A02 Security Misconfiguration, A03 Software Supply Chain Failures, A04 Cryptographic Failures, A05 Injection, A06 Insecure Design, A07 Authentication Failures, A08 Software or Data Integrity Failures, A09 Security Logging and Alerting Failures, A10 Mishandling of Exceptional Conditions.
 
 ---
 
@@ -44,231 +48,126 @@
 
 ### Answer
 
-**Addressing "JWT Is Insecure" — It's Signed, Not Encrypted:**
+!!! tip "30-second answer"
+    A JWS-signed JWT is **readable but tamper-proof**: integrity comes from the signature, not secrecy, so never put secrets or sensitive PII in it (use JWE or an opaque token if you must hide claims). Make verification strict: pin the algorithm, check `iss`, `aud`, `exp`, and the token type; use asymmetric keys (ES256/EdDSA) published via a **JWKS** endpoint with `kid`-based rotation. Revocation is the real trade-off of self-contained tokens: keep access tokens short-lived (5–15 min), make refresh tokens stateful and rotating, and for "logout everywhere" revoke the refresh tokens and push a small **deny-list** (by `jti` or by "tokens for user X issued before T") to services for the remaining access-token lifetime. Any per-request revocation check is state; be explicit about where it lives and what it costs. Follow RFC 8725 (JWT BCP, being updated by the 8725bis draft) and RFC 9068 for access-token JWTs.
 
-```json
-// JWT = JSON Web TOKEN — the key word is "token"
-// JWTs are SIGNED to verify INTEGRITY, not ENCRYPTED for secrecy.
+**Signed, not encrypted:**
 
-// What the JWT contains (base64-decoded):
-Header:
-{
-  "alg": "RS256",
-  "typ": "JWT",
-  "kid": "key-v1"
-}
-Payload:
-{
-  "sub": "user_42",
-  "name": "Alice Smith",
-  "role": "admin",
-  "iat": 1700000000,
-  "exp": 1700003600
-}
+```
+header.payload.signature        (each part base64url-encoded)
 
-// YES, anyone can decode and READ this!
-// The payload is base64-encoded, not encrypted.
+header:  {"alg": "ES256", "typ": "at+jwt", "kid": "2026-10"}
+payload: {"iss": "https://auth.example.com", "aud": "orders-api",
+          "sub": "user_42", "scope": "orders:read",
+          "iat": 1791331200, "exp": 1791331800, "jti": "8f1c..."}
 
-// The security is in the SIGNATURE:
-// RS256 (RSA Signature with SHA-256):
-//   sign(
-//     base64url(header) + "." + base64url(payload),
-//     private_key  ← ONLY the server knows this!
-//   )
-//   verify(
-//     base64url(header) + "." + base64url(payload),
-//     signature,
-//     public_key  ← Shared with services that need to verify
-//   )
-// → Signature = 3rd segment of the JWT
-// → Anyone can forge? NO (they need the private key)
-// → Anyone can tamper? NO (signature won't verify)
-// → Anyone can verify the signature? YES (public key is shared)
-//
-// ⚠️ WARNING: Algorithm confusion attack
-//   If the server uses RS256 but doesn't validate the 'alg' header,
-//   an attacker can change 'alg' to 'HS256' and sign with the
-//   PUBLIC key (which is... public!) to forge tokens.
-//   always specify the expected algorithm when decoding!
-//
-// So: JWT protects against TAMPERING, not against reading.
-// Don't put secrets in the JWT payload!
+signature = ECDSA_P256_SHA256(private_key, base64url(header) + "." + base64url(payload))
 ```
 
-**Revocation — The Hard Problem:**
+- Anyone can **read** it; only the issuer can **mint** it; any change breaks the signature.
+- Base64 is encoding, not encryption. For confidentiality, use JWE (encrypted JWT) or opaque reference tokens that the API introspects (RFC 7662).
+
+**Classic JWT attacks and their fixes:**
+
+| Attack | How it works | Fix |
+|---|---|---|
+| `alg: none` | Token claims to be unsigned | Library-level allowlist of algorithms |
+| Algorithm confusion | Server expects RS256; attacker sends HS256 signed with the **public** key as the HMAC secret | Pin `algorithms=[...]` per key; never let the header choose; modern libraries refuse to use a PEM public key as an HMAC secret |
+| `kid` / `jku` / `x5u` injection | Header points at an attacker-controlled key or a file path / SQL | Treat `kid` as a lookup key into **your** JWKS only; ignore `jku`/`x5u` unless allowlisted |
+| Token substitution across services | A token for service A is accepted by service B | Validate `aud` (and `iss`) on every service |
+| Cross-JWT confusion | An ID token or other JWT is accepted as an access token | Check `typ` (`at+jwt`, RFC 9068) and the expected claim set |
+| Weak HMAC secrets | HS256 secrets brute-forced offline | Asymmetric keys; if HMAC, ≥ 256-bit random secrets |
+| Stolen bearer token | Whoever holds it can use it | Short TTLs; sender-constrained tokens (**DPoP**, RFC 9449, or mTLS-bound, RFC 8705) |
+
+**Issuing and verifying (PyJWT, tested):**
 
 ```python
-# JWTs are stateless — once issued, they're valid until expiry.
-# You CAN'T revoke a JWT by "calling the auth server" because
-# the microservice doesn't check the auth server for every request.
+from datetime import datetime, timedelta, timezone
+import uuid
 
-# Solutions (from worst to best):
+import jwt
 
-# ❌ Bad: Check a "blocklist" database on every request
-#   This eliminates the stateless benefit of JWTs!
-def verify_jwt(token):
-    if token in redis_blocklist:
-        raise RevokedToken()
-    # verify signature...
+ISSUER = "https://auth.example.com"
+AUDIENCE = "orders-api"
 
-# ✅ Good: Short-lived access tokens + long-lived refresh tokens
-ACCESS_TOKEN_LIFETIME = 15 * 60  # 15 minutes
-REFRESH_TOKEN_LIFETIME = 7 * 24 * 60 * 60  # 7 days
 
-# Microservices only verify ACCESS tokens (stateless)
-# Revocation: expire the REFRESH token → user must re-authenticate
-# Max time until revoked (worst case): 15 minutes
-
-# ✅✅ Better: Rotation-based key signing
-# Each version of user token uses a different signing key
-# Revoke by: removing the signing key → ALL tokens signed with
-# that key become invalid!
-
-class TokenVersionService:
-    """
-    Version-based token revocation.
-    
-    Key insight: Each token embeds the user's current version counter.
-    When we increment the counter, ALL tokens issued before that
-    become invalid — instant revocation without a blocklist!
-    
-    ⚠️ This class handles REVOCATION only (user version).
-       KEY ROTATION is handled by KeyRotationService (separate concern).
-       The two services compose together at the call site.
-    """
-
-    def issue_token(self, user_id: int, signing_key: str, kid: str) -> str:
-        """Issue a JWT with the user's current version embedded."""
-        version = self.get_user_version(user_id)  # from DB
-        now = datetime.utcnow()
-        return jwt.encode({
-            "sub": user_id,
-            "ver": version,  # ← User's current token version
+def issue_access_token(user_id: str, kid: str, private_key) -> str:
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "iss": ISSUER,
+            "aud": AUDIENCE,
+            "sub": user_id,                    # must be a string (PyJWT ≥ 2.10 enforces this)
             "iat": now,
-            "exp": now + timedelta(minutes=15),
-        }, signing_key, algorithm="RS256",
-           headers={"kid": kid})  # ← Track which signing key was used
+            "exp": now + timedelta(minutes=10),
+            "jti": uuid.uuid4().hex,           # lets you deny-list a single token
+            "scope": "orders:read",
+        },
+        private_key,
+        algorithm="ES256",
+        headers={"kid": kid, "typ": "at+jwt"},  # RFC 9068 access-token type
+    )
 
-    def verify_token(self, token: str, public_keys: dict) -> dict:
-        """
-        Verify a JWT and check user version revocation.
-        
-        Args:
-            token: The JWT to verify
-            public_keys: Dict of {kid: public_key} from KeyRotationService
-        """
-        # 1. Extract kid from header to select the right verification key
-        headers = jwt.get_unverified_header(token)
-        kid = headers.get("kid")
 
-        if kid not in public_keys:
-            # Unknown kid → token was signed with a rotated-out key
-            raise RevokedToken("Signing key no longer valid (key rotated)")
-
-        public_key = public_keys[kid]
-        payload = jwt.decode(token, public_key,
-                             algorithms=["RS256"])
-
-        # 2. Check user version for revocation
-        expected_version = self.get_user_version(payload["sub"])
-        if payload.get("ver") != expected_version:
-            # Token has been revoked — user re-authenticated
-            raise RevokedToken("Token version mismatch — user session revoked")
-        return payload
-
-    def increment_user_version(self, user_id: int):
-        """Atomically increment the user's token version."""
-        db.execute(
-            "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
-            (user_id,)
-        )
-
-    def revoke_all_sessions(self, user_id: int):
-        # Just tick the version counter! All existing tokens become invalid
-        self.increment_user_version(user_id)
-        # No database blocklist needed — version mismatch = invalid
+def verify_access_token(token: str, keys_by_kid: dict) -> dict:
+    kid = jwt.get_unverified_header(token).get("kid")
+    key = keys_by_kid.get(kid)
+    if key is None:
+        raise jwt.InvalidTokenError("unknown kid")   # refetch JWKS once (rate-limited), then reject
+    return jwt.decode(
+        token,
+        key,
+        algorithms=["ES256"],                         # pinned, never taken from the header
+        audience=AUDIENCE,
+        issuer=ISSUER,
+        options={"require": ["exp", "iat", "iss", "aud", "sub"]},
+        leeway=30,                                    # small clock-skew allowance
+    )
 ```
 
-**Key Rotation Strategy:**
+**Revocation — options and their real cost:**
+
+| Approach | Revocation delay | State per request | Notes |
+|---|---|---|---|
+| Short-lived access token + rotating refresh token | Up to access-token TTL | None | The baseline. Refresh tokens live server-side and can be revoked instantly |
+| Deny-list of `jti` (or user + "not before" timestamp) | Seconds (push to services) | Local lookup in a small in-memory set/Bloom filter fed by an event stream | Entries only need to live until the token's `exp`, so the list stays small |
+| Per-user `token_version` claim checked against a DB/cache | Immediate | A cache read per request | Simple "logout everywhere", but it **is** a stateful check, the same cost class as a session lookup |
+| Token introspection (RFC 7662) / opaque tokens | Immediate | A call (cacheable) to the auth server | Use for high-risk operations |
+| Rotating the signing key | Immediate for **all** users | None | A break-glass response to key compromise, not a per-user tool |
+
+**Refresh-token rotation with reuse detection** (required for public clients by RFC 9700 unless tokens are sender-constrained): each refresh returns a **new** refresh token and invalidates the old one. If an old refresh token is ever presented again, someone has a copy: revoke the whole token family and force re-authentication.
+
+**Key rotation:**
+
+1. Generate the new key pair and **publish** its public key in the JWKS (`kid = "2026-11"`) **before** signing with it, so verifiers that cache the JWKS already know it.
+2. After the JWKS cache TTL has passed, start **signing** with the new key.
+3. Keep the old public key in the JWKS until the **last token it signed has expired** (i.e. max access-token TTL after it stopped signing, not after it was created).
+4. Remove the old key. Verifiers that see an unknown `kid` refetch the JWKS once (rate-limited) before rejecting.
+
+Keep private keys in a KMS/HSM and sign through it, so they never sit on application hosts.
+
+**Logout everywhere:**
 
 ```python
-# JWTs need key rotation. Here's how:
-
-class KeyRotationService:
-    def __init__(self):
-        # Store multiple keys by ID
-        self.keys = {
-            "v1-2024": {"private": load_key("v1-private.pem"),
-                        "public": load_key("v1-public.pem"),
-                        "created_at": "2024-01-01"},
-            "v2-2024": {"private": load_key("v2-private.pem"),
-                        "public": load_key("v2-public.pem"),
-                        "created_at": "2024-06-01"},  # ← Current
-        }
-        self.current_kid = "v2-2024"
-
-    def issue_token(self, user_id: int) -> str:
-        return jwt.encode({
-            "sub": user_id,
-            # ...
-        }, self.keys[self.current_kid]["private"],
-           algorithm="RS256",
-           headers={"kid": self.current_kid})
-
-    def verify_token(self, token: str) -> dict:
-        # Extract kid from header (before verification!)
-        headers = jwt.get_unverified_header(token)
-        key = self.keys[headers["kid"]]["public"]
-        return jwt.decode(token, key, algorithms=["RS256"])
-
-    def rotate_key(self):
-        new_kid = f"v3-2024"
-        self.generate_key(new_kid)
-        self.keys[new_kid] = {"private": ..., "public": ...,
-                              "created_at": datetime.fromisoformat("2024-07-01")}
-        self.current_kid = new_kid
-
-        # Old keys are kept for GRACE PERIOD equal to the max token lifetime
-        # (tokens issued before rotation still need to be verified)
-        # Remove old keys only after ALL tokens they signed have expired
-        max_token_ttl = timedelta(hours=1)  # Max JWT lifetime
-
-        for kid, key_data in list(self.keys.items()):
-            if kid == self.current_kid:
-                continue  # Never delete the current key
-            # A key is safe to delete only if it was created more than
-            # max_token_ttl ago — all tokens signed with it have expired
-            key_age = datetime.utcnow() - key_data["created_at"]
-            if key_age > max_token_ttl + timedelta(hours=1):
-                del self.keys[kid]
+def revoke_all_sessions(user_id: str) -> None:
+    now = int(time.time())
+    db.execute("UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = %s", (user_id,))
+    # Services reject access tokens for this user with iat < now until they expire naturally.
+    event_bus.publish("user.tokens_revoked", {"sub": user_id, "not_before": now,
+                                              "expires_at": now + MAX_ACCESS_TOKEN_TTL})
 ```
 
-**Logout Everywhere:**
-
-```python
-def revoke_all_sessions(user_id: int):
-    # 1. Tick user's token version (invalidates ALL access tokens)
-    token_version_service.increment_user_version(user_id)
-
-    # 2. Delete all refresh tokens from database
-    db.execute("DELETE FROM refresh_tokens WHERE user_id = ?", user_id)
-
-    # 3. Optionally notify other services via event
-    event_bus.publish(UserSessionsRevoked(user_id=user_id))
-    # Other services can flush their local caches for this user
-
-    # 4. Done! No need to broadcast to every microservice —
-    #    they'll reject the old token at next request (signature+version)
-```
+Every service keeps the `{sub: not_before}` entries in memory and drops them after `expires_at`, so the deny-list stays tiny and the check needs no network call.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Signature vs encryption** | Clearly distinguishes JWT signing from encryption |
-| **Revocation** | Has a concrete strategy (short TTL, version tokens, or key rotation) |
-| **Key rotation** | Describes graceful rotation with overlapping key lifetimes |
-| **Logout** | Explains how "logout everywhere" works without a global blocklist |
+| **Signature vs encryption** | Clearly distinguishes JWS signing from JWE encryption; no secrets in claims |
+| **Validation** | Pinned alg, iss/aud/exp/typ checks, JWKS with kid; knows alg confusion and kid injection |
+| **Revocation** | Short TTL + rotating refresh tokens + small pushed deny-list; honest about state |
+| **Key rotation** | Publish-before-sign, retire after last token expires, KMS-held keys |
+| **Token theft** | Mentions DPoP/mTLS sender-constrained tokens |
 
 ---
 
@@ -280,154 +179,116 @@ def revoke_all_sessions(user_id: int):
 
 ### Answer
 
-**Authorization Code + PKCE (The Correct Flow for Mobile Apps):**
+!!! tip "30-second answer"
+    Use **Authorization Code + PKCE** in the **system browser** (ASWebAuthenticationSession on iOS, Custom Tabs on Android, per RFC 8252), never an embedded WebView. The app creates a random `code_verifier`, sends only its SHA-256 hash (`code_challenge`, method `S256`) with the authorization request, and must present the verifier to redeem the code, so an intercepted code is useless. The **implicit** grant returned tokens in the URL fragment with nothing binding them to the client; current guidance (RFC 9700, the OAuth 2.0 Security BCP, January 2025, and the OAuth 2.1 draft) says don't use it, and forbids the password grant. **OAuth** answers "may this client access this API?"; **OpenID Connect** adds an **ID token** that answers "who is the user?", which the client must validate (signature, `iss`, `aud`, `exp`, `nonce`).
+
+**Authorization Code + PKCE for a mobile app with a backend:**
 
 ```
-Mobile App                 Backend              Google Auth Server
-    │                         │                        │
-    │ 1. Login Request        │                        │
-    │────────────────────────►│                        │
-    │                         │                        │
-    │ 2. Generate PKCE params │                        │
-    │    code_verifier = random(128 bytes)             │
-    │    code_challenge = SHA256(code_verifier)         │
-    │    ⚠️ MUST set:         │                        │
-    │    code_challenge_method = 'S256' (not 'plain')  │
-    │                         │                        │
-    │ 3. Open Browser to Auth URL                      │
-    │◄────────────────────────┤                        │
-    │    + code_challenge     │                        │
-    │    + code_challenge_method=S256                   │
-    │                         │                        │
-    │ 4. User authenticates   │                        │
-    │─────────────────────────────────────────────────►│
-    │ 5. Authorization code   │                        │
-    │◄─────────────────────────────────────────────────┤
-    │    + redirect_uri       │                        │
-    │                         │                        │
-    │ 6. Auth Code + Verifier │                        │
-    │────────────────────────►│                        │
-    │                         │ 7. Token Request       │
-    │                         │   auth_code            │
-    │                         │   code_verifier        │
-    │                         │───────────────────────►│
-    │                         │ 8. Verifies:           │
-    │                         │    SHA256(verifier)    │
-    │                         │    == code_challenge   │
-    │                         │◄───────────────────────┤
-    │                         │    access_token        │
-    │ 9. API Response         │    refresh_token       │
-    │◄────────────────────────┤    id_token (OIDC)     │
-    │                         │                        │
+Mobile app                         Google (authorization server)        Your backend
+    │ 1. code_verifier = 32 random bytes, base64url (43-128 chars)
+    │    code_challenge = BASE64URL(SHA256(code_verifier))
+    │    state = random, nonce = random
+    │
+    │ 2. open system browser:
+    │    /authorize?response_type=code&client_id=...&redirect_uri=https://app.example.com/cb
+    │      &scope=openid%20email&code_challenge=...&code_challenge_method=S256
+    │      &state=...&nonce=...
+    │──────────────────────────────────►│
+    │         3. user signs in, consents │
+    │◄──────────────────────────────────│ 4. redirect to claimed https link (Universal/App Link)
+    │    ?code=...&state=...                with the code
+    │ 5. check state
+    │ 6. POST code + code_verifier (+ nonce) over TLS ───────────────────────────►│
+    │                                    │◄── 7. token request: code, verifier,    │
+    │                                    │        client authentication            │
+    │                                    │ 8. checks SHA256(verifier) == challenge │
+    │                                    │──► id_token, access_token, refresh ────►│
+    │                                                     9. validate id_token,    │
+    │◄──────────────────────────────── 10. your own session / tokens ─────────────│
 ```
 
-```yaml
-# ⚠️ Critical: If you omit code_challenge_method=S256, the auth server
-# may default to 'plain', which means the verifier is sent in the clear
-# with no hashing. This completely defeats PKCE's security purpose!
-# Always explicitly set code_challenge_method=S256.
-```
+Two valid shapes: the app redeems the code itself as a **public client** (no client secret can be kept in a mobile binary), or it forwards code + verifier to its backend, which redeems it as a **confidential client** (shown above). Either way PKCE is required (RFC 9700 requires it for public clients and recommends it for all).
 
-**Why Implicit Grant Is Deprecated:**
+**Why `S256`, not `plain`:** with `plain` the challenge equals the verifier, so anyone who sees the authorization request (logs, a malicious app watching the redirect) learns the verifier. Servers should reject `plain` when the client can do `S256`.
 
-```yaml
-# Implicit Grant (deprecated by RFC 6749 bis / OAuth 2.1):
-#   1. App redirects user to auth server
-#   2. Auth server returns access_token in URL FRAGMENT (#token=...)
-#   3. No authorization code, no client authentication
-#
-# Security problems:
-#   - Access token in URL → leaks to browser history, server logs, referrer header
-#   - No client authentication → anyone can use the redirect URL
-#   - No refresh tokens → can't revoke without re-authenticating
-#   - Can't bind to a specific client (no PKCE)
-#
-# PKCE fixes ALL of these:
-#   - Code verifier is only known to this specific app instance
-#   - Even if authorization code is intercepted, can't exchange without verifier
-#   - Token never appears in URL
-#   - Refresh token enables revocation
-```
+**Grants in 2026:**
 
-**OpenID Connect — Authentication on Top of OAuth2:**
+| Grant | Status | Why |
+|---|---|---|
+| Authorization code + PKCE | Use it | Code bound to the client instance; tokens never in the URL |
+| Implicit | Don't (RFC 9700; removed in OAuth 2.1 draft) | Tokens in the URL fragment leak via history, logs, referrers, browser extensions; no sender binding; no refresh tokens |
+| Resource owner password | Must not | App handles the user's password; defeats MFA and phishing resistance |
+| Client credentials | Use for machine-to-machine | No user involved |
+| Device authorization (RFC 8628) | TVs, CLIs | User approves on another device |
+| Refresh token | Use with rotation or sender-constraining | RFC 9700 requires one of the two for public clients |
+
+Other RFC 9700 requirements interviewers like: exact string matching of redirect URIs, no open redirectors, and sender-constrained tokens (DPoP or mTLS) where possible. For high-value APIs, **PAR** (Pushed Authorization Requests, RFC 9126) sends the authorization request over a back channel so it can't be tampered with in the browser.
+
+**OpenID Connect — identity on top of OAuth:**
 
 ```
-OAuth2: "User authorizes App to access their Google Drive" (Authorization)
-OIDC:   "User IS Alice Smith" (Authentication)
+OAuth 2.0:  "The user lets this app read their Google Drive"   (authorization; access token for the API)
+OIDC:       "The user is Google account 1234567890"           (authentication; ID token for the client)
 
-OIDC adds:
-  - id_token (JWT) with claims about WHO the user is
-  - UserInfo endpoint to get additional user info
-  - Standardized claims (sub, name, email, email_verified, etc.)
-
-The id_token JWT payload:
+ID token payload:
 {
   "iss": "https://accounts.google.com",
-  "sub": "1234567890",      // ← Stable user ID (never changes!)
-  "aud": "my-app-client-id",
-  "auth_time": 1700000000,
-  "iat": 1700000000,
-  "exp": 1700003600,
-  "email": "alice@example.com",
-  "email_verified": true,
-  "name": "Alice Smith",
-  "picture": "https://...",
-  "nonce": "abc123"         // ← Replay protection
+  "sub": "1234567890",          ← stable identifier: key your account link on (iss, sub)
+  "aud": "my-app-client-id",    ← must be YOUR client id
+  "exp": 1791334800, "iat": 1791331200,
+  "nonce": "n-0S6_WzA2Mj",      ← must equal the nonce you sent (binds token to this login)
+  "email": "alice@example.com", "email_verified": true
 }
 ```
 
-**Implementing Login with Google:**
+Rules that prevent real breaches:
+
+- **Link accounts by `(iss, sub)`, never by email.** Emails change, can be unverified, and in multi-tenant identity providers can be set by the tenant admin (the "nOAuth" class of bugs).
+- **Don't send ID tokens to APIs as access tokens.** The ID token's audience is your client, not the API.
+- **Validate everything**: signature against the provider's JWKS, `iss`, `aud`, `exp`, `nonce`, and `azp` when present.
+
+**Backend callback (confidential client):**
 
 ```python
-# Backend code for exchanging auth code:
 @router.post("/auth/google/callback")
-async def google_callback(code: str, verifier: str, state: str, session: Session):
-    # 1. Verify state matches (CSRF protection)
-    #    The 'state' parameter was generated and stored in the session
-    #    during step 1. If it doesn't match, this is a CSRF attack!
-    if state != session.pop("oauth_state"):
-        raise HTTPException(400, "Invalid state — possible CSRF attack")
+async def google_callback(body: CallbackBody, session: Session):
+    # 1. state was checked by the app; check the nonce we stored for this login attempt
+    expected_nonce = session.pop("oidc_nonce", None)
 
-    # 2. Exchange code + verifier for tokens
-    token_response = await http_client.post(
-        "https://oauth2.googleapis.com/token",
-        data={
-            "code": code,
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": "https://myapp.com/auth/google/callback",
-            "grant_type": "authorization_code",
-            "code_verifier": verifier,
-        }
-    )
-    tokens = token_response.json()
+    # 2. redeem code + verifier
+    resp = await http.post("https://oauth2.googleapis.com/token", data={
+        "grant_type": "authorization_code",
+        "code": body.code,
+        "code_verifier": body.code_verifier,
+        "redirect_uri": "https://app.example.com/cb",
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,     # from a secret manager, not source code
+    }, timeout=5)
+    resp.raise_for_status()
+    tokens = resp.json()
 
-    # 3. Verify id_token (validate signature, issuer, audience)
-    id_token = await verify_google_jwt(tokens["id_token"])
+    # 3. validate the ID token (signature via Google's JWKS, iss, aud, exp, nonce)
+    claims = verify_google_id_token(tokens["id_token"], audience=GOOGLE_CLIENT_ID,
+                                    nonce=expected_nonce)
 
-    # 4. Extract user info
-    user = await find_or_create_user(
-        provider="google",
-        provider_id=id_token["sub"],
-        email=id_token["email"],
-        name=id_token["name"],
-    )
+    # 4. find or create the local account by (iss, sub)
+    user = await upsert_user(issuer=claims["iss"], subject=claims["sub"],
+                             email=claims.get("email") if claims.get("email_verified") else None)
 
-    # 5. Issue OUR tokens
-    return {
-        "access_token": jwt_encode(user, expires=15*60),
-        "refresh_token": generate_refresh_token(user),
-    }
+    # 5. issue YOUR session or tokens; keep Google's refresh token only if you need offline access
+    return await create_app_session(user)
 ```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **PKCE purpose** | Knows it binds authorization code to a specific client instance |
-| **OIDC vs OAuth2** | Clearly distinguishes authentication (who the user is) from authorization (what app can do) |
-| **Implicit deprecation** | Explains why it's gone (token in URL, no client auth, no refresh) |
-| **id_token verification** | Mentions verifying iss, aud, signature, and nonce |
+| **PKCE purpose** | Binds the code to the client instance; S256; verifier format |
+| **Native app specifics** | System browser, claimed https redirects, public vs confidential client |
+| **Current guidance** | RFC 9700: no implicit, no password grant, refresh token rotation/sender-constraining |
+| **OIDC vs OAuth2** | Authentication vs authorization; ID token vs access token |
+| **id_token verification** | Signature, iss, aud, exp, nonce; links accounts by (iss, sub) |
 
 ---
 
@@ -439,195 +300,137 @@ async def google_callback(code: str, verifier: str, state: str, session: Session
 
 ### Answer
 
-**The Attack Walkthrough — Three SQLi Variants:**
+!!! tip "30-second answer"
+    Fix the root cause: **every value goes through a bound parameter**, including values read back from your own database (second-order injection). Parameters can't be used for identifiers or keywords, so column names, sort direction and table names come from an **allowlist**. Then add defence in depth: a least-privilege database role (no DDL, only the tables it needs), row-level security for tenant isolation, generic error messages, and a WAF as a speed bump while you patch, not as the fix. Find the rest of the bug class with code search for string-built SQL, SAST rules in CI, and DAST. NoSQL has the same bug in a different shape: user input interpreted as **query operators**.
+
+**Three variants:**
 
 ```python
-# ─── Variant 1: In-Band SQLi (Classic) ───
-# Attacker input: ' OR 1=1; DROP TABLE users; --
-query = f"SELECT * FROM users WHERE name = '{request['name']}'"
-# Executes:
-#   SELECT * FROM users WHERE name = '' OR 1=1; DROP TABLE users; --'
-# Result: All users leaked + users table DROPPED
+# 1. In-band (classic)
+query = f"SELECT * FROM users WHERE name = '{name}'"
+# name = "' OR 1=1 --"           → returns every row
+# name = "'; DROP TABLE users --" → stacked query; works only if the driver allows
+#   multiple statements per call (psycopg's simple query protocol does; most MySQL
+#   drivers don't by default)
 
-# ─── Variant 2: Blind SQLi (Boolean-Based) ───
-# Attacker can't see errors, but can infer from response timing/content
-# Input: ' OR (SELECT ascii(substr(password,1,1)) FROM admin)=97 --
-# Compares response when condition is true vs false
-# Attacker exfiltrates data ONE CHARACTER at a time
-# 1000 requests → full admin password
+# 2. Blind (boolean- or time-based): no data in the response, but behaviour leaks it
+# name = "x' OR (SELECT ascii(substr(password,1,1)) FROM admins LIMIT 1) > 109 --"
+# Compare responses (or response time with pg_sleep / SLEEP) and binary-search each
+# character: ~7 requests per character. sqlmap automates this.
 
-# ─── Variant 3: Second-Order SQLi ───
-# Step 1: Register with malicious username:  '; UPDATE users SET role='admin' WHERE id=42; --
-# Step 2: App safely INSERTs the username (parameterized) — NO immediate exploit
-# Step 3: Later, app retrieves username and uses it in ANOTHER query:
-#         f"SELECT * FROM audit WHERE changed_by = '{username}'"
-#         Now the payload executes!
-# Why it's dangerous: First-order defenses (input validation) are bypassed
+# 3. Second-order: payload stored safely, executed later
+# Signup stores username "x'; UPDATE users SET role='admin' WHERE id=42; --"
+# via a parameterized INSERT (fine). Months later a reporting job does:
+#   f"SELECT * FROM audit WHERE changed_by = '{row.username}'"   ← executes the payload
+# Lesson: data from your own DB is still untrusted input.
 ```
 
-**NoSQL Injection (MongoDB):**
+**NoSQL (operator) injection:**
 
 ```javascript
-// NoSQL databases are ALSO vulnerable to injection!
+// Express parses JSON bodies into objects, so this:
+//   {"username": "admin", "password": {"$ne": ""}}
+// turns into a query that matches the admin with ANY password.
+const user = await users.findOne({ username: req.body.username, password: req.body.password });
 
-// Vulnerable (MongoDB):
-app.post('/login', async (req, res) => {
-    const user = await db.collection('users').findOne({
-        username: req.body.username,
-        password: req.body.password
-    });
-    // Attacker sends: { "username": "admin", "password": { "$ne": "" } }
-    // MongoDB interprets $ne (not equal) as an operator!
-    // Query becomes: find user where username='admin' AND password != ''
-    // Bypasses authentication!
-});
-
-// Fix: Never pass user input directly as MongoDB query operators
-app.post('/login', async (req, res) => {
-    const user = await db.collection('users').findOne({
-        username: { $eq: req.body.username },  // Explicit equality
-        password: { $eq: req.body.password }
-    });
-    // Now $ne injection doesn't work — $eq prevents operator injection
-});
+// Fix 1: validate types at the boundary (schema validation: zod, joi, JSON Schema)
+// Fix 2: force equality semantics when building queries
+const user = await users.findOne({ username: { $eq: String(req.body.username) } });
+// Fix 3: never compare passwords in the query; fetch the user, then verify a password HASH
+const ok = user && await argon2.verify(user.passwordHash, String(req.body.password));
+// Also disable server-side JavaScript ($where, mapReduce) unless you need it.
 ```
 
-**Layer 1: Application Code — Parameterized Queries (NON-NEGOTIABLE):**
+**Layer 1: application code — bound parameters everywhere:**
 
 ```python
-# The only COMPLETE defense against SQL injection.
-# Separates SQL code from data — the database engine treats
-# parameters as DATA, never as executable code.
+# psycopg 3
+cur.execute("SELECT id, name FROM users WHERE name = %s AND status = %s", (name, status))
 
-# ✅ Correct: Parameterized query
-cursor.execute(
-    "SELECT * FROM users WHERE name = %s AND status = %s",
-    (request['name'], request['status'])
-)
-# Input: ' OR 1=1; --
-# Treated as literal string data, not SQL code
+# SQLAlchemy 2.0
+stmt = select(User).where(User.name == name)                      # ORM builds parameters
+stmt = text("SELECT * FROM users WHERE name = :name").bindparams(name=name)
 
-# ❌ Wrong: String formatting (even with escape functions)
-cursor.execute(
-    f"SELECT * FROM users WHERE name = '{escape_string(request['name'])}'"
-)
-# escape_string can be bypassed with multi-byte encoding (GBK bypass)
-# NEVER roll your own escaping!
-
-# ❌ Wrong: ORM without parameterized raw queries
-# Even ORMs can be vulnerable if you use raw() or execute()
-Model.objects.raw(f"SELECT * FROM users WHERE name = '{name}'")  # DANGER!
-
-# ORM-safe approaches:
-# Django: Model.objects.filter(name=name)  # ✅ ORM handles parameterization
-# SQLAlchemy: session.query(User).filter(User.name == name)  # ✅
-# SQLAlchemy raw: text("SELECT * FROM users WHERE name = :name").params(name=name)  # ✅
+# Django
+User.objects.filter(name=name)
+User.objects.raw("SELECT * FROM users WHERE name = %s", [name])   # params, not f-strings
 ```
-
-**Stored Procedures — Not a Magic Bullet:**
 
 ```python
-# Myth: "Stored procedures prevent SQL injection"
-# Truth: Stored procedures can STILL be vulnerable if they use dynamic SQL
+# Identifiers can't be parameters: allowlist them
+SORTABLE = {"created_at": "created_at", "name": "name"}
+DIRECTIONS = {"asc": "ASC", "desc": "DESC"}
 
-# ❌ Vulnerable stored procedure:
-CREATE PROCEDURE search_users(@name NVARCHAR(100))
-AS
-BEGIN
-    EXEC('SELECT * FROM users WHERE name = ''' + @name + '''')  # Dynamic SQL!
-END
-
-# ✅ Safe stored procedure:
-CREATE PROCEDURE search_users(@name NVARCHAR(100))
-AS
-BEGIN
-    SELECT * FROM users WHERE name = @name  # Parameterized within SP
-END
+def search_users(cur, name: str, sort: str, direction: str):
+    col = SORTABLE.get(sort, "created_at")
+    dir_ = DIRECTIONS.get(direction.lower(), "DESC")
+    cur.execute(f"SELECT id, name FROM users WHERE name ILIKE %s ORDER BY {col} {dir_} LIMIT 50",
+                (f"%{name}%",))
+    # (psycopg also offers sql.Identifier for safe quoting of dynamic identifiers)
 ```
 
-**Layer 2: Database Hardening (Defense in Depth):**
+Escaping functions are not a substitute: they depend on the connection's character set (the classic GBK multi-byte bypass of `mysql_real_escape_string`) and on every developer remembering every call site.
+
+**Stored procedures aren't automatically safe:**
 
 ```sql
--- Principle of Least Privilege:
--- App connection should NEVER have DROP, TRUNCATE, CREATE, or ALTER
+-- Vulnerable: dynamic SQL inside the procedure (SQL Server)
+CREATE PROCEDURE search_users @name NVARCHAR(100) AS
+    EXEC('SELECT * FROM users WHERE name = ''' + @name + '''');
 
--- ✅ Correct: Minimal grants for the app user
+-- Safe: static SQL, or sp_executesql with parameters
+CREATE PROCEDURE search_users @name NVARCHAR(100) AS
+    SELECT * FROM users WHERE name = @name;
+```
+
+**Layer 2: database hardening (limits the blast radius):**
+
+```sql
+-- The app role gets DML on what it needs, nothing else (no DDL, no superuser)
+CREATE ROLE app_user LOGIN;
 GRANT SELECT, INSERT, UPDATE, DELETE ON app.users TO app_user;
 GRANT SELECT ON app.orders TO app_user;
--- NEVER:
--- GRANT ALL PRIVILEGES ON DATABASE mydb TO app_user;
--- GRANT DROP, TRUNCATE, ALTER TO app_user;
+-- Separate migration role owns the schema and runs DDL during deploys only.
 
--- Revoke PUBLIC schema access (prevents schema discovery)
+-- Since PostgreSQL 15, ordinary users can no longer CREATE in the public schema by
+-- default; on older versions revoke it:
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
--- Row-Level Security (RLS):
--- Even if SQLi succeeds, RLS limits what data can be accessed
+-- Row-level security: even an injected query only sees the current tenant's rows
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
-CREATE POLICY user_isolation ON users
+ALTER TABLE users FORCE ROW LEVEL SECURITY;          -- applies to the table owner too
+CREATE POLICY tenant_isolation ON users
     USING (tenant_id = current_setting('app.tenant_id')::int);
-
--- Prepared Statements (server-side):
-PREPARE search_users_ps(text) AS
-    SELECT * FROM users WHERE name = $1;
-EXECUTE search_users_ps('Alice');
--- Executing via prepared statement name prevents SQL injection
+-- Superusers and roles with BYPASSRLS still bypass it; the app role must have neither.
 ```
 
-**Layer 3: WAF Rules (Last Line of Defense):**
+Also: statement timeouts (limit time-based blind extraction and runaway queries), and alerts on SQL syntax errors from the app role (attack probes cause them).
 
-```python
-# WAF can block obvious attacks but is NOT a complete defense
-# Attackers bypass WAF through:
-#   - Unicode encoding: %u0027 instead of '
-#   - Case variation: UnIoN sElEcT
-#   - Comment injection: UN/**/ION SEL/**/ECT
-#   - HTTP parameter pollution
-#   - Hex/char encoding: CHAR(39) instead of '
+**Layer 3: WAF (virtual patch, not a fix):**
 
-# ModSecurity CRS rules:
-#   - 942100: SQL Injection Detected via libinjection
-#   - 942110: SQL Injection: Common Comment Patterns
-#   - 942120: SQL Injection: Hex Encoding
-#   - 942130: SQL Injection: tautologies (' OR 1=1)
+- Managed rules (OWASP Core Rule Set's libinjection-based rule 942100, AWS `AWSManagedRulesSQLiRuleSet`, Cloudflare managed rules) block common payloads while the code fix ships.
+- Bypasses are routine: encodings, comments inside keywords (`UN/**/ION`), case games, JSON-wrapped payloads, HTTP parameter pollution. Run in block mode for the vulnerable endpoint, and log mode elsewhere to tune false positives.
 
-# AWS WAF SQLI rule group:
-#   - AWS-AWSManagedRulesSQLiRuleSet
-#   - Blocks common SQL injection patterns
-#   - Can be bypassed — NEVER rely on this alone!
+**Finding the rest of the bug class:**
+
+```bash
+# Static: string-built SQL in Python
+semgrep --config p/python --config p/sql-injection .
+# Dynamic, against staging only, with permission
+sqlmap -u "https://staging.example.com/search?name=test" --batch --level 3
 ```
 
-**Detection & Monitoring:**
-
-```python
-# Log all query errors (don't expose to users):
-import logging
-
-try:
-    cursor.execute(query, params)
-except Exception as e:
-    # Log the full error for security analysis
-    logger.warning(f"Query failed: {query} | Error: {e}")
-    # NEVER expose to user:
-    # return {"error": str(e)}  # DANGER: Leaks schema info!
-    return {"error": "An internal error occurred"}  # ✅ Safe
-
-# Automated detection:
-#   - sqlmap can detect blind SQLi automatically
-#   - Run sqlmap as part of CI/CD:
-#     sqlmap -u "https://staging.example.com/search?name=test" --batch
-#   - DAST scanners (Burp Suite, OWASP ZAP) crawl for SQLi
-```
+Also return generic errors to clients and log details server-side (without logging parameter values that contain PII or secrets), since detailed SQL errors make injection far easier.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Parameterized queries** | Knows this is the ONLY complete defense, explains why escaping isn't enough |
-| **Blind SQLi** | Understands time-based/boolean-based exfiltration techniques |
-| **Second-order injection** | Recognizes that stored data can later become an injection vector |
-| **NoSQL injection** | Mentions MongoDB operator injection ($ne, $where, $gt) |
-| **Defense in depth** | Covers app, DB, WAF layers without over-relying on any single one |
+| **Parameterized queries** | The only complete defence; allowlists for identifiers; why escaping isn't enough |
+| **Blind SQLi** | Boolean/time-based exfiltration, ~7 requests per character |
+| **Second-order injection** | Treats data from its own database as untrusted |
+| **NoSQL injection** | Operator injection ($ne, $gt, $where), type validation, hash comparison |
+| **Defense in depth** | Least privilege, RLS (FORCE, BYPASSRLS caveats), WAF as virtual patch, SAST/DAST |
 
 ---
 
@@ -639,336 +442,105 @@ except Exception as e:
 
 ### Answer
 
-**The Three States of Data:**
+!!! tip "30-second answer"
+    **In transit**: TLS 1.3 everywhere (1.2 only with AEAD suites for legacy clients), mTLS between services for workload identity, HSTS at the edge; hybrid post-quantum key exchange (X25519MLKEM768) comes free with current browsers and OpenSSL 3.5. **At rest**: storage encryption (EBS/RDS with KMS keys) protects against lost disks and snapshots, but anyone who can query the database sees plaintext, so the most sensitive PHI fields also get **application-level envelope encryption**: a per-record data key (DEK) encrypts the field with AES-GCM, and a KMS-held key-encryption key (KEK) encrypts the DEK. **Rotation**: rotating the KEK only re-wraps the small DEKs (or, with KMS automatic rotation, nothing at all), so terabytes of data are never re-encrypted. If a **DEK** or the data itself may have leaked, re-wrapping doesn't help: those records must be re-encrypted. **In use**: confidential computing (AMD SEV-SNP, Intel TDX, AWS Nitro Enclaves) for the few workloads that justify it.
 
-```yaml
-# Encryption is not one thing — it's three separate problems:
+**The three states of data:**
 
-┌─────────────────────────────────────────────────────────┐
-│                   DATA LIFECYCLE                         │
-├──────────────┬──────────────────┬──────────────────────-─┤
-│  IN TRANSIT   │    AT REST        │      IN USE           │
-│  Moving data  │    Stored data    │    Processing data    │
-├──────────────┼──────────────────┼───────────────────────┤
-│  TLS 1.3     │  AES-256-GCM     │  AMD SEV-SNP / Intel  │
-│  mTLS        │  TDE / EBS       │  SGX Confidential     │
-│  HSTS        │  Envelope enc.   │  Computing             │
-│  Cipher suites│  Field-level     │  Memory encryption    │
-├──────────────┼──────────────────┼───────────────────────┤
-│  MITM        │  Stolen disk     │  Root/hypervisor      │
-│  attacks     │  Backup leak     │  access attacks       │
-│  Downgrade   │  Physical theft  │  Cold boot attacks    │
-└──────────────┴──────────────────┴───────────────────────┘
-```
+| | In transit | At rest | In use |
+|---|---|---|---|
+| Mechanism | TLS 1.3, mTLS, HSTS | Disk/volume encryption, TDE, field-level envelope encryption | Confidential VMs (SEV-SNP, TDX), enclaves (Nitro Enclaves, SGX), confidential GPUs |
+| Protects against | Eavesdropping, tampering, MITM | Stolen disks, leaked snapshots/backups, (field-level) DB admins and SQL injection | Malicious or compromised host/hypervisor operators |
+| Doesn't protect against | A compromised endpoint | A compromised application with key access | Bugs in the workload itself |
 
-**Encryption in Transit — TLS 1.3 Deep Dive:**
+**In transit:**
+
+- TLS 1.3 handshake is **1 RTT** (TLS 1.2: 2), forward secrecy is mandatory, and downgrade protection is built in (the server signals a downgrade in its random value).
+- Cipher suites: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. For TLS 1.2, ECDHE + AEAD (GCM/ChaCha20) only; no CBC, RC4, 3DES; TLS 1.0/1.1 disabled.
+- **Post-quantum:** hybrid `X25519MLKEM768` key exchange is on by default in Chrome, Firefox, Apple platforms, Cloudflare and OpenSSL 3.5+, protecting recorded traffic from future quantum decryption ("harvest now, decrypt later"), relevant for long-lived PHI.
 
 ```python
-# TLS 1.3 handshake (2 round trips vs TLS 1.2's 4):
-#   Client → Server: ClientHello (supported cipher suites, key share)
-#   Server → Client: ServerHello + encrypted extensions + certificate + finished
-#   Client → Server: Finished (can send encrypted data IMMEDIATELY)
-
-# Cipher suite for TLS 1.3:
-#   TLS_AES_256_GCM_SHA384  ← Gold standard
-#   TLS_CHACHA20_POLY1305_SHA256  ← Mobile-friendly (no AES hardware)
-
-# NEVER use:
-#   TLS 1.0 / 1.1 (deprecated, vulnerable to BEAST, POODLE)
-#   TLS 1.2 with CBC mode ciphers (vulnerable to Lucky13)
-#   RC4, DES, 3DES (fully broken)
-
-# Python Flask: Enforce strong TLS
 import ssl
 
-context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-context.minimum_version = ssl.TLSVersion.TLSv1_3  # Only TLS 1.3
-context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20')  # Strong only
-
-# Nginx: Enforce strong TLS
-# ssl_protocols TLSv1.2 TLSv1.3;
-# ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
-# ssl_prefer_server_ciphers on;
-# add_header Strict-Transport-Security 'max-age=31536000; includeSubDomains';
+ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)   # server-side context
+ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")   # affects TLS 1.2 only; 1.3 suites are all AEAD
+ctx.load_cert_chain("server.crt", "server.key")
 ```
 
-**mTLS — Mutual Authentication for Microservices:**
-
-```python
-# mTLS = Both parties present certificates
-# Server verifies client's cert (not just client verifying server)
-
-# Why mTLS for healthcare:
-#   1. Every service has a unique identity (certificate)
-#   2. Encrypted + authenticated at transport layer
-#   3. No need for JWT/token validation between services
-#   4. Certificate can be short-lived (24h, renewed via Vault/SPIFFE)
-
-# Istio / Linkerd service mesh:
-#   - Automatic mTLS between all services
-#   - No application code changes needed
-#   - Certificate rotation handled by the mesh
+```nginx
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;    # Mozilla's current guidance: let clients pick among strong suites
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
 ```
 
-**Encryption at Rest — Multi-Layer Strategy:**
+**mTLS between services:** gives each workload a cryptographic **identity** (SPIFFE IDs, mesh-issued short-lived certs via Istio/Linkerd/Vault) and encrypts every hop. It does **not** replace authorization or end-user context: services still check "is service A allowed to call this endpoint for this user?", using the propagated user token.
+
+**At rest, in layers:**
+
+| Layer | Example | Protects against | Doesn't protect against |
+|---|---|---|---|
+| Storage / volume | EBS, RDS storage encryption, LUKS | Physical theft, snapshot sharing mistakes (if the key policy blocks it) | Anyone who can connect to the DB or read files on the running host |
+| Database TDE | SQL Server/Oracle TDE; for PostgreSQL, Percona's `pg_tde` extension or vendor forks (core PostgreSQL has none) | Copied data files and backups | DB users, SQL injection |
+| **Field-level (application) envelope encryption** | SSN, diagnosis codes, notes | DB admins, SQL injection, log/backup/analytics leaks | A compromised application that can call KMS |
+
+Note: `pgcrypto` is a library of SQL functions for field-level encryption inside the database, not TDE; keys passed to it travel in SQL and can end up in logs, so application-side encryption is usually preferable.
+
+**Envelope encryption with KMS and AES-GCM (tested with a stub KMS):**
 
 ```python
-from cryptography.fernet import Fernet
-import base64
 import os
 
-# ─── Layer 1: Application-Level (Field-Level Encryption) ───
-# Encrypt PHI fields BEFORE writing to database
-# This protects against: DB admin access, SQL injection, backup leaks
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-class PHIEncryptor:
-    """
-    Encrypts individual PII/PHI fields.
-    Each field gets its own Data Encryption Key (DEK).
-    
-    ⚠️ Fernet expects a 32-byte URL-safe base64-encoded key.
-       The raw DEK must be base64-encoded before passing to Fernet!
-    """
-    def __init__(self, master_key_provider):
-        self.master_key_provider = master_key_provider
-
-    def encrypt_ssn(self, ssn: str, patient_id: str) -> str:
-        # Generate a unique DEK for this patient's SSN
-        raw_dek = self.master_key_provider.generate_dek(f"ssn:{patient_id}")
-        # Fernet requires base64-encoded 32-byte key, not raw bytes!
-        encoded_dek = base64.urlsafe_b64encode(raw_dek)
-        f = Fernet(encoded_dek)
-        return f.encrypt(ssn.encode()).decode()
-
-    def decrypt_ssn(self, encrypted_ssn: str, patient_id: str) -> str:
-        raw_dek = self.master_key_provider.get_dek(f"ssn:{patient_id}")
-        encoded_dek = base64.urlsafe_b64encode(raw_dek)
-        f = Fernet(encoded_dek)
-        return f.decrypt(encrypted_ssn.encode()).decode()
-
-# ─── Layer 2: Database-Level TDE ───
-# PostgreSQL pgcrypto / MySQL AES_ENCRYPT / SQL Server TDE
-# Encrypts the entire database at the page level
-# Protects against: stolen database files, backup tapes
-
-# ⚠️ PostgreSQL does NOT have native TDE syntax like this!
-# Standard PostgreSQL does not support CREATE TABLESPACE ... ENCRYPTION.
-# TDE requires:
-#   - Cloud-specific: AWS RDS encryption, GCP CMEK, Azure TDE
-#   - Extensions: pg_tde (Percona/CyberTec), pgcrypto for field-level
-#   - Filesystem-level: LUKS/dm-crypt on the data directory
-#   - pg_tde example:
-#     SELECT pg_tde_add_key_provider_file('my-provider','/path/to/key');
-#     SELECT pg_tde_set_key_provider('my-provider');
-#     ALTER TABLE patients SET (encryption = 'tde');
-
-# ─── Layer 3: Storage-Level Encryption ───
-# AWS EBS encryption / GCP persistent disk encryption
-# AES-256-XTS for block devices
-# Transparent to the OS — no application changes
-# Protects against: stolen disks, decommissioned hardware
-```
-
-**Envelope Encryption — The Key to Key Management:**
-
-```python
-# The problem: If you encrypt data with one key, and that key is compromised,
-# you must decrypt and re-encrypt ALL data with a new key.
-# 
-# Solution: Envelope Encryption
-#   - Data Encryption Key (DEK): encrypts the actual data
-#   - Key Encryption Key (KEK): encrypts the DEK
-#   - Only the KEK is stored in KMS/Vault
-#   - DEK can be stored alongside the data (encrypted)
-
-# When rotating the KEK:
-#   1. Generate new KEK in KMS
-#   2. Re-encrypt each DEK with the new KEK (NOT the data!)
-#   3. Data stays encrypted — no need to re-encrypt terabytes
-
-from cryptography.fernet import Fernet
-import base64
 
 class EnvelopeEncryption:
-    """
-    Envelope Encryption with AWS KMS
-    
-    ⚠️ Fernet requires a base64-encoded key. KMS returns raw bytes.
-       We must convert the KMS output to base64 before using Fernet!
-    """
-    def __init__(self, kms_client, kms_key_id: str):
-        self.kms = kms_client
-        self.kek_id = kms_key_id  # Key Encryption Key in KMS
+    def __init__(self, kms_client, kek_id: str):
+        self.kms = kms_client          # e.g. boto3.client("kms")
+        self.kek_id = kek_id           # KEK never leaves KMS
 
-    def encrypt(self, plaintext: bytes) -> dict:
-        # 1. Generate random Data Encryption Key
-        response = self.kms.generate_data_key(
-            KeyId=self.kek_id,
-            KeySpec='AES_256'  # Returns: Plaintext + CiphertextBlob
-        )
-        dek_plaintext = response['Plaintext']      # 32 raw bytes (in memory only)
-        dek_ciphertext = response['CiphertextBlob'] # Encrypted DEK (safe to store)
+    def encrypt(self, plaintext: bytes, record_id: str) -> dict:
+        ctx = {"table": "patients", "record_id": record_id}   # KMS encryption context:
+        dk = self.kms.generate_data_key(KeyId=self.kek_id,     # logged in CloudTrail and
+                                        KeySpec="AES_256",     # required again to decrypt
+                                        EncryptionContext=ctx)
+        nonce = os.urandom(12)                                  # unique per encryption
+        ciphertext = AESGCM(dk["Plaintext"]).encrypt(nonce, plaintext, record_id.encode())
+        # record_id as associated data: a ciphertext copied to another row fails to decrypt
+        return {"ciphertext": ciphertext, "nonce": nonce,
+                "encrypted_dek": dk["CiphertextBlob"], "kek_id": self.kek_id}
 
-        # 2. Encode DEK as base64 (Fernet requirement) then encrypt data
-        encoded_dek = base64.urlsafe_b64encode(dek_plaintext)
-        f = Fernet(encoded_dek)
-        ciphertext = f.encrypt(plaintext)
-
-        # 3. Store: encrypted data + encrypted DEK
-        return {
-            'ciphertext': ciphertext,
-            'encrypted_dek': dek_ciphertext,  # Encrypted with KMS KEK
-            'kek_id': self.kek_id,
-        }
-
-    def decrypt(self, encrypted_data: dict) -> bytes:
-        # 1. Ask KMS to decrypt the DEK (KMS never exposes the KEK)
-        response = self.kms.decrypt(
-            CiphertextBlob=encrypted_data['encrypted_dek']
-        )
-        dek_plaintext = response['Plaintext']  # 32 raw bytes
-
-        # 2. Encode DEK as base64 then decrypt data
-        encoded_dek = base64.urlsafe_b64encode(dek_plaintext)
-        f = Fernet(encoded_dek)
-        return f.decrypt(encrypted_data['ciphertext'])
-
-    # Key rotation:
-    #   - Generate new KEK (new KMS key)
-    #   - For each record: KMS re-encrypt the DEK with new KEK
-    #   - Data NEVER needs re-encryption!
-    #   - Old KEK retained for decryption of existing records
+    def decrypt(self, blob: dict, record_id: str) -> bytes:
+        ctx = {"table": "patients", "record_id": record_id}
+        dek = self.kms.decrypt(CiphertextBlob=blob["encrypted_dek"],
+                               EncryptionContext=ctx)["Plaintext"]
+        return AESGCM(dek).decrypt(blob["nonce"], blob["ciphertext"], record_id.encode())
 ```
 
-**Encryption in Use — Confidential Computing:**
+At scale, calling KMS per record is slow and costly: cache plaintext DEKs briefly in memory (the AWS Encryption SDK's caching materials manager does this with limits on age and use count), or use one DEK per tenant/partition. Searching encrypted fields needs a separate design: a keyed hash (HMAC) column for exact-match lookups, or tokenization.
 
-```yaml
-# The frontier: encrypting data WHILE IT'S BEING PROCESSED
-# 
-# AMD SEV-SNP:
-#   - Encrypts VM memory with a per-VM key
-#   - Hypervisor cannot read VM memory (even with physical access)
-#   - CPU decrypts on-the-fly during execution
-#
-# Intel SGX:
-#   - Encrypts memory regions (enclaves) at the CPU level
-#   - Even the OS/kernel cannot read enclave memory
-#   - Attestation: remote party can verify they're talking to genuine enclave
-#
-# Use cases for healthcare:
-#   - Processing genetic data in untrusted cloud environments
-#   - Multi-party computation between hospitals
-#   - Federated learning on PHI
-```
+**Key rotation and compromise — distinguish three cases:**
 
-**Key Rotation Strategy:**
+| Situation | What to do | Data re-encryption? |
+|---|---|---|
+| Routine KEK rotation | AWS KMS automatic rotation (configurable period, plus on-demand rotation) keeps the same key ID and retains old key material, so old DEKs still decrypt. Or create a new KEK and `ReEncrypt` the stored DEKs in a background job | **No** |
+| KEK suspected compromised (e.g. leaked credentials with `kms:Decrypt`) | Revoke access first (key policy, grants, IAM), review CloudTrail for Decrypt calls, re-wrap all DEKs under a new KEK, then disable and schedule deletion of the old key (7–30 day waiting period; `ScheduleKeyDeletion` takes a key ID or ARN, not an alias) | No, unless audit shows Decrypt calls on your DEKs |
+| DEKs or plaintext exposed (memory dump, logs) | The DEK itself is compromised: generate new DEKs and **re-encrypt the affected records** | **Yes**, for affected records |
 
-```python
-# Rotation without downtime or full re-encryption:
+**Protecting the keys:** least-privilege key policies (only the PHI service role can `Decrypt`, only with the right encryption context), separate keys per environment and data class, CloudTrail alerts on unusual Decrypt volume, and dual control for key deletion. With KMS `Decrypt` permission and the ciphertext, an attacker **can** decrypt; envelope encryption reduces exposure, it doesn't make KMS access harmless.
 
-class KeyRotationManager:
-    """
-    Manages key versions for zero-downtime rotation.
-    """
-    def __init__(self, kms_client):
-        self.kms = kms_client
-        # Active keys: new encryption uses the current key
-        self.active_key_ids = {
-            'current': 'alias/phi-key-v2',  # For NEW encryptions
-            'previous': 'alias/phi-key-v1', # For DECRYPTION of old data
-        }
-
-    def encrypt(self, plaintext: bytes) -> dict:
-        # Always use the CURRENT key for new encryptions
-        return self._encrypt_with_key(plaintext, self.active_key_ids['current'])
-
-    def decrypt(self, encrypted_data: dict) -> bytes:
-        # Decrypt based on which KEK was used
-        kek_id = encrypted_data.get('kek_id', 'alias/phi-key-v1')
-        return self._decrypt_with_key(encrypted_data, kek_id)
-
-    def rotate_key(self):
-        # 1. Create new KMS key
-        new_key = self.kms.create_key(Description='PHI Key v3')
-        new_key_id = f'arn:aws:kms:...:key/{new_key["KeyMetadata"]["KeyId"]}'
-
-        # 2. Create alias pointing to new key
-        self.kms.create_alias(
-            AliasName='alias/phi-key-v3',
-            TargetKeyId=new_key_id
-        )
-
-        # 3. Update active keys
-        #    current → v3, previous → v2
-        #    v1 key is retained for decryption only
-        self.active_key_ids = {
-            'current': 'alias/phi-key-v3',
-            'previous': 'alias/phi-key-v2',
-        }
-
-        # 4. Background job: re-encrypt DEKs with v3
-        #    (re-wrap, not re-encrypt data)
-        for record in self.scan_all_encrypted_records():
-            if record['kek_id'] == 'alias/phi-key-v1':
-                # Re-wrap DEK with v3 key
-                new_encrypted_dek = self.kms.re_encrypt(
-                    CiphertextBlob=record['encrypted_dek'],
-                    DestinationKeyId=self.active_key_ids['current']
-                )['CiphertextBlob']
-                # Update record with new encrypted DEK
-                record['encrypted_dek'] = new_encrypted_dek
-                record['kek_id'] = self.active_key_ids['current']
-                record.save()
-
-        # 5. After all records are re-wrapped, schedule old key deletion
-        #    (KMS enforces minimum 7-day waiting period)
-        self.kms.schedule_key_deletion(
-            KeyId='alias/phi-key-v1',
-            PendingWindowInDays=30
-        )
-```
-
-**Attack Scenarios & Mitigations:**
-
-```yaml
-# Attack 1: TLS Downgrade
-#   Attacker intercepts ClientHello, forces TLS 1.0 instead of TLS 1.3
-#   Mitigation: Server-side minimum TLS version, disable backward compat
-
-# Attack 2: Key Compromise
-#   Attacker gains access to KMS (compromised IAM credentials)
-#   Mitigation:
-#     - KMS key policies restrict to specific IAM roles
-#     - Multi-factor authorization for key deletion
-#     - CloudTrail logging for all KMS API calls
-#     - Envelope encryption: even with KMS access, need DEK to decrypt
-
-# Attack 3: Backup Leak
-#   Encrypted database backup falls into wrong hands
-#   Mitigation:
-#     - TDE protects database files even at rest
-#     - Backup encryption (separate key from live DB)
-#     - Offline backup: encrypt with offline KMS key
-
-# Attack 4: Cold Boot Attack
-#   Attacker with physical access reads RAM to extract encryption keys
-#   Mitigation:
-#     - AMD SEV / Intel SGX for sensitive data
-#     - Memory encryption at the hardware level
-#     - LUKS / BitLocker with TPM binding (full-disk encryption)
-#     - ⚠️ LockBit is ransomware, NOT a disk encryption tool!
-#       The correct Linux tool is LUKS (Linux Unified Key Setup).
-```
+**In use — confidential computing:** AMD SEV-SNP and Intel TDX encrypt and integrity-protect a whole VM's memory against the hypervisor and host operators, with remote **attestation** so a key service releases keys only to a verified VM image. AWS Nitro Enclaves isolate a process with no network or persistent storage, again gated by attestation. Use them for multi-party analytics on PHI or key-handling services; they add operational complexity and have had side-channel research findings, so they complement, not replace, the controls above.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Envelope encryption** | Explains DEK vs KEK and why re-wrapping DEKs avoids re-encrypting data |
-| **Three states** | Clearly distinguishes in-transit, at-rest, and in-use encryption |
-| **Key rotation** | Describes zero-downtime rotation without data re-encryption |
-| **mTLS** | Mentions mutual TLS for service-to-service authentication |
-| **Confidential computing** | Shows awareness of SEV/SGX for encrypting data in use |
+| **Envelope encryption** | DEK vs KEK, AES-GCM with associated data, encryption context |
+| **Three states** | Clearly distinguishes in-transit, at-rest (and its layers), in-use |
+| **Key rotation** | KMS automatic rotation vs re-wrap; when data must be re-encrypted |
+| **mTLS** | Workload identity, not a replacement for authorization |
+| **Currency** | TLS 1.3 details, hybrid PQ key exchange, SEV-SNP/TDX/Nitro Enclaves |
 
 ---
 
@@ -980,200 +552,112 @@ class KeyRotationManager:
 
 ### Answer
 
-**The Fundamental Principle: Secrets Are a Service, Not a Config**
+!!! tip "30-second answer"
+    Treat secrets as a **service**, not config. Workloads authenticate with their **platform identity** (Kubernetes service account token, AWS IAM role, SPIFFE ID), never with a bootstrap secret, and fetch short-lived credentials from a secrets manager (HashiCorp Vault or its open-source fork OpenBao, AWS Secrets Manager, GCP Secret Manager). Prefer **dynamic secrets** (a unique DB user per service instance with a TTL) and cloud **workload identity federation** over static keys, so there's little to leak and nothing long-lived to rotate. Deliver secrets through an agent or CSI driver to a memory-backed file, not env vars or images. Prevent leaks with pre-commit and push-protection scanning, log redaction by construction (secret types that don't print), and audit logs on every read.
+
+**What goes wrong without a platform:**
 
 ```yaml
-# NEVER do this:
-config.json:
-  DATABASE_URL: "postgresql://admin:SuperSecret1!@prod-db:5432/mydb"
-  REDIS_PASSWORD: "redis-pass-123"
-  API_KEY: "sk-live-abc123xyz"
-  JWT_SECRET: "my-jwt-secret-key"
-
-# This leaks in:
-#   - Git history (even if .gitignored now, it might have been committed once)
-#   - CI/CD logs
-#   - Developer machines
-#   - Debug endpoints
-#   - Environment variable dumps (/proc/self/environ)
-#   - Error stack traces
+# config.yaml committed to the repo
+DATABASE_URL: "postgresql://admin:SuperSecret1!@prod-db:5432/mydb"
+STRIPE_KEY:   "sk_live_..."
+# Leaks via: git history (forever, even after deletion), CI logs, container image layers,
+# crash dumps and error pages, `env` in debug endpoints, /proc/<pid>/environ,
+# copied .env files on laptops. And it never gets rotated because nobody knows who uses it.
 ```
 
-**HashiCorp Vault — The Production Standard:**
+**Architecture for 200 services:**
+
+```
+Pod (service account "orders")
+  │ 1. projected, audience-bound SA token (short-lived JWT)
+  ▼
+Vault / OpenBao  ── Kubernetes auth: validates the token with the API server,
+  │                 maps (namespace, service account) → policy "orders"
+  │ 2. issues a Vault token with TTL + policy
+  │ 3. orders reads database/creds/orders-rw → a NEW Postgres user, TTL 1h
+  ▼
+Vault Agent sidecar / Secrets Store CSI driver
+  │ 4. renders creds to a tmpfs file, renews the lease, re-renders on rotation
+  ▼
+App reads the file (and reloads on change)        Audit device logs every read
+```
+
+**Dynamic database credentials:**
+
+```bash
+vault secrets enable database
+vault write database/config/orders-db \
+    plugin_name=postgresql-database-plugin \
+    connection_url="postgresql://{{username}}:{{password}}@orders-db:5432/orders" \
+    username="vault_admin" password="..." allowed_roles="orders-rw"
+vault write -f database/rotate-root/orders-db      # now only Vault knows the admin password
+
+vault write database/roles/orders-rw db_name=orders-db \
+    creation_statements="CREATE ROLE \"{{name}}\" LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' IN ROLE orders_rw;" \
+    default_ttl=1h max_ttl=24h
+```
 
 ```python
-# Vault provides:
-#   1. Dynamic secrets — short-lived, auto-expiring credentials
-#   2. Leased secrets — TLS certs with configurable TTL
-#   3. Encrypted storage — data encrypted before writing to backend
-#   4. Audit logging — every access is logged
-#   5. ACL-based access — granular permissions per path
-
-# Example: Dynamic Database Credentials
-
-# Step 1: Configure Vault with database plugin
-# vault write database/config/prod-db \
-#     plugin_name=postgresql-database-plugin \
-#     allowed_roles="app-role" \
-#     connection_url="postgresql://{{username}}:{{password}}@prod-db:5432/"
-
-# Step 2: Create a role for dynamic credentials
-# vault write database/roles/app-role \
-#     db_name=prod-db \
-#     creation_statements="CREATE USER \"{{name}}\" WITH PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
-#     default_ttl="1h" \
-#     max_ttl="24h"
-
-# Step 3: Application retrieves credentials at startup
 import hvac
 
-# ⚠️ NEVER use a static Vault token (app_token) — this defeats the purpose!
-# Instead, authenticate via:
-#   - Kubernetes auth: client.auth_kubernetes(role, jwt)
-#   - AWS IAM auth:    client.auth_aws(role, iam_request_url, iam_request_body)
-#   - AppRole:         client.auth_approle(role_id, secret_id)
-#
-# Static tokens are long-lived credentials that can leak.
-# Dynamic auth methods provide short-lived, auto-renewing tokens.
+client = hvac.Client(url="https://vault.internal:8200")
+with open("/var/run/secrets/tokens/vault-token") as f:          # projected SA token
+    client.auth.kubernetes.login(role="orders", jwt=f.read())
 
-# Example using Kubernetes auth (recommended for containerized workloads):
-client = hvac.Client(url='https://vault.internal:8200')
-client.auth_kubernetes(
-    role='my-app-role',
-    jwt=open('/var/run/secrets/kubernetes.io/serviceaccount/token').read()
-)
-
-# Request dynamic database credentials
-creds = client.secrets.database.generate_credentials(
-    name='app-role',
-    mount_point='database'
-)
-# Returns:
-# {
-#   "data": {
-#     "username": "v-app-role-4f3a2b1c-...",
-#     "password": "A1b2C3d4E5f6...",
-#     "lease_id": "database/creds/app-role/abc123",
-#     "lease_duration": 3600,  # 1 hour — auto-expires!
-#     "renewable": True
-#   }
-# }
-
-# Use credentials to connect
-connection = psycopg2.connect(
-    host='prod-db',
-    user=creds['data']['username'],
-    password=creds['data']['password'],
-    database='mydb'
-)
-# After 1 hour, these credentials expire and are useless
+resp = client.secrets.database.generate_credentials(name="orders-rw")
+username, password = resp["data"]["username"], resp["data"]["password"]
+lease_id, ttl = resp["lease_id"], resp["lease_duration"]        # lease info is top-level
 ```
 
-**Dynamic Secrets vs Static Secrets:**
+Operational details that matter:
 
-```yaml
-Static Secrets:
-  - Stored encrypted in Vault, decrypted at app startup
-  - Same credential reused across restarts
-  - Rotation requires manual process or Vault's rotation API
-  - If leaked, valid until rotated
+- **Connection pools vs TTLs:** a pool holding connections opened with credentials that expire will fail on reconnect. Renew the lease, or re-read credentials and recycle connections before `max_ttl` (most pools support a max connection lifetime).
+- **Grant through a group role** (`IN ROLE orders_rw`): objects created by a short-lived user would otherwise be owned by it and break when it's dropped.
+- **Static secrets** (third-party API keys) can't be dynamic: store them in the secrets manager, rotate on a schedule with **two valid keys** overlapping (issue new, deploy, revoke old), and scope them as narrowly as the vendor allows.
+- **Cloud access without keys:** IRSA / EKS Pod Identity, GKE Workload Identity, and GitHub Actions OIDC → cloud roles remove long-lived cloud credentials entirely.
+- **Licensing note:** HashiCorp moved Vault to the Business Source License in 2023 (and was acquired by IBM in 2025); **OpenBao** is the Linux Foundation fork under MPL 2.0 with a compatible API.
 
-Dynamic Secrets:
-  - Generated on demand, unique per request/session
-  - Auto-expire after TTL (no revocation needed)
-  - Each service instance gets different credentials
-  - If leaked, useless after TTL
-  - Audit trail: exactly WHO requested WHAT credential, WHEN
-```
+**Short-lived TLS certificates:** issue workload certs from an internal CA with short TTLs (hours to days) via the mesh, cert-manager, or Vault PKI, and renew at about two-thirds of the lifetime with retries and backoff. Monitor expiry; expired internal certs are a classic self-inflicted outage.
 
-**Lease-Based Secrets (TLS Certs):**
+**Preventing leaks:**
 
 ```python
-# Vault can issue short-lived TLS certificates
-# Each cert has a TTL (e.g., 24 hours)
-# Services renew before expiry
+# Make secrets hard to log by accident: a type that never prints its value
+from dataclasses import dataclass
 
-class VaultTLSManager:
-    def __init__(self):
-        self.client = hvac.Client(url='https://vault.internal:8200')
-        self.cert = None
-        self.key = None
 
-    def get_certificate(self, common_name: str):
-        # Issue new cert or renew existing
-        result = self.client.secrets.pki.generate_certificate(
-            name='internal-ca',
-            common_name=common_name,
-            ttl='24h',
-            alt_names=[f'{common_name}.service.consul']
-        )
-        return result['data']['certificate'], result['data']['private_key']
+@dataclass(frozen=True)
+class Secret:
+    _value: str
 
-    def renew_periodically(self):
-        """
-        Periodic renewal loop with error handling.
-        
-        If Vault is unreachable, retry with exponential backoff
-        instead of crashing — we'd rather serve a soon-to-expire
-        cert than no cert at all.
-        """
-        retry_delay = 12 * 3600  # Default: renew every 12 hours (before 24h TTL)
-        while True:
-            try:
-                self.cert, self.key = self.get_certificate('my-service')
-                retry_delay = 12 * 3600  # Reset on success
-            except (hvac.exceptions.VaultError, requests.ConnectionError) as e:
-                logger.error(f"Vault renewal failed: {e}")
-                # Exponential backoff: 1min, 2min, 4min, ... up to 1 hour
-                retry_delay = min(retry_delay * 2, 3600) if retry_delay < 3600 else 3600
-            time.sleep(retry_delay)
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "Secret(****)"
+
+    __str__ = __repr__
+
+
+db_password = Secret(password)
+logger.info("connecting with %s", db_password)   # → "connecting with Secret(****)"
 ```
 
-**Preventing Secrets in Logs:**
-
-```python
-# Log redaction — never optional!
-import re
-import logging
-
-class SecretRedactingFormatter(logging.Formatter):
-    SECRET_PATTERNS = [
-        (r'password=[^\s&]+', 'password=***'),
-        (r'secret=[^\s&]+', 'secret=***'),
-        (r'Bearer [A-Za-z0-9-._~+/]+', 'Bearer ***'),
-        (r'Authorization: [^\n]+', 'Authorization: ***'),
-        (r'"token":\s*"[^"]+"', '"token": "***"'),
-        (r'"password":\s*"[^"]+"', '"password": "***"'),
-        (r'"api_key":\s*"[^"]+"', '"api_key": "***"'),
-        (r'PRIVATE KEY-----[^\n]*\n', 'PRIVATE KEY-----\n***\n-----END'),
-    ]
-
-    def format(self, record):
-        msg = super().format(record)
-        for pattern, replacement in self.SECRET_PATTERNS:
-            msg = re.sub(pattern, replacement, msg, flags=re.IGNORECASE)
-        return msg
-```
-
-**The Secrets Lifecycle:**
-
-```
-1. Create:   Vault generates credential (dynamic) or operator stores encrypted secret
-2. Distribute: App retrieves via Vault API at startup (never file/env var)
-3. Use:      Credential in memory only, never written to disk
-4. Renew:    Before TTL expiry, app requests new credential (seamless rotation)
-5. Revoke:   Vault revokes lease, credential auto-expires
-6. Audit:    Every access logged — who got what, when, from which IP
-```
+- **Source control:** pre-commit scanning (gitleaks, trufflehog), GitHub secret scanning **push protection**, and if a secret is committed, **rotate it**; rewriting history isn't enough because clones and forks keep it.
+- **Logs:** redaction at the logging layer (structured logs with deny-listed field names) as a backstop, plus the typed wrapper above as the primary control.
+- **Images and CI:** no secrets in Dockerfiles (`--mount=type=secret` for build-time secrets), CI jobs get short-lived OIDC credentials, and CI egress is restricted (Q9).
+- **Audit:** every secret read is logged with the workload identity; alert on unusual readers or volumes.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Dynamic vs static** | Clearly explains dynamic secrets with auto-expiry |
-| **Vault integration** | Shows concrete API usage (hvac client, lease management) |
-| **Leak prevention** | Mentions log redaction, never-in-env-vars, git history scanning |
-| **Rotation strategy** | Describes zero-downtime credential rotation (warm pools, dual credentials) |
+| **Identity-based access** | Workload identity (K8s auth, IAM roles, OIDC), no bootstrap secrets |
+| **Dynamic vs static** | Dynamic DB creds with TTLs; overlapping-key rotation for static secrets |
+| **Operational detail** | Pools vs TTLs, ownership via group roles, agent/CSI delivery |
+| **Leak prevention** | Push protection, rotate-on-leak, typed secrets, redaction, no secrets in images |
+| **Currency** | OpenBao/BSL change, cloud workload identity federation |
 
 ---
 
@@ -1185,228 +669,140 @@ class SecretRedactingFormatter(logging.Formatter):
 
 ### Answer
 
-**Layer 1: Edge / CDN Protection**
+!!! tip "30-second answer"
+    Defend in layers, cheapest first. **Edge/network** (Cloudflare, AWS Shield + CloudFront, Akamai): absorb volumetric L3/L4 floods with anycast capacity, SYN cookies and scrubbing, and filter L7 floods with WAF rules, bot management and challenges. **Gateway**: per-API-key / per-user / per-IP limits with a token bucket or GCRA, plus per-endpoint cost-based limits for expensive operations. **Service**: concurrency limits and load shedding so overload degrades gracefully. A flash crowd and a botnet both look like "lots of traffic"; distinguish them by **behaviour and reputation** (request mix, session history, TLS/HTTP fingerprints, challenge pass rates), and design so legitimate crowds are served from cache even when you can't tell the difference.
 
-```yaml
-# Cloudflare / AWS Shield / Fastly:
-#   - DDoS mitigation at the network edge (before traffic reaches your servers)
-#   - SYN flood: SYN cookies (stateless TCP handshake verification)
-#   - UDP flood: rate limit per source IP, drop non-essential protocols
-#   - DNS amplification: disable open DNS recursion, rate limit per source
+**Layer 1: edge and network:**
 
-# AWS Shield Advanced:
-#   - Automatic DDoS cost protection
-#   - WAF integration for layer 7 filtering
-#   - Real-time DDoS metrics via CloudWatch
+| Attack | Defence |
+|---|---|
+| Volumetric (UDP/DNS/NTP amplification, multi-Tbps) | Anycast scrubbing capacity at the CDN/DDoS provider (Cloudflare including Magic Transit for whole IP prefixes, AWS Shield Advanced, Akamai Prolexic); you can't absorb this in your own VPC |
+| SYN flood | SYN cookies (stateless handshake), provider-side filtering |
+| L7 HTTP floods, including HTTP/2 "Rapid Reset" (2023) style protocol abuse | WAF rate-based rules, bot management, JS/managed challenges, patched HTTP/2 servers with stream limits |
+| Origin bypass | Lock the origin to the CDN (allowlist provider IPs or authenticated origin pulls / mTLS), so attackers can't go around the edge |
 
-# Cloudflare Magic Transit:
-#   - Anycast network absorbs DDoS traffic
-#   - Rate limiting at edge: 10M+ requests per second
-#   - Bot management: JS challenge, CAPTCHA for suspicious traffic
-```
+**Layer 2: rate limiting algorithms:**
 
-**Layer 2: Application-Level Rate Limiting**
+| Algorithm | Behaviour | Trade-offs |
+|---|---|---|
+| Fixed window counter | `INCR key:minute` | Cheap; allows 2× bursts at window boundaries |
+| Sliding window log | Sorted set of timestamps per key | Exact; memory grows with request rate (bad at 100K rps) |
+| Sliding window counter | Weighted mix of current and previous window counts | Cheap and close enough; widely used |
+| Token bucket | Tokens refill at rate r up to capacity b; each request takes one | Allows controlled bursts; two numbers to store |
+| GCRA (generic cell rate algorithm) | Token bucket expressed as one "theoretical arrival time" | One value per key; used by redis-cell, Envoy-style limiters |
 
 ```python
-# Token Bucket Algorithm — the most common approach
-import time
 import threading
-from collections import defaultdict
+import time
+
 
 class TokenBucket:
-    """
-    Token Bucket: Each user has a bucket with N tokens.
-    Tokens refill at a fixed rate (R tokens/second).
-    Each request consumes 1 token. If bucket is empty, request is denied.
-    
-    Advantages: Allows burst traffic (up to bucket size), smooths out sustained traffic
-    """
+    """In-process token bucket: capacity = burst size, refill_rate = sustained rate."""
+
     def __init__(self, capacity: int, refill_rate: float):
-        self.capacity = capacity         # Max tokens in bucket
-        self.refill_rate = refill_rate    # Tokens per second
-        self.tokens = capacity           # Start full
-        self.last_refill = time.monotonic()
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.tokens = float(capacity)
+        self.last = time.monotonic()
         self.lock = threading.Lock()
 
-    def consume(self) -> bool:
+    def try_acquire(self, cost: float = 1.0) -> bool:
         with self.lock:
             now = time.monotonic()
-            elapsed = now - self.last_refill
-            # Refill tokens based on elapsed time
-            self.tokens = min(self.capacity,
-                              self.tokens + elapsed * self.refill_rate)
-            self.last_refill = now
-
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return True  # Request allowed
-            return False  # Rate limited
-
-
-# Distributed Rate Limiter (Redis-based, sliding window)
-import redis
-
-class SlidingWindowRateLimiter:
-    """
-    Sliding Window Log: Maintains a sorted set of timestamps per user.
-    Count requests in the last window (e.g., 60 seconds).
-    More accurate than fixed window (no thundering herd at window boundary).
-    """
-    def __init__(self, redis_client: redis.Redis):
-        self.redis = redis_client
-
-    def is_allowed(self, key: str, max_requests: int, window_seconds: int = 60) -> bool:
-        """
-        Check if request is allowed using a sliding window.
-        
-        ⚠️ We use a Lua script for ATOMICITY.
-        The pipeline approach has a race condition:
-          1. zremrangebyscore removes old entries
-          2. zcard counts remaining entries
-          3. zadd adds current request
-        
-        Between 1 and 2, another concurrent request could add an entry,
-        making the count inaccurate. A Lua script prevents this by
-        executing all operations atomically.
-        """
-        now = time.time()
-        window_start = now - window_seconds
-        redis_key = f"ratelimit:{key}"
-
-        # Atomic Lua script: remove old entries, count, add, set expiry
-        # Use a unique member (timestamp + random suffix) to prevent
-        # collisions when two requests arrive at the same microsecond
-        import uuid
-        unique_member = f"{now}:{uuid.uuid4().hex[:8]}"
-
-        lua_script = """
-            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
-            local count = redis.call('ZCARD', KEYS[1])
-            redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
-            redis.call('EXPIRE', KEYS[1], ARGV[4])
-            return count
-        """
-
-        request_count = self.redis.eval(
-            lua_script,
-            1,  # number of keys
-            redis_key,
-            window_start,  # ARGV[1]
-            now,           # ARGV[2]
-            unique_member, # ARGV[3] — unique per request
-            window_seconds + 60  # ARGV[4]
-        )
-
-        # Only allow if we're under the limit AFTER counting
-        # (the current request is NOT yet counted)
-        return request_count < max_requests
-
-        # ⚠️ NOTE: We use '< max_requests' not '<= max_requests'
-        # because we need to leave room for THIS request
-
-    # Usage:
-    # Rate limit: 100 requests per minute per user
-    # if limiter.is_allowed(f"user:{user_id}", 100, 60):
-    #     process_request()
-    # else:
-    #     return 429 Too Many Requests
+            self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.refill_rate)
+            self.last = now
+            if self.tokens >= cost:
+                self.tokens -= cost
+                return True
+            return False
 ```
 
-**Multi-Tier Rate Limiting Strategy:**
+**Distributed limiting (Redis, atomic Lua, server-side clock):**
 
 ```python
-class RateLimitMiddleware:
-    """Multi-tier rate limiting:
-    Tier 1: Global (protects the whole system)
-    Tier 2: Per-endpoint (protects expensive operations)
-    Tier 3: Per-user/IP (fairness)
-    Tier 4: Per-user-per-endpoint (granular control)
-    """
+# Token bucket in Redis: one hash per key, evaluated atomically
+TOKEN_BUCKET_LUA = """
+local capacity = tonumber(ARGV[1])
+local rate     = tonumber(ARGV[2])          -- tokens per second
+local cost     = tonumber(ARGV[3])
+local t        = redis.call('TIME')         -- Redis clock: no skew between app servers
+local now      = tonumber(t[1]) + tonumber(t[2]) / 1e6
+local state    = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens   = tonumber(state[1]) or capacity
+local ts       = tonumber(state[2]) or now
+tokens = math.min(capacity, tokens + (now - ts) * rate)
+local allowed = 0
+if tokens >= cost then
+  tokens = tokens - cost
+  allowed = 1
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(capacity / rate) + 1)
+return allowed
+"""
 
-    TIERS = {
-        'global':     {'limit': 100000, 'window': 1,     'key': 'global'},       # 100K req/s
-        'per_ip':     {'limit': 100,    'window': 60,    'key': 'ip:{ip}'},       # 100 req/min per IP
-        'per_user':   {'limit': 1000,   'window': 60,    'key': 'user:{user}'},   # 1K req/min per user
-        'write':      {'limit': 10,     'window': 60,    'key': 'write:{user}'},  # 10 writes/min
-        'search':     {'limit': 30,     'window': 60,    'key': 'search:{ip}'},   # 30 searches/min
-    }
+bucket = redis_client.register_script(TOKEN_BUCKET_LUA)
 
-    def check_all(self, request):
-        for tier_name, config in self.TIERS.items():
-            key = config['key'].format(
-                ip=request.client.host,
-                user=request.user.id if request.user else 'anonymous'
-            )
-            if not self.limiter.is_allowed(key, config['limit'], config['window']):
-                raise RateLimitExceeded(
-                    tier=tier_name,
-                    retry_after=config['window']
-                )
+def allow(key: str, capacity: int, rate: float, cost: int = 1) -> bool:
+    return bucket(keys=[f"rl:{{{key}}}"], args=[capacity, rate, cost]) == 1
+    # {key} hash tag keeps the key on one Redis Cluster slot
 ```
 
-**Flash Crowd vs Botnet Detection:**
+Design decisions at 100K rps:
 
-```python
-# Heuristics to distinguish humans from bots:
+- **Don't put a global limit on one Redis key**: that's a hot key. Enforce global/system-wide limits locally per gateway node (divide the budget by node count) or with approximate counters; use Redis for per-tenant fairness.
+- **Fail open or closed?** If Redis is down, most APIs fail **open** with a local fallback limiter rather than taking the API down.
+- **Cost-based limits:** a search or export should cost more tokens than a GET by ID.
+- **Identify the client correctly:** per API key/user for authenticated traffic; per IP only as a coarse backstop (carrier-grade NAT puts thousands of users behind one IP; IPv6 users can rotate through a /64, so limit per /64 prefix).
 
-def classify_traffic_pattern(requests: list) -> str:
-    """
-    Returns 'human', 'scraper', 'botnet', or 'flash_crowd'
-    """
-    # Botnet signatures:
-    #   1. Same User-Agent across many IPs
-    #   2. No JavaScript execution (no JS challenge solving)
-    #   3. Perfectly regular intervals between requests
-    #   4. Requests come from data center IP ranges
-    #   5. No prior browsing history (no cookies)
+**Tiers:**
 
-    # Flash crowd signature:
-    #   1. Requests from diverse geographic regions
-    #   2. Real browser User-Agents
-    #   3. Natural timing distribution (not perfectly regular)
-    #   4. Existing cookies/sessions from prior activity
-    #   5. Referrers from legitimate sources (social media, news)
-
-    # Human signature:
-    #   1. Mouse movements, scroll events
-    #   2. Variable time between requests (reading time)
-    #   3. Cookies from prior sessions
-    #   4. CAPTCHA solvable
-
-    if is_uniform_timing(requests) and all_same_ua(requests):
-        return 'botnet'
-    elif has_diverse_ips(requests) and has_real_browsers(requests):
-        return 'flash_crowd'
-    elif has_mouse_events(requests):
-        return 'human'
-    else:
-        return 'suspected_scraper'
+```yaml
+limits:
+  per_api_key:      { rate: 100/s,  burst: 200 }      # fairness between customers
+  per_user_write:   { rate: 10/min }                  # abuse of mutations
+  per_ip_anonymous: { rate: 60/min }                  # unauthenticated endpoints, login
+  login_per_account:{ rate: 5/min, then: challenge }  # credential stuffing / brute force
+  export_endpoint:  { concurrency: 2 per tenant }     # expensive operations
+service_protection:
+  max_inflight_requests: adaptive                     # load shedding (Q8 in Concurrency)
 ```
 
-**Response to Rate Limit Exceeded:**
+**Flash crowd vs botnet:**
+
+| Signal | Flash crowd | Botnet / L7 flood |
+|---|---|---|
+| Request mix | Concentrated on the popular page, then normal navigation (assets, follow-up pages) | Hammers one expensive endpoint or random cache-busting URLs |
+| Sessions | Mix of returning users with cookies, logged-in sessions | Few cookies or sessions; sessions don't progress |
+| Client fingerprints | Diverse but realistic browser TLS/HTTP fingerprints (e.g. JA4) | Repeated fingerprints from automation libraries; user agent doesn't match TLS fingerprint |
+| Network origin | Residential and mobile ISPs, matching your user geography | Data-center ASNs, or residential **proxy** networks (hard), unusual geography |
+| Challenges | Pass JS/managed challenges | Fail or solve them at suspicious rates |
+| Referrers | Social, news, search | Absent or forged |
+
+Modern botnets use residential proxies and real browsers, so no single signal is decisive. Combine signals into a risk score at the edge, apply **graduated responses** (allow → rate limit → challenge → block), and protect the system regardless: serve flash crowds from the CDN cache (`stale-while-revalidate`), queue or waiting-room the expensive path (checkout), and shed load before the origin falls over.
+
+**Response format:**
 
 ```http
 HTTP/1.1 429 Too Many Requests
-Retry-After: 45
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 0
-X-RateLimit-Reset: 1700000045
+Retry-After: 30
+RateLimit-Policy: "default";q=100;w=60
+RateLimit: "default";r=0;t=30
+Content-Type: application/problem+json
 
-{
-  "error": "rate_limit_exceeded",
-  "message": "Too many requests. Please try again in 45 seconds.",
-  "retry_after_seconds": 45
-}
+{"type": "https://api.example.com/errors/rate-limited", "title": "Too many requests", "status": 429}
 ```
+
+(`RateLimit`/`RateLimit-Policy` are the IETF httpapi draft headers; many APIs still use the older `X-RateLimit-*` convention.)
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Multi-layer approach** | Describes edge, infrastructure, and application layers |
-| **Algorithm choice** | Explains token bucket vs sliding window vs leaky bucket tradeoffs |
-| **Distributed implementation** | Uses Redis, handles atomicity (lua scripts, redis pipelines) |
-| **False positive prevention** | Distinguishes flash crowds from attacks, uses CAPTCHA/JS challenges |
+| **Multi-layer approach** | Edge (volumetric, L7), gateway limits, service load shedding, origin lock-down |
+| **Algorithm choice** | Token bucket/GCRA vs windows; memory and accuracy trade-offs |
+| **Distributed implementation** | Atomic Lua, server-side time, hot keys, fail-open policy, cluster hash tags |
+| **False positive prevention** | Behavioural/fingerprint signals, graduated responses, cache-first for crowds |
 
 ---
 
@@ -1418,286 +814,159 @@ X-RateLimit-Reset: 1700000045
 
 ### Answer
 
-**Session-Based Authentication:**
+!!! tip "30-second answer"
+    These answer two different questions. **Passkeys/WebAuthn** (vs passwords and OTPs) is how the user **proves who they are**: a per-site key pair where the private key never leaves the authenticator and signatures are bound to your domain, so it's **phishing-resistant** and there's no shared secret to steal or stuff. **Sessions vs JWTs** is how the user **stays authenticated** afterwards. For fintech: passkeys as the primary login, a server-side session (opaque ID in a `__Host-` cookie) for the web app so revocation is instant, short-lived sender-constrained tokens (DPoP) for mobile/API clients, and **step-up** re-authentication with a fresh passkey assertion for high-risk actions like adding a payee. Keep passwords only as a migration path, hashed with Argon2id, plus phishing-resistant MFA.
+
+**Two layers, often confused:**
+
+| Layer | Options | Key property |
+|---|---|---|
+| Authentication (prove identity) | Password, password + OTP/push, **passkey (WebAuthn)**, federated (OIDC) | Phishing resistance, resistance to credential stuffing |
+| Session (stay signed in) | Server-side session, self-contained JWT, opaque token + introspection, DPoP-bound token | Revocation speed, scalability, theft resistance |
+
+**Server-side sessions:**
 
 ```python
-# Server-side state: session ID stored in cookie, session data in Redis/DB
-
-@router.post("/login")
-async def login(username: str, password: str, session: Session):
-    user = authenticate(username, password)
-    if not user:
-        raise HTTPException(401)
-
-    # Server creates session, stores in Redis
-    session_id = secrets.token_urlsafe(32)
-    await redis.setex(
-        f"session:{session_id}",
-        3600,  # 1 hour
-        json.dumps({"user_id": user.id, "role": user.role, "mfa": True})
-    )
-
-    # Set httpOnly, Secure, SameSite cookie
+@router.post("/login/complete")
+async def login_complete(user: User, response: Response):
+    session_id = secrets.token_urlsafe(32)                      # 256 bits, unguessable
+    await redis.set(f"session:{session_id}",
+                    json.dumps({"uid": user.id, "aal": 2, "auth_time": int(time.time())}),
+                    ex=15 * 60)                                  # idle timeout, refreshed on use
     response.set_cookie(
-        key="session_id",
-        value=session_id,
-        httponly=True,     # Not accessible via JavaScript
-        secure=True,        # HTTPS only
-        samesite="lax",    # CSRF protection
-        max_age=3600
+        "__Host-session", session_id,                            # __Host-: Secure, Path=/, no Domain
+        httponly=True, secure=True, samesite="lax", path="/",
     )
+    # Always issue a NEW session ID at login (prevents session fixation).
 
-
-@router.get("/api/balance")
-async def get_balance(session_id: str = Cookie(None)):
-    # Every request: server looks up session in Redis
-    session_data = await redis.get(f"session:{session_id}")
-    if not session_data:
-        raise HTTPException(401, "Session expired")
-
-    user = json.loads(session_data)
-    return get_account_balance(user["user_id"])
-
-# Revocation: DELETE the Redis key. Instant. Done.
-# async def logout(session_id):
-#     await redis.delete(f"session:{session_id}")
+# Revocation: delete the key. "Log out everywhere": index sessions by user id and delete all.
 ```
 
-**Token-Based Authentication (JWT):**
+**Self-contained tokens (JWT) for API/mobile clients:**
 
 ```python
-# Stateless: token contains all user info + signature
-# No server-side storage needed for verification
-
-ACCESS_TOKEN_TTL = 15 * 60      # 15 minutes
-REFRESH_TOKEN_TTL = 7 * 24 * 3600  # 7 days
-
-@router.post("/login")
-async def login(username: str, password: str):
-    user = authenticate(username, password)
-
-    # Access token: short-lived, stateless
-    access_token = jwt.encode({
-        "sub": user.id,
-        "role": user.role,
-        "ver": user.token_version,  # For revocation
-        "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(seconds=ACCESS_TOKEN_TTL),
-    }, SECRET_KEY, algorithm="HS256")
-
-    # Refresh token: longer-lived, stored in DB
-    refresh_token = secrets.token_urlsafe(64)
-    await db.execute(
-        "INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
-        [hash_token(refresh_token), user.id, datetime.utcnow() + timedelta(days=7)]
+def issue_tokens(user) -> dict:
+    access = issue_access_token(str(user.id), CURRENT_KID, SIGNING_KEY)   # Q1: ES256, 10 min
+    refresh = secrets.token_urlsafe(32)
+    db.execute(
+        "INSERT INTO refresh_tokens (token_hash, user_id, family_id, expires_at)"
+        " VALUES (%s, %s, %s, now() + interval '30 days')",
+        (sha256(refresh), user.id, uuid.uuid4()),
     )
+    return {"access_token": access, "refresh_token": refresh, "expires_in": 600}
 
-    return {"access_token": access_token, "refresh_token": refresh_token, "expires_in": ACCESS_TOKEN_TTL}
 
-
-@router.post("/refresh")
-async def refresh(refresh_token: str):
-    # Verify refresh token in DB
-    stored = await db.fetch_one(
-        "SELECT user_id FROM refresh_tokens WHERE token_hash = ? AND expires_at > NOW()",
-        [hash_token(refresh_token)]
-    )
-    if not stored:
-        raise HTTPException(401, "Invalid or expired refresh token")
-
-    # Issue new access token
-    user = await get_user(stored["user_id"])
-    new_access = jwt.encode({
-        "sub": user.id,
-        "role": user.role,
-        "ver": user.token_version,
-        "exp": datetime.utcnow() + timedelta(seconds=ACCESS_TOKEN_TTL),
-    }, SECRET_KEY, algorithm="HS256")
-
-    return {"access_token": new_access, "expires_in": ACCESS_TOKEN_TTL}
+def refresh(refresh_token: str) -> dict:
+    row = db.fetch_one("SELECT * FROM refresh_tokens WHERE token_hash = %s", (sha256(refresh_token),))
+    if row is None or row.expires_at < now():
+        raise Unauthorized()
+    if row.used_at is not None:                    # reuse = theft: kill the whole family
+        db.execute("UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = %s",
+                   (row.family_id,))
+        raise Unauthorized()
+    db.execute("UPDATE refresh_tokens SET used_at = now() WHERE id = %s", (row.id,))
+    return issue_rotated_tokens(row.user_id, row.family_id)   # new refresh token, same family
 ```
 
-**Passwordless Authentication (WebAuthn / FIDO2 / Passkeys):**
+**Passkeys with WebAuthn (py_webauthn 2.x/3.x API):**
 
 ```python
-# WebAuthn uses public key cryptography — no passwords to leak!
-# User registers a device (or passkey), which generates a key pair:
-#   - Private key: stays on the user's device (phone, YubiKey, TPM)
-#   - Public key: sent to the server
+from webauthn import (generate_registration_options, verify_registration_response,
+                      generate_authentication_options, verify_authentication_response,
+                      options_to_json)
+from webauthn.helpers.structs import (AuthenticatorSelectionCriteria, ResidentKeyRequirement,
+                                      UserVerificationRequirement, PublicKeyCredentialDescriptor)
 
-# Registration (one-time):
+RP_ID, ORIGIN = "fintech-app.com", "https://fintech-app.com"
 
-@router.post("/webauthn/register/begin")
-async def webauthn_register_begin(user: User):
-    # Server generates a challenge and sends it to the browser
-    options = generate_registration_options(
-        rp_id="fintech-app.com",          # Relying Party ID
-        rp_name="Fintech App",
-        user_id=str(user.id),
+@router.post("/passkeys/register/options")
+async def register_options(user: User):
+    opts = generate_registration_options(
+        rp_id=RP_ID, rp_name="Fintech App",
+        user_id=user.webauthn_handle,          # random bytes, not the email or DB id
         user_name=user.email,
-        # Require user verification (biometric or PIN) for fintech
-        authenticator_selection={
-            "user_verification": "required",    # Fingerprint/PIN required!
-            "resident_key": "required",         # Creates a passkey
-        },
-        # Timeout: 5 minutes
-        timeout=300000,
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.REQUIRED,             # discoverable = passkey
+            user_verification=UserVerificationRequirement.REQUIRED,   # biometric/PIN
+        ),
+        exclude_credentials=[PublicKeyCredentialDescriptor(id=c.credential_id)
+                             for c in await user_credentials(user)],
     )
-    # Store challenge temporarily for verification
-    await redis.setex(f"webauthn:challenge:{user.id}", 300, options.challenge)
-    return options
+    await redis.set(f"webauthn:reg:{user.id}", opts.challenge, ex=300)
+    return options_to_json(opts)
 
-
-@router.post("/webauthn/register/complete")
-async def webauthn_register_complete(user: User, credential: dict):
-    # Browser sends back the credential (public key + signed challenge)
-    expected_challenge = await redis.get(f"webauthn:challenge:{user.id}")
-
-    registration = verify_registration_response(
-        credential=credential,
-        expected_challenge=expected_challenge,
-        expected_origin="https://fintech-app.com",
-        expected_rp_id="fintech-app.com",
+@router.post("/passkeys/register/verify")
+async def register_verify(user: User, credential: dict):
+    challenge = await redis.getdel(f"webauthn:reg:{user.id}")       # single use
+    reg = verify_registration_response(
+        credential=credential, expected_challenge=challenge,
+        expected_rp_id=RP_ID, expected_origin=ORIGIN,
+        require_user_verification=True,      # default is False: set it explicitly
     )
+    await save_credential(user, reg.credential_id, reg.credential_public_key, reg.sign_count)
 
-    # Store the public key for future authentication
-    await db.execute("""
-        INSERT INTO webauthn_credentials
-        (user_id, credential_id, public_key, sign_count, device_name)
-        VALUES (?, ?, ?, ?, ?)
-    """, [
-        user.id,
-        registration.credential_id,
-        registration.credential_public_key,
-        registration.sign_count,
-        credential.get("device_name", "Unknown Device")
-    ])
+@router.post("/passkeys/login/options")
+async def login_options(login_attempt_id: str):
+    # Discoverable credentials: no username needed, no allow-list → no account enumeration,
+    # and the browser can offer passkeys in the username field's autofill ("conditional UI").
+    opts = generate_authentication_options(
+        rp_id=RP_ID, user_verification=UserVerificationRequirement.REQUIRED)
+    await redis.set(f"webauthn:auth:{login_attempt_id}", opts.challenge, ex=300)
+    return options_to_json(opts)
 
-    return {"status": "registered", "credential_id": registration.credential_id}
-
-
-# Authentication (passwordless login):
-
-@router.post("/webauthn/login/begin")
-async def webauthn_login_begin(email: str):
-    user = await get_user_by_email(email)
-    credentials = await db.fetch_all(
-        "SELECT credential_id FROM webauthn_credentials WHERE user_id = ?",
-        [user.id]
+@router.post("/passkeys/login/verify")
+async def login_verify(login_attempt_id: str, credential: dict):
+    challenge = await redis.getdel(f"webauthn:auth:{login_attempt_id}")
+    stored = await find_credential(credential["rawId"])               # identifies the user
+    auth = verify_authentication_response(
+        credential=credential, expected_challenge=challenge,
+        expected_rp_id=RP_ID, expected_origin=ORIGIN,
+        credential_public_key=stored.public_key,
+        credential_current_sign_count=stored.sign_count,
+        require_user_verification=True,
     )
-
-    options = generate_authentication_options(
-        rp_id="fintech-app.com",
-        allow_credentials=[
-            {"id": c["credential_id"], "type": "public-key"}
-            for c in credentials
-        ],
-        user_verification="required",  # Biometric check!
-    )
-    await redis.setex(f"webauthn:challenge:{user.id}", 300, options.challenge)
-    return options
-
-
-@router.post("/webauthn/login/complete")
-async def webauthn_login_complete(email: str, credential: dict):
-    user = await get_user_by_email(email)
-    expected_challenge = await redis.get(f"webauthn:challenge:{user.id}")
-
-    # Find the stored public key for this credential
-    stored_cred = await db.fetch_one(
-        "SELECT * FROM webauthn_credentials WHERE credential_id = ? AND user_id = ?",
-        [credential["id"], user.id]
-    )
-
-    authentication = verify_authentication_response(
-        credential=credential,
-        expected_challenge=expected_challenge,
-        expected_origin="https://fintech-app.com",
-        expected_rp_id="fintech-app.com",
-        credential_public_key=stored_cred["public_key"],
-        credential_current_sign_count=stored_cred["sign_count"],
-    )
-
-    # Update sign count to detect cloned authenticators
-    if authentication.new_sign_count <= stored_cred["sign_count"]:
-        # Possible cloned authenticator! Alert security team
-        raise HTTPException(401, "Authenticator may be cloned")
-    await db.execute(
-        "UPDATE webauthn_credentials SET sign_count = ? WHERE credential_id = ?",
-        [authentication.new_sign_count, credential["id"]]
-    )
-
-    # Issue session (WebAuthn verified the user)
-    return create_session(user)
+    # The library rejects a non-increasing NON-ZERO counter (possible cloned authenticator).
+    # Synced passkeys (iCloud Keychain, Google Password Manager) always report 0; don't treat
+    # 0 as an attack or you'll lock out most passkey users.
+    await update_sign_count(stored, auth.new_sign_count)
+    return await create_session(stored.user)
 ```
 
-**Comparison Table:**
+Why passkeys resist phishing: the browser puts the **origin** into the signed client data and the authenticator scopes the key to the **RP ID**, so a look-alike domain can't obtain a valid assertion for your site, however convincing the page.
 
-| Aspect | Sessions | JWT Tokens | WebAuthn/Passkeys |
-|--------|----------|------------|-------------------|
-| **State** | Server-side (Redis/DB) | Client-side (stateless) | Client-side (private key) |
-| **Revocation** | Instant (delete session) | Requires version/blocklist | Instant (delete public key) |
-| **Phishing resistance** | Medium (cookie theft possible) | Low (token theft = full access) | High (bound to origin) |
-| **Scalability** | Requires shared session store | Trivially scalable | Minimal server state |
-| **User experience** | Login + optional MFA | Login + optional MFA | Biometric/fingerprint |
-| **Password leak risk** | Password stored (hashed) | Password stored (hashed) | No passwords at all! |
-| **Device support** | All browsers | All browsers | Modern browsers + devices |
-| **MFA integration** | Manual (app-level) | Manual (app-level) | Built-in (biometric required) |
-| **Credential stuffing** | Blocked by rate limiting + CAPTCHA | Blocked by rate limiting + CAPTCHA | Not possible (no passwords) |
-| **Token binding (DPoP)** | Not applicable (stateful) | Needs DPoP extension | Inherent (key bound to device) |
+**Comparison:**
 
-**Recommendation for Fintech:**
+| Aspect | Server sessions | Self-contained JWT | Passkeys (WebAuthn) |
+|---|---|---|---|
+| What it is | Session mechanism | Session/token mechanism | Authentication method |
+| Revocation | Instant (delete) | At expiry unless you add state (Q1) | Remove the credential; existing sessions handled by the session layer |
+| Scaling | Shared store lookup per request (cheap with Redis) | Local verification | Server stores public keys only |
+| Theft impact | Stolen cookie works until revoked/expired (mitigate: HttpOnly, short idle timeout, device binding) | Stolen bearer token works until expiry (mitigate: DPoP) | Nothing reusable to steal from the server; phishing-resistant |
+| Fits | Browser apps | Mobile/API clients, service-to-service | Primary login and step-up everywhere |
 
-```yaml
-# Hybrid approach (what I'd actually build):
+**If you keep passwords (migration period):**
 
-Primary: WebAuthn/Passkeys
-  - No passwords to leak
-  - Phishing-resistant (bound to origin)
-  - Built-in biometric MFA
-  - Great UX (biometric = frictionless)
+- Hash with **Argon2id** (OWASP minimum: m = 19 MiB, t = 2, p = 1; tune upward to ~0.5 s on your hardware), or bcrypt (cost ≥ 10, 72-byte input limit) for legacy; never fast hashes.
+- **NIST SP 800-63B-4** (final, 2025): at least 15 characters when the password is the only factor, at least 8 when it's part of MFA; accept at least 64; no composition rules; no forced periodic rotation; check new passwords against breached-password lists; allow paste and password managers. It also recognises syncable passkeys for AAL2.
+- Defend login endpoints against credential stuffing: per-account and per-IP throttling, breached-password checks (k-anonymity range API of Have I Been Pwned), and risk-based challenges.
 
-Fallback: Short-lived sessions (with TOTP MFA)
-  - For devices that don't support WebAuthn
-  - Session-based (easy revocation for fraud)
-  - Rotate session ID on privilege escalation
+**Recommendation for fintech:**
 
-Credential Stuffing Prevention:
-  - WebAuthn completely eliminates passwords → immune to stuffing
-  - Session fallback: rate-limit login attempts per IP + per user
-    (e.g., 5 attempts per minute → lockout + CAPTCHA)
-  - Use haveibeenpwned API to check passwords at registration
-  - Monitor for credential stuffing patterns: same password,
-    different usernames, from same IP range
-
-Step-Up Authentication:
-  - Low-risk actions (view balance): WebAuthn biometric is enough
-  - High-risk actions (transfer >$10K): RE-AUTHENTICATE with biometric
-  - Critical actions (add beneficiary): Require fresh biometric +
-    device-bound confirmation (e.g., "confirm on phone")
-  - This is called Step-Up or Incremental Authentication
-
-DPoP (Demonstration of Proof-of-Possession):
-  - Binds a JWT to a specific client instance using a public key
-  - The client proves possession of the private key on each request
-  - Prevents token theft: even if JWT is stolen, attacker can't
-    use it without the corresponding private key
-  - Reference: RFC 9449 — OAuth 2.0 DPoP
-
-Never: Long-lived JWTs alone
-  - Fintech can't tolerate 15-minute revocation window
-  - Token theft = instant fraud
-  - No built-in MFA
-```
+1. **Passkeys first**, with recovery designed as carefully as login (recovery is where account takeover happens: verified identity checks, cooling-off periods, notifications).
+2. **Web**: server-side sessions in `__Host-` cookies, idle timeout ~15 min, absolute timeout, rotation on privilege change.
+3. **Mobile/API**: short-lived access tokens bound with **DPoP** (RFC 9449) to a key in the device's secure enclave/keystore, plus rotating refresh tokens.
+4. **Step-up**: fresh WebAuthn assertion (check `auth_time` / authentication context) for transfers, new payees, changing contact details; consider transaction signing that shows the amount and payee.
+5. Monitoring: anomalous device, geography or velocity triggers step-up or holds.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Tradeoff analysis** | Clearly articulates stateful vs stateless revocation tradeoffs |
-| **WebAuthn depth** | Understands challenge-response, origin binding, sign count anti-cloning |
-| **Practical recommendation** | Proposes a hybrid based on threat model (not a one-size-fits-all) |
-| **MFA integration** | Distinguishes app-level MFA vs WebAuthn's built-in biometric verification |
+| **Layering** | Separates "how you authenticate" from "how you stay authenticated" |
+| **Tradeoff analysis** | Stateful vs stateless revocation, theft impact, DPoP |
+| **WebAuthn depth** | Challenge single use, origin/RP binding, UV required, sign-count nuance for synced passkeys |
+| **Password hygiene** | Argon2id parameters, NIST 800-63B-4 rules, credential-stuffing defences |
+| **Practical recommendation** | Passkeys + sessions + step-up, recovery flow, based on the threat model |
 
 ---
 
@@ -1709,245 +978,144 @@ Never: Long-lived JWTs alone
 
 ### Answer
 
-**Diagnosis — The Cookie Isn't Being Sent:**
+!!! tip "30-second answer"
+    The key word is **site**, not origin. `app.example.com` → `api.example.com` was cross-**origin** but **same-site** (same registrable domain), so a `SameSite=Lax` session cookie was sent on `fetch` calls. `app.newdomain.com` → `api.example.com` is **cross-site**: `Lax` cookies aren't sent on cross-site subresource requests, and the cookie is now a **third-party cookie**, which Safari blocks outright and Firefox partitions. Setting `SameSite=None; Secure` plus credentialed CORS makes it work only in some browsers. The robust fix is to make the API **same-site** again: serve it as `api.newdomain.com` (or proxy `/api` through the frontend's host, the backend-for-frontend pattern) and issue the cookie there. Then CSRF protection: `SameSite=Lax`, a token or Fetch Metadata check for state-changing requests, and strict CORS.
 
-```yaml
-# Problem:
-#   Frontend: https://app.newdomain.com
-#   Backend:  https://api.example.com
-#   
-#   Browser blocks cookie from being sent because:
-#     1. Different origin (newdomain.com ≠ example.com)
-#     2. Cookie's Domain attribute doesn't match
-#     3. SameSite defaults to Lax — may not be sent on cross-origin POST
-#     4. CORS preflight may fail without proper Access-Control-* headers
+**Diagnosis checklist:**
+
+```
+DevTools → Network → the failing API request
+  - Cookie header missing?  → Application tab shows the cookie with a warning icon:
+      "blocked because SameSite=Lax and the request is cross-site"  or
+      "blocked: third-party cookie"
+  - Is fetch() using credentials: 'include'? (default 'same-origin' never sends cookies cross-origin)
+  - CORS error in console? → response lacks Access-Control-Allow-Origin: https://app.newdomain.com
+      and Access-Control-Allow-Credentials: true (and "*" is not allowed with credentials)
+  - Preflight (OPTIONS) failing? → custom headers / JSON content type trigger it
 ```
 
-**Step 1: Fix CORS Configuration**
+**Definitions that decide everything:**
+
+| Term | Defined by | Example |
+|---|---|---|
+| Origin | scheme + host + port | `https://app.example.com` ≠ `https://api.example.com` |
+| Site | scheme + registrable domain (eTLD+1, per the Public Suffix List) | `https://example.com` covers both of the above |
+| CORS | Origin-based: may JavaScript **read** the response? | Doesn't decide whether cookies are **sent** |
+| SameSite | Site-based: is the cookie **sent** with this request? | |
+
+**SameSite modes:**
+
+| Mode | Sent on | Notes |
+|---|---|---|
+| `Strict` | Same-site requests only | Even top-level navigation from an email link arrives without the cookie |
+| `Lax` | Same-site requests + cross-site **top-level GET navigations** | Chrome/Edge treat cookies without `SameSite` as Lax; Firefox and Safari don't apply that default |
+| `None` (requires `Secure`) | All requests, including cross-site | Subject to third-party cookie blocking: Safari (ITP) blocks, Firefox partitions per top-level site (Total Cookie Protection), Chrome still allows them by default after Google abandoned its 2024–25 deprecation plan, but users can block them |
+
+**Fix A (recommended): make it same-site again**
+
+```
+Option 1: api.newdomain.com → cookie set by api.newdomain.com (or Domain=newdomain.com)
+Option 2: app.newdomain.com/api/* reverse-proxied to the backend → cookie is first-party,
+          no CORS at all (same origin)
+```
 
 ```python
-# CORS = Cross-Origin Resource Sharing
-# Server must explicitly whitelist the frontend origin
+response.set_cookie(
+    "__Host-session", session_id,    # host-only, Secure, Path=/ (hardest to tamper with)
+    httponly=True, secure=True, samesite="lax", path="/",
+)
+```
 
+**Fix B (if the API must stay on another site): credentialed CORS + `SameSite=None`**
+
+```python
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    # NEVER use "*" for credentialed requests!
-    allow_origins=[
-        "https://app.newdomain.com",
-        # For local development:
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
-    # Critical for cookies:
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-CSRF-Token"],
+    allow_origins=["https://app.newdomain.com"],   # exact origins; never reflect arbitrary Origin
+    allow_credentials=True,                        # → Access-Control-Allow-Credentials: true
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "X-CSRF-Token"],
+    max_age=600,                                   # browsers cap preflight caching (Chrome: 2 h)
 )
 
-# The browser sends a preflight OPTIONS request before the actual request
-# If the server doesn't respond with proper Access-Control-Allow-Origin,
-# the browser BLOCKS the request entirely
+response.set_cookie("session", session_id, httponly=True, secure=True,
+                    samesite="none", path="/")     # still blocked by Safari; partitioned in Firefox
 ```
-
-**Step 2: Fix Cookie Configuration**
-
-```python
-# The cookie set by the backend must be accessible from the new frontend
-
-response.set_cookie(
-    key="session_id",
-    value=session_id,
-    httponly=True,
-    secure=True,             # Required for cross-origin (HTTPS only)
-    samesite="none",         # REQUIRED for cross-origin requests!
-    # Caveat: SameSite=None requires Secure=True
-    # Without SameSite=None, browser won't send cookie cross-origin
-    domain=".example.com",   # Must match the backend domain
-    # Note: Can't set Domain to "newdomain.com" — cookies are domain-specific!
-    max_age=3600,
-)
-```
-
-**The SameSite Cookie Attribute — Deep Dive:**
-
-```yaml
-# SameSite is the MODERN defense against CSRF (replaces CSRF tokens in many cases)
-
-SameSite=Strict:
-  - Cookie sent ONLY for same-site requests
-  - Not sent for: links from other sites, forms from other sites
-  - Not sent for: images/iframes from other sites
-  - Best for: banking sessions, account settings
-  - Downside: User clicks a link from email → not authenticated
-
-SameSite=Lax:
-  - Cookie sent for top-level navigations (GET requests)
-  - Not sent for: POST forms from other sites, images, fetch/XHR
-  - Browser DEFAULT (since 2020)
-  - Best for: most web apps (balance of security and UX)
-
-SameSite=None:
-  - Cookie sent for ALL cross-origin requests
-  - REQUIRES Secure=True (HTTPS only)
-  - Required for: API-only backends, separate frontend + backend domains
-  - Vulnerable to CSRF if no other protection
-```
-
-**Beyond CSRF: Other Critical HTTP Security Headers:**
-
-```yaml
-# A complete defense-in-depth strategy includes these headers:
-
-# 1. Content-Security-Policy (CSP): Prevents XSS by controlling which
-#    resources can be loaded and executed.
-#    Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-abc123'
-#    - 'self' is already inherited from default-src, but explicitly including
-#      script-src with a nonce allows safe inline scripts
-
-# 2. X-Content-Type-Options: Prevents MIME-type sniffing attacks.
-#    X-Content-Type-Options: nosniff
-
-# 3. X-Frame-Options: Prevents clickjacking by blocking iframe embedding.
-#    X-Frame-Options: DENY
-
-# 4. Strict-Transport-Security (HSTS): Forces HTTPS connections.
-#    Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
-
-# 5. Permissions-Policy: Restricts browser API access (camera, mic, etc.)
-#    Permissions-Policy: camera=(), microphone=(), geolocation=()
-
-# 6. Referrer-Policy: Controls how much referrer info is sent.
-#    Referrer-Policy: strict-origin-when-cross-origin
-```
-
-**Step 3: Add CSRF Protection (Because SameSite=None is vulnerable):**
-
-```python
-# CSRF = Cross-Site Request Forgery
-# Attacker tricks user into performing actions on another site
-# 
-# Attack:
-#   1. User is logged in at bank.com (session cookie set with SameSite=None)
-#   2. User visits attacker.com
-#   3. attacker.com sends POST to bank.com/transfer
-#   4. Browser includes the session cookie (because SameSite=None)
-#   5. Bank processes the transfer — ATTACKED!
-
-# Defense: CSRF Token (Double-Submit Cookie Pattern)
-
-import secrets
-from fastapi import Request, HTTPException
-
-class CSRFTokenMiddleware:
-    """
-    Double-Submit Cookie Pattern:
-      1. Server sets a random CSRF token in a cookie (not httpOnly)
-      2. Frontend reads the cookie and sends it as a header (X-CSRF-Token)
-      3. Server verifies: cookie value == header value
-      4. Attacker can't read the cookie from a different origin (SOP)
-    """
-
-    async def get_csrf_token(self, request: Request, response: Response):
-        # Generate token if not present
-        token = request.cookies.get("csrf_token")
-        if not token:
-            token = secrets.token_urlsafe(32)
-            response.set_cookie(
-                key="csrf_token",
-                value=token,
-                httponly=False,   # Must be readable by JavaScript!
-                secure=True,
-                samesite="strict",
-                # Path=/ ensures the cookie is sent to all endpoints
-                path="/",
-            )
-        return token
-
-    async def verify_csrf(self, request: Request):
-        # Skip for safe methods (GET/HEAD/OPTIONS are read-only)
-        if request.method in ("GET", "HEAD", "OPTIONS"):
-            return True
-
-        cookie_token = request.cookies.get("csrf_token")
-        header_token = request.headers.get("X-CSRF-Token")
-
-        if not cookie_token or not header_token:
-            raise HTTPException(403, "Missing CSRF token")
-
-        # Constant-time comparison to prevent timing attacks
-        if not secrets.compare_digest(cookie_token, header_token):
-            raise HTTPException(403, "CSRF token mismatch")
-
-        return True
-        header_token = request.headers.get("X-CSRF-Token")
-
-        if not cookie_token or not header_token:
-            raise HTTPException(403, "Missing CSRF token")
-
-        if not secrets.compare_digest(cookie_token, header_token):
-            raise HTTPException(403, "CSRF token mismatch")
-
-        return True
-```
-
-**Frontend Implementation:**
 
 ```javascript
-// Frontend must include the CSRF token in all mutation requests
-
-async function apiPost(url, data) {
-  // Read the CSRF token from the cookie
-  const csrfToken = getCookie('csrf_token');
-
-  const response = await fetch(url, {
-    method: 'POST',
-    credentials: 'include',     // Send cookies cross-origin
-    headers: {
-      'Content-Type': 'application/json',
-      'X-CSRF-Token': csrfToken,  // Double-submit
-    },
-    body: JSON.stringify(data),
-  });
-
-  return response.json();
-}
-
-function getCookie(name) {
-  const value = `; ${document.cookie}`;
-  const parts = value.split(`; ${name}=`);
-  if (parts.length === 2) return parts.pop().split(';').shift();
-}
+await fetch("https://api.example.com/transfer", {
+  method: "POST",
+  credentials: "include",                          // send cookies cross-origin
+  headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+  body: JSON.stringify(data),
+});
 ```
 
-**Full CORS Preflight Example:**
+Common CORS mistakes: reflecting the request's `Origin` header back with credentials allowed (any site can read authenticated responses), allowing `null` origin, regex allowlists like `.*example.com` that match `evilexample.com`.
+
+**CSRF: what still protects you:**
 
 ```
-# Browser sends PREFLIGHT (OPTIONS) before the actual POST:
-
-OPTIONS /api/transfer HTTP/1.1
-Origin: https://app.newdomain.com
-Access-Control-Request-Method: POST
-Access-Control-Request-Headers: Content-Type, X-CSRF-Token
-
-# Server responds:
-HTTP/1.1 204 No Content
-Access-Control-Allow-Origin: https://app.newdomain.com
-Access-Control-Allow-Credentials: true
-Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
-Access-Control-Allow-Headers: Content-Type, X-CSRF-Token
-Access-Control-Max-Age: 86400  # Cache preflight for 24 hours
+Attack: user is logged in to bank.com; evil.com auto-submits
+  <form action="https://bank.com/transfer" method="POST">
+The browser attaches bank.com cookies if their SameSite policy allows it.
 ```
+
+| Defence | Notes |
+|---|---|
+| `SameSite=Lax`/`Strict` session cookies | Blocks cross-site POSTs carrying the cookie. Not sufficient alone: same-site attackers (a compromised subdomain), GET endpoints with side effects, and browsers without Lax-by-default |
+| **Fetch Metadata** check | Reject state-changing requests with `Sec-Fetch-Site: cross-site` (allow `same-origin`/`same-site` and `none` for typed URLs); supported by all major browsers |
+| Synchronizer token / **signed** double-submit token | Token bound to the session (HMAC of session ID), sent in a header or form field. A naive double-submit cookie (unsigned random value) can be defeated by an attacker who can write cookies from a sibling subdomain |
+| Custom header requirement for JSON APIs | Cross-site forms can't set custom headers; a cross-site `fetch` with them triggers a CORS preflight your server rejects |
+
+Note for Fix B: JavaScript on `app.newdomain.com` **can't read** cookies set by `api.example.com`, so a "read the CSRF cookie and echo it in a header" scheme breaks across sites; return the CSRF token in a response body (e.g. from `GET /csrf`) instead.
+
+```python
+import hashlib
+import hmac
+import secrets
+
+
+def csrf_token_for(session_id: str) -> str:
+    nonce = secrets.token_urlsafe(16)
+    mac = hmac.new(CSRF_KEY, f"{session_id}!{nonce}".encode(), hashlib.sha256).hexdigest()
+    return f"{nonce}.{mac}"
+
+
+def verify_csrf(request) -> None:
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+        raise Forbidden("cross-site request")
+    token = request.headers.get("X-CSRF-Token", "")
+    nonce, _, mac = token.partition(".")
+    expected = hmac.new(CSRF_KEY, f"{request.session_id}!{nonce}".encode(),
+                        hashlib.sha256).hexdigest()
+    if not mac or not hmac.compare_digest(mac, expected):
+        raise Forbidden("bad CSRF token")
+```
+
+**Related headers worth setting:**
+
+| Header | Purpose |
+|---|---|
+| `Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-…'; frame-ancestors 'none'` | XSS mitigation; `frame-ancestors` supersedes `X-Frame-Options` for clickjacking |
+| `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload` | HTTPS only (and makes `Secure` cookies meaningful) |
+| `X-Content-Type-Options: nosniff` | No MIME sniffing |
+| `Referrer-Policy: strict-origin-when-cross-origin` | Limit URL leakage |
+| `Cross-Origin-Opener-Policy: same-origin` | Isolate the browsing context from cross-origin popups |
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **SameSite understanding** | Knows the three modes and their security implications |
-| **CORS configuration** | Explains credentialed requests require explicit origin + allow-credentials |
-| **CSRF token mechanism** | Describes the double-submit cookie pattern |
-| **Defense in depth** | Combines SameSite + CSRF tokens + CORS rather than relying on one |
+| **Site vs origin** | Explains why the migration turned a same-site cookie into a third-party one |
+| **SameSite understanding** | Three modes, browser differences, third-party cookie blocking |
+| **CORS configuration** | Exact origins with credentials, no Origin reflection; CORS controls reads, not cookie sending |
+| **CSRF mechanism** | Fetch Metadata, session-bound tokens, why naive double-submit is weak |
+| **Fix quality** | Prefers making the API same-site (subdomain or BFF proxy) over SameSite=None |
 
 ---
 
@@ -1959,249 +1127,158 @@ Access-Control-Max-Age: 86400  # Cache preflight for 24 hours
 
 ### Answer
 
-**The Threat Model:**
+!!! tip "30-second answer"
+    Assume a dependency **will** be malicious, and limit what it can reach. **Respond now**: find every build and deployment that pulled the bad version (lockfiles, SBOMs), rotate every secret those environments could see, and pin to a known-good version. **Prevent**: lockfiles with integrity hashes and `npm ci`; a **cooldown** before adopting new releases (most malicious versions are caught within days); block install scripts by default; route installs through an internal registry proxy that can quarantine packages; malware scanning, not just CVE scanning. **Contain**: CI jobs with no long-lived secrets (OIDC to the cloud), restricted egress, and builds isolated from deploy credentials, so stolen environment variables are worthless. **Verify**: SLSA provenance and signatures (Sigstore/cosign) checked at admission. The 2025 npm worms (e.g. Shai-Hulud, which stole tokens from developer machines and CI and republished infected packages) are exactly this scenario; npm responded by revoking classic tokens and pushing trusted publishing.
 
-```yaml
-Attack vectors in the software supply chain:
+**Threat model:**
 
-1. Compromised upstream dependency (event-stream, ua-parser-js)
-   - Attacker gains maintainer access, publishes malicious version
+| Vector | Examples | Primary defence |
+|---|---|---|
+| Hijacked maintainer account / token → malicious release | event-stream (2018), ua-parser-js (2021), the chalk/debug compromise and Shai-Hulud worm (2025) | Cooldown, malware scanning, install-script blocking, egress limits |
+| Dependency confusion | Internal package name published publicly with a higher version | Scoped/namespaced packages, single proxy registry, exclusive repository rules |
+| Typosquatting / slopsquatting (names hallucinated by AI assistants) | `crossenv` vs `cross-env` | Allowlisted registry, review of new dependencies |
+| Build system compromise | SolarWinds (2020), Codecov bash uploader (2021) | Hermetic, ephemeral builds; provenance; least-privilege CI |
+| Compromised maintainer with long-term access | xz-utils backdoor (2024) | Hard; reproducible builds, diverse review, distro vigilance |
 
-2. Dependency confusion (npm, pip)
-   - Attacker publishes package with same name as internal package in public repo
-   - Package manager installs the public (malicious) one if priority is misconfigured
+**Stage 0: incident response for this alert**
 
-3. Typosquatting (crossenv vs cross-env, tor-request vs got)
-   - Attacker registers a similar-looking package name
+1. Identify exposure: search lockfiles and SBOMs across repos and images for the bad version; check CI logs for builds in the exposure window.
+2. **Rotate** every secret present in affected developer machines, CI jobs and runtime environments (cloud keys, npm/GitHub tokens, DB passwords). Exfiltration already happened; patching doesn't undo it.
+3. Pin or roll back, rebuild from clean runners, redeploy.
+4. Hunt for follow-on activity: new tokens, packages published from your org, unusual cloud API calls.
 
-4. Build infrastructure compromise (Codecov, SolarWinds)
-   - Attacker compromises CI/CD pipeline, injects malicious artifacts
+**Stage 1: development and dependency intake**
 
-5. Compromised developer machine
-   - Attacker steals signing keys, publishes as legitimate maintainer
+```bash
+npm ci --ignore-scripts          # exact lockfile versions + integrity hashes; no lifecycle scripts
+npm config set ignore-scripts true   # or allowlist the few packages that need build scripts
+                                     # (pnpm ≥ 10 doesn't run dependency scripts unless allowlisted)
 ```
 
-**Stage 1: Development — Dependency Management:**
-
 ```yaml
-# Package-lock.json / yarn.lock / requirements.txt:
-#   Lock files PIN exact versions and verify integrity hashes
-#   Without lock files: floating versions = ticking time bomb
-
-# Example: package-lock.json entry
-"axios": {
-  "version": "1.6.2",
-  "resolved": "https://registry.npmjs.org/axios/-/axios-1.6.2.tgz",
-  "integrity": "sha512-7f+0Sa+...",  # SHA-512 checksum
-}
-
-# Best practices:
-#   1. Commit lock files (always!)
-#   2. Use npm ci instead of npm install in CI/CD (uses lock file exactly)
-#   3. Enable npm audit / pip audit in pre-commit hooks
-#   4. Use Snyk / Dependabot / Renovate for automated dependency scanning
-```
-
-**Dependency Scanning Configuration:**
-
-```yaml
-# .github/dependabot.yml
+# .github/dependabot.yml: update regularly, but let new releases age first
 version: 2
 updates:
   - package-ecosystem: "npm"
     directory: "/"
-    schedule:
-      interval: "daily"
-    # Auto-create PRs, assign reviewers
-    # Include security score for each update
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "security"
-
-  - package-ecosystem: "pip"
-    directory: "/"
-    schedule:
-      interval: "daily"
-
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
+    schedule: { interval: "weekly" }
+    cooldown:
+      default-days: 7            # don't propose versions younger than 7 days
+    groups:
+      minor-and-patch: { update-types: ["minor", "patch"] }
 ```
 
-**Stage 2: CI/CD — Artifact Verification:**
+Equivalent cooldowns exist in Renovate (`minimumReleaseAge`) and pnpm (`minimumReleaseAge`). Pair with a **malware-aware** scanner (Socket, OSV's malicious-packages feed, registry-proxy quarantine) because `npm audit`, Trivy and Grype only know about **published CVEs**, which a fresh malicious release won't have.
 
-```python
-# Before building, verify ALL dependencies against known vulnerabilities
-# Fail the build if any vulnerability exceeds threshold
-
-# Trivy — vulnerability scanner for containers and dependencies
-# trivy fs --severity CRITICAL,HIGH ./my-project
-
-# Grype — dependency-focused scanner
-# grype package-lock.json
-
-# In CI/CD pipeline:
-stages:
-  - security-scan
-  - build
-  - sign
-  - push
-
-security-scan:
-  script:
-    - npm audit --audit-level=high
-    - trivy fs --severity CRITICAL,HIGH --exit-code 1 .
-    - grype . --fail-on critical
-  only:
-    - main
-    - tags
-
-sign:
-  # Sign the container image with cosign
-  script:
-    - cosign sign --key cosign.key ghcr.io/myapp:${CI_COMMIT_TAG}
-    # Signature is stored in the container registry
-    # Verification: cosign verify --key cosign.pub ghcr.io/myapp:tag
-```
-
-**Stage 3: Deployment — Runtime Verification:**
+**Stage 2: CI/CD — contain and attest**
 
 ```yaml
-# Kubernetes admission control:
-#   Only allow verified images!
+# GitHub Actions sketch
+permissions:
+  contents: read
+  id-token: write                       # OIDC → short-lived cloud creds; no stored cloud keys
+jobs:
+  build:
+    runs-on: ubuntu-latest              # ephemeral runner
+    steps:
+      - uses: actions/checkout@<full-commit-sha>        # pin actions by SHA, not tag
+      - uses: step-security/harden-runner@<sha>          # egress allowlist / audit
+        with: { egress-policy: block, allowed-endpoints: "registry.npmjs.org:443 ghcr.io:443" }
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: |
+          trivy fs --severity CRITICAL,HIGH --exit-code 1 .
+          syft . -o cyclonedx-json > sbom.cdx.json
+      - name: build, push, sign by digest (keyless)
+        run: |
+          docker build -t ghcr.io/acme/app:${GITHUB_SHA} .
+          DIGEST=$(docker push ghcr.io/acme/app:${GITHUB_SHA} | awk '/digest:/ {print $3}')
+          cosign sign --yes ghcr.io/acme/app@${DIGEST}                    # Sigstore OIDC identity
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json ghcr.io/acme/app@${DIGEST}
+```
 
-# Kyverno policy:
+- **Separate build from deploy:** the job that runs third-party code (install, tests) must not hold deploy or publish credentials.
+- **Provenance:** SLSA Build Level 3 means provenance generated by a hardened, isolated build platform (e.g. GitHub's artifact attestations or the SLSA generator), so a consumer can verify which repo, commit and workflow produced an artifact.
+- **Publishing your own packages:** npm **trusted publishing** (OIDC from CI, no tokens; npm revoked all classic tokens in December 2025) and `npm publish --provenance`; PyPI has trusted publishing and attestations too.
+
+**Stage 3: deployment — verify before running**
+
+```yaml
+# Kyverno: only admit images signed by our CI workflow identity (keyless)
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: verify-image
+  name: verify-image-signatures
 spec:
-  validationFailureAction: Enforce
   rules:
-    - name: verify-cosign-signature
+    - name: require-ci-signature
       match:
-        resources:
-          kinds:
-            - Pod
+        any:
+          - resources: { kinds: ["Pod"] }
       verifyImages:
-        - image: "ghcr.io/myapp/*"
-          key: |
-            -----BEGIN PUBLIC KEY-----
-            ...
-            -----END PUBLIC KEY-----
-          # Only deploy images with valid cosign signatures
-
-# Also: ImagePolicyWebhook — verify image age, scan results
+        - imageReferences: ["ghcr.io/acme/*"]
+          failureAction: Enforce
+          mutateDigest: true           # pin the tag to the verified digest
+          attestors:
+            - entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subject: "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main"
 ```
 
-**Software Bill of Materials (SBOM):**
+Sigstore's policy-controller and cloud equivalents (GKE Binary Authorization) do the same. At runtime, egress network policies and runtime detection (Falco, Tetragon) catch exfiltration attempts from compromised code.
 
-```yaml
-# SBOM = A complete inventory of all components in your software
-# Standard format: SPDX or CycloneDX
+**SBOMs — useful when queried, not when filed:**
 
-# Generate SBOM with syft:
-#   syft ghcr.io/myapp:latest -o spdx-json > sbom.json
-
-# Store SBOMs in a registry for audit and vulnerability correlation
-
-# What the SBOM contains:
-{
-  "spdxVersion": "SPDX-2.3",
-  "name": "myapp-1.2.3",
-  "packages": [
-    {
-      "name": "axios",
-      "versionInfo": "1.6.2",
-      "licenseDeclared": "MIT",
-      "externalRefs": [
-        {
-          "referenceCategory": "SECURITY",
-          "referenceType": "cpe23Type",
-          "referenceLocator": "cpe:2.3:a:axios_project:axios:1.6.2:*:*:*:*:*:*:*"
-        }
-      ]
-    },
-    # ... every single dependency
-  ]
-}
-
-# When a new CVE is announced, you can:
-#   grep -f cve-cpes sbom.json → find ALL affected deployments
-#   This is the key benefit of SBOMs!
+```bash
+syft ghcr.io/acme/app@sha256:... -o spdx-json > sbom.spdx.json
+grype sbom:./sbom.spdx.json                 # match against current vulnerability data
 ```
 
-**Dependency Confusion Prevention:**
+Feed SBOMs into an inventory (Dependency-Track, GUAC, your registry's SBOM features) so "which services run package X version Y?" is a query that takes minutes, not a week of grepping.
 
-```python
-# The Attack:
-#   1. You use an internal package "auth-service" (published only to GitHub Packages)
-#   2. Attacker publishes "auth-service" to npm public registry
-#   3. If npm registry has higher priority, npm installs the malicious one
-#   4. Malicious "auth-service" sends your secrets to attacker
+**Dependency confusion prevention:**
 
-# Prevention:
+```ini
+# .npmrc: internal scope always resolves to the internal registry
+@acme:registry=https://npm.internal.acme.com/
+```
 
-# npm: .npmrc
-@mycompany:registry=https://npm.pkg.github.com/
-# This scopes all @mycompany/* packages to GitHub Packages only
+```ini
+# pip.conf: ONE index that proxies PyPI and hosts internal packages
+[global]
+index-url = https://pypi.internal.acme.com/simple
+# Never: extra-index-url = ...  → pip picks the highest version across BOTH indexes
+```
 
-# pip: pip.conf
-# ⚠️ DANGER: extra-index-url creates dependency confusion risk!
-#   If both public PyPI and your private registry are searched,
-#   an attacker can publish a package with the same name on PyPI
-#   and pip will install the one with the HIGHER version number.
-[install]
-# ❌ WRONG: this searches BOTH registries
-# extra-index-url = https://my-private-pypi.com/simple
-#
-# ✅ CORRECT: use --index-url with a SINGLE registry that proxies both
-# index-url = https://my-private-pypi.com/simple
-#
-# Or use --require-hashes to pin exact checksums:
-# my-internal-lib==1.0.0 --hash=sha256:abc123...
+```bash
+pip install --require-hashes -r requirements.txt   # every pin has --hash=sha256:...
+# uv defaults to the first index that has a package ("first-index" strategy), which avoids
+# the extra-index-url confusion by design.
+```
 
-# pip: requirements.txt with hashes
-# --require-hashes ensures EXACT package hashes, prevents substitution
-my-internal-lib==1.0.0 --hash=sha256:abc123...
-
-# Gradle/Maven: repository priority
+```kotlin
+// Gradle: internal groups may only come from the internal repo
 repositories {
-    maven {
-        url "https://internal-artifactory.com/releases"
-        // Higher priority than Maven Central
+    exclusiveContent {
+        forRepository { maven("https://artifacts.acme.com/releases") }
+        filter { includeGroupByRegex("com\\.acme\\..*") }
     }
     mavenCentral()
 }
 ```
 
-**Signed Commits & Artifacts:**
-
-```yaml
-# Every commit should be signed with GPG or SSH:
-#   git commit -S -m "feat: add payment processing"
-#   git log --show-signature
-
-# Every container image should be signed with cosign:
-#   cosign sign --key cosign.key ghcr.io/myapp:latest
-#   cosign verify --key cosign.pub ghcr.io/myapp:latest
-
-# Sigstore — free, automated signing:
-#   cosign sign --fulcio-url=https://fulcio.sigstore.dev ghcr.io/myapp:latest
-#   Uses ephemeral keys + identity (OIDC)
-#   No key management needed!
-```
+**Signed commits and protected branches:** require signed commits (SSH or GPG, or Sigstore's gitsign) and reviews on protected branches, and keep CI workflow files under CODEOWNERS review; a malicious workflow change is a supply-chain attack on yourself. OpenSSF Scorecard gives a quick read on an upstream project's practices.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Multi-stage defense** | Covers dev, CI/CD, and runtime — not just one layer |
-| **SBOM knowledge** | Knows what SBOMs are, how to generate them (syft), and how to use them |
-| **Dependency confusion** | Understands the attack and how to prevent it (scoped packages, hashes) |
-| **Artifact signing** | Mentions cosign/sigstore for container image verification |
+| **Incident response** | Rotates secrets first; uses lockfiles/SBOMs to scope exposure |
+| **Prevention** | Cooldowns, install-script blocking, malware (not just CVE) scanning, proxy registry |
+| **Containment** | CI without long-lived secrets (OIDC), egress control, build/deploy separation |
+| **Verification** | Keyless signing by digest, SLSA provenance, admission policies |
+| **Dependency confusion** | Scopes, single index, hashes, exclusive repository content |
 
 ### 🔐 Zero Trust Security Quick Reference
 
@@ -2210,15 +1287,15 @@ repositories {
 #   "Never trust, always verify"
 #
 # Key principles applied to this pipeline:
-#   1. Verify every artifact: Signature check before deployment
-#   2. Least privilege: Minimal IAM roles, network policies
-#   3. Assume breach: Short-lived creds, audit logging
-#   4. Micro-segmentation: Network policies between services
+#   1. Verify every artifact: signature and provenance check before deployment
+#   2. Least privilege: minimal IAM roles, short-lived credentials, network policies
+#   3. Assume breach: no long-lived secrets in CI, audit logging, egress control
+#   4. Micro-segmentation: network policies and service identity (mTLS) between services
 #
 # For supply chain specifically:
-#   - Never trust upstream packages without verification
+#   - Never trust upstream packages without verification and an aging period
 #   - Verify signatures at every stage (dev → CI → deploy)
-#   - Continuously scan running containers for new CVEs
+#   - Continuously rescan running images and SBOMs for new CVEs
 ```
 
 ---
@@ -2231,309 +1308,160 @@ repositories {
 
 ### Answer
 
-**The Attack Walkthrough:**
+!!! tip "30-second answer"
+    First contain: revoke the role's sessions, rotate anything it could read, and audit CloudTrail for use of the stolen credentials from outside your network. Then fix in layers. **Cloud**: enforce **IMDSv2** with hop limit 1 (most SSRF can't send the required PUT with a custom header), shrink the instance role to least privilege, and use pod-level identities. **Network**: user-supplied-URL fetches go through an **egress proxy** (e.g. Stripe's Smokescreen) that resolves DNS and blocks private, loopback and link-local addresses at **connect time**, and default-deny egress elsewhere. **Application**: allowlist destinations when you can; otherwise allow only `https`, resolve once, reject any non-public address, **connect to that exact IP** (defeats DNS rebinding) while verifying TLS for the hostname, and don't follow redirects automatically. OWASP Top 10:2025 files SSRF under **A01 Broken Access Control**.
+
+**The attack:**
 
 ```python
-# The vulnerable endpoint:
-
-@router.get("/fetch-url")
-async def fetch_url(url: str):
-    # User provides a URL, server fetches it
-    # User input: "http://169.254.169.254/latest/meta-data/iam/security-credentials/admin-role"
-    # 
-    # What happens:
-    #   1. Server makes HTTP request to 169.254.169.254
-    #   2. This is the AWS metadata endpoint (link-local address)
-    #   3. AWS EC2 returns the IAM role's temporary credentials
-    #   4. Attacker now has ACCESS_KEY, SECRET_KEY, TOKEN
-    #   5. Attacker uses these to access ANY AWS resource the role has access to
-
-    response = requests.get(url)  # DANGER: No URL validation!
-    return response.text
+@router.get("/preview")
+async def preview(url: str):
+    return requests.get(url).text      # attacker: url=http://169.254.169.254/latest/meta-data/iam/security-credentials/web-role
+# IMDSv1 answers a plain GET with temporary AccessKeyId / SecretAccessKey / Token.
+# The attacker uses them from anywhere until they expire (hours), with every permission
+# the instance role has: read S3, query DynamoDB, launch instances...
 ```
 
-**The Scope of Damage:**
+The 2019 Capital One breach (data on ~100 million US customers) followed this path: SSRF through a misconfigured WAF to the metadata service, then an over-privileged role that could list and read S3 buckets.
+
+**Other SSRF targets:** internal admin panels and APIs (no auth because "it's internal"), Kubernetes API and kubelet, Redis/Memcached (via `gopher://` in clients that support it), cloud metadata on other providers (GCP/Azure also use 169.254.169.254, with required headers), and `file://` reads.
+
+**Defense layer 1: cloud configuration (fastest risk reduction):**
+
+```bash
+# Require IMDSv2 tokens; hop limit 1 stops containers (one extra network hop) from reaching it
+aws ec2 modify-instance-metadata-options --instance-id i-0abc... \
+    --http-tokens required --http-put-response-hop-limit 1 --http-endpoint enabled
+
+# Account-level default for new instances in a region
+aws ec2 modify-instance-metadata-defaults --http-tokens required --http-put-response-hop-limit 1
+```
+
+- IMDSv2 requires `PUT /latest/api/token` with an `X-aws-ec2-metadata-token-ttl-seconds` header, then the token in a header on each GET. A typical SSRF controls only a URL for a GET, so it can't complete this. Many recent AMIs (e.g. Amazon Linux 2023) default to IMDSv2-only. Monitor the `MetadataNoToken` CloudWatch metric before enforcing.
+- **Least privilege** for the role, and **no instance role at all** for workloads that don't need one. On EKS use **Pod Identity** or IRSA so each pod gets its own narrowly scoped role and the node role isn't reachable.
+- Detect use of stolen credentials: GuardDuty flags instance credentials used from outside AWS; data-perimeter policies (`aws:SourceVpc`, `aws:ec2InstanceSourceVPC`) make them useless off-network.
+
+**Defense layer 2: network:**
+
+- Put fetches of user-supplied URLs behind an **egress proxy** that enforces "public internet only" at connect time, after DNS resolution (Smokescreen does exactly this). The application can't bypass it because the workload has no other route out.
+- Default-deny egress with network policies; allow only what each service needs.
 
 ```yaml
-# What the attacker can do with metadata credentials:
-#   - Read S3 buckets (data exfiltration)
-#   - Create EC2 instances (crypto mining)
-#   - Access RDS databases
-#   - Modify security groups
-#   - Create IAM users
-#   - Delete resources (ransomware)
-
-# The 2021 Capital One breach: SSRF → metadata → 100M customer records
-# The 2019 Tesla breach: SSRF → metadata → EC2 instance access
-# This is a CRITICAL vulnerability (CVSS 9.1+)
-```
-
-**Defense Layer 1: Application-Level URL Validation**
-
-```python
-from urllib.parse import urlparse
-import ipaddress
-import socket
-
-class SSRFProtector:
-    """
-    Multi-layer URL validation for SSRF prevention
-    """
-
-    # Allowlist of approved external services
-    ALLOWED_HOSTS = {
-        "api.stripe.com",
-        "api.github.com",
-        "maps.googleapis.com",
-    }
-
-    # Explicitly blocked private/reserved IP ranges
-    BLOCKED_IP_RANGES = [
-        ipaddress.ip_network("127.0.0.0/8"),       # Loopback
-        ipaddress.ip_network("10.0.0.0/8"),        # Private (VPC)
-        ipaddress.ip_network("172.16.0.0/12"),     # Private
-        ipaddress.ip_network("192.168.0.0/16"),    # Private
-        ipaddress.ip_network("169.254.169.254/32"),# AWS/GCP/Azure metadata!
-        ipaddress.ip_network("169.254.170.2/32"),  # AWS ECS metadata
-        ipaddress.ip_network("100.100.100.204/32"),# Alibaba metadata
-        ipaddress.ip_network("fd00::/8"),          # Unique local address (IPv6)
-        ipaddress.ip_network("fe80::/10"),         # Link-local (IPv6)
-        ipaddress.ip_network("0.0.0.0/8"),         # Invalid
-        ipaddress.ip_network("::1/128"),            # IPv6 loopback
-    ]
-
-    def validate_url(self, url: str) -> bool:
-        """
-        Returns True if URL is safe to fetch, raises SSRFException otherwise
-        """
-        parsed = urlparse(url)
-
-        # Reject URLs without hostname
-        if not parsed.hostname:
-            raise SSRFException("No hostname in URL")
-
-        # Block unexpected schemes
-        if parsed.scheme not in ("https",):
-            # Only HTTPS allowed — block HTTP, file, ftp, gopher, dict
-            raise SSRFException(f"Scheme not allowed: {parsed.scheme}")
-
-        # Check allowlist first
-        if parsed.hostname in self.ALLOWED_HOSTS:
-            return True
-
-        # Resolve hostname to IP (BEFORE making the request!)
-        try:
-            ip = socket.gethostbyname(parsed.hostname)
-        except socket.gaierror:
-            raise SSRFException(f"Could not resolve hostname: {parsed.hostname}")
-
-        # Check if resolved IP is in blocked ranges
-        ip_addr = ipaddress.ip_address(ip)
-        for blocked in self.BLOCKED_IP_RANGES:
-            if ip_addr in blocked:
-                raise SSRFException(f"Blocked IP range: {blocked}")
-
-        # Additional: Block redirects that lead to private IPs
-        # (implemented in the HTTP client below)
-        return True
-
-    def fetch_safely(self, url: str) -> requests.Response:
-        self.validate_url(url)
-
-        # ⚠️ DNS Rebinding Protection:
-        # After validate_url resolves the hostname, an attacker could change
-        # the DNS record to point to a private IP. We must re-resolve and
-        # re-validate when actually connecting.
-        #
-        # Strategy: Connect to the resolved IP directly, not the hostname.
-        parsed = urlparse(url)
-        resolved_ip = socket.gethostbyname(parsed.hostname)
-
-        # Re-validate the resolved IP (in case DNS rebinding happened)
-        ip_addr = ipaddress.ip_address(resolved_ip)
-        for blocked in self.BLOCKED_IP_RANGES:
-            if ip_addr in blocked:
-                raise SSRFException(f"Blocked IP after resolution: {resolved_ip}")
-
-        # Instead of passing the URL to requests (which re-resolves DNS),
-        # create a connection to the IP directly and send the Host header
-        # for virtual hosting
-        actual_url = url.replace(parsed.hostname, resolved_ip)
-
-        # Use a session with redirect validation
-        session = requests.Session()
-
-        def redirect_hook(response, *args, **kwargs):
-            # Check redirect target before following
-            if response.is_redirect:
-                redirect_url = response.headers["Location"]
-                # Re-validate each redirect target
-                self.validate_url(redirect_url)
-
-        # Set strict timeouts (no hanging connections)
-        response = session.get(
-            actual_url,
-            headers={"Host": parsed.hostname},  # Original hostname for virtual hosting
-            timeout=(3, 5),        # (connect timeout, read timeout)
-            allow_redirects=True,
-            hooks={'response': redirect_hook},
-            # Don't send credentials to arbitrary URLs
-        )
-        return response
-
-
-class SSRFException(Exception):
-    pass
-```
-
-**Defense Layer 2: DNS Rebinding Protection**
-
-```python
-# DNS Rebinding Attack:
-#   1. Attacker controls example.com, which initially resolves to PUBLIC IP
-#   2. Application validates the URL → passes (public IP)
-#   3. Application makes the request
-#   4. Between validation and request, attacker changes DNS to PRIVATE IP (10.0.0.1)
-#   5. Application makes request to private IP — BYPASSED!
-
-# Prevention: Resolve + validate + request with a SINGLE connection
-
-def fetch_with_rebind_protection(url: str):
-    """
-    Resolve, validate, and connect in one go — no window for DNS rebinding
-    """
-    parsed = urlparse(url)
-
-    # Use socket.create_connection with the explicit IP
-    # (bypasses DNS resolution at the HTTP layer)
-    ip = socket.gethostbyname(parsed.hostname)
-    validate_ip(ip)
-
-    # Connect to the IP directly, not the hostname
-    # Set Host header to the original hostname
-    conn = http.client.HTTPSConnection(ip, timeout=5)
-    conn.request(
-        "GET",
-        parsed.path or "/",
-        headers={"Host": parsed.hostname}  # Original hostname for virtual hosting
-    )
-    return conn.getresponse()
-```
-
-**Defense Layer 3: Network Architecture**
-
-```yaml
-# Never allow application servers direct access to cloud metadata!
-
-# Architecture change:
-#   ❌ Before: App server → direct outbound internet access
-#       App server can reach 169.254.169.254 (metadata endpoint)
-#
-#   ✅ After: App server → outbound proxy (with SSRF filtering)
-#       App server has NO direct internet access
-#       All outbound requests go through a proxy with allowlist rules
-
-# AWS: Use VPC endpoints + IMDSv2
-#
-# IMDSv2 (Instance Metadata Service Version 2):
-#   - Requires session token (PUT request first, then GET with token)
-#   - Token is bound to the instance, not the network
-#   - Single-hop: TTL=1 prevents forwarding
-#   - Makes SSRF exploitation MUCH harder
-#   
-#   # Enable IMDSv2 and require token:
-#   # aws ec2 modify-instance-metadata-options \
-#   #     --instance-id i-1234567890abcdef0 \
-#   #     --http-tokens required \
-#   #     --http-put-response-hop-limit 1
-#
-#   # Without IMDSv2: SSRF → curl 169.254.169.254/latest/meta-data/
-#   # With IMDSv2:    SSRF → must first PUT to get token (harder to exploit)
-
-# AWS: Use VPC Endpoints for AWS Services
-#   - S3 VPC Endpoint: s3.amazonaws.com routes through VPC, not internet
-#   - Never give EC2 instances IAM roles that can access the internet
-#   - Use private DNS + VPC endpoints for S3, DynamoDB, etc.
-
-# Kubernetes: Network Policies
+# Kubernetes: allow DNS and public internet, block metadata and private ranges
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: deny-egress-metadata
+  name: link-preview-egress
 spec:
   podSelector:
-    matchLabels:
-      app: my-service
-  policyTypes:
-    - Egress
+    matchLabels: { app: link-preview }
+  policyTypes: ["Egress"]
   egress:
-    # Allow outbound only to specific CIDRs
+    - to:                                   # DNS must be allowed explicitly, or nothing resolves
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-              - 169.254.169.254/32  # BLOCKED
-              - 169.254.170.2/32    # ECS metadata
-              - 10.0.0.0/8          # Private IPs
+              - 169.254.0.0/16              # link-local, incl. metadata endpoints
+              - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+              - 100.64.0.0/10               # carrier-grade NAT / some cloud internals
+      ports:
+        - { protocol: TCP, port: 443 }
 ```
 
-**Defense Layer 4: Disable Unnecessary Features**
+(Whether `ipBlock` applies to traffic that the node itself handles differs by CNI; verify with a test pod. On EKS, also block IMDS via hop limit 1.)
+
+**Defense layer 3: application code (tested):**
 
 ```python
-# Disable HTTP redirect following (default in many HTTP clients follows redirects)
-# Attacker: example.com → internal-service.internal/delete-all
+import http.client
+import ipaddress
+import socket
+import ssl
+from urllib.parse import urlsplit
 
-# Python requests:
-session = requests.Session()
-session.max_redirects = 0  # Don't follow redirects at all
-# Or validate each redirect target (as shown above)
 
-# Disable support for uncommon protocols:
-# Block: file://, ftp://, gopher://, dict:// (historically used for SSRF)
-# Allow: https:// only
+class SSRFError(Exception):
+    pass
 
-# Disable HTTP methods that could be abused:
-# Use GET/HEAD only for outbound requests
 
-# Timeouts — ALWAYS set timeouts:
-# No timeout = attacker can make your server hang forever
+ALLOWED_PORTS = {443}
+
+
+def resolve_public_ip(host: str, port: int) -> str:
+    """Resolve ALL addresses and refuse if any of them is non-public."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise SSRFError(f"cannot resolve {host}") from e
+    ips = {info[4][0] for info in infos}
+    for ip in ips:
+        addr = ipaddress.ip_address(ip)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped                     # ::ffff:169.254.169.254
+        if not addr.is_global:                          # private, loopback, link-local
+            raise SSRFError(f"{host} resolves to non-public {addr}")   # (all of 169.254/16),
+    return sorted(ips)[0]                               # CGNAT, reserved, unspecified, ...
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a pre-validated IP, but do SNI and certificate checks for the hostname."""
+
+    def __init__(self, host: str, ip: str, port: int = 443, timeout: float = 5.0):
+        super().__init__(host, port, timeout=timeout, context=ssl.create_default_context())
+        self._ip = ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def fetch_untrusted_url(url: str, max_bytes: int = 1_000_000) -> bytes:
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise SSRFError("only https URLs with a hostname are allowed")
+    port = parts.port or 443
+    if port not in ALLOWED_PORTS:
+        raise SSRFError(f"port {port} not allowed")
+    ip = resolve_public_ip(parts.hostname, port)        # resolve once ...
+    conn = PinnedHTTPSConnection(parts.hostname, ip, port)  # ... connect to that same IP
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    conn.request("GET", path, headers={"User-Agent": "link-preview/1.0"})
+    resp = conn.getresponse()
+    if 300 <= resp.status < 400:
+        # A redirect is a NEW untrusted URL: validate it from scratch (with a hop limit)
+        raise SSRFError("redirect not followed")
+    return resp.read(max_bytes)                          # cap the response size
 ```
 
-**Blind SSRF Detection:**
+Why each piece matters:
 
-```python
-# Blind SSRF = attacker can't see the response, but can trigger side effects
-# Detection through out-of-band techniques:
+- **`is_global` instead of a hand-written blocklist:** hand-written lists routinely miss ranges (all of `169.254.0.0/16`, `100.64.0.0/10`, `0.0.0.0`, IPv6 ULA `fc00::/7`, IPv4-mapped IPv6, AWS's IPv6 IMDS `fd00:ec2::254`). Alternative encodings (`http://2852039166/`, `0xA9FEA9FE`, `169.254.169.254.nip.io`) are handled because you validate the **resolved address**, not the string.
+- **DNS rebinding:** if you validate one resolution and then let the HTTP library resolve again, an attacker's DNS (TTL 0) can answer with a public IP first and `169.254.169.254` second. Connecting to the exact validated IP removes the window.
+- **Keep TLS verification:** replacing the hostname with the IP in the URL (a common "fix") breaks certificate verification or tempts people to disable it. Pin the socket, keep `server_hostname`.
+- **Redirects** re-enter the whole validation; most libraries follow them by default (`requests` does; set `allow_redirects=False`).
+- **Allowlist when possible:** webhooks to customer endpoints need the general approach above; integrations with known partners should be a fixed allowlist of hostnames.
 
-# 1. Attacker makes server request to attacker-controlled domain
-#    GET http://attacker-controlled.com
-#    → Attacker sees the request in their logs (confirms SSRF)
-
-# 2. Attacker uses DNS exfiltration
-#    GET http://secret-metadata.attacker.burpcollaborator.net
-#    → DNS query leaks to attacker's DNS server
-
-def detect_ssrf_probes():
-    """Log and alert on suspicious outbound requests"""
-    # Log all outbound HTTP requests with metadata
-    # Alert on:
-    #   - Requests to unknown domains
-    #   - Requests containing metadata endpoints in URL
-    #   - Requests from user-input URLs
-    #   - Requests to IPs in private ranges
-```
+**Blind SSRF:** the attacker sees no response but can still trigger internal actions or confirm reachability via timing or out-of-band callbacks (an attacker-controlled DNS name that logs lookups). Detect with egress-proxy logs (denied private-range attempts are a strong signal), alerts on requests to metadata addresses, and DAST tools with out-of-band detection (Burp Collaborator, interactsh).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **DNS rebinding** | Understands the attack and how to prevent it (resolve + validate in one call) |
-| **Multi-layer defense** | Covers app code, network architecture, and cloud config |
-| **IMDSv2** | Knows about AWS metadata service hardening (session tokens, TTL=1) |
-| **Blind SSRF** | Mentions detection through out-of-band / DNS exfiltration techniques |
+| **Containment** | Revokes/rotates credentials and audits their use before fixing code |
+| **Cloud hardening** | IMDSv2 + hop limit, least privilege, pod identities, GuardDuty/data perimeter |
+| **DNS rebinding** | Resolve once, validate all addresses, connect to that IP, keep TLS verification |
+| **Multi-layer defense** | Egress proxy, network policy (with DNS allowed), app-level validation, redirects |
+| **Blind SSRF** | Out-of-band detection and egress logging |
 
 ---
 
-> *All 10 questions now provide full code examples, attack scenarios, and evaluation rubrics at staff-engineer depth. For complementary resources, see the [cs-interview README](../README.md).*
+> *All 10 questions include code examples, attack scenarios, and evaluation rubrics at staff-engineer depth. For complementary resources, see the [cs-interview README](../README.md).*

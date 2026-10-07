@@ -293,14 +293,14 @@
 
 | Topic | Questions | Depth |
 |-------|-----------|-------|
-| **🖥️ [Operating Systems](cs-interview/operating-systems/INTERVIEW_QUESTIONS.md)** | ~12 Q | Virtual memory, page tables, CFS, epoll vs io_uring, cgroups v2 |
+| **🖥️ [Operating Systems](cs-interview/operating-systems/INTERVIEW_QUESTIONS.md)** | ~12 Q | Virtual memory, page tables, EEVDF/CFS, epoll vs io_uring, cgroups v2 |
 | **🌐 [Computer Networks](cs-interview/computer-networks/INTERVIEW_QUESTIONS.md)** | ~12 Q | BBR vs Cubic, HTTP/2/3, QUIC, TLS 1.3, CDN strategies |
 | **🗄️ [Database Systems](cs-interview/database-systems/INTERVIEW_QUESTIONS.md)** | ~14 Q | B-Tree vs LSM, MVCC, indexing, sharding, 2PL vs OCC |
 | **🌍 [Distributed Systems](cs-interview/distributed-systems/INTERVIEW_QUESTIONS.md)** | ~12 Q | Raft, Paxos, CRDTs, gossip, consistent hashing |
-| **⚡ [Concurrency & Parallelism](cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md)** | ~10 Q | Lock-free, Amdahl's Law, RCU, work-stealing |
+| **⚡ [Concurrency & Parallelism](cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md)** | ~9 Q | Lock-free, memory models, USL, RCU, work-stealing |
 | **📊 [Data Structures & Algorithms](cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS.md)** | ~10 Q | Bloom filters, HyperLogLog, Merkle trees, sketches |
-| **🏛️ [Software Architecture](cs-interview/software-architecture/INTERVIEW_QUESTIONS.md)** | ~12 Q | DDD, CQRS, event sourcing, SAGA, backpressure |
-| **🔒 [Security](cs-interview/security/INTERVIEW_QUESTIONS.md)** | ~10 Q | JWT, OAuth2 PKCE, OWASP, Vault, SSRF prevention |
+| **🏛️ [Software Architecture](cs-interview/software-architecture/INTERVIEW_QUESTIONS.md)** | ~15 Q | DDD, CQRS/ES, sagas, modular monolith, API versioning, ADRs |
+| **🔒 [Security](cs-interview/security/INTERVIEW_QUESTIONS.md)** | ~10 Q | JWT, OAuth 2.1/PKCE, passkeys, OWASP 2025, supply chain, SSRF |
 
 <br>
 
