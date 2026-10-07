@@ -1,6 +1,6 @@
 # ☁️ AWS Compute — Staff-Level Interview Questions
 
-> *10 questions covering EC2, Lambda, ECS, EKS, Fargate, Auto Scaling, and serverless architectures — every question expects principal engineer-level depth with production patterns.*
+> *10 questions covering EC2, Lambda, ECS, EKS, Fargate, Auto Scaling, Batch and compute cost. Each answer leads with the 30-second version, then the mechanism, trade-offs, failure modes and what interviewers probe next. Limits and features checked against AWS documentation, October 2026.*
 
 ---
 
@@ -27,60 +27,50 @@
 
 ### Answer
 
-**EC2 Instance Families:**
+!!! tip "30-second answer"
+    Pick the family by the bottleneck: M (balanced), C (CPU), R/X (memory), I/D (local NVMe/HDD), P/G/Trn/Inf (accelerators), Hpc (tightly coupled HPC). Suffixes tell you the CPU and extras: `g` Graviton, `i` Intel, `a` AMD, `d` local NVMe, `n` extra network, `e` extra memory. On Nitro, networking is SR-IOV through the **ENA** driver straight to the Nitro card, with multiple queues spread across vCPUs. "100 Gbps" is the instance aggregate: a **single TCP flow is capped at 5 Gbps** (10 Gbps in a cluster placement group, 25 Gbps with ENA Express), so you need many flows, a cluster placement group and jumbo frames. For RDMA-style HPC/ML collectives use **EFA**.
 
-```yaml
-General purpose (M series):
-  M7g: Graviton3, 64 vCPU, 256GB RAM, up to 50 Gbps ENA
-  M7i: Intel Xeon, 48 vCPU, 384GB RAM, up to 50 Gbps ENA
+**Reading instance names** (examples current in 2026):
 
-Compute optimized (C series):
-  C7g: Graviton3, 64 vCPU, 128GB RAM, up to 100 Gbps ENA
-  C7i: Intel Xeon, max turbo 4.1GHz
+| Family | Examples | Notes |
+|---|---|---|
+| General purpose | M8g (Graviton4), **M9g** (Graviton5, GA June 2026), M8i (Intel Xeon 6), M8a (AMD) | Default starting point |
+| Compute optimised | C8g, C8gn (network-optimised), C8i | Batch, encoding, high-RPS services |
+| Memory optimised | R8g, R8i, X2iedn, X8g | Caches, in-memory DBs, large JVM heaps |
+| Storage optimised | I8g, I7ie (local NVMe), D3 (dense HDD) | Self-managed databases, Kafka, search |
+| Accelerated | P5/P5en (H100/H200), P6 (Blackwell), G6/G6e (L4/L40S), Trn2 (Trainium), Inf2 (Inferentia) | Training vs inference, cost per token |
+| HPC | Hpc7g, Hpc7a | 200 Gbps EFA, tightly coupled MPI |
 
-Memory optimized (R/X series):
-  R7g: Graviton3, 64 vCPU, 512GB RAM
-  X2iedn: Intel Xeon, 128 vCPU, 4TB RAM, up to 100 Gbps, 3.8TB NVMe local
+Graviton generally gives the best price-performance for code that builds for arm64 (most JVM, Go, Python, Node workloads); check native dependencies and vendor agents first.
 
-Storage optimized (I/D series):
-  I4i: Intel Xeon, NVMe local (up to 30TB), 32 vCPU
-  D3: Dense storage (up to 336TB HDD)
-
-GPU (P/G series):
-  P5: NVIDIA H100, 8 GPUs × 80GB HBM, 3200 Gbps EFA
-  G5: NVIDIA A10G, 4 GPUs, up to 100 Gbps
-
-Network optimized:
-  Hpc7g: Graviton3E, instance-level EFA, 200 Gbps
-  Trn1: Trainium chips for ML training, 1600 Gbps EFA
-```
-
-**Enhanced Networking & ENA:**
+**Nitro and ENA:**
 
 ```
-Nitro Hypervisor (replaces Xen since 2013):
-  - Dedicated hardware for networking (ENA), storage (NVMe), and control
-  - VirtIO-based, no host CPU involvement for data path
-  - < 5μs network latency (vs 30-50μs with Xen)
-
-ENA (Elastic Network Adapter):
-  - Network throughput per instance: 25-100 Gbps
-  - ENA Express (SRD): reliable datagram protocol
-  - Single root I/O virtualization (SR-IOV): direct NIC-to-instance
-
-Instance optimization for 100Gbps:
-  1. Enable ENA in AMI
-  2. Jumbo frames: MTU 9001 (within VPC), 1500 for internet
-  3. Multi-queue: one RX/TX queue per vCPU
-  4. RSS (Receive Side Scaling): distribute packets across CPUs
-  5. EFA (Elastic Fabric Adapter): RDMA for HPC/ML
-
-Instance storage (NVMe):
-  I4i: 3.8TB NVMe per instance (max 30TB)
-  Throughput: 16 GB/s read, 8 GB/s write
-  IOPS: 1M+ random read, 500K random write
-  Ephemeral: data LOST on stop/terminate!
+ guest OS (ENA driver, N queues ≈ vCPUs)
+        │ SR-IOV virtual function: no hypervisor in the data path
+        ▼
+ Nitro card (VPC networking, security groups, encryption, EBS as NVMe)
+        │
+        ▼
+ AWS network fabric (SRD for ENA Express and EFA)
 ```
+
+- The **Nitro System** (first shipped with C5 in 2017) moves networking, EBS and management to dedicated cards and uses a thin KVM-based hypervisor, so nearly all host CPU goes to the guest. It replaced the Xen-based platform for new instance types; it is not a VirtIO design.
+- **ENA** exposes SR-IOV virtual functions with multiple TX/RX queues; Receive Side Scaling spreads flows across vCPUs. Check per-queue interrupts are spread (irqbalance) at high packet rates.
+- **ENA Express** uses AWS's Scalable Reliable Datagram (SRD) protocol to spray one flow over many paths, raising single-flow bandwidth to 25 Gbps and cutting tail latency between supported instances in the same AZ.
+- **EFA** adds OS-bypass (libfabric) for MPI/NCCL. It is what makes multi-node GPU training scale.
+
+**Getting to 100 Gbps in practice:**
+
+1. Choose an instance whose *documented* bandwidth meets the target (many "up to" figures are burst; sustained baseline is lower on smaller sizes).
+2. Place communicating instances in a **cluster placement group** in one AZ.
+3. Use **jumbo frames (MTU 9001)** inside the VPC. Traffic through an internet gateway, VPN or inter-Region peering is limited to 1500; Transit Gateway supports 8500.
+4. Use many parallel flows (or ENA Express). Watch `ethtool -S` counters such as `bw_in_allowance_exceeded` and `pps_allowance_exceeded`: they show the instance hitting its allowance, not the network failing.
+5. Traffic leaving the Region or going to the internet gets a smaller share (typically 5 Gbps, or 50% of bandwidth on instances with 32+ vCPUs).
+
+**Instance store (NVMe) caveat:** fastest local I/O, but data survives only a reboot. It is lost on stop, hibernate, terminate or host failure, so use it for caches, scratch, or replicated stores (Kafka, Cassandra, Elasticsearch) that tolerate node loss.
+
+**What they probe next:** EBS-optimised bandwidth as a separate limit from network bandwidth; placement group types (cluster, spread, partition) and their failure-domain trade-offs; why burstable T instances fail under sustained load (CPU credits).
 
 ### 🔍 Staff-Level Evaluation
 
@@ -88,8 +78,8 @@ Instance storage (NVMe):
 |-----------|----------------------|
 | **Instance families** | Can match workload to appropriate family (M, C, R, I, P, etc.) |
 | **Nitro architecture** | Understands hardware offloading for network/storage/control |
-| **ENA deep dive** | Explains SR-IOV, multi-queue, jumbo frames for 100Gbps |
-| **EFA for HPC** | Knows Elastic Fabric Adapter provides RDMA with OS bypass |
+| **ENA deep dive** | Knows per-flow limits, placement groups, MTU and allowance counters, not just "enable ENA" |
+| **EFA for HPC** | Knows Elastic Fabric Adapter provides OS-bypass for MPI/NCCL |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -104,9 +94,6 @@ Instance storage (NVMe):
 
 ---
 
-
----
-
 ## 2. EC2 Auto Scaling Groups: Policies & Lifecycle
 
 **Q:** "Your web service handles variable traffic: 10K requests/s during the day, 2K at night. Design an Auto Scaling Group with dynamic scaling policies, lifecycle hooks, and graceful shutdown. How does the ASG interact with the ALB target group?"
@@ -115,145 +102,121 @@ Instance storage (NVMe):
 
 ### Answer
 
-**ASG + ALB Architecture:**
+!!! tip "30-second answer"
+    Use **target tracking** on a load metric that scales linearly with instances (ALB `RequestCountPerTarget` beats CPU for web tiers), add **predictive scaling** or scheduled actions for the known daily curve, and set a **default instance warmup** so new instances don't count until they're ready. On scale-in, the ASG first **deregisters the instance from the target group** (deregistration delay drains in-flight requests), then a **termination lifecycle hook** holds it in `Terminating:Wait` so you can flush logs or finish work before it dies. Enable ELB health checks on the ASG so instances failing the target-group check get replaced.
+
+**ASG + ALB architecture:**
 
 ```
 Application Load Balancer
     │
-    ├── Target Group (port 8080)
-    │       ├── EC2 instance A (InService)
-    │       ├── EC2 instance B (InService)
-    │       ├── EC2 instance C (Draining → soon terminated)
-    │       └── EC2 instance D (Pending → soon InService)
-    │
-    └── Auto Scaling Group: my-app-asg
-            ├── Launch Template: my-app-launch-template-v3 (AMI, instance type)
-            ├── Min: 2, Max: 20, Desired: 4 (current)
-            └── Scaling Policies:
-                 ├── CPU Target Tracking (target: 60%)
-                 └── Scheduled: scale to 3 at 8PM, to 10 at 8AM
+    └── Target group (port 8080, health check /health)
+            ├── instance A  InService
+            ├── instance B  InService
+            ├── instance C  draining (deregistration delay) → Terminating:Wait
+            └── instance D  Pending:Wait → registered → InService
+
+Auto Scaling group: my-app-asg
+    ├── Launch template v3 (AMI, IMDSv2 required, user data)
+    ├── Mixed instances policy (m8g/m7g/c8g; On-Demand base + Spot)
+    ├── min 2 / max 20, 3 AZs, health check type ELB
+    └── Policies: target tracking (RequestCountPerTarget = 1000)
+                  + predictive scaling (forecast from 14 days of history)
 ```
 
-**Scaling Policies:**
+**Scaling policy types:**
+
+| Policy | How it works | Use when |
+|---|---|---|
+| **Target tracking** | Keeps a metric at a target; creates and manages the CloudWatch alarms; scales out fast, in conservatively | Default choice |
+| **Step scaling** | Alarm breach size maps to step adjustments; uses instance warmup, not cooldown | You need asymmetric or aggressive steps |
+| **Simple scaling** | One adjustment per alarm, then a cooldown | Legacy; avoid |
+| **Scheduled** | Changes min/max/desired at a cron time (with time zone) | Known events, business hours |
+| **Predictive** | Forecasts load from history and launches capacity ahead of the curve | Strong daily/weekly cycles with slow boot times |
 
 ```yaml
-# 1. Target Tracking (recommended)
-# Automatically scales to maintain metric at target value
-my-app-cpu-tracking:
-  type: "TargetTrackingScaling"
-  target_value: 60   # Keep CPU at 60% average
-  metric: ASGAverageCPUUtilization
-  # Pros: Simple, automatic, self-correcting
-  # Cons: Can't specify custom scale-in/out cooldowns
+TargetTracking:
+  PredefinedMetricType: ALBRequestCountPerTarget
+  ResourceLabel: app/my-alb/abc123/targetgroup/my-tg/def456
+  TargetValue: 1000          # requests per target per minute
+  DisableScaleIn: false
 
-# 2. Step Scaling (more control)
-my-app-request-tracking:
-  type: "StepScaling"
-  adjustment_type: "ChangeInCapacity"
-  
-  step_adjustments:
-  - metric_interval_lower: 0
-    metric_interval_upper: 1000
-    scaling_adjustment: 0          # Normal: no change
-  
-  - metric_interval_lower: 1000
-    metric_interval_upper: 5000
-    scaling_adjustment: 2          # Slight load: add 2 instances
-  
-  - metric_interval_lower: 5000
-    scaling_adjustment: 5          # Heavy load: add 5 instances
-  
-  cooldown: 120                    # Wait 2 min between scaling activities
+ScheduledActions:
+  - Recurrence: "0 8 * * 1-5"
+    TimeZone: "America/New_York"
+    MinSize: 5
+  - Recurrence: "0 22 * * 1-5"
+    TimeZone: "America/New_York"
+    MinSize: 2
 
-# 3. Scheduled Scaling (predictable patterns)
-my-app-daytime-scale:
-  type: "ScheduledScaling"
-  schedule: "0 8 * * 1-5"         # Weekdays 8 AM
-  min: 5, max: 20, desired: 10
-
-my-app-nighttime-scale:
-  type: "ScheduledScaling"
-  schedule: "0 22 * * 1-5"        # Weekdays 10 PM
-  min: 2, max: 5, desired: 3
+DefaultInstanceWarmup: 120   # seconds before a new instance's metrics count
 ```
 
-**Lifecycle Hooks (Graceful Shutdown):**
+**Lifecycle on scale-in (the order matters):**
+
+```
+scale-in decision
+   │
+   ▼
+deregister from target group ──► ALB stops new requests; in-flight ones get
+   │                              up to the deregistration delay (default 300 s)
+   ▼
+Terminating:Wait (lifecycle hook) ──► EventBridge event → your handler
+   │      heartbeat to extend; default timeout 1 hour
+   ▼
+complete_lifecycle_action(CONTINUE) or timeout ──► Terminating:Proceed ──► terminated
+```
 
 ```python
 import boto3
-import json
 
-# Lifecycle hook: on instance termination, execute graceful shutdown
-# Pattern: ASG sends SNS notification → Lambda performs hook
+autoscaling = boto3.client("autoscaling")
+ssm = boto3.client("ssm")
 
-def lambda_handler(event, context):
-    # 1. Parse lifecycle notification
-    message = json.loads(event['Records'][0]['Sns']['Message'])
-    instance_id = message['EC2InstanceId']
-    hook_id = message['LifecycleHookId']
-    asg_name = message['AutoScalingGroupName']
-
-    # 2. Drain connections (ALB already stopped sending)
-    # Actually: ALB connection draining and lifecycle hook work together
-    # - ALB removes instance from target group (stops new connections)
-    # - Lifecycle hook fires: instance is in "Terminating:Wait" state
-    # - During wait: existing connections finish (connection draining timeout)
-
-    # 3. Perform cleanup
-    perform_drain(instance_id)  # e.g., signal service to stop accepting
-    wait_for_active_connections_to_finish(instance_id)
-
-    # 4. Complete lifecycle action (allows termination)
-    client = boto3.client('autoscaling')
-    client.complete_lifecycle_action(
-        LifecycleHookName=hook_id,
-        AutoScalingGroupName=asg_name,
-        LifecycleActionResult='CONTINUE',
-        InstanceId=instance_id
+def handler(event, context):
+    """EventBridge rule: 'EC2 Instance-terminate Lifecycle Action'."""
+    d = event["detail"]
+    # Kick off an on-host drain script and return quickly; the script itself
+    # calls complete-lifecycle-action when done (it may take minutes).
+    ssm.send_command(
+        InstanceIds=[d["EC2InstanceId"]],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": [
+            "systemctl stop my-worker",          # stop pulling new work
+            "/opt/app/flush-and-upload-logs.sh",
+            "aws autoscaling complete-lifecycle-action"
+            f" --lifecycle-hook-name {d['LifecycleHookName']}"
+            f" --auto-scaling-group-name {d['AutoScalingGroupName']}"
+            f" --lifecycle-action-token {d['LifecycleActionToken']}"
+            " --lifecycle-action-result CONTINUE",
+        ]},
     )
-
-    return {'statusCode': 200}
 ```
 
-**ASG + ALB Warm-Up:**
+Don't make a Lambda sit and wait for connections to drain: it has a 15-minute ceiling and you pay for idle time. Start the work and let the instance (or Step Functions) complete the action, sending `record-lifecycle-action-heartbeat` if it needs longer.
 
-```yaml
-# New instances must be "warm" before serving traffic
+**Warm-up and health:**
 
-# Launch template: configure health check
-  InstanceMetadataOptions:
-    HttpTokens: required   # IMDSv2 for security
-    
-  UserData: |
-    #!/bin/bash
-    # Install and configure application
-    # Wait for app to be healthy before signaling
-    
-    /opt/start-app.sh
-    
-    # Signal to ASG that instance is healthy
-    /opt/aws/bin/cfn-signal \
-      --stack my-stack \
-      --resource AutoScalingGroup \
-      --region us-east-1
+- Launch: the `Pending:Wait` hook is where you pre-warm caches or wait for config. The instance registers with the target group just before `InService`.
+- `HealthCheckGracePeriod` is an **ASG** setting (how long to ignore failed health checks after launch); the target group has its own `HealthyThresholdCount`/interval.
+- **Warm pools** keep pre-initialised stopped (or hibernated) instances to cut scale-out time for slow-booting apps.
+- **Instance refresh** rolls a new launch template through the group with a minimum healthy percentage, checkpoints and automatic rollback on alarm.
 
-# ALB health check (before adding to rotation):
-  HealthCheckPath: /health
-  HealthCheckIntervalSeconds: 10    # Every 10s
-  HealthCheckTimeoutSeconds: 5      # 5s timeout
-  HealthyThresholdCount: 2          # 2 successful checks = healthy
-  UnhealthyThresholdCount: 3         # 3 failed checks = unhealthy
-  HealthCheckGracePeriod: 300        # 5 min grace period after launch
-```
+**Failure modes and probes:**
+
+- *Scaling on CPU for an I/O-bound service* never triggers; scale on request count or queue backlog per instance.
+- *Flapping:* scale-in too eager after scale-out; target tracking already scales in slowly, and warmup prevents double-counting.
+- *AZ imbalance:* the ASG rebalances across AZs, which can terminate healthy instances. Use the instance maintenance policy to launch-before-terminate.
+- *Health check mismatch:* ASG with EC2 checks only will keep an instance whose app is dead. Use `HealthCheckType: ELB`.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Scaling policy types** | Can compare target tracking vs step vs scheduled for different patterns |
-| **Lifecycle hooks** | Understands Terminating:Wait state for graceful shutdown |
-| **ALB integration** | Knows target group health checks, connection draining, warm-up |
-| **Cooldown tuning** | Sets appropriate cooldown to avoid scaling flapping |
+| **Scaling policy types** | Can compare target tracking vs step vs scheduled vs predictive for different patterns |
+| **Lifecycle hooks** | Understands deregistration happens before Terminating:Wait, and how to complete the action asynchronously |
+| **ALB integration** | Knows target group health checks, deregistration delay, ELB health check type on the ASG |
+| **Warm-up tuning** | Uses instance warmup (not cooldowns) to avoid scaling flapping |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -268,9 +231,6 @@ def lambda_handler(event, context):
 
 ---
 
-
----
-
 ## 3. AWS Lambda: Execution Model & Cold Starts
 
 **Q:** "Your Lambda processes API requests with a 200ms latency SLA. Cold starts are causing 2-3 second delays for 5% of requests. Diagnose the cold start causes and design mitigation strategies including VPC cold starts, SnapStart, and provisioned concurrency."
@@ -279,38 +239,63 @@ def lambda_handler(event, context):
 
 ### Answer
 
-**Lambda Execution Environment Lifecycle:**
+!!! tip "30-second answer"
+    A cold start is Lambda creating a new Firecracker microVM, fetching your code, starting the runtime and running your init code; it happens on first invoke and every time concurrency grows. Measure it with the `Init Duration` in the REPORT log line. 2–3 s is almost always **runtime plus init code** (JVM class loading, framework DI, big imports, secrets fetched at startup), not VPC: VPC networking stopped adding per-cold-start ENI time in 2019. Fixes in order of cost: shrink init (lazy load, smaller package, more memory = more CPU), **SnapStart** (Java 11+, Python 3.12+, .NET 8+), then **provisioned concurrency** sized to steady-state concurrency for a hard SLA.
+
+**Execution environment lifecycle:**
 
 ```
-1. DOWNLOAD: Lambda service downloads your code from S3
-   - Unzips to /var/task (ephemeral storage, 512MB default, max 10GB)
-
-2. STARTUP: Firecracker microVM initialization
-   - Create MicroVM (KVM-based, ~50ms)
-   - Assign ENI from VPC (if VPC-configured): ~250-500ms
-   - Configure IAM credentials (STS AssumeRole)
-
-3. RUNTIME INIT: Language runtime startup
-   - Python: import all modules → 100-500ms
-   - Node.js: require all modules → 50-200ms
-   - Java: JVM startup + class loading → 1-5s
-   - .NET: JIT compilation → 1-3s
-
-4. HANDLER INIT: Execute initialization code
-   - Global scope (outside handler) runs
-   - Database connections, HTTP clients, config loading
-   - Time: variable (100ms - 5s)
-
-5. INVOKE: Execute handler function
-   - Warm: microsecond cost
-   - Cold: total = DOWNLOAD + STARTUP + RUNTIME + HANDLER + INVOKE
-
-Cold start latency:
-  Python + no VPC: ~200ms
-  Python + VPC:    ~500ms (ENI assignment!)
-  Java + VPC:      ~5s (JVM + ENI)
-  C# + VPC:        ~3s (JIT + ENI)
+INIT  (cold only; up to 10 s for on-demand functions)
+  ├─ create microVM + fetch code (zip from Lambda storage / image from ECR, cached)
+  ├─ start runtime + extensions
+  └─ run code outside the handler (clients, config, frameworks)
+INVOKE (every request)
+  └─ run handler; environment is frozen between invocations and reused
+SHUTDOWN
+  └─ after an idle period (not documented, not guaranteed), or on scale-in/updates
 ```
+
+Since **August 1, 2025** the INIT phase is billed for all on-demand functions (previously free for zip packages on managed runtimes), so heavy init now costs money as well as latency.
+
+**Typical cold-start contributors (orders of magnitude, measure your own):**
+
+| Contributor | Typical | Fix |
+|---|---|---|
+| Node.js / Python small function | ~100–400 ms | Bundle and tree-shake (esbuild), lazy imports |
+| Java / .NET with frameworks | 1–6 s | SnapStart; avoid reflection-heavy DI; GraalVM native / .NET Native AOT |
+| Large packages / images | Hundreds of ms | Trim dependencies; images are cached and lazily loaded, so size matters less than you'd think |
+| Low memory setting | Init is CPU-bound | More memory gives proportionally more CPU (1,769 MB = 1 vCPU) |
+| VPC | ~0 per cold start today | Hyperplane ENIs are created when the function is created or its VPC config changes, then shared |
+
+**Mitigations compared:**
+
+| Option | Effect | Cost | Caveats |
+|---|---|---|---|
+| **Provisioned concurrency** | N environments initialised ahead of time; double-digit ms start | Hourly charge per GB of provisioned concurrency plus lower duration rate | Over N, you get normal cold starts; scale it with Application Auto Scaling (scheduled or target tracking on utilisation) |
+| **SnapStart** | Snapshot of the initialised microVM taken at version publish; new environments restore from it, often sub-second | Free for Java; caching + per-restore charges for Python and .NET | Published versions/aliases only; not with provisioned concurrency, EFS or >512 MB `/tmp`; uniqueness (random seeds, IDs, connections) must be re-established in `afterRestore` hooks |
+| **Reduce init work** | Faster for every cold start | Free | Move rarely used clients to lazy init; don't fetch secrets synchronously at startup if they can be cached via the Parameters and Secrets extension |
+| **"Keep-warm" pings** | Keeps one or a few environments alive | Cheap | Doesn't help concurrent bursts; mostly obsolete |
+| **Lambda Managed Instances** (Dec 2025) | Functions run on EC2 instances Lambda manages in your account; each environment serves many concurrent requests | EC2 price + management fee + per-request charge; Savings Plans apply | For steady high-volume traffic; scaling is instance-based, not per request |
+
+**Execution context reuse:**
+
+```python
+import os
+import boto3
+
+# Runs once per execution environment (INIT), reused on warm invokes
+table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+def handler(event, context):
+    # Runs on every invocation
+    return table.get_item(Key={"pk": event["key"]}).get("Item")
+```
+
+Reused across invocations in the same environment: globals, SDK clients and their keep-alive connections, `/tmp` (512 MB default, up to 10,240 MB). Never store per-request or per-user state in globals.
+
+**Hard limits to know (2026):** memory 128–10,240 MB; timeout 15 minutes; synchronous payload 6 MB each way, **streamed responses up to 200 MB**; asynchronous payload 1 MB; zip package 50 MB zipped / 250 MB unzipped including layers; container image 10 GB; 5 layers; 4 KB of environment variables.
+
+**What they probe next:** how you'd prove the fix (p99 of `Init Duration` and of end-to-end latency, by cold vs warm), SnapStart's uniqueness pitfalls, why API Gateway + Lambda for a 200 ms SLA might be the wrong tool versus a container service with always-warm processes.
 
 ### 🎬 Animated Sequence Diagram
 
@@ -323,85 +308,14 @@ Cold start latency:
   <em>🎬 Animated Lambda Cold Start & Execution Lifecycle — download → Firecracker µVM → runtime init → handler → warm reuse — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
----
-
-**Cold Start Mitigation Strategies:**
-
-```yaml
-# Strategy 1: Provisioned Concurrency (most expensive, most effective)
-# Pre-warms N execution environments
-  ProvisionedConcurrency: 50
-  # Cost: always running (like EC2, ~$15/concurrency/month)
-  # Zero cold starts for first 50 concurrent executions
-  # Auto-scaling: gradual warm-up for spikes
-
-# Strategy 2: SnapStart (Java only, very effective)
-  SnapStart: true
-  # Lambda takes a snapshot of the initialized execution environment
-  # New invocations: load snapshot instead of running init
-  # Cold start: 5s → 200ms (JVM pre-loaded!)
-  # Limitation: no unique runtime state (ephemeral data must be lazy-init)
-
-# Strategy 3: VPC cold start elimination
-  # VPC Lambda = Lambda + Hyperplane ENI (pre-created)
-  # Hyperplane: AWS-managed NAT, assigns ENI lazily
-  
-  # Solution: Reserve ENIs
-  # AWS Lambda now supports VPC without ENI overhead (Lambda Hyperplane)
-  # Must use: AWSLambdaVPCAccessExecutionRole with ENI creation
-  # ENI created ONCE (per function+subnet combination), reused across invocations
-
-# Strategy 4: Keep warm with scheduled invocations
-  # CloudWatch Events → Lambda every 5 minutes
-  # Prevents idle timeout (15-45 min inactivity → recycles)
-  # Only works: if concurrency doesn't exceed provisioned instances
-
-# Strategy 5: Language optimization
-  # Python: lazy imports, use ORJSON instead of json, use uvloop
-  # Node.js: minimize require(), use bundler (esbuild)
-  # Java: use SnapStart or Quarkus/Micronaut native compilation
-  # .NET: use NativeAOT compilation (AWS Lambda runtime for .NET 8)
-```
-
-**Lambda Execution Context Reuse:**
-
-```python
-# Execution context reuse: Lambda MAY reuse the same sandbox
-# for multiple invocations (but NOT guaranteed!)
-
-# What gets reused:
-# - /tmp directory (512MB - 10GB)
-# - Database connections (if created in global scope)
-# - HTTP persistent connections
-# - AWS SDK clients
-
-# Best practice: initialize in GLOBAL scope (outside handler)
-import boto3
-import os
-
-# Global scope: runs ONCE during cold start, REUSED on warm invocations
-dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table(os.environ['TABLE_NAME'])
-
-def handler(event, context):
-    # Handler scope: runs EVERY invocation
-    return table.get_item(Key={'pk': event['key']})
-
-# Worst practice: initialize inside handler
-def bad_handler(event, context):
-    # Creates new client EVERY invocation!
-    dynamodb = boto3.resource('dynamodb')  # 200ms overhead per request!
-    ...
-```
-
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Cold start causes** | Breaks down the 4 phases: download, VM, runtime, handler init |
-| **VPC cold start** | Knows ENI attachment adds 250-500ms, now mitigated by Hyperplane |
-| **Provisioned concurrency** | Understands cost vs latency trade-off |
-| **SnapStart** | Knows Java SnapStart eliminates JVM startup cost |
+| **Cold start causes** | Breaks down init (microVM, code fetch, runtime, init code) and measures with `Init Duration` |
+| **VPC cold start** | Knows Hyperplane ENIs (2019) removed per-cold-start ENI cost |
+| **Provisioned concurrency** | Understands cost vs latency trade-off and sizing to concurrency, not RPS |
+| **SnapStart** | Knows supported runtimes, restrictions and uniqueness hooks |
 
 ---
 
@@ -413,127 +327,74 @@ def bad_handler(event, context):
 
 ### Answer
 
-**Lambda Concurrency Model:**
+!!! tip "30-second answer"
+    Concurrency = requests per second × average duration in seconds. All functions in a Region share one account pool (1,000 by default, raisable to tens of thousands). Each function can add **1,000 execution environments every 10 seconds**. **Reserved concurrency** carves out a slice that is both a floor and a ceiling for one function, free of charge. **Provisioned concurrency** pre-initialises environments to remove cold starts, for a fee. For the scenario: request a quota increase, reserve concurrency for the API function, and cap the SQS consumer with the event source mapping's **maximum concurrency** so it can't starve the API.
+
+**The shared pool:**
 
 ```
-Account-level concurrency limit: 1000 (default, can be increased)
-
-Regional pool: 1000 concurrent executions shared across ALL functions
-
-                    ┌─────────────────────────────────────────┐
-                    │  Regional Concurrency Pool (1000)        │
-                    │                                         │
-                    │  ┌────────────────────┐                  │
-                    │  │ API Handler (600)  │ (burst)         │
-                    │  ├────────────────────┤                  │
-                    │  │ SQS Handler (300)  │ (burst)         │
-                    │  ├────────────────────┤                  │
-                    │  │ Scheduled Job (100)│ (burst)         │
-                    │  └────────────────────┘                  │
-                    │                                         │
-                    │  Region limit 1000 = 1000 total          │
-                    │  If API spikes to 800 → SQS drops to 200 │
-                    │  (unfair competition!)                   │
-                    └─────────────────────────────────────────┘
-
-Burst concurrency (per minute):
-  - 500-3000 per region (varies by region)
-  - First minute: 3000 concurrent
-  - Subsequent: 500 concurrent per minute
-
-Solution: Reserved Concurrency
-  API Handler:   reserved=500 (guaranteed 500, max 500)
-  SQS Handler:   reserved=300 (guaranteed 300, max 300)
-  Scheduled Job: reserved=100 (guaranteed 100, max 100)
-  Remaining:     100 (shared pool)
+Account concurrency (Region): 1,000
+┌──────────────────────────────────────────────────────────────┐
+│ API handler        reserved 500  (always available, max 500) │
+│ SQS consumer       ESM MaximumConcurrency 200 (cap only)     │
+│ Scheduled job      unreserved                                │
+│ Unreserved pool    500 (Lambda always keeps ≥100 unreserved) │
+└──────────────────────────────────────────────────────────────┘
+Without reservations, a burst in the SQS consumer can take the
+whole pool and the API function gets 429 TooManyRequestsException.
 ```
 
-**Reserved vs Provisioned Concurrency:**
+Sizing example: 2,000 requests/s at 150 ms average needs about 300 concurrent environments. Halving duration halves concurrency, which is why tuning memory (more CPU) often fixes "throttling".
 
-```yaml
-Reserved Concurrency:
-  - Guarantees: this function can always scale to this limit
-  - Prevents: other functions from using this capacity
-  - Cold starts: STILL possible within reserved concurrency
-  - Cost: no extra charge (just the normal execution cost)
-  - Use: critical functions that must not be throttled
+**Scaling rate (since Nov 2023):** each function scales independently by up to 1,000 concurrent environments every 10 seconds until the account limit. The old Region-wide "burst 500–3,000 then +500/min" model no longer applies.
 
-Provisioned Concurrency:
-  - Pre-warms: N execution environments BEFORE requests arrive
-  - Zero cold starts: first N invocations are warm
-  - Cost: $0.000004 per GB-second (24/7 cost, regardless of usage)
-  - Scaling: application auto scaling can adjust provisioned level
-  - Use: latency-sensitive workloads where cold starts are unacceptable
+**Reserved vs provisioned:**
 
-Comparison:
-  Feature               | Reserved  | Provisioned
-  ----------------------|-----------|---------------
-  Prevents throttling   | ✅ Yes    | ✅ Yes
-  Prevents cold starts  | ❌ No     | ✅ Yes
-  Additional cost       | ❌ Free   | 💰 Per GB-second
-  Auto-scaling          | ❌ Fixed  | ✅ Application auto scaling
-```
+| | Reserved concurrency | Provisioned concurrency |
+|---|---|---|
+| Purpose | Guarantee and cap | Remove cold starts |
+| Cold starts | Still happen | None up to the provisioned amount |
+| Cost | Free | Charged per GB-second provisioned, whether used or not |
+| Applies to | Function | Version or alias |
+| Side effect | Caps the function; reserving 0 disables it (kill switch) | Counts against the function's reserved or the account pool |
 
-**SQS Lambda Event Source Mapping (Throttling Handling):**
+**Throttling behaviour depends on the invocation type:**
 
-```python
-# When Lambda throttles SQS messages:
-# 1. Messages stay in SQS (VisibilityTimeout extends)
-# 2. Lambda sends back: "too many invocations"
-# 3. SQS retries after visibility timeout expires
-# 4. Messages may go to DLQ after maxReceiveCount
+| Invocation | On throttle |
+|---|---|
+| Synchronous (API Gateway, ALB, SDK) | Caller gets 429; client must retry with backoff |
+| Asynchronous (S3, SNS, EventBridge) | Lambda's internal queue retries for up to 6 hours (configurable max event age), then on-failure destination or DLQ |
+| SQS event source mapping | Pollers back off; messages stay in the queue and reappear after the visibility timeout; repeated failures count toward `maxReceiveCount` |
+| Kinesis/DynamoDB Streams | Retries the batch, blocking that shard until success, record expiry or max retries |
 
-# Architecture to avoid throttling:
-# - Set reserved concurrency for SQS handler
-# - Use batch size to reduce invocation count
-# - Enable parallelization factor (SQS, only 1 per shard by default)
+**SQS event source mapping, configured correctly:**
 
+```json
 {
-    "EventSourceMapping": {
-        "BatchSize": 10,              # Max 10 messages per invocation
-        "MaximumBatchingWindowInSeconds": 5,  # Wait 5s to fill batch
-        "ParallelizationFactor": 1,   # Default: 1 concurrent per SQS message
-        "FunctionResponseTypes": ["ReportBatchItemFailures"],  # Partial failures
-        "ReservedConcurrency": 500    # Guarantee 500 concurrent
-    }
+  "BatchSize": 10,
+  "MaximumBatchingWindowInSeconds": 5,
+  "ScalingConfig": { "MaximumConcurrency": 200 },
+  "FunctionResponseTypes": ["ReportBatchItemFailures"]
 }
-
-# SQS throttling mitigation:
-# With reserved concurrency=500 and batch size=10
-# Max throughput: 500 × 10 = 5000 messages per invocation burst
-# (but throttled by SQS's own limits: 120K messages/min from SQS to Lambda)
 ```
 
-**Lambda Best Practices for Throughput:**
+- `MaximumConcurrency` (minimum 2) caps how many concurrent invocations the mapping drives. Prefer it to reserved concurrency for capping consumers: reserved concurrency makes pollers hit throttles, which burns receive counts and can push good messages into the DLQ.
+- `ParallelizationFactor` applies to Kinesis and DynamoDB Streams only, not SQS.
+- Default SQS mappings scale to about 1,250 concurrent invocations. **Provisioned mode** for SQS mappings (Nov 2025) lets you set minimum/maximum event pollers for faster and higher scaling.
+- Set the queue visibility timeout to at least 6× the function timeout.
 
-```yaml
-# 1. Increase memory (CPU scales linearly with memory)
-# 1792MB = full vCPU, <1792MB = fraction of vCPU
-# More memory = faster execution = higher throughput per concurrency
+**Memory and throughput:** CPU scales with memory; 1,769 MB equals one vCPU and 10,240 MB gives up to 6 vCPUs. For CPU-bound code, more memory often costs the same or less because duration drops. Use Lambda Power Tuning to find the knee.
 
-# 2. Use burst concurrency wisely
-# First minute of burst: 3000 concurrent
-# Design for burst: have enough downstream capacity
-
-# 3. Async invocation: SQS vs Lambda async
-# SQS: managed retry, DLQ, batch, slow start protection
-# Lambda async: 2x retry, DLQ, no throttling protection
-# → Prefer SQS for critical workloads
-
-# 4. Function timeout alignment
-# API Lambda: 30s max (API Gateway 29s timeout)
-# SQS Lambda: 6x visibility timeout / batch size (recommended)
-# Event Lambda: matches event source timeout
-```
+**Timeouts to align:** API Gateway REST APIs default to a 29 s integration timeout (raisable for Regional and private REST APIs since June 2024); HTTP APIs max out at 30 s. Set the function timeout just above the caller's.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Concurrency pool** | Understands account-level shared concurrency |
-| **Reserved vs provisioned** | Can explain guarantee vs pre-warming difference |
-| **SQS throttling** | Knows messages stay in queue, retry after visibility timeout |
-| **Memory scaling** | Understands CPU scales with memory allocation |
+| **Concurrency pool** | Understands account-level shared concurrency and the per-function scaling rate |
+| **Reserved vs provisioned** | Can explain guarantee/cap vs pre-warming difference |
+| **SQS throttling** | Uses ESM maximum concurrency rather than reserved concurrency to cap consumers |
+| **Memory scaling** | Understands CPU scales with memory allocation and concurrency = RPS × duration |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -548,9 +409,6 @@ Comparison:
 
 ---
 
-
----
-
 ## 5. ECS: Task Definition, Service, Cluster
 
 **Q:** "Design an ECS deployment for a microservice using Fargate launch type with service discovery, rolling updates, and canary deployments. How does the ECS service scheduler work? How does Service Connect differ from classic service discovery?"
@@ -559,182 +417,105 @@ Comparison:
 
 ### Answer
 
-**ECS Task Definition:**
+!!! tip "30-second answer"
+    A **task definition** is the immutable recipe (image, CPU/memory, ports, IAM roles, secrets, logging); a **service** keeps N copies running, spreads them across AZs, registers them with a target group and replaces failures. Rolling updates use `minimumHealthyPercent`/`maximumPercent` plus the **deployment circuit breaker** and CloudWatch alarm rollback. Since July 2025 ECS has **built-in blue/green**, and since October 2025 **linear and canary** strategies, so you no longer need CodeDeploy for traffic shifting. **Service Connect** adds a managed proxy per task for client-side load balancing, retries, timeouts and per-service metrics; plain Cloud Map discovery is DNS only.
+
+**Task definition (Fargate):**
 
 ```json
 {
-    "family": "my-app",
-    "taskRoleArn": "arn:aws:iam::123456789:role/my-app-task-role",
-    "executionRoleArn": "arn:aws:iam::123456789:role/ecsTaskExecutionRole",
-    "networkMode": "awsvpc",
-    "requiresCompatibilities": ["FARGATE"],
-    "cpu": "512",        // 0.5 vCPU
-    "memory": "1024",    // 1GB
-    "containerDefinitions": [{
-        "name": "my-app",
-        "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:latest",
-        "essential": true,
-        "portMappings": [{
-            "containerPort": 8080,
-            "protocol": "tcp"
-        }],
-        "environment": [
-            { "name": "DB_HOST", "value": "db.example.com" }
-        ],
-        "secrets": [
-            { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:..." }
-        ],
-        "logConfiguration": {
-            "logDriver": "awslogs",
-            "options": {
-                "awslogs-group": "/ecs/my-app",
-                "awslogs-region": "us-east-1",
-                "awslogs-stream-prefix": "ecs"
-            }
-        },
-        "healthCheck": {
-            "command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
-            "interval": 10,
-            "timeout": 5,
-            "retries": 3,
-            "startPeriod": 60
-        }
-    }]
+  "family": "my-app",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/my-app-task-role",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "cpu": "512",
+  "memory": "1024",
+  "containerDefinitions": [{
+    "name": "my-app",
+    "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:1.42.0",
+    "essential": true,
+    "portMappings": [{ "name": "http", "containerPort": 8080, "protocol": "tcp" }],
+    "secrets": [
+      { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-pass" }
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/my-app",
+        "awslogs-region": "us-east-1",
+        "awslogs-stream-prefix": "ecs"
+      }
+    },
+    "healthCheck": {
+      "command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+      "interval": 10, "timeout": 5, "retries": 3, "startPeriod": 60
+    }
+  }]
 }
 ```
 
-**ECS Service + Deployment:**
+- **Task role**: what your code can call. **Execution role**: what the ECS agent needs to pull the image, fetch secrets and write logs. Mixing them up is a classic least-privilege mistake.
+- Pin images by immutable tag or digest; `:latest` makes rollbacks and audits meaningless.
+- Fargate CPU/memory come in fixed combinations (0.25 vCPU/0.5 GB up to 16 vCPU/120 GB).
+
+**Service and deployment:**
 
 ```yaml
-# Service definition:
-my-app-service:
-  type: ECS
-  cluster: my-cluster
-  taskDefinition: my-app:42          # Revision 42
-  desiredCount: 4
-  platformVersion: LATEST            # Fargate platform 1.4+
-  networkConfiguration:
-    awsvpcConfiguration:
-      subnets:
-        - subnet-abc
-        - subnet-def
-      securityGroups:
-        - sg-app
-      assignPublicIp: ENABLED         # Or DISABLED for private subnets
-  
-  # Load balancing
-  loadBalancers:
-    - targetGroupArn: arn:aws:elasticloadbalancing:...:my-app-tg
-      containerName: my-app
-      containerPort: 8080
-  
-  # Service discovery (Cloud Map)
-  serviceRegistries:
-    - registryArn: arn:aws:servicediscovery:...:my-app-ns
-  
-  # Service Connect (advanced service mesh)
-  serviceConnectConfiguration:
-    enabled: true
-    namespace: "my-app.local"
-    services:
-      - portName: "my-app"
-        clientAliases:
-          - port: 8080
-
-  # Deployment
-  deploymentController:
-    type: ECS                       # Rolling update (default)
-    # type: CODE_DEPLOY             # Blue/green via CodeDeploy
-    # type: EXTERNAL                # Third-party (Terraform, etc.)
-  
-  deploymentConfiguration:
-    minimumHealthyPercent: 100      # Keep 100% of desired count
-    maximumPercent: 200             # Allow 200% during deployment (8 total)
-    alerts:
-      - alarmName: my-app-high-error-rate
-        rollback: true
-  
-  # Service auto scaling
-  scalingPolicies:
-    - type: TargetTrackingScaling
-      targetValue: 60
-      predefinedMetricSpecification:
-        predefinedMetricType: ECSServiceAverageCPUUtilization
+service: my-app
+launchType: FARGATE            # or a capacity provider strategy (FARGATE / FARGATE_SPOT / Managed Instances)
+desiredCount: 4
+networkConfiguration:
+  awsvpcConfiguration:
+    subnets: [subnet-private-a, subnet-private-b, subnet-private-c]
+    securityGroups: [sg-app]
+    assignPublicIp: DISABLED
+loadBalancers:
+  - targetGroupArn: arn:aws:elasticloadbalancing:...:targetgroup/my-app/abc
+    containerName: my-app
+    containerPort: 8080
+deploymentConfiguration:
+  strategy: CANARY               # ROLLING (default) | BLUE_GREEN | LINEAR | CANARY
+  minimumHealthyPercent: 100     # used by ROLLING
+  maximumPercent: 200
+  deploymentCircuitBreaker: { enable: true, rollback: true }
+  alarms: { alarmNames: [my-app-5xx-rate], enable: true, rollback: true }
+  bakeTimeInMinutes: 10          # keep the old revision for fast rollback
 ```
 
-**Canary Deployment with CodeDeploy:**
+**Deployment strategies:**
 
-```yaml
-# Blue/green deployment: CodeDeploy + ECS
-# Traffic shifting: linear 10% every 5 minutes
+| Strategy | How traffic moves | Rollback | Notes |
+|---|---|---|---|
+| Rolling (`ECS` controller) | Replace tasks in batches bounded by min/max percent | Circuit breaker or alarm | Both versions serve traffic at once; needs backward-compatible changes |
+| Built-in blue/green | New revision stands up fully, then the listener switches 100% | Instant during bake time | Lifecycle hooks (Lambda) for tests before traffic |
+| Built-in linear / canary | Shift X% per step, or a small canary % then the rest | Alarm-driven | Replaces most CodeDeploy use cases |
+| CodeDeploy controller | Same patterns via AppSpec | Alarm-driven | Still supported; legacy for new services |
 
-deploymentController:
-  type: CODE_DEPLOY
+**How the scheduler places tasks:** spreads across AZs by default; with EC2 capacity it also applies placement strategies (`spread`, `binpack`, `random`) and constraints. Capacity providers decide *where* (Fargate, Fargate Spot, an ASG, or **ECS Managed Instances**, where AWS runs and patches the EC2 instances for you).
 
-# AppSpec.yaml (CodeDeploy):
-version: 1
-Resources:
-  - TargetService:
-      Type: AWS::ECS::Service
-      Properties:
-        TaskDefinition: "arn:aws:ecs:...:task-definition/my-app:43"
-        LoadBalancerInfo:
-          ContainerName: "my-app"
-          ContainerPort: 8080
+**Service Connect vs Cloud Map DNS:**
 
-Hooks:
-  - BeforeAllowTraffic: "arn:aws:lambda:...:before-allow-fn"
-  # Run integration tests against new version
-  - AfterAllowTraffic: "arn:aws:lambda:...:after-allow-fn"
-  # Validate production traffic, rollback if needed
+| | Cloud Map service discovery | Service Connect |
+|---|---|---|
+| Mechanism | DNS A/SRV records (or API discovery) | Managed proxy (Envoy-based) injected into each task; still uses a Cloud Map namespace |
+| Load balancing | Client DNS resolution; stale records until TTL expires | Proxy-side, health-aware, outlier detection |
+| Retries / timeouts | Your code | Configurable |
+| Metrics | None built in | Per-service request metrics in CloudWatch |
+| Cost | Cloud Map queries | Proxy CPU/memory in your task |
+| Cross-cluster / cross-account | Namespace sharing | Same namespace across clusters; for cross-VPC/account, consider VPC Lattice |
 
-# Traffic shifting:
-# Phase 1: 10% traffic for 5 min → observability check
-# Phase 2: 100% traffic → completion
-# Rollback: one-click revert to old task definition
-```
-
-**ECS Service Connect vs Cloud Map:**
-
-```yaml
-Cloud Map:
-  - DNS-based service discovery
-  - A-record, SRV record, or HTTP health checks
-  - TTL: 60s default (stale DNS cache possible)
-  - Separate Cloud Map namespace per environment
-  - Simple, stateless, no traffic management
-
-Service Connect:
-  - Envoy sidecar proxy on each task
-  - Intercepts traffic: app → service connect → destination
-  - Features:
-    - Load balancing: round-robin, health checks
-    - Retries: configurable
-    - Timeouts: per-service
-    - Observability: metrics, tracing (AWS Distro for OpenTelemetry)
-  - DNS: local namespace (service-name:port)
-  - Port management: automatic assignment
-  - No load balancer needed for inter-service communication
-  
-  Cloud Map + Service Connect comparison:
-  Feature              | Cloud Map | Service Connect
-  ---------------------|-----------|-----------------
-  Load balancing       | DNS RR    | Client-side LB
-  Health checks        | DNS TTL   | Real-time
-  Retry/timeout        | ❌        | ✅ Built-in
-  Require DNS cache    | ✅        | ❌ (real-time)
-  Complexity           | Low       | Higher
-  Best for             | Simple    | Complex microservices
-```
+**What they probe next:** why tasks fail health checks only during deploys (start period, slow JVM warm-up), ECS vs EKS for a 10-engineer team (ECS is less to operate; EKS if you need Kubernetes ecosystem portability), and **ECS Express Mode** (Nov 2025), which provisions the service, ALB, scaling and roles from just an image and is the migration path AWS recommends for App Runner, which closed to new customers on April 30, 2026.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Task definition fields** | Knows task role, execution role, port mappings, secrets |
-| **Deployment strategies** | Compares rolling vs blue/green vs canary |
-| **Service Connect** | Understands Envoy sidecar proxy for inter-service comm |
-| **Auto scaling** | Uses target tracking with predefined metrics |
+| **Task definition fields** | Knows task role vs execution role, port mappings, secrets |
+| **Deployment strategies** | Compares rolling vs built-in blue/green vs linear/canary, with alarm rollback |
+| **Service Connect** | Understands managed proxy for inter-service comm vs DNS discovery |
+| **Auto scaling** | Uses target tracking with request count or CPU, and scales on the right metric |
 
 ---
 
@@ -746,121 +527,83 @@ Service Connect:
 
 ### Answer
 
-**EKS Architecture:**
+!!! tip "30-second answer"
+    AWS runs the control plane (API servers and etcd across three AZs in an AWS-owned account); you choose how nodes are run: **EKS Auto Mode** (AWS runs Karpenter-style provisioning, nodes and core add-ons, for a per-instance management fee), **managed node groups** (AWS-managed ASGs, you pick types), **Karpenter on your own nodes**, **self-managed** nodes, or **Fargate** (one pod per microVM, many restrictions). Secure it with **access entries** (not the old `aws-auth` ConfigMap) for humans, **EKS Pod Identity** (or IRSA) for pods, a private API endpoint, network policies, and namespaces with quotas per tenant.
+
+**Architecture:**
 
 ```
-EKS Control Plane (AWS-managed, single tenant):
-  - API server: Highly available (3 AZs)
-  - etcd: Encrypted, auto-scaled, 3000+ nodes support
-  - Controllers: scheduler, controller-manager, cloud-controller-manager
-  - Certificates: auto-rotated every 90 days
-  - Upgrades: manual trigger (or auto via EKS Auto Mode)
-
-Data Plane (customer-managed):
-  ┌─────────────────────────────────────────────────┐
-  │ Node Group Options:                              │
-  │  1. Managed Node Groups (EC2)                    │
-  │  2. Self-Managed Node Groups (EC2)               │
-  │  3. Fargate Profiles (serverless)                │
-  │  4. EKS Auto Mode (new, fully managed)           │
-  └─────────────────────────────────────────────────┘
-
-  VPC CNI: aws-node (DaemonSet)
-  - Assigns VPC IPs to pods directly (no overlay!)
-  - Each pod gets a VPC IP from the subnet
-  - Networking: native VPC routing (no VXLAN/overhead!)
-  - Limits: EC2 ENI limits determine pod density
+EKS control plane (AWS-managed, per cluster)
+  ├─ kube-apiserver instances behind an NLB, across AZs
+  ├─ etcd across 3 AZs, encrypted (envelope encryption of Secrets with KMS)
+  ├─ scheduler, controller-manager
+  └─ standard tier ($0.10/hr), extended support for older versions ($0.60/hr),
+     or Provisioned Control Plane tiers (XL–8XL) for predictable large-scale API capacity
+          │ cross-account ENIs in your subnets
+          ▼
+Data plane (your VPC)
+  ├─ Auto Mode nodes | managed node groups | Karpenter | self-managed | Fargate
+  ├─ Amazon VPC CNI: each pod gets a VPC IP (no overlay)
+  └─ add-ons: CoreDNS, kube-proxy, EBS CSI, Pod Identity agent, ...
 ```
 
-**Node Group Comparison:**
+**Data plane options:**
 
-```yaml
-Managed Node Groups:
-  - AWS manages: EC2 ASG, launch template, patching, updates
-  - Node updates: rolling replacement (drain + replace)
-  - Customization: launch template for user data, instance types
-  - Cost: no extra charge (pay for EC2 only)
-  - Best for: most workloads (balance of control and automation)
+| Option | Who manages nodes | Strengths | Watch out for |
+|---|---|---|---|
+| **EKS Auto Mode** (Dec 2024) | AWS: provisioning, Bottlerocket AMIs, patching (nodes max ~21 days), core add-ons, load balancer and storage controllers | Least ops; uses Karpenter-style NodePools | Management fee on top of EC2 (not covered by Savings Plans); less node customisation |
+| Managed node groups | AWS manages the ASG lifecycle; you choose AMI type, sizes, update timing | Simple, predictable | Scaling is per-group; pair with Cluster Autoscaler or Karpenter |
+| Karpenter (self-run) | You run Karpenter; it launches right-sized instances per pending pod | Fast, bin-packing, Spot diversification, consolidation | You own its upgrades and NodePool design |
+| Self-managed nodes | You | Full control (custom kernels, special AMIs) | All patching and draining is yours |
+| Fargate | AWS; one pod per microVM | Strong isolation, no nodes | No DaemonSets, privileged pods, hostNetwork, GPUs or EBS (EFS only); slower pod start; pricier at density |
 
-Self-Managed Node Groups:
-  - You manage: ASG, launch template, patching, updates
-  - Full control: kubelet config, bootstrap script, custom AMIs
-  - Node replacement: custom tooling (drain scripts, etc.)
-  - Best for: GPU/ML workloads (custom AMI needed)
+GPU workloads no longer need self-managed nodes: managed node groups, Karpenter and Auto Mode all support accelerated AMIs.
 
-Fargate Profiles:
-  - No nodes to manage: AWS runs pods as Fargate tasks
-  - Isolation: each pod gets dedicated microVM
-  - No node patching, no capacity management
-  - Limitations:
-    - DaemonSets not supported (no privileged containers)
-    - Host networking not supported
-    - PVC: only EFS (no EBS)
-    - GPUs not supported
-    - Pod startup: 30-60s (cold start)
+**Networking (VPC CNI):** pods get real VPC IPs, so security groups, flow logs and routing work natively. Pod density is limited by ENIs × IPs per ENI; enable **prefix delegation** (/28 prefixes per ENI slot) to raise it, plan subnets generously or use **IPv6**, and use **security groups for pods** for per-workload network policy at the VPC level. Kubernetes `NetworkPolicy` is supported natively by the VPC CNI.
 
-EKS Auto Mode (newest):
-  - Fully managed: control plane + data plane + add-ons
-  - AWS chooses: instance types, scaling, updates
-  - No node group configuration needed
-  - Best for: teams wanting to focus on apps, not infrastructure
+**Access control:**
 
-Performance comparison:
-  100 pods across 3 AZs:
-  - Managed: 2 m5.large nodes (~$70/month)
-  - Fargate: 100 pods (100 × ~$15/month = $1500/month!)
-  - EKS Auto: EC2 pricing (most cost-effective)
+```bash
+# Humans/CI: access entries map IAM principals to Kubernetes permissions
+aws eks create-access-entry --cluster-name prod \
+  --principal-arn arn:aws:iam::123456789012:role/platform-admins
+aws eks associate-access-policy --cluster-name prod \
+  --principal-arn arn:aws:iam::123456789012:role/platform-admins \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster
 ```
 
-**Security: IRSA (IAM Roles for Service Accounts):**
-
-```yaml
-# IAM Roles for Service Accounts (IRSA)
-# Pod gets IAM role via Kubernetes ServiceAccount
-
-# Step 1: Create IAM role with trust policy
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {
-      "Federated": "arn:aws:iam::123456789:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E"
-    },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": {
-        "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E:sub": "system:serviceaccount:my-ns:my-app-sa"
-      }
-    }
-  }]
-}
-
-# Step 2: Create Kubernetes ServiceAccount with annotation
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: my-app-sa
-  namespace: my-ns
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/my-app-role
-
-# Step 3: Pod uses the ServiceAccount
-spec:
-  serviceAccountName: my-app-sa
-
-# Pod gets: AWS credentials for my-app-role
-# No: long-term credentials on EC2 instance profile!
-# Security: least privilege per microservice
+```bash
+# Pods: EKS Pod Identity (Nov 2023) — no OIDC provider or trust-policy per cluster
+aws eks create-pod-identity-association --cluster-name prod \
+  --namespace payments --service-account payments-api \
+  --role-arn arn:aws:iam::123456789012:role/payments-api
+# Role trust policy principal: pods.eks.amazonaws.com (actions sts:AssumeRole, sts:TagSession)
 ```
+
+| | IRSA | EKS Pod Identity |
+|---|---|---|
+| Mechanism | Projected service-account token, `AssumeRoleWithWebIdentity` via the cluster's OIDC provider | Pod Identity agent on the node exchanges the token via the EKS Auth API |
+| Per-cluster setup | IAM OIDC provider and role trust policy naming the cluster's issuer | None; same role reusable across clusters |
+| Session tags (ABAC) | No | Yes (cluster, namespace, service account tags) |
+| Where it still wins | Fargate pods, other Kubernetes distributions | Default choice on EKS EC2 nodes |
+
+Also block pod access to the node's instance role: require IMDSv2 with hop limit 1 so pods can't steal node credentials.
+
+**Multi-tenancy for 50 services:** namespace per team/service with ResourceQuotas and LimitRanges, NetworkPolicies default-deny, Pod Security Admission (`restricted`), separate NodePools for noisy or sensitive tenants, and a separate cluster (or account) when tenants need hard isolation. Soft multi-tenancy in one cluster is not a security boundary against a hostile tenant.
+
+**Cost comparison (illustrative):** 100 small pods at 0.25 vCPU / 0.5 GB on Fargate cost roughly $900/month in us-east-1; the same pods bin-packed onto a few m8g.xlarge nodes cost a fraction of that, plus the cluster fee. Fargate wins for spiky, low-count or isolation-sensitive workloads; nodes win at density.
+
+**What they probe next:** cluster upgrade strategy (in-place vs blue/green clusters; versions move ~3 times a year and fall into paid extended support after ~14 months), control-plane scaling and API priority/fairness, and how you'd handle IP exhaustion.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Node group types** | Can compare managed vs self-managed vs Fargate vs Auto Mode |
-| **VPC CNI** | Understands native VPC IPs vs overlay networking |
-| **IRSA** | Explains OIDC federation and per-pod IAM roles |
-| **Fargate limitations** | Knows DaemonSet, host networking, GPU, and PVC limitations |
+| **Node group types** | Can compare managed vs self-managed vs Fargate vs Auto Mode vs Karpenter |
+| **VPC CNI** | Understands native VPC IPs vs overlay networking, prefix delegation, IP exhaustion |
+| **Pod IAM** | Explains Pod Identity and IRSA, and blocking IMDS from pods |
+| **Fargate limitations** | Knows DaemonSet, host networking, GPU, and EBS limitations |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -875,117 +618,63 @@ spec:
 
 ---
 
-
----
-
 ## 7. Fargate: Serverless Containers & Networking
 
 **Q:** "Your ECS service on Fargate needs to connect to an RDS database in a private subnet and an external API via the internet. Design the networking. How does Fargate's network stack work? Compare Fargate platform versions 1.3 vs 1.4."
 
-**What They're Really Testing:** Whether you understand Fargate's network architecture — the Hyperplane ENI, NAT requirements, and platform version differences.
+**What They're Really Testing:** Whether you understand Fargate's network architecture — the task ENI, NAT requirements, and platform version differences.
 
 ### Answer
 
-**Fargate Networking Architecture:**
+!!! tip "30-second answer"
+    Every Fargate task gets its own ENI in your subnet (`awsvpc` mode) with its own security group. Put tasks in private subnets; the RDS security group allows the task security group on 5432/3306; outbound internet goes through a NAT gateway. On platform **1.4.0** (the current `LATEST` for Linux), *all* task traffic, including image pulls from ECR, Secrets Manager lookups and log shipping, uses that task ENI, so private subnets need either NAT or VPC endpoints (ECR API, ECR DKR, S3 gateway, Logs, Secrets Manager). Endpoints keep AWS traffic private and are usually cheaper than NAT at volume.
+
+**Network layout:**
 
 ```
-AWS Cloud ──────────────────────────────────
-│                                          │
-│  VPC                  Fargate Task       │
-│  ┌─────────────────┐  ┌──────────────┐  │
-│  │ Public Subnet    │  │ Container    │  │
-│  │ 10.0.1.0/24     │  │ eth0:        │  │
-│  │                 │  │ 10.0.1.42/24 │  │
-│  │ IGW ─── NAT GW  │  │              │  │
-│  └────────┬────────┘  │ Routes:      │  │
-│           │           │ 0.0.0.0/0    │  │
-│  ┌────────▼────────┐  │   → NAT GW   │  │
-│  │ Private Subnet  │  │ 10.0.1.0/24  │  │
-│  │ 10.0.2.0/24     │  │   → local    │  │
-│  │                 │  │              │  │
-│  │ RDS (internal)  │  └──────────────┘  │
-│  │ 10.0.2.100/24  │                    │
-│  └─────────────────┘                    │
-│                                          │
-│  Hyperplane ENI (AWS-managed):           │
-│  - Assigned to Fargate task             │
-│  - Provides VPC connectivity            │
-│  - No public IP without NAT             │
-└──────────────────────────────────────────┘
+VPC 10.0.0.0/16
+├── Public subnets (per AZ)          IGW, ALB
+├── Private app subnets (per AZ)     Fargate task ENIs  ── sg-app
+│      route 0.0.0.0/0 → NAT gateway (zonal per AZ, or one regional NAT gateway)
+│      S3 / DynamoDB prefix lists → gateway endpoints (free)
+│      ECR, Logs, Secrets Manager → interface endpoints (per-AZ ENIs)
+└── Private data subnets             RDS  ── sg-db allows 5432 from sg-app only
 ```
 
-**Platform Versions:**
+**Platform versions:**
 
-```yaml
-Platform version 1.3 (Legacy):
-  - Network: Linux bridge, task ENI in VPC
-  - No internal DNS (must use custom DNS)
-  - No EFS support
-  - No ephemeral storage management
-  - Task ENI: created/destroyed with each task start/stop
+| | 1.3.0 (legacy) | 1.4.0 (`LATEST` for Linux) |
+|---|---|---|
+| Image pulls, secrets, logs | Through a separate Fargate-owned ENI | Through the **task ENI**, so they obey your routes, SGs and endpoints |
+| EFS volumes | No | Yes |
+| Ephemeral storage | Fixed 10 GB container + 4 GB volume | 20 GiB default, configurable up to 200 GiB |
+| Network metrics, SYS_PTRACE, etc. | No | Yes |
 
-Platform version 1.4 (Current):
-  - Network: awsvpc, task ENI directly in VPC
-  - DNS resolution: VPC DNS resolver (Route53 Resolver)
-  - EFS: supports EFS filesystem mounts
-  - Ephemeral storage: 20GB default, 200GB max
-  - Task ENI: pre-warmed (faster task startup!)
-  - Security group: per task ENI (fine-grained security)
+There is no Linux 1.5. Features added since (EBS volumes attached to ECS tasks on Fargate in Jan 2024, Graviton/ARM64, Windows containers on their own 1.0.0 version line, Fargate Spot) arrived as capabilities, not platform versions. Fargate does **not** offer GPUs; use EC2 capacity (or ECS Managed Instances) for that. Migrating from 1.3 to 1.4 commonly breaks image pulls in private subnets that relied on the old Fargate-owned path: add the endpoints or NAT first.
 
-Platform version 1.5+ (Latest):
-  - EBS: supports EBS volumes (Fargate + EBS!)
-  - Faster startup: optimized Firecracker microVM
-  - GPU: supports GPU workloads
-  - Graviton: supports ARM-based Fargate tasks
-  - Improved observability: enhanced CloudWatch metrics
+**NAT gateway cost and alternatives (us-east-1 list prices):**
 
-AWS Fargate Platform differences:
-  Feature                | 1.3     | 1.4     | 1.5+
-  -----------------------|---------|---------|------
-  awsvpc network mode    | ✅      | ✅      | ✅
-  EFS volumes            | ❌      | ✅      | ✅
-  EBS volumes            | ❌      | ❌      | ✅
-  Ephemeral storage >20GB| ❌      | ✅ 200GB| ✅
-  GPU                    | ❌      | ❌      | ✅
-  Graviton               | ❌      | ✅      | ✅
-  Task startup speed     | ~60s    | ~30s    | ~15s
-```
+| Option | Price | Use for |
+|---|---|---|
+| NAT gateway | ~$0.045/hour (~$33/month) per gateway + $0.045/GB processed | Internet egress |
+| Gateway endpoints (S3, DynamoDB) | Free | Always add them |
+| Interface endpoints | ~$0.01/hour per AZ + ~$0.01/GB | High-volume AWS API traffic (ECR pulls, Logs) |
+| Regional NAT gateway (Nov 2025) | NAT pricing; one ID spanning AZs, no public subnet needed | Simpler multi-AZ egress |
+| Centralised egress VPC via Transit Gateway | TGW attachment + data charges | Many VPCs, central inspection |
 
-**NAT Gateway Cost Optimization:**
+Example: 50 tasks pulling 5 TB/month of images and logs through NAT costs ~$225 in processing; through interface endpoints ~$50 plus endpoint hours. Zonal NAT gateways: deploy one per AZ, or an AZ failure takes out egress for the others and cross-AZ data charges apply.
 
-```yaml
-# Fargate in private subnet needs NAT for internet access
-# NAT Gateway: ~$32/month + $0.045/GB processed
+**Other Fargate facts:** tasks up to 16 vCPU / 120 GB; each task is its own microVM (no shared kernel with other customers); Fargate Spot gives a 2-minute warning (task receives SIGTERM) at up to 70% off; Graviton tasks are ~20% cheaper than x86.
 
-# Cost example:
-# 50 Fargate tasks × 100GB data/month = $32 + (5000 × 0.045) = $257/month!
-
-# Optimization strategies:
-# 1. VPC endpoints for AWS services (FREE data transfer!)
-# S3 Gateway Endpoint: free
-# DynamoDB Gateway Endpoint: free
-# ECR API/DKR Endpoints: free
-# CloudWatch Logs Endpoint: free
-# Secrets Manager Endpoint: free
-#
-# 2. Only NAT for non-AWS external APIs
-# Most traffic stays within AWS → near-zero NAT cost
-
-# 3. Shared NAT Gateway across multiple VPCs
-# Transit Gateway + shared NAT (cost split across teams)
-
-# 4. NAT Instance (EC2) as cheaper alternative
-# c6g.large NAT instance: ~$25/month (vs $32 NAT Gateway)
-# But: less available, needs manual failover
-```
+**What they probe next:** task startup time (image size and pull path dominate; use smaller images, SOCI lazy loading), why public IP assignment on tasks is a smell (and costs $0.005/hour per public IPv4 since February 2024), and IPv6-only task networking.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Fargate networking** | Understands awsvpc mode, task ENI, NAT requirement |
-| **Platform versions** | Knows 1.4+ supports EFS, 1.5+ supports EBS and GPU |
-| **NAT cost optimization** | Uses VPC endpoints to minimize NAT data processing |
+| **Fargate networking** | Understands awsvpc mode, task ENI, NAT/endpoint requirement |
+| **Platform versions** | Knows 1.4.0 routes all traffic through the task ENI and is the latest Linux version |
+| **NAT cost optimization** | Uses gateway endpoints always and interface endpoints where volume justifies them |
 | **Security groups** | Applies per-task security groups for micro-segmentation |
 
 ### 🎬 Animated Sequence Diagram
@@ -1001,9 +690,6 @@ AWS Fargate Platform differences:
 
 ---
 
-
----
-
 ## 8. Spot Instances: Interruption Handling & Strategies
 
 **Q:** "You run a batch processing workload on EC2 that costs $50K/month in on-demand. How would you migrate to Spot Instances to reduce costs by 70%? Design the interruption handling strategy: how to checkpoint, handle termination notices, and diversify instance types."
@@ -1012,156 +698,104 @@ AWS Fargate Platform differences:
 
 ### Answer
 
-**Spot Instance Market Mechanics:**
+!!! tip "30-second answer"
+    Spot is spare capacity at up to ~90% off, reclaimed with a **2-minute warning** when EC2 needs it back. There is no bidding: prices move slowly, and interruptions are driven by capacity. Make the work interruptible (idempotent units, checkpoints to S3, work pulled from a queue), diversify across **many instance types and all AZs** with the **price-capacity-optimized** allocation strategy, react to the **rebalance recommendation** (early) and the **interruption notice** (2 minutes), and keep a small On-Demand base for anything that must finish on time.
 
-```
-Spot pricing:
-  - Spot price: dynamic, based on supply/demand of spare capacity
-  - Price: typically 60-90% discount vs on-demand
-  - "Spot" means: can be reclaimed with 2-minute notice
+**Signals you get:**
 
-  - A h1.4xlarge: on-demand $1.00/hr → spot ~$0.20/hr (80% off)
+| Signal | When | Where |
+|---|---|---|
+| Rebalance recommendation | Elevated interruption risk; often well before a notice | IMDS `meta-data/events/recommendations/rebalance`, EventBridge `EC2 Instance Rebalance Recommendation` |
+| Interruption notice | 2 minutes before stop/terminate/hibernate | IMDS `meta-data/spot/instance-action`, EventBridge `EC2 Spot Instance Interruption Warning` |
+| OS shutdown | At the end of the 2 minutes | ACPI shutdown → your service gets SIGTERM from systemd/the container runtime, with little time left |
 
-Interruption reasons:
-  1. Capacity needed back (most common)
-  2. Spot price exceeds your max bid
-  3. Service limit reached
-  4. Instance type discontinued
+Interruption reasons: capacity (the vast majority), your optional max price being lower than the current Spot price, or constraints you set (launch group, AZ group).
 
-Termination notice:
-  - 2-minute warning (via Instance Metadata Service)
-  - AWS sends: REBALANCE_IN_PROGRESS → INSTANCE_TERMINATION_NOTICE
-  - Instance state: running → stopping/terminated (after 2 min)
-```
-
-**Interruption Handling Strategy:**
+**Interruption handler (runs on the instance):**
 
 ```python
-import boto3
-import signal
 import json
 import time
-import requests
+import urllib.request
 
-# Instance metadata endpoint
-IMDS_TOKEN = "http://169.254.169.254/latest/api/token"
-IMDS_SPOT = "http://169.254.169.254/latest/meta-data/spot/termination-time"
+IMDS = "http://169.254.169.254/latest"
 
-def get_imds_token():
-    return requests.put(
-        IMDS_TOKEN,
-        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
-    ).text
-
-def check_termination_notice():
-    """Check if spot termination notice is received"""
+def imds_get(path: str, token: str):
+    req = urllib.request.Request(f"{IMDS}/{path}", headers={"X-aws-ec2-metadata-token": token})
     try:
-        token = get_imds_token()
-        resp = requests.get(
-            IMDS_SPOT,
-            headers={"X-aws-ec2-metadata-token": token},
-            timeout=2
-        )
-        if resp.status_code == 200:
-            # 200 = termination notice received!
-            termination_time = resp.text
-            return termination_time
-        return None
-    except:
-        return None
+        with urllib.request.urlopen(req, timeout=1) as r:
+            return r.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:          # no notice yet
+            return None
+        raise
 
-def graceful_shutdown(signum, frame):
-    """Handle SIGTERM (from instance rebalance recommendation)"""
-    print("Received termination notice. Starting graceful shutdown...")
-    
-    # Step 1: Stop accepting new work
-    signal_work_queue_pause()
-    
-    # Step 2: Save checkpoint
-    save_checkpoint(last_processed_id, "/data/checkpoint/spot-last.json")
-    
-    # Step 3: Upload checkpoint to S3 (cross-region durable)
-    s3 = boto3.client('s3')
-    s3.upload_file(
-        "/data/checkpoint/spot-last.json",
-        "my-batch-checkpoints",
-        f"checkpoints/{instance_id}.json"
+def imds_token() -> str:
+    req = urllib.request.Request(
+        f"{IMDS}/api/token", method="PUT",
+        headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
     )
-    
-    # Step 4: Drain connections (if any)
-    database.flush()
-    
-    print("Checkpoint saved. Instance ready for termination.")
+    with urllib.request.urlopen(req, timeout=1) as r:
+        return r.read().decode()
 
-# Register signal handler
-signal.signal(signal.SIGTERM, graceful_shutdown)
+def watch(worker):
+    token = imds_token()
+    while True:
+        if imds_get("meta-data/events/recommendations/rebalance", token):
+            worker.stop_taking_new_work()          # finish current unit, don't start more
+        notice = imds_get("meta-data/spot/instance-action", token)
+        if notice:
+            action = json.loads(notice)            # {"action": "terminate", "time": "..."}
+            worker.checkpoint_to_s3()              # must finish well inside 2 minutes
+            worker.release_current_unit()          # e.g. ChangeMessageVisibility to 0
+            return action
+        time.sleep(5)
 ```
 
-**Spot Diversification Strategy:**
+(Refresh the token before its TTL in long-running processes. In containers, the AWS Node Termination Handler on Kubernetes, or Karpenter's interruption queue, does this for you; ECS drains Spot tasks automatically when `ECS_ENABLE_SPOT_INSTANCE_DRAINING=true`.)
+
+**Checkpointing design:** the unit of work should be small enough to redo cheaply (minutes, not hours). For long jobs, checkpoint every N minutes to S3 with a version or sequence number, and make resume idempotent. Two minutes is not enough to upload a 50 GB checkpoint; plan for losing the work since the last periodic checkpoint.
+
+**Diversification:**
 
 ```yaml
-# Capacity Pool: a combination of (instance type, AZ)
-# Problem: Single pool → high interruption risk
-
-# Solution: Diversify across multiple pools
-
-EC2 Fleet / Spot Fleet:
-  AllocationStrategy: capacityOptimized  # AWS picks best pools
-  
-  LaunchTemplateOverrides:
-  # Pool 1: different type, same AZ
-  - InstanceType: c6g.4xlarge
-    Subnet: subnet-a (us-east-1a)
-    WeightedCapacity: 16 (units)
-    
-  # Pool 2: same type, different AZ
-  - InstanceType: c6i.4xlarge
-    Subnet: subnet-b (us-east-1b)
-    WeightedCapacity: 16
-    
-  # Pool 3: different type, different AZ
-  - InstanceType: m6i.4xlarge
-    Subnet: subnet-c (us-east-1c)
-    WeightedCapacity: 16
-    
-  # Pool 4: ARM architecture (cheaper + diverse!)
-  - InstanceType: c7g.4xlarge
-    Subnet: subnet-a
-    WeightedCapacity: 16
-
-# Strategy: 6-10 diverse instance types across 3 AZs
-# Result: < 5% chance of mass interruption
+# ASG mixed instances policy (or EC2 Fleet / Karpenter NodePool)
+MixedInstancesPolicy:
+  InstancesDistribution:
+    OnDemandBaseCapacity: 2
+    OnDemandPercentageAboveBaseCapacity: 10
+    SpotAllocationStrategy: price-capacity-optimized
+  LaunchTemplate:
+    Overrides:                      # or attribute-based selection: vCPU 16, memory 32-64 GiB
+      - InstanceType: c7g.4xlarge
+      - InstanceType: c8g.4xlarge
+      - InstanceType: m7g.4xlarge
+      - InstanceType: c6i.4xlarge
+      - InstanceType: c7i.4xlarge
+      - InstanceType: m6i.4xlarge
+      - InstanceType: c6a.4xlarge
+      - InstanceType: m7a.4xlarge
+CapacityRebalance: true             # launch a replacement on rebalance recommendation
+VPCZoneIdentifier: subnet-a,subnet-b,subnet-c
 ```
 
-**Spot Cost Savings Calculation:**
+- A capacity pool is (instance type, AZ). Ten types × three AZs = 30 pools; losing one pool barely dents the fleet.
+- `price-capacity-optimized` is AWS's recommended strategy: it picks the deepest pools and then the cheapest of those. `lowest-price` concentrates you in the pool most likely to be reclaimed.
+- Mixing architectures (x86 and Graviton) needs multi-arch AMIs or images.
+- Use the Spot placement score and the Spot Instance Advisor's interruption frequency bands to choose types; don't quote a fixed interruption percentage.
 
-```yaml
-Before (on-demand): 100 c6i.4xlarge
-  $0.68/hr × 100 × 730 hrs/month = $49,640/month
+**Cost estimate (illustrative, us-east-1):** 100 × c6i.4xlarge On-Demand at $0.68/hour ≈ $49,600/month. If diversified Spot averages ~65–70% off and you keep ~10% On-Demand for deadlines, the blended bill lands near $17,000–20,000/month, a 60–65% saving. Getting to 70%+ usually also needs Graviton and right-sizing, plus accounting for rework lost to interruptions.
 
-After (spot + diversified):
-  $0.15/hr (average across diverse pools)
-  100 instances × $0.15 × 730 = $10,950/month
-  2% interruption rate → 2 instances need replacement
-  Replacement: $0.15 × 2 × 2hr backup = $0.60 (negligible)
-
-Total: ~$11,000/month
-Savings: ~78% ($39,000/month)
-
-Additional savings: Reserved + Spot mix
-  - Baseline (always on): Reserved Instances (1yr, ~40% off)
-  - Peak/elastic: Spot (70-90% off)
-  - Combined: 50-70% total savings
-```
+**What they probe next:** Spot for stateful services (only with replication and fast replacement), Spot for Kubernetes (Karpenter consolidation and disruption budgets), and why "Spot price exceeds max bid" is mostly a historical concern.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Termination notice handling** | Monitors IMDS, checkpoint state, drains connections |
-| **Capacity pool diversification** | Diversifies across types, sizes, and AZs |
-| **Fleet allocation** | Uses capacityOptimized strategy for least interruption |
-| **Reserved + spot mix** | Combines reserved for baseline, spot for elasticity |
+| **Termination notice handling** | Uses rebalance recommendation and instance-action, checkpoints, releases work |
+| **Capacity pool diversification** | Diversifies across types, sizes, architectures and AZs |
+| **Fleet allocation** | Uses price-capacity-optimized and capacity rebalancing |
+| **Reserved + spot mix** | Combines Savings Plans/On-Demand for baseline, Spot for elasticity |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -1176,9 +810,6 @@ Additional savings: Reserved + Spot mix
 
 ---
 
-
----
-
 ## 9. AWS Batch: Job Scheduling & Compute Environments
 
 **Q:** "You need to run 10,000 genomics analysis jobs daily. Each job takes 1-60 minutes on 16 vCPU, 64GB RAM. Design an AWS Batch architecture. How does Batch optimize resource utilization across job queues? How does it handle job dependencies?"
@@ -1187,190 +818,127 @@ Additional savings: Reserved + Spot mix
 
 ### Answer
 
-**AWS Batch Architecture:**
+!!! tip "30-second answer"
+    Submit the 10,000 samples as one **array job** (up to 10,000 children, each gets `AWS_BATCH_JOB_ARRAY_INDEX`). The job queue feeds an ordered list of **compute environments**: a Spot environment first (`SPOT_PRICE_CAPACITY_OPTIMIZED`, many instance types, `minvCpus: 0`) and an On-Demand one as fallback. Batch launches instances sized to the queued jobs' vCPU/memory and scales back to zero. Pipelines use `dependsOn` (with `N_TO_N` between array jobs of equal size), or Step Functions for anything with branching. **Fair-share scheduling policies** divide capacity between teams. Watch the memory math: a 64 GB job will not fit on a 64 GB instance.
+
+**Architecture:**
 
 ```
-Job submission: 
-  ┌────────────────────┐
-  │    Job Queue:      │  ← Managed by Batch (FIFO by priority)
-  │  genomics-queue    │
-  │  Priority: 1-100   │
-  │  State: ENABLED    │
-  └────────┬───────────┘
-           │
-           ▼
-  ┌────────────────────┐
-  │  Compute Env:      │  ← Manages EC2/Fargate/Spot resources
-  │  genomics-env      │
-  │  Type: MANAGED     │
-  │  Instance: c6i.4xl  │
-  │  Min/Max/Desired   │
-  └────────┬───────────┘
-           │
-           ▼
-  ┌────────────────────┐
-  │    Batch Jobs      │  ← Run on EC2/Fargate
-  │  genomics-job-1    │
-  │  genomics-job-2    │
-  │  ...               │
-  └────────────────────┘
+submit-job (array size 10,000)
+        │
+        ▼
+Job queue: genomics (priority 10, fair-share policy)
+        │ tries compute environments in order
+        ├── 1. genomics-spot   (EC2 Spot, price-capacity-optimized, 0–4,096 vCPU)
+        └── 2. genomics-od     (EC2 On-Demand, 0–1,024 vCPU)
+        ▼
+ECS tasks on Batch-managed instances  (or Fargate / EKS compute environments)
+        │ inputs/outputs: S3; shared reference data: EFS or FSx for Lustre
 ```
 
-**Job Definition:**
+**Job definition:**
 
 ```json
 {
-    "jobDefinitionName": "genomics-analysis",
-    "type": "container",
-    "containerProperties": {
-        "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/genomics:latest",
-        "vcpus": 16,
-        "memory": 65536,
-        "command": ["analysis.py", "Ref::input_file", "Ref::output_bucket"],
-        "environment": [
-            {"name": "MAX_RUNTIME", "value": "3600"}
-        ],
-        "resourceRequirements": [
-            {"type": "VCPU", "value": "16"},
-            {"type": "MEMORY", "value": "65536"}
-        ],
-        "volumes": [{
-            "name": "ref_data",
-            "efsVolumeConfiguration": {
-                "fileSystemId": "fs-abc123",
-                "transitEncryption": "ENABLED",
-                "authorizationConfig": {
-                    "accessPointId": "fsap-abc123",
-                    "iam": "ENABLED"
-                }
-            }
-        }],
-        "linuxParameters": {
-            "sharedMemorySize": 16384  // 16GB /dev/shm
-        },
-        "logConfiguration": {
-            "logDriver": "awslogs",
-            "options": {
-                "awslogs-group": "/aws/batch/genomics",
-                "awslogs-stream-prefix": "batch"
-            }
-        }
-    },
-    "retryStrategy": {
-        "attempts": 3,
-        "evaluations": [
-            {"action": "EXIT", "onExitCode": "1-127"},
-            {"action": "RETRY", "onExitCode": "128-255"},
-            {"action": "EXIT", "onReason": "OutOfMemory*"}
-        ]
-    },
-    "timeout": {
-        "attemptDurationSeconds": 7200
-    }
+  "jobDefinitionName": "genomics-analysis",
+  "type": "container",
+  "containerProperties": {
+    "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/genomics:2.3.1",
+    "command": ["analysis.py", "Ref::input_prefix", "Ref::output_bucket"],
+    "resourceRequirements": [
+      { "type": "VCPU",   "value": "16" },
+      { "type": "MEMORY", "value": "61440" }
+    ],
+    "volumes": [{
+      "name": "ref_data",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-abc123",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": { "accessPointId": "fsap-abc123", "iam": "ENABLED" }
+      }
+    }],
+    "mountPoints": [{ "sourceVolume": "ref_data", "containerPath": "/ref", "readOnly": true }],
+    "linuxParameters": { "sharedMemorySize": 16384 },
+    "logConfiguration": { "logDriver": "awslogs" }
+  },
+  "retryStrategy": {
+    "attempts": 3,
+    "evaluateOnExit": [
+      { "onStatusReason": "Host EC2*",           "action": "RETRY" },
+      { "onReason":       "OutOfMemoryError*",   "action": "EXIT"  },
+      { "onExitCode":     "*",                   "action": "EXIT"  }
+    ]
+  },
+  "timeout": { "attemptDurationSeconds": 7200 }
 }
 ```
 
-**Job Dependencies & Sequencing:**
+- Use `resourceRequirements`, not the deprecated top-level `vcpus`/`memory`.
+- **Memory fit:** the ECS agent and OS reserve some memory, so a "64 GB" request does not fit an m-family 4xlarge (64 GiB). Request ~60 GiB, or allow 8xlarge / r-family 4xlarge (128 GiB) in the compute environment. A job whose request fits no allowed instance type stays `RUNNABLE` forever, the most common Batch support ticket.
+- `retryStrategy` retries Spot reclaims (status reason starts with `Host EC2`) and gives up on application errors. Rules are evaluated in order; patterns are globs.
 
-```yaml
-# Job A (alignment) → Job B (variant calling) → Job C (report)
+**Dependencies and array jobs:**
 
-# Submit with dependencies:
-aws batch submit-job \
-    --job-name genomics-report \
-    --job-queue genomics-queue \
-    --job-definition genomics-report \
-    --depends-on jobId=abc-123,type=SEQUENTIAL \
-    --depends-on jobId=def-456,type=SEQUENTIAL
+```bash
+# 10,000-way fan-out
+ALIGN=$(aws batch submit-job --job-name align --job-queue genomics \
+  --job-definition genomics-analysis --array-properties size=10000 \
+  --parameters input_prefix=s3://data/inputs/,output_bucket=s3://data/aligned/ \
+  --query jobId --output text)
 
-# Dependency types:
-#   SEQUENTIAL: child runs after parent completes SUCCESSFULLY
-#   TO_RETRY: child runs after retries exhausted (for error handling)
-#   N_TO_N: parallel dependency (child runs after ALL parents complete)
+# Child i of variant-calling waits only for child i of align
+CALL=$(aws batch submit-job --job-name call --job-queue genomics \
+  --job-definition variant-calling --array-properties size=10000 \
+  --depends-on jobId=$ALIGN,type=N_TO_N --query jobId --output text)
 
-# Array jobs (10,000 similar jobs):
-aws batch submit-job \
-    --job-name genomics-array \
-    --job-queue genomics-queue \
-    --job-definition genomics-analysis \
-    --array-properties size=10000 \
-    --parameters input_file=s3://my-bucket/inputs/
-
-# Each child array job gets AWS_BATCH_JOB_ARRAY_INDEX (0-9999)
-# Use index to determine which input to process:
-# input_file = f"s3://data/input_{AWS_BATCH_JOB_ARRAY_INDEX}.fastq"
+# Report waits for the whole variant-calling array
+aws batch submit-job --job-name report --job-queue genomics \
+  --job-definition report --depends-on jobId=$CALL
 ```
 
-**Compute Environment Optimization:**
+- Plain `dependsOn` (no type) waits for the parent to **succeed**; if a parent fails, dependents fail too.
+- `N_TO_N` links array children index-to-index; `SEQUENTIAL` (only within one array job) runs children one after another.
+- A job can list up to 20 dependencies. For conditional logic, retries per stage or human approval, orchestrate with **Step Functions** (which has a native Batch integration).
+
+**Compute environment:**
 
 ```yaml
-# High-throughput compute environment (spot + on-demand mix):
-
-genomics-compute:
+genomics-spot:
   type: MANAGED
   computeResources:
-    type: SPOT                    # 90% cost savings!
-    allocationStrategy: BEST_FIT  # Use largest instances first
-    
-    minvCpus: 0
-    desiredvCpus: 1024           # 64 × 16 vCPU instances
-    maxvCpus: 4096               # 256 × 16 vCPU instances
-    
-    instanceTypes:
-      - c6i.4xlarge              # Primary: 16 vCPU, 32GB
-      - c6a.4xlarge              # AMD alternative
-      - c7g.4xlarge              # Graviton (ARM, cheaper)
-      - m6i.4xlarge              # Fallback (memory-optimized)
-      - r6i.4xlarge              # Fallback
-    
-    # Spot bid percentage:
-    bidPercentage: 80            # Max 80% of on-demand price
-    spotIamFleetRole: arn:aws:iam::...:role/aws-ec2-spot-fleet-tagging-role
-    
-    # Block device:
-    blockDeviceMappings:
-      - deviceName: /dev/xvda
-        ebs:
-          volumeSize: 500        # 500GB GP3
-          volumeType: gp3
-          iops: 6000
-          throughput: 500
-    
-    tags:
-      Environment: production
-      Project: genomics
-
-# Scheduling policy (fair share):
-genomics-queue:
-  state: ENABLED
-  priority: 10
-  computeEnvironmentOrder:
-    - order: 1
-      computeEnvironment: genomics-compute-spot
-    - order: 2
-      computeEnvironment: genomics-compute-od
-    
-  schedulingPolicyArn: arn:aws:batch:...:scheduling-policy/genomics-fairshare
-
-# Fair share policy:
-genomics-fairshare:
-  type: FAIR_SHARE
-  fairSharePolicy:
-    shareDecaySeconds: 3600      # Fairness window: 1 hour
-    computeReservation: 10        # Reserve 10% for urgent jobs
-    shareDistribution:
-      - shareIdentifier: teamA
-        weightFactor: 1.0
-      - shareIdentifier: teamB
-        weightFactor: 0.5
+    type: SPOT
+    allocationStrategy: SPOT_PRICE_CAPACITY_OPTIMIZED   # recommended; no Spot Fleet role needed
+    minvCpus: 0                                         # scale to zero overnight
+    maxvCpus: 4096
+    instanceTypes: [m6i.8xlarge, m7i.8xlarge, m6a.8xlarge, r6i.4xlarge, r7i.4xlarge, r6a.4xlarge]
+    subnets: [subnet-a, subnet-b, subnet-c]
+    launchTemplate: { launchTemplateName: genomics-lt }   # e.g. larger gp3 root volume
 ```
+
+`BEST_FIT` (the legacy default) picks the single cheapest fitting type and waits if it is unavailable; `BEST_FIT_PROGRESSIVE` and the Spot strategies are what you want at scale.
+
+**Fair share between teams:**
+
+```yaml
+genomics-fairshare:
+  fairsharePolicy:
+    shareDecaySeconds: 3600     # how far back usage counts
+    computeReservation: 10      # hold back capacity so an idle share identifier can start promptly
+    shareDistribution:
+      - { shareIdentifier: teamA, weightFactor: 1.0 }
+      - { shareIdentifier: teamB, weightFactor: 0.5 }   # lower weight = larger share
+```
+
+Without a scheduling policy the queue is FIFO, so one team's 10,000-job array starves everyone else. Note that in Batch fair share a **lower** weight factor gets **more** capacity.
+
+**What they probe next:** Batch vs Step Functions Distributed Map vs EKS jobs (Batch for container jobs needing big instances and queueing; Distributed Map for many short Lambda tasks over S3 objects), multi-node parallel jobs for MPI, and data locality (FSx for Lustre linked to S3 for heavy reads).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Compute environment** | Optimizes spot with fallback to on-demand |
-| **Job dependencies** | Uses SEQUENTIAL and N_TO_N for pipeline orchestration |
+| **Compute environment** | Optimizes spot with fallback to on-demand, and checks memory fit |
+| **Job dependencies** | Uses N_TO_N between arrays and plain dependsOn for fan-in |
 | **Fair share scheduling** | Implements resource sharing across teams/projects |
 | **Array jobs** | Uses array jobs for embarrassingly parallel workloads |
 
@@ -1395,96 +963,66 @@ genomics-fairshare:
 
 ### Answer
 
-**AWS Compute Pricing Models:**
+!!! tip "30-second answer"
+    Order matters: **eliminate waste first** (idle and over-sized resources, old-generation instances, unattached volumes), **then re-architect** (Graviton, Spot for interruptible work, scale to zero), and only **then commit** (Savings Plans sized to the post-optimisation baseline, laddered over time). Committing first locks in waste. Prove savings with tagged cost allocation, unit costs (cost per request/customer), and Cost Explorer or CUR 2.0 data, compared against a usage-normalised baseline.
 
-```yaml
-Pricing model           | Discount | Commitment | Flexibility
-------------------------|----------|------------|------------
-On-Demand               | 0%       | None       | Maximum
-Spot                    | 60-90%   | None       | Medium (interruptible)
-Reserved Instance (1yr) | 40%      | 1 year     | Low (fixed instance)
-Reserved Instance (3yr) | 60%      | 3 years    | Low (fixed instance)
-Savings Plan (1yr)      | 30-40%   | 1 year     | High (compute, any instance)
-Savings Plan (3yr)      | 50-60%   | 3 years    | High (compute, any instance)
+**Purchase options (discounts are AWS's "up to" figures):**
 
-Reserved Instance types:
-  - Standard: fixed instance, capacity reservation (best discount)
-  - Convertible: can change instance family (lower discount)
-  - Scheduled: reserved for specific time windows
+| Option | Max discount | Commitment | Flexibility |
+|---|---|---|---|
+| On-Demand | 0% | None | Full |
+| Spot | Up to 90% | None | Interruptible |
+| **Compute Savings Plan** | Up to 66% | $/hour for 1 or 3 years | Any EC2 family, size, OS, Region, plus Fargate and Lambda |
+| EC2 Instance Savings Plan | Up to 72% | $/hour, 1 or 3 years | One instance family in one Region; any size, OS, tenancy |
+| Standard Reserved Instance | Up to 72% | 1 or 3 years | Fixed attributes; can be sold on the RI Marketplace; **zonal** RIs also reserve capacity |
+| Convertible RI | Up to 66% | 1 or 3 years | Exchangeable |
+| Database Savings Plans (Dec 2025) | Up to 35% | $/hour, 1 year | RDS, Aurora, DynamoDB, ElastiCache and other managed databases |
+| On-Demand Capacity Reservations | 0% (combine with SPs) | None | Guarantees capacity in an AZ; you pay whether used or not |
 
-Savings Plan types:
-  - Compute SP: most flexible (EC2, Fargate, Lambda)
-  - EC2 Instance SP: less flexible (EC2 only, specific family)
-  - SageMaker SP: SageMaker only
-```
+Scheduled RIs are no longer offered. For new compute commitments, Savings Plans have largely replaced RIs; RIs remain relevant for RDS/ElastiCache/OpenSearch (alongside Database Savings Plans) and when you need zonal capacity.
 
-**Cost Optimization Strategy:**
+**Strategy:**
+
+1. **Visibility:** enforce cost allocation tags (`team`, `service`, `env`) with tag policies; activate them in Billing; use CUR 2.0 / Data Exports into Athena or Cost Explorer.
+2. **Right-size:** AWS Compute Optimizer recommendations for EC2, ASGs, EBS, Lambda and ECS on Fargate; Cost Optimization Hub to rank all recommendations by savings.
+3. **Modernise:** Graviton (commonly 20–40% better price-performance; Lambda and Fargate arm64 are ~20% cheaper per unit), current-generation instances, gp3 instead of gp2.
+4. **Spot** for CI, batch, stateless and Kubernetes worker capacity.
+5. **Schedule** non-prod to stop outside working hours (often 60%+ of non-prod compute).
+6. **Commit** with Savings Plans to cover ~70–90% of the steady baseline, purchased in tranches (e.g. quarterly) so commitments track a shrinking or growing baseline.
+
+**Blended cost model:**
 
 ```python
-# Step 1: Right-sizing analysis
-# Use AWS Compute Optimizer to find over-provisioned instances
+def blended_cost(baseline_od, elastic_od, sp_discount=0.45, spot_discount=0.65, spot_fraction=0.8):
+    """Monthly cost given On-Demand-equivalent spend.
 
-# Step 2: Graviton migration
-# ARM-based Graviton3: 20-30% better price/performance
-# Migration steps:
-#   1. Build ARM container image (multi-arch build)
-#   2. Deploy to Graviton test environment
-#   3. Validate performance
-#   4. Replace x86 instances with Graviton
+    baseline_od: steady 24/7 usage, priced at On-Demand ($/month)
+    elastic_od:  variable usage above the baseline, priced at On-Demand ($/month)
+    """
+    baseline = baseline_od * (1 - sp_discount)                # covered by a Savings Plan
+    spot = elastic_od * spot_fraction * (1 - spot_discount)   # interruptible part on Spot
+    on_demand = elastic_od * (1 - spot_fraction)              # part that must not be interrupted
+    total = baseline + spot + on_demand
+    return round(total), round(1 - total / (baseline_od + elastic_od), 2)
 
-# Step 3: Savings Plan + Spot mix
-def compute_optimal_mix(workload):
-    baseline = workload.min_hourly  # Always-running portion
-    elastic = workload.max_hourly - baseline  # Variable portion
-    
-    return {
-        'savings_plan': baseline * 0.6,  # 3yr Compute SP: 60% off on-demand
-        'spot': elastic * 0.8,           # Spot: 80% off on-demand
-        'on_demand': 0,                   # No on-demand for elastic!
-        # Annual savings: (baseline × 0.6 × on_demand) + (elastic × 0.8 × on_demand)
-        # Typically: 65-75% total savings
-    }
-
-# Step 4: Serverless optimization
-lambda_optimization:
-  - Increase memory: 1792MB for CPU-bound functions (full vCPU)
-  - Reduce timeout: pay only for execution time
-  - Use Graviton Lambda: 20% cheaper
-  - Use SnapStart: reduce Java cold start cost
-
-  Cost comparison per 1M invocations (128MB, 100ms):
-    x86 Lambda: 1M × ($0.0000166667/GB-s) × 0.125GB × 0.1s = $0.20
-    ARM Lambda: $0.20 × 0.80 = $0.16 (20% cheaper)
-    SnapStart: reduces Init duration cost by ~80%
+print(blended_cost(baseline_od=100_000, elastic_od=50_000))   # (79000, 0.47)
 ```
 
-**Cost Tracking & Attribution:**
+A realistic blended saving is 40–55%, not 75%: not everything can run on Spot, and 3-year all-upfront discounts aren't free money if your architecture changes.
 
-```yaml
-# Tagging strategy for cost allocation:
-  - Environment: production, staging, development
-  - Team/CostCenter: team-a, team-b, platform
-  - Application: my-app, analytics-pipeline
-  - Auto-scaling group: web-asg, worker-asg
+**Lambda cost example (us-east-1, 1M invocations, 128 MB, 100 ms):**
 
-# Create cost allocation tags in AWS Cost Explorer:
-  Cost Allocation Tags:
-    - user:Environment
-    - user:Team
-    - user:Application
-
-# Budget alerts:
-  AWS Budgets:
-    - Monthly budget: compute-$200,000
-    - Alert: 80% → email notification
-    - Alert: 100% → SNS → Lambda auto-shutdown non-critical
-
-# Compute Optimizer recommendations:
-  AWS Compute Optimizer:
-    - Finds over-provisioned instances (CPU < 20% → downsize)
-    - Identifies rightsizing candidates
-    - Provides estimated savings per recommendation
 ```
+requests:  1M × $0.20 per million                      = $0.20
+duration:  1M × 0.1 s × 0.125 GB = 12,500 GB-s
+           x86   × $0.0000166667                        = $0.21
+           arm64 × $0.0000133334                        = $0.17
+total ≈ $0.41 (x86) vs $0.37 (arm64)
+```
+
+At low memory, request charges are half the bill, so batching (SQS batch size, fewer invocations) matters as much as memory tuning. SnapStart is free for Java but charges for caching and restores on Python and .NET.
+
+**Proving savings:** report unit cost (e.g. $ per 1,000 orders) month over month, Savings Plans **coverage** and **utilisation** (aim for >95% utilisation), and the Compute Optimizer savings realised. AWS Budgets with alerts at forecasted 80/100%, and Cost Anomaly Detection per service and per cost-allocation tag, catch regressions. Automatic shutdown of production resources on a budget alarm is dangerous; reserve it for sandboxes.
 
 ### 🔍 Staff-Level Evaluation
 
@@ -1492,8 +1030,8 @@ lambda_optimization:
 |-----------|----------------------|
 | **Savings Plan vs RI** | Can explain flexibility difference and when to use each |
 | **Graviton migration** | Plans multi-arch builds for ARM migration |
-| **Spot + SP mix** | Uses SP for baseline, spot for elasticity |
-| **Cost attribution** | Uses tags, budgets, and Compute Optimizer for tracking |
+| **Spot + SP mix** | Uses SP for baseline after right-sizing, spot for elasticity |
+| **Cost attribution** | Uses tags, unit costs, CUR, budgets, anomaly detection and Compute Optimizer for tracking |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -1505,9 +1043,6 @@ lambda_optimization:
   <br/>
   <em>🎬 Animated Compute Cost Optimization — Savings Plans, Spot Instances, Graviton migration, and rightsizing for 75% savings — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
-
----
-
 
 ---
 

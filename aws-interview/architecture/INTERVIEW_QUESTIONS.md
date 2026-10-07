@@ -1,6 +1,6 @@
 # ☁️ AWS Architecture — Staff-Level Interview Questions
 
-> *8 questions covering Well-Architected Framework, multi-region design, migration strategies, cost optimization, microservices, serverless vs containers, cloud-native patterns, and resilience engineering — every question expects principal engineer-level depth with production patterns.*
+> *8 questions covering the Well-Architected Framework, multi-Region DR, migration strategy, cost governance, microservices, serverless vs containers, cloud-native patterns and resilience engineering. Each answer leads with the 30-second version, then the mechanism, trade-offs, failure modes and what interviewers probe next. Service facts checked against AWS documentation, October 2026.*
 
 ---
 
@@ -25,139 +25,43 @@
 
 ### Answer
 
-**The Six Pillars:**
+!!! tip "30-second answer"
+    Six pillars: Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization and Sustainability (added December 2021). A review is a structured conversation per **workload** (a set of components that deliver business value together, not each microservice) that produces **high- and medium-risk issues (HRIs/MRIs)**. For a payments system, prioritise by blast radius on money and data: security and reliability HRIs first, then operational gaps that slow recovery, then cost and efficiency. Operationalise with the Well-Architected Tool (custom lenses, review templates, milestones), automated evidence from Security Hub CSPM, Config and Trusted Advisor, and a recurring cadence tied to architecture changes, not a one-off audit.
 
-```yaml
-1. Operational Excellence:
-   - Run and monitor systems to deliver business value
-   - Key questions:
-     - How do you understand the health of your workload? (dashboards, alarms)
-     - How do you manage workload resources? (IaC, tagging, change management)
-     - How do you improve operations? (runbooks, post-incident reviews)
-   - Best practices:
-     - Infrastructure as Code (CloudFormation/Terraform)
-     - Immutable infrastructure (AMI/container immutability)
-     - Deployment pipelines (CI/CD with canary deployments)
-     - Observability: structured logging, distributed tracing, metrics
-   - Metrics: MTTR, deployment frequency, change failure rate
+**What to ask per pillar (a payments workload):**
 
-2. Security:
-   - Protect data, systems, and assets
-   - Key questions:
-     - How do you manage identities? (IAM, SSO, least privilege)
-     - How do you protect data at rest and in transit? (KMS, TLS)
-     - How do you detect security events? (GuardDuty, Security Hub)
-   - Best practices:
-     - IAM: permission boundaries, SCPs, service-linked roles
-     - Encryption: envelope encryption with KMS, S3 default encryption
-     - Network: VPC isolation, security groups, NACLs
-   - Metrics: time to detect/correlate/remediate security findings
+| Pillar | Questions that find real risk | Evidence |
+|---|---|---|
+| Operational Excellence | How do you know it's healthy right now? How do you deploy and roll back? When did you last run the incident runbook? | SLO dashboards, deployment frequency, change failure rate, MTTR, post-incident reviews |
+| Security | Who can move money or read card data, and how do you know? How are secrets and keys managed? How fast do you detect a leaked credential? | IAM Access Analyzer, CloudTrail, GuardDuty/Security Hub findings, KMS key policies |
+| Reliability | What happens when an AZ, a dependency or the database fails? What are RTO/RPO and when were they last tested? Are retries idempotent? | Multi-AZ design, quotas headroom, DR test results, FIS experiments |
+| Performance Efficiency | What limits throughput first? How do you load test? | Load test reports, p99 under peak, saturation metrics |
+| Cost Optimization | What's the cost per transaction and how is it trending? What's idle? | Tagged cost allocation, unit costs, Savings Plans coverage |
+| Sustainability | Are you using efficient instance types and scaling to demand? What data do you keep that you don't need? | Utilisation, Graviton share, storage lifecycle, Customer Carbon Footprint Tool |
 
-3. Reliability:
-   - Recover from failures and meet demand
-   - Key questions:
-     - How do you plan for failure? (Multi-AZ, multi-region)
-     - How do you handle changes? (deployment rollback, feature flags)
-     - How do you manage capacity? (auto-scaling, load testing)
-   - Best practices:
-     - Horizontal scaling (ASG, ECS service auto-scaling)
-     - Graceful degradation (circuit breakers, bulkheads)
-     - Data durability (S3 11 9s, RDS Multi-AZ, Aurora replication)
-   - Metrics: availability %, RTO, RPO, error budget
+Lenses add domain-specific questions (Serverless, SaaS, Financial Services, Container Build, Generative AI and others); use the Financial Services lens here.
 
-4. Performance Efficiency:
-   - Use computing resources efficiently
-   - Key questions:
-     - How do you select compute resources? (right-sizing, Graviton)
-     - How do you optimize storage? (S3 lifecycle, EBS gp3)
-     - How do you monitor performance? (CloudWatch, Perf Insights)
-   - Best practices:
-     - Right-size: use Compute Optimizer to find over-provisioned resources
-     - Graviton migration: 20-40% better price/performance
-     - Serverless: eliminate idle capacity
-   - Metrics: resource utilization %, cost per transaction, p50/p99 latency
+**Prioritising remediation:**
 
-5. Cost Optimization:
-   - Avoid unnecessary costs
-   - Key questions:
-     - How do you match supply with demand? (auto-scaling, spot instances)
-     - How do you monitor cost? (budgets, anomaly detection)
-     - How do you optimize over time? (Savings Plans, Reserved Instances)
-   - Best practices:
-     - Spot instances: 60-90% discount for fault-tolerant workloads
-     - Savings Plans: 30-60% discount with flexibility
-     - S3 lifecycle: auto-move data to colder tiers
-   - Metrics: unit cost (cost per transaction/customer), unused resources
+- Rank HRIs by likelihood × impact, with impact expressed in business terms (lost transactions per minute, regulatory exposure).
+- Typical top findings in payments systems: overly broad IAM (`*` on production data), untested DR, retries without idempotency keys (double charges), single-AZ dependencies hidden in "managed" components, no alarms on queue age or DLQs.
+- Fix HRIs within a fixed window (e.g. one sprint), MRIs within a quarter, and record decisions to accept risk explicitly with an owner.
 
-6. Sustainability (newest pillar, 2021+):
-   - Minimize environmental impact
-   - Key questions:
-     - How do you measure your carbon footprint? (Customer Carbon Footprint Tool)
-     - How do you minimize impact? (Graviton, serverless, efficient code)
-   - Best practices:
-     - Graviton ARM: 60% less energy for same compute
-     - Right-sizing: eliminate idle resources
-     - Efficient storage: compress data, use lifecycle policies
-   - Metrics: CO2e per workload, power usage effectiveness
-```
+**Operationalising across 50 microservices:**
 
-**Prioritizing Remediation:**
-
-```yaml
-# WA review workflow for 50 microservices:
-
-# Step 1: Triage by risk score
-Risk = Likelihood × Impact
-  Likelihood: 1-5 (how likely is this to fail?)
-  Impact: 1-5 (how bad is the impact?)
-  
-  High risk (15-25): fix within 1 sprint (2 weeks)
-  Medium risk (8-14): fix within 2 sprints (1 month)
-  Low risk (1-7): prioritize by effort
-
-# Step 2: Common high-risk findings:
-# Pillar   | Finding                     | Risk | Fix
-# ---------|-----------------------------|------|---------------------------
-# Security | IAM roles too permissive    | 25   | Implement least privilege
-# Reliabil | No multi-region DR          | 20   | Design DR plan
-# Cost     | Right-size opportunities    | 16   | Use Compute Optimizer
-# Security | S3 buckets publicly acessbl | 20   | Block public access
-# Reliabil | No auto-scaling configured  | 15   | Implement ASG
-
-# Step 3: Automate reviews
-# AWS Well-Architected Tool: API-driven reviews
-# Custom lenses: organization-specific best practices
-# CI/CD integration: WA checks in deployment pipeline
-# Score: track per-microservice WA score over time (goal: 80%+)
-```
-
-**Operationalizing WA Reviews:**
-
-```yaml
-# Quarterly WA review cadence:
-# Month 1: Self-assessment (microservice owner fills out questions)
-# Month 2: Peer review (two senior engineers review)
-# Month 3: Remediation (fix high/medium findings)
-# Month 4: Score tracking (update WA dashboard)
-
-# WA tool configuration:
-# - Use the AWS Well-Architected Tool (free)
-# - Create a workload for each microservice
-# - Define custom lenses for org-specific patterns
-# - Link to milestones (Jira tickets for remediation)
-# - Track improvement over time
-
-# Reward: teams scoring 90%+ get fast-track deployment approval
-```
+- Group services into a handful of workloads (payments core, ledger, notifications) and review those; service-level checks are automated rather than questionnaire-based.
+- WA Tool: review templates pre-fill org-wide answers (shared platform controls), profiles set business priorities, **custom lenses** encode internal standards, milestones snapshot progress. The WA Tool API exports risks to your tracker.
+- Continuous evidence: Security Hub CSPM controls, Config conformance packs and Trusted Advisor checks feed the review, so the questionnaire focuses on design and process.
+- Cadence: on major architecture changes and at least annually per workload, with a light quarterly risk check. Track the HRI count and age, not a vanity score.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Pillar depth** | Can explain specific best practices and metrics for each of the 6 pillars |
-| **Prioritization** | Uses risk scoring (likelihood × impact) to triage remediation |
-| **Operationalization** | Designs quarterly review cadence with self-assessment, peer review, remediation |
-| **Automation** | Uses WA Tool API, CI/CD integration, and custom lenses for scale |
+| **Pillar depth** | Asks evidence-seeking questions per pillar, tied to the business |
+| **Prioritization** | Ranks HRIs by business impact and tracks accepted risk explicitly |
+| **Operationalization** | Reviews per workload with templates, lenses and recurring cadence |
+| **Automation** | Uses WA Tool API and continuous evidence from Security Hub, Config, Trusted Advisor |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -172,9 +76,6 @@ Risk = Likelihood × Impact
 
 ---
 
-
----
-
 ## 2. Multi-Region Architecture & Disaster Recovery
 
 **Q:** "Design a multi-region architecture for a financial services platform with RPO of 1 second and RTO of 5 minutes. 99.999% availability required. Compare active-passive vs active-active strategies. How do you handle data replication across regions with strong consistency requirements?"
@@ -183,129 +84,63 @@ Risk = Likelihood × Impact
 
 ### Answer
 
-**DR Strategies Comparison:**
+!!! tip "30-second answer"
+    99.999% is ~5 minutes of downtime a year, so failover must be pre-provisioned, rehearsed and mostly automated. RPO 1 s rules out backup/restore and pilot light; it means continuous replication with bounded lag (Aurora Global Database with an RPO limit, DynamoDB global tables) or synchronous multi-Region writes (DynamoDB **MRSC**, **Aurora DSQL**) where you need RPO 0. An RTO of 5 minutes fits **warm standby** with a scripted, operator-triggered Region switch (Route 53 ARC). Active-active is only worth it when you partition data by home Region or use a multi-Region strongly consistent store; otherwise you're trading failover time for conflict resolution bugs.
 
-```yaml
-Backup & Restore:
-  RPO: 24 hours (last backup)
-  RTO: 12-24 hours (restore from S3/Glacier)
-  Cost: low (S3 storage + occasional restore testing)
-  Complexity: low
-  Use: non-critical systems, dev/test
+**DR strategies:**
 
-Pilot Light:
-  RPO: minutes (replication lag)
-  RTO: 30-60 minutes
-  Cost: medium (smaller standby environment)
-  Complexity: medium
-  Architecture: replicate data, keep minimal compute running
-  Use: moderately critical systems
+| Strategy | RPO | RTO | Standby cost | Notes |
+|---|---|---|---|---|
+| Backup & restore | Hours (backup interval) | Hours | Lowest | AWS Backup cross-Region copies; IaC to rebuild |
+| Pilot light | Minutes or less (data replicated) | Tens of minutes | Low | Data live, compute off; AWS Elastic Disaster Recovery for server workloads |
+| Warm standby | Seconds | Minutes | Medium | Scaled-down full stack, scale up on failover |
+| Active-active (multi-site) | Seconds to zero | Near zero for reads; seconds for writes | Highest | Requires data partitioning or multi-Region consistency |
 
-Warm Standby:
-  RPO: seconds (CDC replication)
-  RTO: 5-15 minutes
-  Cost: high (50-60% of prod capacity in DR)
-  Complexity: high
-  Architecture: scaled-down replica of prod, auto-scale on failover
-  Use: critical production systems
+**Warm standby for RPO 1 s / RTO 5 min:**
 
-Multi-Site Active-Active:
-  RPO: near-zero (synchronous replication)
-  RTO: <1 minute (DNS or Global Accelerator failover)
-  Cost: very high (100% capacity in each region)
-  Complexity: very high (conflict resolution, data consistency)
-  Use: mission-critical, 99.999% required
+```
+us-east-1 (primary)                         us-west-2 (standby)
+Route 53 ARC routing control: ON            routing control: OFF
+ALB → ECS (100 tasks)                       ALB → ECS (20 tasks, pre-scaled minimum)
+Aurora Global DB writer ───storage repl───► Aurora secondary cluster (readers)
+DynamoDB global table   ◄──── MREC ─────►   replica
+ElastiCache Global Datastore ────────────►  replica (warm cache)
+S3 (CRR + RTC)          ─────────────────►  bucket
+SQS / in-flight work    (not replicated: rebuild from DB/outbox state)
 ```
 
-**Active-Passive Architecture (for RPO=1s, RTO=5min):**
+**Failover runbook (ARC Region switch or Step Functions), in this order:**
 
-```yaml
-# Primary: us-east-1 (active)
-# DR: us-west-2 (warm standby)
+1. **Decide** (T+0–1 min): a human (or a strict multi-signal rule) declares the Region impaired. Fully automatic failover on a single health check risks flapping and split brain.
+2. **Fence** the old primary: stop writers (routing control off, app write-disable flag) so nothing commits there after promotion.
+3. **Promote data** (T+1–2): Aurora Global Database *failover* (unplanned; RPO = lag at that moment) or *switchover* (planned; RPO 0). Use the global writer endpoint so apps don't need new connection strings.
+4. **Scale** standby compute (pre-warmed minimums so you're not waiting on capacity).
+5. **Shift traffic** (T+3–4): ARC routing control on in us-west-2; DNS TTLs of 60 s or less; or Global Accelerator traffic dials for near-instant shifts.
+6. **Verify** with synthetic transactions; reconcile the replication-lag window (idempotency keys make replays safe).
 
-┌─────────────────────────┐     ┌─────────────────────────┐
-│  us-east-1 (Primary)    │     │  us-west-2 (DR)         │
-│                         │     │                         │
-│  Aurora Global DB       │────►│  Aurora (read replica)  │
-│  (writer)               │     │  (replication lag <1s)  │
-│                         │     │                         │
-│  ALB (active)           │     │  ALB (standby, 0 weight)│
-│                         │     │                         │
-│  ECS services           │     │  ECS services           │
-│  (desired: 100)         │     │  (desired: 10, standby) │
-│                         │     │                         │
-│  ElastiCache (primary)  │     │  ElastiCache (replica)  │
-│  (Global Datastore)     │────►│  (cross-region repl.)   │
-│                         │     │                         │
-│  SQS queues (active)    │     │  SQS queues (empty)     │
-│                         │     │                         │
-│  DynamoDB Global Tables │────►│  DynamoDB (replica)     │
-│  (active writer)        │     │  (active reader)        │
-└─────────────────────────┘     └─────────────────────────┘
+**Making RPO 1 s real:** Aurora Global Database lag is *typically* under a second, not guaranteed. Aurora PostgreSQL's `rds.global_db_rpo` parameter makes the primary block commits when secondaries fall further behind than the limit, trading availability for a hard RPO. DynamoDB MREC typically replicates in under a second with last-writer-wins; for balances use MRSC (RPO 0, exactly three Regions, higher write latency, no transactions).
 
-Failover sequence (RTO < 5 min):
-  T+0:   Detect primary region failure (Route53 health check fails)
-  T+0.5: Route53 failover → traffic shifted to us-west-2
-  T+1:   Aurora promote reader → writer (~60s)
-  T+2:   ECS services scale up from 10 → 100 desired (2 min)
-  T+3:   ALB health checks pass → traffic flowing to new instances
-  T+4:   Validate: all transactions processing
-  T+5:   Failover declared complete
+**Active-active options:**
 
-# RPO validation:
-# - Aurora replication: <1s lag → at most 1 second of data loss
-# - DynamoDB Global Tables: <1s replication
-# - Application: idempotent writes to handle duplicate transactions
-```
+| Approach | Consistency | Cost of the choice |
+|---|---|---|
+| Partition by home Region (user/tenant pinned to a Region) | Strong within the home Region | Re-homing users, cross-Region reads for shared data |
+| DynamoDB MREC | Eventual, last writer wins per item | Conflicts silently overwrite; design commutative or idempotent writes |
+| DynamoDB MRSC / Aurora DSQL | Strong across Regions | Higher write latency (cross-Region round trips), feature limits |
+| CRDTs / custom merge | Convergent | Application complexity |
 
-**Active-Active Architecture (for zero-downtime):**
+Reads stay local; route users to their nearest healthy Region with Route 53 latency records or Global Accelerator.
 
-```yaml
-# Both regions actively serving traffic
-# Requires: conflict resolution, idempotent writes, careful data modeling
-
-┌──────────────────┐     ┌──────────────────┐
-│  us-east-1       │     │  eu-west-1       │
-│                  │     │                  │
-│  Route53 latency │     │  Route53 latency │
-│  (50% traffic)   │     │  (50% traffic)   │
-│       │          │     │       │          │
-│  Global Accelerator   │  Global Accelerator │
-│       │          │     │       │          │
-│  ALB + ECS       │     │  ALB + ECS       │
-│       │          │     │       │          │
-│  ┌──────────┐    │     │  ┌──────────┐    │
-│  │DynamoDB  │    │     │  │DynamoDB  │    │
-│  │Global Tab│◄───┼─────┼──►│Global Tab│    │
-│  └──────────┘    │     │  └──────────┘    │
-│       │          │     │       │          │
-│  ┌──────────┐    │     │  ┌──────────┐    │
-│  │SQS (FIFO)│    │     │  │SQS (FIFO)│    │
-│  │per region│    │     │  │per region│    │
-│  └──────────┘    │     │  └──────────┘    │
-└──────────────────┘     └──────────────────┘
-
-Conflict resolution:
-  1. Last-writer-wins (DynamoDB): acceptable for some data
-  2. CRDTs: mergeable data types (counters, sets)
-  3. Application-level: version vectors, custom merge logic
-  4. Shard by region: each region owns a subset of data (e.g., user region)
-
-Data access patterns:
-  - Read: local region (low latency)
-  - Write: local region (async replicated)
-  - Strong consistency reads: read from local region with conditional check
-  - Cross-region reads: use Global Accelerator for low-latency
-```
+**Testing:** run Region evacuation game days quarterly (ARC Region switch plans, FIS cross-Region connectivity scenario), measure real RTO/RPO, and keep quotas (instance limits, concurrency, IPs) raised in the standby Region; failover fails most often on quotas and stale config.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |----------|----------------------|
 | **DR strategies** | Can quantitatively compare backup/pilot/warm/active-active with RPO, RTO, cost |
-| **Failover sequence** | Has granular step-by-step failover plan with timing for each step |
-| **Cross-region data** | Uses Aurora Global DB, DynamoDB Global Tables, ElastiCache Global Datastore |
-| **Active-active** | Understands conflict resolution (LWW, CRDTs, sharding) and idempotent writes |
+| **Failover sequence** | Fences, promotes data, scales, then shifts traffic, with timing for each step |
+| **Cross-region data** | Uses Aurora Global DB (with RPO limit), DynamoDB global tables (MREC vs MRSC), Global Datastore |
+| **Active-active** | Understands conflict resolution (LWW, CRDTs, home-Region partitioning) and idempotent writes |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -320,9 +155,6 @@ Data access patterns:
 
 ---
 
-
----
-
 ## 3. Cloud Migration Strategies: The 6 Rs
 
 **Q:** "Your company has 200 on-premises servers running a mix of legacy .NET applications, Java microservices, and Oracle databases. The CFO wants 40% cost reduction in 18 months. Walk through the migration strategy: how do you assess, prioritize, and execute? What are the 6 Rs and when do you use each?"
@@ -331,124 +163,58 @@ Data access patterns:
 
 ### Answer
 
-**The 6 Rs of Migration:**
+!!! tip "30-second answer"
+    AWS now uses **7 Rs**: Retire, Retain, Rehost, **Relocate** (added for VMware Cloud on AWS), Replatform, Repurchase, Refactor. Assess first (discovery data on utilisation and dependencies, plus a business case), then move in waves grouped by dependency, starting with low-risk rehosts that build the factory. Savings come mostly from **right-sizing during migration, retiring what nobody uses, licence changes (Oracle/SQL Server/Windows), and commitments**, not from the move itself. A 40% cut in 18 months is achievable if you plan those levers up front and track unit costs.
 
-```yaml
-1. Rehost (Lift & Shift) — fastest, lowest risk:
-   - Move applications as-is to EC2
-   - Use: VMware Cloud on AWS, AWS SMS (Server Migration Service)
-   - Timeline: weeks per app
-   - Savings: 20-30% (data center exit, no hardware refresh)
-   - Tools: AWS Application Migration Service (MGN), CloudEndure
-   - Best for: time-sensitive migrations, apps needing immediate cloud benefits
+**The 7 Rs:**
 
-2. Replatform (Lift, Tinker & Shift) — moderate effort:
-   - Move to managed services without changing app code
-   - Example: RDS instead of self-managed Oracle, ECS instead of EC2
-   - Timeline: weeks to months
-   - Savings: 30-50% (managed services reduce operational overhead)
-   - Best for: databases to RDS/Aurora, web servers to Elastic Beanstalk
+| R | What | When | Typical tooling |
+|---|---|---|---|
+| Retire | Switch it off | Unused or duplicate apps (often 10%+ of a portfolio) | Discovery data, owner sign-off |
+| Retain | Keep on-prem for now | Recent hardware investment, compliance, pending replacement | Revisit later |
+| Rehost | Lift and shift to EC2 | Speed matters, app works as is | **AWS Application Migration Service (MGN)** |
+| Relocate | Move VMware VMs without converting them | Large VMware estates, minimal change | VMware Cloud on AWS / VMware HCX |
+| Replatform | Small changes for managed services | Self-managed DB → RDS, app server → containers | DMS, MGN with modernisation options |
+| Repurchase | Move to SaaS | Non-differentiating apps (CRM, HR, ITSM) | Vendor tools |
+| Refactor | Re-architect | Apps needing scale, agility or licence escape | AWS Transform (.NET, mainframe, VMware), containers/serverless |
 
-3. Refactor / Re-architect — highest effort, biggest benefit:
-   - Rewrite or significantly modify applications
-   - Example: monolith → microservices, Oracle → Aurora PostgreSQL
-   - Timeline: months to years
-   - Savings: 50-70% (serverless, right-sized, auto-scaling)
-   - Best for: applications needing modernization, scale, or new features
+AWS Server Migration Service and CloudEndure Migration were retired in favour of MGN, and **AWS Migration Hub stopped accepting new customers in November 2025**; its planning features moved into **AWS Transform** (agentic AI assistance for .NET porting, mainframe and VMware migrations).
 
-4. Repurchase (Drop & Shop) — vendor change:
-   - Replace with SaaS alternative
-   - Example: CRM → Salesforce, CMS → WordPress.com
-   - Timeline: months (procurement + migration)
-   - Savings: varies (licensing consolidation)
-   - Best for: non-differentiated applications (HR, CRM, email)
+**Assessment:**
 
-5. Retire — decommission:
-   - Shut down applications that are no longer needed
-   - 10-20% of apps are typically retired
-   - Timeline: weeks (data archival + sunset)
-   - Savings: 100% of hosting cost
-   - Best for: zombie servers, duplicate apps, end-of-life systems
+- Discovery: AWS Application Discovery Service agents/collectors or existing CMDB/monitoring data → utilisation (CPU p95, memory), dependencies (network connections), software inventory.
+- Business case: **Migration Evaluator** or equivalent, using actual utilisation for right-sized targets and licence-included vs BYOL options.
+- Prioritise with a matrix of business value, technical complexity and dependency coupling. Move tightly coupled apps together in one wave; chatty cross-premises calls over a VPN are where migrations stall.
 
-6. Retain (Revisit) — keep on-premises:
-   - Applications that can't move yet or shouldn't move
-   - Reasons: regulatory, latency-sensitive, pending replacement
-   - Timeline: indefinite (revisit in 12 months)
-   - Savings: 0% (but avoids migration cost/risk)
-   - Best for: legacy mainframe, real-time trading systems, compliance-locked data
-```
+**Example plan for 200 servers (illustrative):**
 
-**Migration Assessment & Prioritization:**
+| Wave | Months | Content | Strategy |
+|---|---|---|---|
+| 0 | 1–2 | Landing zone, network (Direct Connect), identity, migration factory | — |
+| 1 | 3–5 | 30 low-risk stateless apps; retire 20 servers | Rehost with right-sizing |
+| 2 | 6–11 | .NET apps → Windows containers or .NET 8 on Linux; SQL Server → RDS | Replatform/refactor (AWS Transform for .NET) |
+| 3 | 9–15 | Oracle → Aurora PostgreSQL for apps that can change; RDS for Oracle (BYOL) for those that can't | Replatform/refactor with DMS |
+| 4 | 15–18 | Remaining apps, data centre exit | Rehost/retain decisions |
 
-```yaml
-# Phase 1: Discovery (2-4 weeks)
-# Use AWS Discovery Agent or Migration Evaluator
+**Where the 40% comes from:**
 
-Discovery output per server:
-  Server: web-001.prod.example.com
-    CPU: 8 vCPU, avg 15% utilization (over-provisioned!)
-    Memory: 32GB, avg 8GB used (75% waste)
-    Storage: 500GB, 100GB used
-    Network: 100Mbps peak
-    Dependencies: db-001, cache-001, ldap-001
-    Application: customer-portal (.NET 4.8, IIS)
-    Database: SQL Server 2016 (50GB)
+- Right-sizing at migration time (on-prem servers commonly run at low average CPU).
+- Retiring idle and duplicate servers.
+- Licence: Windows → Linux for .NET 8, Oracle → PostgreSQL, SQL Server Enterprise → Standard where features allow.
+- Commitments: Compute Savings Plans and Database Savings Plans once usage stabilises.
+- Elasticity: scale-to-demand and non-prod schedules.
+- Exit costs avoided: hardware refresh, data centre lease, power.
 
-# Phase 2: Prioritization matrix
-App       | Complexity | Business Value | Migration Strategy | Effort | Savings
-----------|------------|----------------|-------------------|--------|--------
-Portal    | Low        | High           | Replatform (ECS)  | 4 wk   | 50%
-CRM       | High       | Medium         | Repurchase (Sales)| 8 wk   | 30%
-Legacy DB | High       | High           | Rehost (RDS)      | 6 wk   | 60%
-Reporting | Medium     | Low            | Retire            | 2 wk   | 100%
-
-# Prioritize by: (Business Value − Complexity) / Effort
-# High value + low complexity = quick wins (do first)
-# Low value + high complexity = retain or retire
-
-# Phase 3: Migration waves
-Wave 1 (Month 1-3): Rehost 20 low-risk apps (quick wins, prove the model)
-Wave 2 (Month 4-9): Replatform 40 apps (RDS, ECS, ElastiCache)
-Wave 3 (Month 10-15): Refactor 5 strategic apps (microservices, serverless)
-Wave 4 (Month 16-18): Retire 10 apps + migrate remaining 10
-```
-
-**Cost Optimization Post-Migration:**
-
-```yaml
-# Year 1: Optimize after migration
-# On-prem cost: $200K/month (servers, licenses, power, cooling, staff)
-# After rehost: $150K/month (25% savings)
-# After replatform: $120K/month (40% savings)
-# After refactor: $80K/month (60% savings)
-# After optimization: $60K/month (70% total savings)
-
-# Optimization levers (after migration):
-# 1. Right-sizing: use Compute Optimizer
-#    → 30% savings (downsize over-provisioned instances)
-# 2. Graviton migration: ARM-based instances
-#    → 20% savings (better price/performance)
-# 3. Spot instances: for fault-tolerant workloads
-#    → 60-90% savings on compute
-# 4. Savings Plans: 1-year Compute SP
-#    → 30-40% discount on compute
-# 5. S3 lifecycle: move cold data to Glacier
-#    → 80-95% storage savings
-# 6. Reserved RDS instances: 3-year
-#    → 40-60% database cost reduction
-
-# Target: 40% cost reduction in 18 months
-# Track with: AWS Cost Explorer + tagging + budgets
-```
+Track it: tag every migrated resource with the app and wave (MGN can tag automatically), measure monthly run-rate vs the on-prem baseline, and watch for the "double bubble" of paying for both environments during overlap. AWS's Migration Acceleration Program (MAP) credits can offset migration costs.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **6 Rs fluency** | Can explain each R, when to use it, and typical savings/effort |
-| **Assessment process** | Uses discovery tools to catalog servers, dependencies, and utilization |
-| **Prioritization** | Creates wave plan (quick wins first, strategic refactors later) |
-| **Cost optimization** | Has post-migration optimization plan with quantifiable savings levers |
+| **7 Rs fluency** | Can explain each R (including Relocate), when to use it, and current tooling |
+| **Assessment process** | Uses discovery data to catalog servers, dependencies, and utilization |
+| **Prioritization** | Creates dependency-aware wave plan (quick wins first, strategic refactors later) |
+| **Cost optimization** | Identifies where savings actually come from and tracks them against a baseline |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -458,11 +224,8 @@ Wave 4 (Month 16-18): Retire 10 apps + migrate remaining 10
     Your browser does not support the video tag.
   </video>
   <br/>
-  <em>🎬 Animated Cloud Migration 6 Rs — Retire, Retain, Rehost, Replatform, Refactor, Repurchase with prioritization matrix — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+  <em>🎬 Animated Cloud Migration 6 Rs — Retire, Retain, Rehost, Replatform, Refactor, Repurchase with prioritization matrix (AWS has since added a seventh R, Relocate) — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
-
----
-
 
 ---
 
@@ -474,179 +237,73 @@ Wave 4 (Month 16-18): Retire 10 apps + migrate remaining 10
 
 ### Answer
 
-**Cost Governance Framework:**
+!!! tip "30-second answer"
+    15% month over month is 5x a year; first ask whether revenue is growing with it. Govern with **unit economics** (cost per transaction or per customer), not total spend. Three layers: **visibility** (account-per-team structure plus enforced tags, CUR 2.0 data in Athena/QuickSight, showback/chargeback), **guardrails** (budgets with alerts and actions, Cost Anomaly Detection per account and tag, SCPs/tag policies on expensive choices), and **optimisation loops** (Cost Optimization Hub and Compute Optimizer recommendations, commitment management, architecture changes). Automate shutdown only in non-prod; in prod, automate detection and routing to owners.
 
-```yaml
-# Three pillars of cloud cost governance:
+**Visibility:**
 
-Pillar 1: Visibility (Tagging + Allocation)
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Tagging Strategy:                                           │
-  │   Required tags (enforced by SCP):                          │
-  │     - CostCenter: team-a, team-b, platform                  │
-  │     - Environment: production, staging, development          │
-  │     - Application: order-service, payment-service            │
-  │     - Owner: dev-team@example.com                            │
-  │     - AutoShutdown: true/false                               │
-  │                                                             │
-  │   Automated enforcement:                                     │
-  │     - AWS Tag Policies (Organization level)                  │
-  │     - SCP: deny launch if required tags missing              │
-  │     - Lambda: auto-tag resources on creation                 │
-  │                                                             │
-  │   Cost allocation reports:                                   │
-  │     - By CostCenter: $500K team-a, $300K team-b              │
-  │     - By Environment: $1.2M prod, $400K staging, $400K dev  │
-  │     - By Service: $600K compute, $400K storage, $300K data  │
-  └─────────────────────────────────────────────────────────────┘
+- Accounts are the cleanest cost boundary (one team or product per account); tags handle what accounts can't (shared clusters, per-feature cost).
+- Required tags (`team`, `service`, `env`) enforced with **tag policies** (allowed values) and SCP conditions on `aws:RequestTag` for create calls; activate them as cost allocation tags. Untagged spend is reported weekly as a team's debt.
+- Shared costs (EKS clusters, data platforms) allocated with split cost allocation data for EKS/ECS, or by a documented formula.
+- Data: **CUR 2.0 via Data Exports** into S3 → Athena/QuickSight (or the CUDOS dashboards); Cost Explorer for ad-hoc questions.
 
-Pillar 2: Governance (Budgets + Anomaly Detection)
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Budget Structure:                                            │
-  │   Level 1: Organization ($2M/month)                         │
-  │     → CTO gets alert at 80%, 90%, 100%                      │
-  │                                                             │
-  │   Level 2: Cost Center ($500K/team/month)                   │
-  │     → Team lead gets alert at 85%                           │
-  │                                                             │
-  │   Level 3: Service ($100K/service/month)                   │
-  │     → Service owner gets alert at 80%                       │
-  │                                                             │
-  │   Anomaly Detection (AWS Cost Anomaly Detection):           │
-  │     - ML-based: learns normal spending patterns             │
-  │     - Detects: unexpected spikes (10%+ above normal)        │
-  │     - Root cause analysis: linked to specific service/region │
-  │     - Alert: Slack + email within 24 hours                  │
-  │                                                             │
-  │   Automated response to anomaly:                             │
-  │     - SNS → Lambda → analyze Cost Explorer                  │
-  │     - If anomaly > $10K/day: auto-stop non-critical resources │
-  │     - Create Jira ticket for investigation                  │
-  └─────────────────────────────────────────────────────────────┘
+**Guardrails:**
 
-Pillar 3: Optimization (Continuous Improvement)
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Rightsizing (monthly):                                       │
-  │   - AWS Compute Optimizer scans all EC2, ECS, Lambda       │
-  │   - Finds over-provisioned resources (<20% CPU utilization) │
-  │   - Estimated savings: $50K/month                           │
-  │   - Auto-remediate: resize during maintenance window        │
-  │                                                             │
-  │   Resource type   | Over-provisioned | Target   | Savings   │
-  │   c5.4xlarge (50) | 16 vCPU, 5% util  | c5.xlarge | $15K/mo │
-  │   r5.2xlarge (30) | 64GB, 10% used    | r5.large  | $12K/mo │
-  │   Lambda 1024MB   | 40% of invocations| 512MB     | $8K/mo  │
-  │                                                             │
-  │ Purchases (quarterly):                                       │
-  │   - Compute Savings Plan (3yr, partial upfront): 50-60% off  │
-  │   - RDS Reserved Instance (3yr): 40-60% off                 │
-  │   - DynamoDB Reserved Capacity: 50-70% off                  │
-  │                                                             │
-  │ Architecture (continuous):                                   │
-  │   - Graviton migration: 20-40% better price/performance     │
-  │   - Spot instances: 60-90% off for batch/fault-tolerant     │
-  │   - S3 Lifecycle: auto-move to IA/Glacier after N days      │
-  │   - EBS gp3: 20% cheaper than gp2 with better performance  │
-  └─────────────────────────────────────────────────────────────┘
-```
+| Control | Use |
+|---|---|
+| AWS Budgets (per account, per tag) | Alerts on actual and *forecasted* spend; budget actions can apply an IAM/SCP policy or stop EC2/RDS in non-prod |
+| Cost Anomaly Detection | ML monitors per service, account, cost category or tag; alerts to SNS/Slack/email (immediate, daily or weekly) with root-cause dimensions |
+| SCPs / declarative policies | Deny unapproved instance families or Regions in sandboxes, require tags on create |
+| Service Quotas | Keep quotas near expected use in sandboxes as a blast-radius cap |
 
-**Automated Cost Remediation:**
+**Optimisation loop:**
+
+- **Cost Optimization Hub** consolidates recommendations (right-sizing, Graviton, idle resources, Savings Plans/RI purchases) across accounts and ranks them by savings, de-duplicating overlaps.
+- **Compute Optimizer** for EC2, ASGs, EBS, Lambda, ECS on Fargate, RDS.
+- Commitments: Compute Savings Plans for the stable compute baseline, **Database Savings Plans** (Dec 2025, up to 35%) or RIs for databases, laddered quarterly so commitments track growth. Target high utilisation (>95%) and rising coverage.
+- Architecture: Graviton, Spot for interruptible work, gp3 instead of gp2, S3 lifecycle/Intelligent-Tiering, VPC endpoints to cut NAT processing, cross-AZ traffic reduction, log retention and sampling (CloudWatch Logs is a frequent surprise).
+
+**Anomaly handler (SNS-subscribed Lambda):**
 
 ```python
-import boto3
 import json
+import boto3
 
-def lambda_handler(event, context):
-    """
-    Auto-remediate cost anomalies.
-    Triggered by: AWS Budgets action or Cost Anomaly Detection.
-    """
-    anomaly = json.loads(event['detail']['analysis'])
-    service = anomaly['service']
-    estimated_impact = anomaly['estimatedImpact']['actualAmount']
-    
-    if estimated_impact > 10000:  # > $10K/day anomaly
-        # Step 1: Identify the resources causing the spike
-        resources = identify_anomalous_resources(anomaly)
-        
-        # Step 2: Categorize by criticality
-        critical = [r for r in resources if r.get('critical', False)]
-        non_critical = [r for r in resources if not r.get('critical', False)]
-        
-        # Step 3: Stop non-critical resources immediately
-        for resource in non_critical:
-            if resource['type'] == 'ec2':
-                ec2 = boto3.client('ec2')
-                ec2.stop_instances(InstanceIds=[resource['id']])
-                print(f"Stopped non-critical EC2: {resource['id']}")
-            
-            elif resource['type'] == 'ecs-service':
-                ecs = boto3.client('ecs')
-                ecs.update_service(
-                    cluster=resource['cluster'],
-                    service=resource['service'],
-                    desired_count=0
-                )
-                print(f"Scaled down ECS service: {resource['service']}")
-        
-        # Step 4: Notify owners
-        sns = boto3.client('sns')
-        sns.publish(
-            TopicArn='arn:aws:sns:us-east-1:123456789:cost-anomaly',
-            Message=json.dumps({
-                'action': 'STOPPED_NON_CRITICAL',
-                'resources': non_critical,
-                'estimated_savings': estimated_impact,
-                'investigation_link': f'https://console.aws.amazon.com/cost-management/home?region=us-east-1#/custom?anomaly={anomaly["anomalyId"]}'
-            })
-        )
+ecs = boto3.client("ecs")
+sns = boto3.client("sns")
+
+def handler(event, context):
+    msg = json.loads(event["Records"][0]["Sns"]["Message"])     # Cost Anomaly Detection alert
+    impact = msg["impact"]["totalImpact"]
+    causes = msg.get("rootCauses", [])                          # service, region, account, usage type
+
+    owners = route_to_owners(causes)                            # via account → team mapping
+    for owner in owners:
+        sns.publish(TopicArn=owner.topic_arn, Subject=f"Cost anomaly ${impact:,.0f}",
+                    Message=json.dumps({"anomalyId": msg["anomalyId"], "rootCauses": causes}))
+
+    # Automatic action only for non-production accounts with an explicit opt-in tag
+    for svc in non_prod_services_opted_in(causes):
+        ecs.update_service(cluster=svc.cluster, service=svc.name, desiredCount=0)
 ```
 
-**Building a Cost Culture:**
+Stopping production resources because spend spiked is how a successful launch becomes an outage. Make the default action "page the owner with root cause", and reserve automatic stops for sandboxes and non-prod.
 
-```yaml
-# Cultural practices for cost awareness:
+**Culture:**
 
-# 1. Cost dashboards per team
-# Each team has a CloudWatch dashboard showing:
-#   - Daily cost trend (7-day, 30-day)
-#   - Cost by service (top 5)
-#   - Cost anomalies (last 30 days)
-#   - Unit cost (cost per request/transaction)
-
-# 2. Weekly cost reviews
-# 15 min in team standup:
-#   - Cost change vs last week: +5% (expected: +3%)
-#   - Anomaly: new QA environment left running over weekend
-#   - Action: implement auto-shutdown for non-prod
-
-# 3. Game Days (quarterly)
-# Team challenge: reduce cost by 10% in 1 week
-# Prize: team lunch sponsored by "savings"
-# Typical findings: orphaned volumes, oversized instances, unused load balancers
-
-# 4. Cost efficiency as a metric
-# Include in performance reviews:
-#   - Unit cost reduction: cost per API call, cost per active user
-#   - Savings implemented: $ value of rightsizing/purchases
-#   - Anomaly response time: time to remediate cost spikes
-
-# 5. Guardrails (SCP enforcement)
-# Prevent costly mistakes:
-#   - Deny: non-Graviton instance types in dev
-#   - Require: auto-shutdown tag for non-prod
-#   - Limit: max instance size in dev accounts
-#   - Enforce: gp3 instead of io1 unless approved
-```
+- Each team sees its own spend and unit cost on its dashboard; cost is reviewed in the same forum as reliability.
+- Engineers estimate the cost of a design in design reviews (data transfer, request counts and log volume are where estimates miss).
+- Celebrate removed waste the same way as shipped features; give teams the savings to reinvest.
+- A central FinOps function owns commitments and tooling; teams own their usage.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Governance framework** | Designs 3-pillar approach: visibility, governance, optimization |
-| **Anomaly detection** | Uses ML-based detection with automated remediation workflows |
-| **Tagging strategy** | Enforces required tags via SCP, automates cost allocation |
-| **Cost culture** | Implements team dashboards, weekly reviews, game days, SCP guardrails |
+| **Governance framework** | Designs visibility, guardrails and optimisation loops around unit cost |
+| **Anomaly detection** | Uses ML-based detection that routes to owners; automates only safe actions |
+| **Tagging strategy** | Enforces required tags via tag policies/SCPs, uses accounts as primary boundary |
+| **Cost culture** | Implements team dashboards, design-time cost estimates, shared ownership |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -661,9 +318,6 @@ def lambda_handler(event, context):
 
 ---
 
-
----
-
 ## 5. Microservices Architecture Patterns on AWS
 
 **Q:** "Your team is migrating a monolithic .NET application to microservices on AWS. Design the architecture covering: service decomposition, inter-service communication, data management, and observability. How do you handle distributed transactions? How do you manage service discovery?"
@@ -672,160 +326,106 @@ def lambda_handler(event, context):
 
 ### Answer
 
-**Service Decomposition Strategy:**
+!!! tip "30-second answer"
+    Decompose by **bounded context** and team ownership, extract incrementally with the strangler fig, and give each service its own data store. Default to **asynchronous events** between services (EventBridge/SNS+SQS, published via a transactional outbox) and keep synchronous calls for queries that need an immediate answer, with timeouts, retries with backoff and circuit breakers. Replace distributed transactions with **sagas**: Step Functions orchestration when the flow has many steps or needs audit, choreography when it's short. Discovery is ECS Service Connect, Kubernetes services, or VPC Lattice across accounts. Observability is OpenTelemetry traces, structured logs with trace IDs, and RED metrics per service.
 
-```yaml
-# Monolith: e-commerce platform
-# Decomposed into bounded contexts:
+**Decomposition:**
 
-┌─────────────────────────────────────────────────────────┐
-│                    API Gateway (AWS API Gateway)         │
-├─────────────┬────────────┬─────────────┬────────────────┤
-│  Order      │  Payment   │  Inventory  │  Notification  │
-│  Service    │  Service   │  Service    │  Service       │
-│  ─────────  │  ────────  │  ─────────  │  ────────────  │
-│  DynamoDB   │  RDS       │  DynamoDB   │  DynamoDB      │
-│  + SQS      │  (Aurora)  │  + SQS      │  + SNS         │
-└─────────────┴────────────┴─────────────┴────────────────┘
-
-Decomposition rules:
-  1. Business capability: each service owns a complete business function
-  2. Data autonomy: each service owns its data (no shared databases!)
-  3. Communication: async via events (SNS/SQS), sync only when necessary
-  4. Deployment independence: each service deploys separately
-
-  Strangler Fig pattern:
-    Phase 1: New microservice handles NEW functionality
-    Phase 2: Route NEW requests to microservice, old to monolith
-    Phase 3: Migrate monolith features one by one
-    Phase 4: Decommission monolith
+```
+           API Gateway / ALB (routing, auth, throttling)
+     ┌───────────────┬──────────────┬──────────────┬───────────────┐
+     │ Orders        │ Payments     │ Inventory    │ Notifications │
+     │ DynamoDB      │ Aurora PG    │ DynamoDB     │ DynamoDB      │
+     │ outbox→Stream │ outbox table │              │               │
+     └───────┬───────┴──────┬───────┴──────┬───────┴───────┬───────┘
+             └──────────────┴── EventBridge bus ───────────┘
 ```
 
-**Inter-Service Communication Patterns:**
+- **Data ownership:** no shared tables. Other services get data via APIs or events and keep their own read copies.
+- **Size:** a service should be owned by one team and deployable alone; if two services always deploy together, they're one service.
+- **Start with the seams** that change most often or need to scale differently; leave the stable core in the monolith longer.
 
-```yaml
-# Pattern 1: Async Event-Driven (preferred)
-# Order Service → SNS event → Payment Service (SQS) + Inventory Service (SQS)
+**Communication patterns:**
 
-Order Service:
-  1. Create order (write to own DB)
-  2. Publish: "OrderPlaced" event to SNS
-  3. Return 202 Accepted to client
+| Pattern | Use | AWS building blocks | Watch out for |
+|---|---|---|---|
+| Async event | State changes others react to | EventBridge, SNS→SQS, Kinesis/MSK for streams | At-least-once delivery → idempotent consumers; schema evolution |
+| Async command | "Do this work" | SQS queue owned by the receiver | Backpressure, DLQs |
+| Sync request/response | Queries needing an answer now | HTTP/gRPC via Service Connect, VPC Lattice, ALB | Latency chains, cascading failure; set timeouts below the caller's |
+| Workflow | Multi-step business process | Step Functions | State machine becomes a coupling point; version it |
 
-Payment Service:
-  1. Consume "OrderPlaced" from SQS
-  2. Process payment
-  3. Publish: "PaymentProcessed" or "PaymentFailed" event
+Publish events reliably with a **transactional outbox**: write the business row and the event row in one DB transaction, then relay (DynamoDB Streams → EventBridge Pipes, or Debezium/DMS CDC for relational DBs). Without it, a crash between "commit" and "publish" loses or invents events.
 
-# Pattern 2: Sync Request-Reply (use only when necessary)
-# API Gateway → Order Service → Payment Service (HTTP)
+**Orchestrated saga (Step Functions):**
 
-Order → Payment:
-  GET /payment/status?orderId=123
-  # Problem: synchronous coupling
-  # Payment service failure = Order service failure
-  # Mitigation: circuit breaker + timeout + fallback
-
-# Pattern 3: EventBridge for complex routing
-# Central event bus with rules
-
-OrderPlaced → EventBridge → Rule: amount > $1000 → Fraud Detection Lambda
-                         → Rule: all → Inventory SQS
-                         → Rule: digital goods → Fulfillment SQS
-```
-
-**Handling Distributed Transactions — Orchestration Saga (Step Functions):**
-
-```yaml
-# Orchestration Saga: AWS Step Functions as central coordinator
-# Each step has a compensating transaction for rollback
-
-Order Saga state machine:
+```json
 {
-  "Comment": "Order Processing Saga",
+  "Comment": "Order saga with compensations",
   "StartAt": "ProcessPayment",
   "States": {
     "ProcessPayment": {
       "Type": "Task",
-      "Resource": "arn:aws:lambda:process-payment",
-      "Next": "ReserveInventory",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "CancelOrder" }]
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "process-payment", "Payload.$": "$" },
+      "Retry": [{ "ErrorEquals": ["Lambda.TooManyRequestsException", "States.Timeout"],
+                  "IntervalSeconds": 1, "BackoffRate": 2, "MaxAttempts": 3, "JitterStrategy": "FULL" }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CancelOrder" }],
+      "ResultPath": "$.payment",
+      "Next": "ReserveInventory"
     },
     "ReserveInventory": {
       "Type": "Task",
-      "Resource": "arn:aws:lambda:reserve-inventory",
-      "Next": "ConfirmOrder",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "RefundPayment" }]
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "reserve-inventory", "Payload.$": "$" },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RefundPayment" }],
+      "ResultPath": "$.inventory",
+      "Next": "ConfirmOrder"
     },
     "ConfirmOrder": {
       "Type": "Task",
-      "Resource": "arn:aws:lambda:confirm-order",
-      "End": true,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseInventory" }]
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "confirm-order", "Payload.$": "$" },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ReleaseInventory" }],
+      "End": true
     },
-    "CancelOrder": { "Type": "Task", "Resource": "...cancel-order", "End": true },
-    "RefundPayment": { "Type": "Task", "Resource": "...refund-payment", "Next": "CancelOrder" },
-    "ReleaseInventory": { "Type": "Task", "Resource": "...release-inventory", "Next": "RefundPayment" }
+    "ReleaseInventory": { "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                          "Parameters": { "FunctionName": "release-inventory", "Payload.$": "$" },
+                          "Next": "RefundPayment" },
+    "RefundPayment":    { "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                          "Parameters": { "FunctionName": "refund-payment", "Payload.$": "$" },
+                          "Next": "CancelOrder" },
+    "CancelOrder":      { "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                          "Parameters": { "FunctionName": "cancel-order", "Payload.$": "$" },
+                          "Next": "Failed" },
+    "Failed": { "Type": "Fail", "Error": "OrderSagaFailed" }
   }
 }
-
-# Compensation flows (execute in reverse order of success):
-# 1. ConfirmOrder fails → ReleaseInventory → RefundPayment
-# 2. ReserveInventory fails → RefundPayment (no inventory to release)
-# 3. ProcessPayment fails → CancelOrder (no payment to refund)
-
-# Idempotency key pattern:
-# Each saga instance gets a unique saga_id
-# All compensating actions use saga_id to ensure idempotent retries
-# Step Functions automatically retries on transient failures using the same input
 ```
 
-**Service Discovery & Observability:**
+- Compensations run in reverse order of completed steps and must themselves be idempotent and retried until they succeed (a refund that fails needs alerting, not silence).
+- Pass a saga ID / idempotency key to every participant so retries don't double-charge.
+- Step Functions retries only what you declare in `Retry`; Standard workflows suit long-running sagas (up to a year, exactly-once state transitions), Express suits high-volume short ones.
 
-```yaml
-Service Discovery:
-  ECS Service Connect:
-    - Envoy sidecar proxy per task
-    - DNS: service-name.namespace (e.g., order-service.prod)
-    - Client-side load balancing + health checks
-    - No ALB needed for inter-service calls
-  
-  AWS Cloud Map:
-    - DNS-based: A records + SRV records + health checks
-    - TTL: 60s (DNS caching)
-    - Simple but less feature-rich than Service Connect
-  
-  API Gateway:
-    - External entry point (public APIs)
-    - Route: /orders → order-service, /payments → payment-service
-    - Internal: use VPC link to private NLB/ALB
+**Service discovery:**
 
-Observability (three pillars):
-  Logging: CloudWatch Logs → central account
-    - Structured logging (JSON)
-    - Correlation ID across services (trace ID in every log)
-    - Log group: /ecs/{service-name}
-  
-  Metrics: CloudWatch + custom metrics
-    - RED metrics: Rate (requests/s), Errors (error rate), Duration (latency)
-    - USE metrics: Utilization, Saturation, Errors (for infrastructure)
-    - Business metrics: orders processed, revenue, conversion
-  
-  Tracing: AWS X-Ray
-    - Trace: end-to-end request flow across services
-    - Segments: API Gateway → Order → Payment → RDS
-    - Annotations: order ID, customer ID for filtering
-    - Sampling: 10% of requests (or 1 req/sec, whichever is higher)
-```
+- **ECS Service Connect** (managed proxy, Cloud Map namespace) inside ECS; Kubernetes Services/DNS inside EKS.
+- **VPC Lattice** for service-to-service traffic across VPCs and accounts, with IAM auth policies and no need for peering or non-overlapping CIDRs.
+- Plain Cloud Map DNS when you just need names; mind client DNS caching.
+
+**Observability:**
+
+- **Traces:** OpenTelemetry (ADOT or the CloudWatch agent) to X-Ray / CloudWatch Application Signals. The X-Ray SDKs and daemon entered maintenance mode in February 2026 (end of support February 2027), so new code should instrument with OpenTelemetry. X-Ray's default sampling records the first request each second and 5% of the rest; tail-based sampling of errors is worth adding.
+- **Logs:** structured JSON with trace ID, request ID, tenant; central log account; retention policies set deliberately.
+- **Metrics:** RED (rate, errors, duration) per endpoint, plus business metrics (orders/min) and queue age for async paths. SLOs with error budgets per service (Application Signals supports SLOs).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **Decomposition** | Uses bounded contexts, Strangler Fig pattern, data autonomy per service |
-| **Async-first** | Prefers SNS/SQS events over sync HTTP; uses Saga for distributed transactions |
-| **Service discovery** | Designs Service Connect or Cloud Map for inter-service communication |
-| **Observability** | Implements RED metrics, structured logging with correlation IDs, X-Ray tracing |
+| **Async-first** | Prefers events with an outbox; uses sagas with idempotent compensations |
+| **Service discovery** | Chooses Service Connect, Kubernetes services or VPC Lattice appropriately |
+| **Observability** | Implements OpenTelemetry tracing, structured logs with correlation IDs, RED metrics and SLOs |
 
 ---
 
@@ -837,121 +437,63 @@ Observability (three pillars):
 
 ### Answer
 
-**Decision Framework:**
+!!! tip "30-second answer"
+    Decide on **utilisation, latency and constraints**, not fashion. Lambda wins for spiky or low average utilisation, event-driven glue and teams that want zero infrastructure; it gets expensive at sustained high request rates, and cold starts plus a 15-minute limit rule it out for some work. Containers on ECS/EKS (Fargate for no-node operations, EC2 for price, GPUs and tuning) win for steady high throughput, long-running or stateful processes, and special hardware. For 0–50K req/s with a <100 ms API: put the API on containers with autoscaling (or Lambda with provisioned concurrency if traffic is truly bursty and near zero most of the time), and batch on Fargate/EC2 Spot or AWS Batch fed by SQS.
 
-```yaml
-# Decision factors:
-Factor                | Serverless (Lambda/Fargate) | Containers (ECS/EKS)
-----------------------|----------------------------|---------------------
-Startup latency       | 10-200ms cold start        | <1ms (always running)
-Max execution time    | 15 min (Lambda), 8h (Farg)| No limit
-Concurrency           | 1000 default (soft limit)  | Node limits (EC2)
-Memory                | 10GB (Lambda), 120GB (Far) | Rack-scale (24TB)
-GPU                   | ❌ (Lambda), ✅ (Fargate 1.5+)| ✅ All GPU types
-Cost at low traffic   | Very low (pay per request) | High (pay per node)
-Cost at high traffic  | Higher (per-request premium)| Lower (fixed cost)
-Operational overhead  | Minimal (no servers)       | Cluster management
-Customization         | Limited runtime/OS choices | Any container, any OS
-Cold start mitigation | Provisioned concurrency    | N/A (always warm)
+**Decision factors:**
 
-# Decision matrix for specific workloads:
+| Factor | Lambda | Fargate (ECS/EKS) | ECS/EKS on EC2 |
+|---|---|---|---|
+| Max duration | 15 minutes | Unlimited | Unlimited |
+| Scale-out speed | 1,000 environments per function every 10 s | Tens of seconds to minutes per task | Minutes (new instances), seconds with spare capacity |
+| Cold start | Yes (mitigate: SnapStart, provisioned concurrency) | Task start time | None for warm capacity |
+| Memory / CPU | Up to 10 GB / 6 vCPU | Up to 120 GB / 16 vCPU | Any instance type |
+| GPU | No | No | Yes |
+| Concurrency model | One request per environment (except Lambda Managed Instances) | Many requests per task | Many requests per task |
+| Idle cost | Zero | Per running task | Per node |
+| Ops burden | Lowest | Low | Highest (patching, capacity), reduced by EKS Auto Mode / ECS Managed Instances |
 
-Workload type          | Recommended | Rationale
------------------------|-------------|---------------------------------------
-Real-time API          | Lambda      | Auto-scale, pay per request
-WebSocket connections  | ECS/Fargate | Long-lived connections, Lambda max 15min
-Batch processing       | Batch/Fargate| Lambda 15min limit, GPU needs
-ML inference           | EKS+Fargate | GPU required, long inference times
-Event processing       | Lambda      | Native S3/SQS/SNS integration
-Stateful workloads     | ECS+EFS     | Lambda is stateless by design
-High-perf computing    | EKS+EC2     | Bare metal, EFA networking
-CI/CD pipeline         | Fargate     | Ephemeral runners, no cluster management
+**Where serverless gets expensive (us-east-1 list prices):**
+
+```
+Steady 1B requests/month, 128 MB, 100 ms:
+  Lambda   requests 1B × $0.20/M = $200 + duration 12.5M GB-s × $0.0000166667 = $208  → ~$408
+  ECS      2 × c6g.large on-demand (~385 req/s average is easy for 2 vCPU each)       → ~$99
+
+Sustained 50K req/s (131B requests/month), 512 MB, 100 ms:
+  Lambda   requests ≈ $26,000 + duration ≈ $109,500                                   → ~$135,000
+  Same load on containers is typically a small fraction of that if utilisation stays high.
+
+Provisioned concurrency 50 × 1 GB for a month:
+  50 GB × 2.63M s × $0.0000041667 ≈ $548 (before invocation charges), vs ~$30 for a t3.medium
 ```
 
-**Combined Architecture (Serverless + Containers):**
+The break-even depends on average utilisation: Lambda charges only for busy time, containers charge for provisioned time. A service that's busy 5% of the day favours Lambda; one at 60% sustained utilisation favours containers. Run the numbers with your traffic shape.
 
-```yaml
-┌─────────────────────────────────────────────────────────────┐
-│                    API Gateway                                │
-│                         │                                     │
-│           ┌─────────────┴─────────────┐                     │
-│           │                           │                      │
-│     Lambda (API)                 Lambda (Auth)              │
-│     - 50ms p99 latency          - JWT validation            │
-│     - Auto-scale from 0         - Cache with ElastiCache    │
-│           │                           │                      │
-│           └─────────────┬─────────────┘                     │
-│                         │                                     │
-│              ┌──────────▼──────────┐                         │
-│              │  SQS Queue          │                         │
-│              │  (request buffer)   │                         │
-│              └──────────┬──────────┘                         │
-│                         │                                     │
-│              ┌──────────▼──────────┐                         │
-│              │  ECS/Fargate        │                         │
-│              │  - Heavy processing  │                         │
-│              │  - 5 min tasks      │                         │
-│              │  - GPU for ML       │                         │
-│              │  - Auto-scale:      │                         │
-│              │    SQS queue depth  │                         │
-│              └──────────┬──────────┘                         │
-│                         │                                     │
-│              ┌──────────▼──────────┐                         │
-│              │  S3 (output) + SNS  │                         │
-│              │  (notify completion)│                         │
-│              └─────────────────────┘                         │
-└─────────────────────────────────────────────────────────────┘
+**Combined design for this platform:**
 
-# Why this split:
-# API layer: Lambda (auto-scale from 0, low latency, pay per request)
-# Processing layer: ECS/Fargate (no 15-min limit, GPU support, lower cost at scale)
-# Queue: SQS buffers traffic spikes (safety valve between layers)
-
-# Cost comparison at 50K req/s:
-# All Lambda: $12,000/month (higher per-request cost)
-# All ECS: $8,000/month (but must run 24/7, even at 0 traffic)
-# Hybrid Lambda+ECS: $6,500/month (Lambda handles low traffic, ECS for burst)
+```
+Clients → API Gateway or ALB
+            ├── API: ECS on Fargate/EC2, autoscaled on request count (p99 < 100 ms, no cold starts)
+            │      or Lambda + provisioned concurrency for the bursty, low-volume endpoints
+            └── async submissions → SQS
+                     └── workers: ECS on Spot (scale on backlog per task) or AWS Batch
+                             └── results → S3; completion events → EventBridge/SNS
+Lambda for glue: S3 events, EventBridge rules, scheduled jobs, light transformations
 ```
 
-**When Serverless Becomes Expensive:**
-
-```yaml
-# Serverless cost traps:
-
-# Trap 1: High-throughput, steady-state workloads
-Lambda 128MB, 100ms, 1B requests/month:
-  Cost: 1B × $0.0000002 × 0.125GB × 0.1s = $2.50
-  Plus: 1B × $0.20/1M = $200
-  Total: $202.50
-
-Same workload on ECS (2 c6g.large, always on):
-  Cost: 2 × $0.068 × 730 = $99.28/month
-  → ECS is 50% cheaper for steady-state high throughput!
-
-# Trap 2: Lambda Provisioned Concurrency
-50 provisioned concurrency = 50 × $0.000004 × 730h = $146/month
-  → Equivalent to a t3.medium EC2 instance! ($30/month)
-
-# Trap 3: Data transfer costs
-Lambda → S3 (same region): free
-Lambda → DynamoDB (same region): free
-Lambda → external API (internet): $0.09/GB
-ECS → external API: same $0.09/GB (no difference)
-
-# Recommendation:
-# - Lambda: < 100K req/s, variable traffic, event-driven
-# - ECS/Fargate: > 100K req/s steady, long-running, GPU
-# - Hybrid: Lambda front-end + ECS back-end (best of both)
-```
+- The queue decouples the API's latency from batch capacity and absorbs the 0→50K bursts.
+- Scale workers on **backlog per task** (queue depth ÷ tasks) and `ApproximateAgeOfOldestMessage`, not CPU.
+- The lines are blurring: **Lambda Managed Instances** (Lambda on EC2 you don't manage, multi-concurrency, EC2 pricing) and **ECS Managed Instances / EKS Auto Mode** (EC2 capacity AWS manages) let you pick the programming model and the cost model somewhat independently.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Decision framework** | Has structured criteria (latency, duration, cost, GPU) for choosing Lambda vs ECS |
-| **Cost awareness** | Quantifies where Lambda gets expensive (steady-state high throughput) |
-| **Hybrid architecture** | Designs Lambda front-end + ECS back-end with SQS as buffer |
-| **Provisioned concurrency** | Knows when Provisioned Concurrency (Lambda) costs more than EC2 |
+| **Decision framework** | Has structured criteria (utilisation, latency, duration, hardware, ops) for choosing Lambda vs containers |
+| **Cost awareness** | Quantifies where Lambda gets expensive with correct pricing math |
+| **Hybrid architecture** | Designs API + queue + workers with the right compute for each part |
+| **Provisioned concurrency** | Knows what provisioned concurrency costs relative to always-on capacity |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -966,9 +508,6 @@ ECS → external API: same $0.09/GB (no difference)
 
 ---
 
-
----
-
 ## 7. Cloud-Native Design Patterns: Strangler Fig, CQRS, Saga
 
 **Q:** "Your legacy monolith is 500K lines of code, serving 10K customers. You need to modernize without downtime. Walk through the Strangler Fig pattern for incremental migration. When would you use CQRS? How does the Saga pattern handle distributed transactions across microservices?"
@@ -977,150 +516,69 @@ ECS → external API: same $0.09/GB (no difference)
 
 ### Answer
 
-**Strangler Fig Pattern:**
+!!! tip "30-second answer"
+    **Strangler fig:** put a routing layer (API Gateway, ALB rules, or a proxy) in front of the monolith, then move one capability at a time behind it, with an **anti-corruption layer** translating between old and new models, and data synchronised (CDC or events) until the old path is gone. **CQRS:** separate the write model from purpose-built read models when read and write shapes or scales diverge a lot; accept eventual consistency on the read side. **Saga:** a sequence of local transactions with compensations instead of a distributed transaction; choreographed via events for short flows, orchestrated (Step Functions, see Q5) for long or audited ones.
 
-```yaml
-# Phase 1: Identify Strangler Fig entry points
-# New feature request: add real-time inventory tracking
+**Strangler fig, step by step:**
 
-┌─────────────────────────────────────────────────────┐
-│  Legacy Monolith                                      │
-│  ┌───────────────────────────────────────────┐       │
-│  │ Orders │ Customers │ Payments │ Inventory │       │
-│  └───────────────────────────────────────────┘       │
-│                                                        │
-│  New Feature: Real-time Inventory                     │
-│  ┌─────────────────────┐  ┌────────────────────┐     │
-│  │ API Gateway         │  │ Route: /inventory/*│     │
-│  └──────────┬──────────┘  │ → New Service     │     │
-│             │             └────────────────────┘     │
-│  ┌──────────▼──────────┐                             │
-│  │ Inventory Service    │  (NEW microservice)        │
-│  │ - DynamoDB           │                             │
-│  │ - Real-time updates  │                             │
-│  │ - WebSocket API      │                             │
-│  └─────────────────────┘                             │
-└─────────────────────────────────────────────────────┘
-
-# Phase 2: Incrementally migrate features
-# Month 1: Inventory (new feature → new service)
-# Month 2: Checkout → new Order Service (CQRS)
-# Month 3: Customer profiles → new Customer Service
-# Month 4: Legacy reports → new Analytics Service
-
-# Phase 3: Route traffic gradually
-# API Gateway routes:
-#   /orders/v1/* → Legacy monolith (old customers)
-#   /orders/v2/* → New Order Service (new customers)
-#   /customers/* → New Customer Service (after migration complete)
-
-# Phase 4: Decommission monolith
-# When: all routes point to microservices
-# Verify: zero traffic to legacy monolith for 30 days
-# Archive: source code + data snapshot
+```
+Phase 1  Client → Router ──────────────────────────────► Monolith (everything)
+Phase 2  Client → Router ─ /inventory/* ─► Inventory svc (new feature, own DynamoDB)
+                         └ everything else ─► Monolith
+Phase 3  Client → Router ─ /orders/*  ─► Order svc ◄─ CDC/events ─ Monolith DB (sync both ways during transition)
+                         ├ /inventory/* ─► Inventory svc
+                         └ rest ─► Monolith
+Phase 4  Monolith handles nothing; zero traffic for N weeks; archive and delete
 ```
 
-**CQRS (Command Query Responsibility Segregation):**
+- Route by path, header, tenant or percentage (canary per capability), so you can move a few tenants first and roll back by flipping the route.
+- The hard part is **data**: during transition both systems may need the same data. Pick one owner per entity at each phase, replicate with DMS/Debezium CDC or domain events, and avoid dual writes from application code.
+- Expect the long tail: reports, batch jobs and integrations that hit the monolith's database directly. Inventory them early.
 
-```yaml
-# Problem: single database handles both writes and complex reads
-# Writes: simple CRUD (insert/update individual records)
-# Reads: complex aggregations (10-table JOIN, GROUP BY, window functions)
-# Result: read queries slow down write throughput
+**CQRS:**
 
-# Solution: Separate read and write paths
-
-┌─────────────────────────────────────────────────────┐
-│  CQRS Architecture for Order Service                  │
-│                                                        │
-│  Command Side (Write):                                 │
-│  ┌────────────┐    ┌──────────────┐                   │
-│  │ API: POST  │───►│ Write Model  │                   │
-│  │ /orders    │    │ (DynamoDB)   │                   │
-│  └────────────┘    └──────┬───────┘                   │
-│                           │                            │
-│                    DynamoDB Streams                    │
-│                           │                            │
-│  Query Side (Read):      │                            │
-│  ┌────────────┐    ┌──────▼───────┐                   │
-│  │ API: GET   │───►│ Read Model   │                   │
-│  │ /orders    │    │ (Elasticache │                   │
-│  │ /reports   │    │  + S3 + ES)  │                   │
-│  └────────────┘    └──────────────┘                   │
-│                                                        │
-│  Eventual consistency: write → read in <100ms         │
-└─────────────────────────────────────────────────────┘
-
-# When to use CQRS:
-# - Complex read queries that don't match write model
-# - High read/write ratio (e.g., 100:1)
-# - Different performance requirements for reads vs writes
-# - Multiple read models needed (dashboard, API, search)
-
-# When NOT to use CQRS:
-# - Simple CRUD (no complex queries)
-# - Strong consistency required (read-after-write, same transaction)
-# - Small application (over-engineering)
-
-# Implementation on AWS:
-Write model: DynamoDB (single-item writes, low latency)
-Read model: ElasticSearch (full-text search, aggregations)
-Sync: DynamoDB Streams → Lambda → ElasticSearch
-Cache: ElastiCache (frequently accessed read models)
-Materialized views: event-sourced projections
-
-# Example: Order dashboard displaying:
-# - Total revenue by product category (7-day window)
-# - Top 10 customers by spend
-# - Order status distribution (pie chart)
-# → Complex aggregation query
-# → Read model: ElasticSearch pre-aggregated index
-# → Write model: DynamoDB individual order records
 ```
-**Saga Pattern — Choreography (Event-Driven):**
-
-```yaml
-# Choreography Saga: no central coordinator
-# Each service emits events and subscribes to relevant events
-
-Order Service         Payment Service        Inventory Service    Shipping Service
-    │                      │                      │                    │
-    │──OrderCreated─────►  │                      │                    │
-    │                      │──PaymentAuthorized─► │                    │
-    │                      │                      │──InventoryDeducted→│
-    │                      │                      │                    │──ShipmentCreated→
-    │                      │                      │                    │
-    │◄─────────OrderConfirmed─────────────────────│                    │
-    │                      │                      │                    │
-    │ Failure: Payment fails                       │                    │
-    │◄──PaymentFailed───  │                      │                    │
-    │(compensation: cancel order, notify user)     │                    │
-    │                      │                      │                    │
-    │ Failure: Inventory unavailable               │                    │
-    │                      │◄──InventoryFailed── │                    │
-    │◄──PaymentRefund───  │(compensation: refund payment)             │
-    │(compensation:        │                      │                    │
-    │ notify user)         │                      │                    │
-
-# Key difference from orchestration (covered in Q5):
-# - Choreography: services talk via event bus (SNS/EventBridge)
-# - Orchestration: Step Functions controls the flow
-# 
-# Choreography pros: simpler, less coupling, no single point of failure
-# Choreography cons: harder to trace flow, no centralized error handling
-# 
-# When to use each:
-#   Choreography: few services (<5), simple compensation logic
-#   Orchestration: complex sagas with branching, compliance-heavy workflows
+Commands: POST /orders ──► Order service ──► DynamoDB (write model, single-item writes)
+                                                 │ DynamoDB Streams / outbox
+                                                 ▼
+Queries:  GET /orders/search, /dashboards ◄── OpenSearch (search), ElastiCache (hot views),
+                                              S3 + Athena (analytics) — each a projection
 ```
+
+| Use CQRS when | Avoid it when |
+|---|---|
+| Reads need shapes the write model can't serve efficiently (search, aggregates) | Simple CRUD |
+| Read and write volumes differ by orders of magnitude | Users must always read their own writes from the read model |
+| Several consumers need different views | A small team can't operate the extra pipeline |
+
+Propagation is usually sub-second but unbounded under load or failure; show "pending" states, read-your-writes from the write model where it matters, and make projections rebuildable from the source (event log or table export).
+
+**Saga by choreography:**
+
+```
+Order svc ──OrderCreated──► Payment svc ──PaymentAuthorized──► Inventory svc ──InventoryReserved──► Shipping svc
+    ▲                           │                                   │
+    └──── PaymentFailed ────────┘                                   │
+    ▲                                                               │
+    └──── OrderCancelled ◄── Payment svc refunds ◄── InventoryFailed┘
+```
+
+| | Choreography | Orchestration (Step Functions) |
+|---|---|---|
+| Coupling | Services know event types, not each other | Orchestrator knows every step |
+| Visibility | Reconstruct from traces and events | Execution history shows the whole flow |
+| Change | Easy to add listeners; hard to change the flow | Change in one place |
+| Best for | 2–4 steps, independent teams | Many steps, branching, timeouts, human approval, audit |
+
+Either way: idempotent participants, compensations that can't be skipped, a timeout for "stuck" sagas, and a semantic lock (e.g. `PENDING` order status) so other operations don't act on half-finished state.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Strangler Fig** | Plans incremental migration with API Gateway routing, no downtime |
-| **CQRS** | Separates read/write paths, uses DynamoDB Streams for sync, knows when NOT to use it |
-| **Orchestration Saga** | Implements Step Functions state machine with compensation flows and idempotency keys |
+| **Strangler Fig** | Plans incremental migration with routing, anti-corruption layer and a data ownership plan |
+| **CQRS** | Separates read/write paths, uses streams for sync, knows when NOT to use it |
+| **Saga** | Compares choreography and orchestration, with idempotency, compensations and timeouts |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -1135,9 +593,6 @@ Order Service         Payment Service        Inventory Service    Shipping Servi
 
 ---
 
-
----
-
 ## 8. Resilience Engineering & Chaos Engineering
 
 **Q:** "Design a resilience strategy for a payment processing system processing $1M/hour. How do you implement circuit breakers, bulkheads, and retry with exponential backoff? How do you use Chaos Engineering to validate resilience? Walk through a Game Day scenario."
@@ -1146,229 +601,92 @@ Order Service         Payment Service        Inventory Service    Shipping Servi
 
 ### Answer
 
-**Resilience Patterns:**
+!!! tip "30-second answer"
+    Contain failures so they degrade one feature, not the system: **timeouts** on every call, **retries** with capped exponential backoff and full jitter plus a retry budget, **idempotency keys** so a retried charge never double-charges, **circuit breakers** to fail fast when a dependency is down, **bulkheads** (separate pools, queues, cells) so one dependency can't exhaust shared resources, and **load shedding** to protect the core path. Validate with **AWS Fault Injection Service (FIS)** experiments that have explicit hypotheses and CloudWatch-alarm stop conditions, first in staging then in production at small blast radius, and run game days that exercise people and runbooks, not just software.
 
-```yaml
-# Pattern 1: Circuit Breaker
-# Prevents cascading failures when downstream service is unhealthy
+**Patterns:**
 
-┌────────────────┐    ┌────────────────┐    ┌────────────────┐
-│ Payment API    │───►│ Circuit        │───►│ Payment        │
-│                │    │ Breaker        │    │ Gateway (3rd   │
-│                │    │                │    │ party)         │
-│                │    │ States:        │    │                │
-│                │    │  CLOSED: normal│    │                │
-│                │    │  OPEN: failing │    │                │
-│                │    │  HALF_OPEN: try│    │                │
-└────────────────┘    └────────────────┘    └────────────────┘
+| Pattern | What it prevents | Key settings |
+|---|---|---|
+| Timeout | Threads stuck forever on a slow dependency | Below the caller's timeout; budget across hops |
+| Retry with backoff + jitter | Synchronised retry storms | Cap attempts (2–3), cap delay, full jitter, retry only idempotent or idempotency-keyed operations |
+| Retry budget / token bucket | Retries amplifying an outage | e.g. retries ≤ 10% of requests (AWS SDKs' adaptive/standard retry modes do this) |
+| Circuit breaker | Hammering a failed dependency; slow failures | Open on error rate or slow-call rate over a window, half-open probes |
+| Bulkhead | One dependency consuming all threads/connections | Separate pools or separate queues/workers per dependency |
+| Load shedding / admission control | Collapse under overload | Reject early with 429/503, prioritise payments over reports |
+| Cell-based architecture | Region-wide blast radius | Independent cells (stacks) each serving a subset of customers |
 
-# Circuit breaker configuration:
-circuit_breaker:
-  failure_threshold: 5        # Open after 5 consecutive failures
-  success_threshold: 3        # Close after 3 consecutive successes
-  timeout: 30000              # 30 seconds in OPEN state before HALF_OPEN
-  half_open_limit: 1          # Only 1 request when in HALF_OPEN
+**Retry with idempotency (payment calls):**
 
-# Implementation:
-def charge_payment(order_id, amount):
-    cb = circuit_breaker.get('payment-gateway')
-    
-    if not cb.allow_request():
-        # Circuit is OPEN → fail fast
-        queue_payment_for_retry(order_id, amount, delay=30000)
-        return PaymentResult(status='QUEUED', message='Circuit open, retrying later')
-    
-    try:
-        result = payment_gateway.charge(amount)
-        cb.record_success()
-        return result
-    
-    except (ConnectionError, TimeoutError) as e:
-        cb.record_failure()
-        
-        if cb.is_open():
-            # Open circuit → switch to retry queue
-            queue_payment_for_retry(order_id, amount, backoff=True)
-        
-        raise
+```python
+import random
+import time
 
-# Pattern 2: Bulkhead (isolate failure domains)
-# Prevents one service failure from consuming all resources
+class TransientError(Exception): ...
 
-┌─────────────────────────────────────────────┐
-│               Thread Pools                    │
-│                                                │
-│  ┌──────────────────┐  ┌──────────────────┐  │
-│  │ Payment Pool      │  │ Notification Pool│  │
-│  │ max: 10 threads  │  │ max: 5 threads   │  │
-│  │ queue: 100       │  │ queue: 50        │  │
-│  └──────────────────┘  └──────────────────┘  │
-│                                                │
-│  ┌──────────────────┐  ┌──────────────────┐  │
-│  │ Report Pool       │  │ Health Check Pool│  │
-│  │ max: 2 threads   │  │ max: 2 threads   │  │
-│  │ queue: 10        │  │ queue: 10        │  │
-│  └──────────────────┘  └──────────────────┘  │
-└─────────────────────────────────────────────┘
-
-# Benefit: Payment pool exhaustion does NOT affect health checks
-# Result: system stays alive (degraded but operational)
-
-# Pattern 3: Retry with Exponential Backoff + Jitter
-def retry_with_backoff(operation, max_retries=5):
-    for attempt in range(max_retries):
+def call_with_retries(op, *, idempotency_key, attempts=3, base=0.2, cap=2.0):
+    for attempt in range(attempts):
         try:
-            return operation()
-        except (TransientError, ThrottlingError) as e:
-            if attempt == max_retries - 1:
-                raise  # Last attempt failed permanently
-            
-            # Exponential backoff: 1s, 2s, 4s, 8s, 16s
-            delay = 2 ** attempt
-            
-            # Add jitter: ±50% random variance
-            jitter = random.uniform(0.5, 1.5)
-            delay = delay * jitter
-            
-            time.sleep(delay)
-            
-            # On retry: try alternate endpoint if available
-            operation.endpoint = select_healthy_endpoint()
+            return op(idempotency_key=idempotency_key)   # gateway dedups on this key
+        except TransientError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(random.uniform(0, min(cap, base * 2 ** attempt)))   # full jitter
 ```
 
-**Chaos Engineering Principles:**
+Without the idempotency key, a timeout after the gateway charged the card plus a retry is a double charge, which is the most expensive bug in this system.
+
+**Circuit breaker behaviour:**
+
+```
+CLOSED ──(error rate > 50% over 20 calls, or slow calls > threshold)──► OPEN
+OPEN ──(after 30 s)──► HALF_OPEN ──(probe calls succeed)──► CLOSED
+                                  └──(probe fails)────────► OPEN
+```
+
+While open, the payment API returns "pending" and enqueues the charge to SQS for a worker to retry later, rather than failing the checkout. Use a library (resilience4j, Polly, or a service-mesh/proxy policy) rather than hand-rolling state machines.
+
+**Chaos engineering with FIS:**
 
 ```yaml
-# Chaos Engineering: proactive failure testing
-# Core principle: inject failures in production to validate resilience
-
-# AWS Fault Injection Simulator (FIS):
-# Managed chaos engineering service
-
-# Experiment template:
-Experiment: payment-system-resilience
-  Targets:
-    - payment-service (ECS service, us-east-1)
-  
-  Actions:
-    - Stop EC2 instances: 20% of tasks
-      Duration: 5 minutes
-    - Network latency: inject 500ms on 30% of requests
-      Duration: 3 minutes
-    - CPU stress: 80% utilization on 2 instances
-      Duration: 2 minutes
-  
-  Stop conditions:
-    - Error rate > 5% (if exceeded, rollback immediately)
-    - P99 latency > 2s
-    - Payment failures > 1% of total
+Experiment: payment-gateway-degradation
+Hypothesis: >99% of checkouts complete or are queued; p99 < 2 s; no double charges
+Targets: payment-service ECS tasks in one AZ (25%)
+Actions:
+  - aws:ecs:task-network-latency        # +500 ms to the gateway's port
+  - aws:ecs:task-network-blackhole-port # then drop traffic to it entirely
+  - aws:ecs:stop-task                   # kill 25% of tasks
+Stop conditions:                         # CloudWatch alarms; FIS halts the experiment
+  - CheckoutErrorRate > 2% for 1 minute
+  - PaymentDLQDepth > 0
+Rollback: actions end and faults are removed; your system must recover on its own
 ```
 
-**Game Day Scenario: Payment System Failure:**
+FIS (renamed from Fault Injection Simulator to Fault Injection *Service* in 2023) also provides scenarios such as AZ power interruption and cross-Region connectivity disruption, and integrates with ARC zonal shift so you can practise moving traffic away from an impaired AZ.
 
-```yaml
-# Game Day: Simulate payment gateway outage
+**Game day: payment gateway outage:**
 
-Pre-conditions:
-  - All teams on-call are available
-  - Monitoring dashboards are configured
-  - Runbook is updated
-  - Stakeholders are informed (no surprises)
+| Time | Expected | Check |
+|---|---|---|
+| T−1 week | Hypothesis, blast radius, abort criteria, comms plan agreed | Runbooks reviewed |
+| T+0 | FIS blackholes gateway traffic for 25% of tasks | — |
+| T+1 min | Breaker opens; checkouts return "pending"; charges queued | Alarm fires, on-call paged, dashboard shows breaker state |
+| T+5 min | Fault removed; breaker half-opens and closes | Queue drains via autoscaling on backlog |
+| T+15 min | Error rate and queue age back to baseline | Reconcile: every queued charge processed exactly once |
+| After | Review: what surprised us, action items with owners | Track to completion |
 
-Experiment timeline:
+Typical findings: alarms on averages that hid the problem, retries in two layers multiplying load, a runbook step that no longer matches the console, autoscaling too slow to drain backlog.
 
-T-1 week: Announce Game Day
-  - Teams prepare: review runbooks, check monitoring
-  - Communication plan: who to notify if things go wrong
-
-T-0: Inject failure
-  FIS Action: Block all traffic to payment-gateway.example.com
-  Expected: Payment circuit breaker opens within 30 seconds
-
-T+1min: Detection
-  CloudWatch alarm: PaymentErrorRate > 10%
-  Dashboard: Circuit breaker shows OPEN state
-  Alert: PagerDuty notifies on-call engineer
-
-T+3min: Mitigation
-  Service switches to degraded mode:
-  - New payments queued (SQS) instead of processed
-  - 202 Accepted returned with "Processing" status
-  - Customers see: "Payment pending, we'll notify you"
-  - No data loss (all queued)
-
-T+5min: Recovery
-  FIS removes the block
-  Circuit breaker: transitions to HALF_OPEN
-  First request: try one request → success
-  Circuit breaker: transitions to CLOSED
-
-T+6min: Backlog processing
-  SQS queue has 10,000 pending payments
-  Payment service scales up to drain queue
-  Auto-scaling: SQS queue depth triggers scale-out
-
-T+10min: All clear
-  Queue drained (10K payments processed)
-  Error rate back to normal (<0.1%)
-  Circuit breaker: CLOSED (normal operation)
-
-Post-Game Day review:
-  What went well:
-    - Circuit breaker opened correctly
-    - Queued payments prevented data loss
-    - Auto-scaling handled backlog
-  
-  What to improve:
-    - Alert was 30 seconds late (tune health check interval)
-    - Runbook was outdated (step 3 was wrong)
-    - Some customers saw 500 errors (add better error messages)
-  
-  Action items:
-    - Fix runbook (owner: on-call team, due: 1 week)
-    - Reduce health check interval from 30s to 10s
-    - Add "maintenance mode" status page for customer visibility
-```
-
-**Resilience Metrics & Monitoring:**
-
-```yaml
-# Key resilience metrics:
-
-Metric                  | Target        | Description
-------------------------|---------------|----------------------------------------
-Availability            | 99.99%        | Uptime across all services
-Error rate              | <0.1%         | 5xx errors / total requests
-P99 latency             | <500ms        | Slowest 1% of requests
-Circuit breaker state   | CLOSED        | Should be closed >99% of time
-SQS queue depth         | <1000         | Messages waiting to be processed
-DLQ depth               | 0             | Messages that failed permanently
-Recovery time (MTTR)    | <5 min        | Time to recover from failure
-
-# Monitoring:
-# CloudWatch dashboard: Service Health
-# - Circuit breaker status per service (OPEN/CLOSED)
-# - Error rate (5xx) per service, per endpoint
-# - P50/P99/P999 latency per service
-# - SQS queue depth (showing backlog)
-# - DLQ count (spike = permanent failures)
-# - Auto-scaling events (scale-in/out activity)
-
-# Alarms (PagerDuty):
-# - PaymentErrorRate > 1% → Critical (page on-call)
-# - Any circuit breaker OPEN > 1 min → Warning
-# - SQS queue depth > 10K → Warning
-# - DLQ has messages → Info (investigate next business day)
-```
+**Resilience metrics:** availability per SLO (successful checkouts / attempts), p99 latency, queue age and DLQ depth, breaker open time, MTTD/MTTR, and error-budget burn rate alerts rather than static thresholds.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Circuit breaker** | Implements with failure/success thresholds, half-open state, fast-fail on open |
-| **Bulkhead isolation** | Separates thread pools for different service types to prevent cascading failure |
-| **Chaos Engineering** | Designs FIS experiments with stop conditions (error budget), Game Day scenarios |
-| **Post-incident culture** | Runs post-Game Day reviews with concrete action items and ownership |
+| **Circuit breaker** | Implements with rate-based thresholds, half-open probes, fail-fast with a fallback |
+| **Retries and idempotency** | Uses capped backoff with jitter and idempotency keys for payments |
+| **Chaos Engineering** | Designs FIS experiments with hypotheses and alarm-based stop conditions |
+| **Post-incident culture** | Runs game days and reviews with concrete action items and ownership |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -1380,9 +698,6 @@ Recovery time (MTTR)    | <5 min        | Time to recover from failure
   <br/>
   <em>🎬 Animated Resilience & Chaos Engineering — circuit breaker, bulkhead, retry backoff, and FIS Game Day scenario — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
-
----
-
 
 ---
 

@@ -1,6 +1,6 @@
 # ☁️ AWS Storage & Database — Staff-Level Interview Questions
 
-> *10 questions covering S3, RDS, DynamoDB, ElastiCache, Aurora, and storage architecture — every question expects principal engineer-level depth with production patterns.*
+> *10 questions covering S3, RDS, Aurora, DynamoDB, ElastiCache/MemoryDB, RDS Proxy, DMS and archival. Each answer leads with the 30-second version, then the mechanism, trade-offs, failure modes and what interviewers probe next. Prices are us-east-1 list prices; limits and features checked against AWS documentation, October 2026.*
 
 ---
 
@@ -27,138 +27,74 @@
 
 ### Answer
 
-**S3 Storage Classes:**
+!!! tip "30-second answer"
+    Match class to access frequency, but remember the hidden terms: minimum storage durations (30/90/180 days), minimum billable object sizes (128 KB for IA classes), per-GB retrieval fees, and per-object transition and monitoring charges. Use lifecycle rules where access is predictable by age, **Intelligent-Tiering** where it isn't. S3 supports at least **3,500 writes and 5,500 reads per second per prefix**, and scales by splitting busy prefixes automatically, so 10K PUT/s needs the keys spread over several prefixes and a ramp-up (or retries on `503 SlowDown`) while S3 repartitions. For a data lake, store columnar files (Parquet) in **S3 Tables** (managed Iceberg) or a self-managed Iceberg catalog rather than millions of small JSON objects.
+
+**Storage classes:**
+
+| Class | $/GB-month | Min duration | Min billable size | Retrieval | Use |
+|---|---|---|---|---|---|
+| S3 Standard | 0.023 | — | — | Free, ms | Hot data |
+| S3 Express One Zone | Higher per GB, cheaper requests | — | — | Single-digit ms, one AZ, directory buckets | Latency-critical scratch, ML training, query engines |
+| Intelligent-Tiering | 0.023 → 0.0125 → 0.004 (auto) | — | Objects <128 KB stay in the frequent tier, unmonitored | Free | Unknown or changing access; $0.0025 per 1,000 monitored objects |
+| Standard-IA | 0.0125 | 30 days | 128 KB | $0.01/GB | Monthly access |
+| One Zone-IA | 0.01 | 30 days | 128 KB | $0.01/GB | Re-creatable data (single AZ) |
+| Glacier Instant Retrieval | 0.004 | 90 days | 128 KB | $0.03/GB, ms | Quarterly access, needs instant reads |
+| Glacier Flexible Retrieval | 0.0036 | 90 days | 40 KB overhead per object | Minutes (expedited) to 3–5 h (standard) to 5–12 h (bulk, free) | Archives with occasional restores |
+| Glacier Deep Archive | 0.00099 | 180 days | 40 KB overhead per object | Within 12 h (standard), 48 h (bulk) | Compliance retention |
+
+Durability is designed for 11 nines in every class (One Zone and Express One Zone keep data in a single AZ, so an AZ loss can lose it).
+
+**Lifecycle rules (API class names):**
 
 ```yaml
-S3 Standard:
-  - Durability: 99.999999999% (11 9's)
-  - Availability: 99.99%
-  - Min object size: 0 bytes
-  - Retrieval: instant
-  - Cost: $0.023/GB/month
-  - Use: hot data (active datasets)
-
-S3 Intelligent-Tiering:
-  - Automatically moves between tiers based on access patterns
-  - Tiers: Frequent, Infrequent, Archive Instant, Archive (90 days)
-  - Monitoring fee: $0.0025/1000 objects
-  - Use: unknown or unpredictable access patterns
-
-S3 Standard-IA:
-  - Availability: 99.9%
-  - Min object size: 128KB (billed)
-  - Retrieval fee: $0.01/GB
-  - Cost: $0.0125/GB/month
-  - Use: warm data, accessed infrequently
-
-S3 One Zone-IA:
-  - Availability: 99.5% (single AZ)
-  - Cost: $0.01/GB/month
-  - Use: reproducible data (can regenerate)
-
-S3 Glacier Instant Retrieval:
-  - Retrieval: milliseconds
-  - Min storage: 90 days
-  - Cost: $0.004/GB/month
-  - Use: archive data needing instant access
-
-S3 Glacier Flexible Retrieval:
-  - Retrieval: 1-5 minutes (expedited), 3-5 hours (standard)
-  - Min storage: 90 days
-  - Cost: $0.0036/GB/month
-  - Use: long-term archive
-
-S3 Glacier Deep Archive:
-  - Retrieval: 12 hours (standard)
-  - Min storage: 180 days
-  - Cost: $0.00099/GB/month
-  - Use: regulatory compliance (7+ years)
+Rules:
+  - ID: raw-events
+    Filter: { Prefix: "raw/" }
+    Status: Enabled
+    Transitions:
+      - { Days: 30,  StorageClass: STANDARD_IA }
+      - { Days: 90,  StorageClass: GLACIER_IR }     # Glacier Instant Retrieval
+      - { Days: 365, StorageClass: DEEP_ARCHIVE }
+    Expiration: { Days: 2555 }                      # ~7 years
+  - ID: unpredictable
+    Filter: { Prefix: "curated/" }
+    Status: Enabled
+    Transitions:
+      - { Days: 0, StorageClass: INTELLIGENT_TIERING }
+  - ID: cleanup-multipart
+    Filter: { Prefix: "" }
+    Status: Enabled
+    AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
 ```
 
-**Lifecycle Policy:**
+- Lifecycle transitions cost a per-object request fee, and since September 2024 objects smaller than 128 KB are not transitioned by default. Millions of tiny objects can cost more to transition than to keep; compact them first.
+- Moving from IA to Glacier at day 31 is fine; deleting from Glacier IR before day 90 bills the remaining days.
+- Measure before choosing: **S3 Storage Lens** and **Storage Class Analysis** show actual access patterns per prefix.
 
-```yaml
-# Lifecycle for data lake (500TB):
-LifecycleConfiguration:
-  Rules:
-    - ID: "hot-to-warm"
-      Filter:
-        Prefix: "active/"
-      Status: Enabled
-      Transitions:
-        - Days: 30
-          StorageClass: STANDARD_IA         # After 30 days → warm
-        - Days: 90
-          StorageClass: GLACIER_INSTANT_RETRIEVAL  # After 90 days → archive instant
-        - Days: 365
-          StorageClass: DEEP_ARCHIVE        # After 1 year → deep archive
-      Expiration:
-        Days: 2555                          # After 7 years → delete
+**Performance at 10K PUT/s:**
 
-    - ID: "intelligent-tiering"
-      Filter:
-        Prefix: "unknown/"
-      Status: Enabled
-      Transitions:
-        - Days: 0
-          StorageClass: INTELLIGENT_TIERING  # Auto-manage from day 1
-
-    - ID: "expire-incomplete-multiparts"
-      Filter:
-        Prefix: ""
-      Status: Enabled
-      AbortIncompleteMultipartUpload:
-        DaysAfterInitiation: 7
-
-# Cost comparison for 500TB over 7 years:
-# All Standard: 500TB × $0.023 × 84 months = $966K
-# Lifecycle managed: ~$200K (79% savings!)
+```
+s3://lake/events/dt=2026-10-07/hour=13/part-<uuid>.parquet       # one prefix → ~3,500 PUT/s at first
+s3://lake/events/shard=07/dt=2026-10-07/hour=13/part-<uuid>.parquet   # 16 shards → room for ~56K PUT/s
 ```
 
-**S3 Performance Limits:**
+- A "prefix" is any leading key string S3 chooses to partition on; random hashing of key names hasn't been necessary since 2018, but you still need *distinct* prefixes to get multiple partitions' worth of throughput.
+- S3 scales a hot prefix up over minutes; during that window it returns `503 SlowDown`. SDKs retry with backoff; for a launch, ramp traffic or pre-spread keys.
+- Large objects: multipart upload (5 MiB–5 GiB parts, up to 10,000 parts) and byte-range GETs in parallel; use the AWS CRT-based transfer manager. Maximum object size is **50 TB** since December 2025 (was 5 TB).
+- **Transfer Acceleration** speeds long-distance uploads over CloudFront edges ($0.04/GB extra, charged only when it's faster).
+- Request costs matter at this rate: 10K PUT/s ≈ 26 billion PUTs a month ≈ $130K/month at $0.005 per 1,000. Batch small records into bigger objects (Firehose, or buffering in the writer) before storing them.
 
-```yaml
-# S3 performance characteristics:
-
-# Single prefix: 3,500 PUT/POST/DELETE + 5,500 GET/HEAD per second
-# Multi-prefix: no limit (distribute across prefixes)
-
-# For 10K PUT/s:
-# Need: 10,000 / 3,500 = 3 prefixes minimum
-# Design: partition key as prefix
-#   /user/123/  (prefix: user/123/)
-#   /user/456/  (prefix: user/456/)
-# Hash prefix: /{hash_prefix(4 chars)}/{year}/{month}/{day}/
-
-# Example partition scheme:
-s3://data-lake/ab12/2024/01/15/events-001.json
-s3://data-lake/cd34/2024/01/15/events-002.json
-s3://data-lake/ef56/2024/01/15/events-003.json
-
-# PUT performance: 3,500 × N prefixes
-# With 10,000 prefixes: 35M PUT/s
-# With 1,000 prefixes: 3.5M PUT/s (more than enough)
-
-# Multipart upload (for large objects >100MB):
-# Upload in parallel parts (up to 10,000 parts)
-# Each part can be uploaded in parallel
-# For 10GB file: 100 parts × 100MB
-# Parallel upload: completes in 1/100th of sequential time
-
-# S3 Transfer Acceleration:
-# Global uploads: uses CloudFront edge locations
-# Improves upload speed by 50-500% for global users
-# Cost: $0.04/GB (vs $0.00/GB standard)
-```
+**What they probe next:** small-file problem for Athena/Spark (target 128 MB–1 GB files; Iceberg compaction or S3 Tables automatic compaction), S3 Metadata tables for querying object metadata, S3 Vectors for low-cost vector storage, and whether your hot tier should be S3 at all.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Storage class economics** | Quantifies cost difference between classes, uses lifecycle for automatic transitions |
-| **Performance limits** | Knows 3,500 PUT/s per prefix, uses hash prefixes for scale |
-| **Lifecycle rules** | Applies transitions at appropriate intervals, includes expiration |
-| **Multipart upload** | Uses parallel parts for large objects, knows 10,000 part limit |
+| **Storage class economics** | Quantifies cost difference including min duration, min size, retrieval and request fees |
+| **Performance limits** | Knows 3,500 PUT / 5,500 GET per prefix, gradual scaling and 503 SlowDown |
+| **Lifecycle rules** | Applies transitions at appropriate intervals, includes expiration and multipart cleanup |
+| **Multipart upload** | Uses parallel parts for large objects, knows part and object size limits |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -181,31 +117,41 @@ s3://data-lake/ef56/2024/01/15/events-003.json
 
 ### Answer
 
-**S3 Consistency Model (As of December 2020):**
+!!! tip "30-second answer"
+    Since December 2020, S3 is **strongly consistent** for every object operation: GET, HEAD and **LIST** after a PUT (new or overwrite) or DELETE all see the latest state, at no extra cost. So "stale data" today comes from somewhere else: a CDN or client cache, a read from a *replica* bucket, or two writers racing (S3 is last-writer-wins). Fix races with **conditional writes**: `If-None-Match: *` (create only if absent, Aug 2024) and `If-Match: <ETag>` (compare-and-swap, Nov 2024). Versioning keeps every overwrite and turns deletes into delete markers. Replication is asynchronous; **Replication Time Control** gives an SLA of 99.99% of objects within 15 minutes, which is your RPO, not your RTO.
 
-```yaml
-# Strong read-after-write consistency for ALL operations:
-# - PUT of new objects: immediately readable
-# - PUT of overwrites: immediately readable
-# - DELETE operations: immediately reflected
-# - HEAD/GET: returns latest version
-# - List: eventually consistent (can take seconds to propagate)
-# - Bucket configuration changes: eventually consistent
+**What is and isn't strongly consistent:**
 
-# What this means:
-# Write object → immediately GET → returns the object (strong!)
-# Write object → immediately LIST → MAY NOT appear yet (eventual)
-# Delete object → immediately GET → 404 (strong!)
-# Delete object → immediately LIST → MAY still appear (eventual)
+| Operation | Consistency |
+|---|---|
+| PUT/DELETE then GET, HEAD, LIST in the same bucket | Strong |
+| Object tags, ACLs, metadata changes | Strong |
+| Bucket configuration (policy, versioning, lifecycle, CORS) | Eventually consistent; can take minutes |
+| Reads from a replicated destination bucket | Eventually consistent (async replication) |
+| Two concurrent PUTs to the same key | Last writer wins; no locking unless you use conditional writes |
 
-# Pre-December 2020:
-# - PUT new: strong
-# - PUT overwrite: eventual (could read old version!)
-# - DELETE: eventual
+**Conditional writes, the building block for safe concurrency:**
 
-# Impact: Most applications don't need special handling anymore
-# But: LIST consistency is STILL eventual
+```python
+import boto3
+from botocore.exceptions import ClientError
+
+s3 = boto3.client("s3")
+
+def put_if_absent(bucket, key, body):
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body, IfNoneMatch="*")
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("PreconditionFailed", "ConditionalRequestConflict"):
+            return False          # someone else created it first
+        raise
+
+def compare_and_swap(bucket, key, new_body, expected_etag):
+    s3.put_object(Bucket=bucket, Key=key, Body=new_body, IfMatch=expected_etag)
 ```
+
+This is what lets table formats and simple "leader lease" or manifest files work on S3 without an external lock service. Bucket policies can require conditional writes (`s3:if-none-match` / `s3:if-match` condition keys).
 
 ### 🎬 Animated Sequence Diagram
 
@@ -215,121 +161,55 @@ s3://data-lake/ef56/2024/01/15/events-003.json
     Your browser does not support the video tag.
   </video>
   <br/>
-  <em>🎬 Animated S3 Strong Consistency Model — read-after-write, strong deletes, and LIST eventual consistency — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+  <em>🎬 Animated S3 Strong Consistency Model — read-after-write and strong deletes. Note: since December 2020 LIST is strongly consistent too; only bucket configuration changes and cross-bucket replication are eventual — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
----
+**Versioning:**
 
-**S3 Versioning:**
+- States: unversioned → enabled → suspended (can never return to unversioned).
+- DELETE without a version ID adds a **delete marker**; the data is still there and you can restore by deleting the marker. DELETE with a version ID removes that version permanently.
+- Cost control: `NoncurrentVersionExpiration` (e.g. keep 30 days or the last N versions) and `ExpiredObjectDeleteMarker` cleanup, or a versioned bucket quietly doubles in size.
+- Stronger protection: **S3 Object Lock** (WORM, governance or compliance mode, legal holds) and MFA Delete (root user, CLI only). For ransomware resilience, also replicate to a separate account with its own Object Lock.
 
-```yaml
-# Versioning prevents accidental deletion and overwrite:
-# - Each object version gets unique version ID
-# - DELETE creates a delete marker (not permanent deletion)
-# - Delete marker hides the object, not deletes it
-# - Permanently delete: specify version ID
-
-# Versioning states:
-#   Unversioned (default)
-#   Enabled (irreversible — can suspend, but never disable)
-#   Suspended (no new versions, existing versions retained)
-
-# Lifecycle with versioning:
-LifecycleRule:
-  - ID: "expire-old-versions"
-    Filter:
-      Prefix: "logs/"
-    Status: Enabled
-    NoncurrentVersionExpiration:
-      NoncurrentDays: 90       # Delete noncurrent versions after 90 days
-    NoncurrentVersionTransitions:
-      - NoncurrentDays: 30
-        StorageClass: STANDARD_IA
-
-# MFA Delete:
-# Require MFA to permanently delete versions
-# Protects against accidental or malicious deletion
-# Only enabled with versioning
-```
-
-**Cross-Region Replication (CRR):**
+**Cross-Region Replication with RTC:**
 
 ```yaml
-# CRR configuration for RTO < 15 minutes:
-
 ReplicationConfiguration:
-  Role: arn:aws:iam::123456789:role/s3-crr-role
-  
+  Role: arn:aws:iam::123456789012:role/s3-crr-role
   Rules:
-    - ID: "crr-to-dr-region"
+    - ID: crr-critical
       Status: Enabled
       Priority: 1
-      
-      Filter:
-        Prefix: "critical-data/"
-      
+      Filter: { Prefix: "critical-data/" }
+      DeleteMarkerReplication: { Status: Enabled }
+      SourceSelectionCriteria:
+        SseKmsEncryptedObjects: { Status: Enabled }
       Destination:
         Bucket: arn:aws:s3:::dr-bucket-us-west-2
-        StorageClass: STANDARD
-        ReplicationTime:            # S3 Replication Time Control (S3 RTC)
-          Status: Enabled
-          Time: 15                   # 15-minute SLA to replicate 99.99% of objects
-        
-        Metrics:
-          Status: Enabled
-          EventThreshold:
-            Minutes: 15
-        
-      SourceSelectionCriteria:
-        SseKmsEncryptedObjects:
-          Status: Enabled            # Replicate SSE-KMS encrypted objects too
-      
-      DeleteMarkerReplication:
-        Status: Enabled              # Replicate delete markers
-      
-      # Same-Region Replication (SRR):
-      # Use for: log aggregation across accounts, prod→test sync
-
-# Replication metrics:
-# - BytesPending: objects pending replication
-# - OperationsPending: operations pending
-# - ReplicationLatency: time to replicate (S3 RTC guarantees <15 min)
-# - MaxReplicationLag: in seconds
-
-# Replication time without RTC: 15-30 minutes
-# Replication time with RTC: <15 minutes (SLA)
+        Account: "210987654321"                     # separate DR account
+        AccessControlTranslation: { Owner: Destination }
+        EncryptionConfiguration:
+          ReplicaKmsKeyID: arn:aws:kms:us-west-2:210987654321:key/...   # required for SSE-KMS objects
+        ReplicationTime: { Status: Enabled, Time: { Minutes: 15 } }
+        Metrics:         { Status: Enabled, EventThreshold: { Minutes: 15 } }
 ```
 
-**S3 Batch Operations:**
+- Requires versioning on both buckets. Only **new** objects replicate; use **S3 Batch Replication** to backfill existing ones or retry failures.
+- Without RTC most objects replicate within minutes but there's no bound; some take hours. RTC adds a per-GB fee and the SLA.
+- Monitor `ReplicationLatency`, `BytesPendingReplication`, `OperationsPendingReplication`, `OperationsFailedReplication`, and subscribe to `s3:Replication:OperationMissedThreshold` events.
+- Deletes of specific versions are never replicated (by design, protecting the DR copy from malicious deletes).
+- **RTO** comes from how fast clients switch buckets: use an **S3 Multi-Region Access Point** with failover controls (active/passive routing you can flip in about a minute) or app-level config, and test it.
 
-```yaml
-# Batch operations for large-scale object management:
-
-# 1. Batch invoke Lambda:
-# Process 100M objects → invoke Lambda on each
-# Use: transform data, re-encrypt, change storage class
-
-# 2. Batch copy:
-# Copy 100M objects between buckets
-# Use: migration, replication backfill
-
-# 3. Batch restore:
-# Restore 100M Glacier objects to Standard
-# Use: bulk retrieval for compliance audit
-
-# Manifest: S3 inventory report (list of objects)
-# Batch job progress: CloudWatch Events
-# Completion: SNS notification
-```
+**S3 Batch Operations:** run one operation over billions of objects from an S3 Inventory or CSV manifest: copy, replicate, invoke Lambda, restore from Glacier, set tags/Object Lock, with a completion report. Use it for re-encryption, storage class changes and backfills.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Consistency model** | Knows all operations are strongly consistent (since Dec 2020), LIST is eventual |
-| **Versioning** | Uses versioning for data protection, lifecycle for old version cleanup |
-| **CRR with RTC** | Configures S3 RTC for 15-minute replication SLA |
-| **Delete marker replication** | Replicates delete markers for consistent DR state |
+| **Consistency model** | Knows object reads and LIST are strongly consistent since Dec 2020; config and replicas are eventual |
+| **Concurrency** | Uses conditional writes (If-None-Match / If-Match) for races |
+| **CRR with RTC** | Configures S3 RTC for a 15-minute replication SLA and separates RPO from RTO |
+| **Delete marker replication** | Replicates delete markers deliberately and protects the DR copy |
 
 ---
 
@@ -341,115 +221,52 @@ ReplicationConfiguration:
 
 ### Answer
 
-**Multi-AZ vs Read Replicas:**
+!!! tip "30-second answer"
+    Diagnose before scaling: look at database load by **wait event** and **top SQL** (Performance Insights, now surfaced through **CloudWatch Database Insights**), plus `pg_stat_statements`. 5–10 s spikes are usually a missing index, lock contention, connection storms or I/O limits, and none of those are fixed by adding replicas. Classic **Multi-AZ instance** deployments are for availability only (the standby isn't readable). A **Multi-AZ DB cluster** has two *readable* standbys and faster failover. Read replicas scale reads asynchronously, so they serve stale data and don't help writes.
 
-```yaml
-Multi-AZ:
-  - Purpose: High availability (not read scaling!)
-  - Architecture: primary in AZ-A, standby in AZ-B
-  - Replication: synchronous (committed on both before ack)
-  - Failover: automatic (60-120s DNS change)
-  - Read/write: only from primary (standby is NOT readable)
-  - Cost: 2× compute + 2× storage
-  - Performance impact: minor (sync replication adds ~1-5ms)
+**Deployment options:**
 
-  # Common misconception: Multi-AZ offloads reads
-  # WRONG! Standby is NOT accessible for reads
-  # Multi-AZ only protects against AZ failure
+| | Multi-AZ instance | Multi-AZ DB cluster | Read replica |
+|---|---|---|---|
+| Purpose | HA | HA + some read scaling | Read scaling, DR (cross-Region) |
+| Replication | Synchronous block-level to one standby | Semi-synchronous to two readable standbys | Asynchronous (engine-native) |
+| Readable standby | No | Yes (reader endpoint) | Yes |
+| Failover | Automatic, typically 60–120 s | Automatic, typically under 35 s | Manual promotion |
+| Write latency cost | Small | Small (commit waits for one standby) | None on primary |
 
-Read Replicas:
-  - Purpose: Read scaling (not HA!)
-  - Architecture: primary in AZ-A, replicas in any AZ
-  - Replication: asynchronous (<100ms lag typical)
-  - Failover: manual (promote replica to primary)
-  - Read/write: replicas are READ-ONLY
-  - Cost: each replica = full compute + full storage
-  - Performance impact: minor on primary (async replication)
+Multi-AZ doesn't help read performance with the instance deployment, and no option helps a write bottleneck: that needs query/index work, a bigger instance, batching, Aurora, or partitioning/sharding.
 
-Scaling strategy for 10K TPS:
-  # Analyze workload: 70% reads, 30% writes
-  # Read replicas: 5 replicas
-  #   Each replica: 2K TPS read
-  #   Total read throughput: 10K TPS
-  #   Write throughput: 3K TPS (single primary)
-  
-  # If writes are bottleneck: switch to Aurora or shard
-```
+**Using wait events (PostgreSQL names):**
 
-**Performance Insights:**
+| Dominant wait | Usually means | Fix |
+|---|---|---|
+| `CPU` | Expensive plans, too many concurrent queries | Indexes, plan fixes, bigger instance |
+| `IO:DataFileRead` | Working set doesn't fit in memory, sequential scans | Indexes, more RAM, Optimized Reads (local NVMe) |
+| `IO:WALWrite`, `IO:XactSync` | Commit-heavy, tiny transactions | Batch commits, gp3/io2 IOPS, Optimized Writes (MySQL) |
+| `Lock:transactionid`, `Lock:tuple` | Row contention (hot rows, long transactions) | Shorter transactions, avoid hot counters, `SKIP LOCKED` queues |
+| `LWLock:*` | Internal contention (buffer mapping, lock manager with many partitions) | Fewer connections, partition pruning |
+| `Client:ClientRead` | App holding transactions open | Fix the app; idle-in-transaction timeouts |
 
-```yaml
-# Performance Insights dashboard:
+Rule of thumb: when database load (average active sessions) exceeds the vCPU count, sessions are queueing. Performance Insights' own console reached end of life on July 31, 2026; the same data lives on in CloudWatch Database Insights (Standard and Advanced modes) and the PI API.
 
-# Top SQL by average active sessions:
-┌──────────────────────────────────────┬────────────┬─────────┐
-│ SQL                                  │ Avg Active │ Wait    │
-├──────────────────────────────────────┼────────────┼─────────┤
-│ SELECT * FROM orders WHERE ...       │    45      │ IO:Data │
-│ UPDATE inventory SET qty = qty - 1 ..│    12      │ Lock:Row│
-│ INSERT INTO audit_log ...            │     8      │ IO:Log  │
-└──────────────────────────────────────┴────────────┴─────────┘
+**A plausible plan for the 10K TPS case:**
 
-# Common wait events and fixes:
-Wait Event                  | Cause                        | Solution
-----------------------------|------------------------------|--------------------------
-IO:DataFileRead             | Full table scan, missing idx | Add index, optimize query
-IO:WALWrite                 | Too many write operations    | Batch writes, reduce fsync
-Lock:RowExclusive           | Row contention/blocking      | Optimize transaction length
-CPU:Quantum                 | Compute-bound                | Increase instance size
-Network:Throughput          | Large result sets            | Pagination, limit columns
+1. Fix the top 3 SQL by load (indexes, rewrite N+1s); usually the biggest win.
+2. Put **RDS Proxy** (or PgBouncer) in front if connection count spikes with traffic (see Q8).
+3. Move read-only, staleness-tolerant traffic (reports, search) to replicas or a Multi-AZ DB cluster's reader endpoint; keep read-your-writes paths on the primary.
+4. Right-size storage: gp3 with provisioned IOPS/throughput or io2 Block Express; check `ReadIOPS`/`WriteIOPS` against limits.
+5. If writes are still the bottleneck: Aurora, partitioning, or sharding by tenant.
 
-# Performance Insights metrics to monitor:
-# - DBLoad: average active sessions (should be < CPU count)
-# - DBLoadCPU: CPU-bound sessions
-# - DBLoadWait: wait-bound sessions
-# - CPUCreditBalance (burstable instances)
-```
-
-**Connection Pooling with RDS Proxy:**
-
-```yaml
-# RDS Proxy manages database connections:
-# Problem: 10K TPS × 100ms query = 1000 concurrent connections
-#          Each connection = ~2MB memory
-#          Total: 2GB just for connection overhead!
-
-# RDS Proxy:
-# - Connection multiplexing: 1000 app connections → 10 DB connections
-# - 99% reduction in database connection overhead
-# - Connection pooling: reuse connections
-# - IAM authentication: no DB password in application config
-# - Failover: proxy maintains connections during Multi-AZ failover
-# - Cost: $0.015/hour per vCPU of RDS instance
-
-RDS Proxy configuration:
-  Proxy:
-    EngineFamily: POSTGRESQL
-    RoleARN: arn:aws:iam::123456789:role/rds-proxy-role
-    VpcSubnetIds:
-      - subnet-abc
-      - subnet-def
-    SecurityGroups:
-      - sg-proxy
-    IdleClientTimeout: 1800           # 30 minutes idle timeout
-    MaxConnectionsPercent: 100        # % of max DB connections
-    SessionPinningFilters:
-      - EXCLUDE_VARIABLE_SESSIONS     # Don't pin for session variables
-    RequireTLS: true
-
-# Application connection string:
-# Before: jdbc:postgresql://my-db.xyz.us-east-1.rds.amazonaws.com:5432/mydb
-# After:  jdbc:postgresql://my-proxy.proxy-xyz.us-east-1.rds.amazonaws.com:5432/mydb
-```
+**Operational features worth knowing:** **Blue/Green Deployments** for major-version upgrades and schema changes with a switchover usually under a minute; **RDS Extended Support** (paid) when you can't upgrade off an end-of-life major version in time; and storage autoscaling.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Multi-AZ vs replicas** | Clearly distinguishes HA (Multi-AZ) from read scaling (replicas) |
-| **Performance Insights** | Uses wait events to diagnose bottlenecks (IO vs Lock vs CPU) |
-| **Connection pooling** | Uses RDS Proxy to reduce connection overhead by 90%+ |
-| **Scaling strategy** | Combines replicas for reads, proxy for connections, right-sizing for compute |
+| **Multi-AZ vs replicas** | Distinguishes HA (Multi-AZ) from read scaling (replicas) and knows Multi-AZ DB clusters have readable standbys |
+| **Performance Insights** | Uses real wait events and top SQL to diagnose bottlenecks |
+| **Connection pooling** | Uses RDS Proxy or PgBouncer for connection storms |
+| **Scaling strategy** | Fixes queries first, then replicas for reads, then architecture for writes |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -472,152 +289,54 @@ RDS Proxy configuration:
 
 ### Answer
 
-**Aurora's Distributed Storage Architecture:**
+!!! tip "30-second answer"
+    Aurora separates compute from a shared, log-structured storage volume: the writer sends only **redo log records** to six storage copies across three AZs and commits when **4 of 6** acknowledge; storage nodes materialise pages themselves. That's why replicas share storage (lag typically under 100 ms), crash recovery doesn't replay a long log, and clones and backups are cheap. **Serverless v2** scales the same instances in fine-grained ACU steps (down to 0 with auto-pause); **provisioned** is cheaper for steady load. **Global Database** gives cross-Region reads with typically sub-second lag. If you need multi-Region *writes* with strong consistency, look at **Aurora DSQL**; for write scale beyond one instance, **Aurora PostgreSQL Limitless Database**.
 
-```yaml
-Aurora separates compute from storage:
+**Storage architecture:**
 
-Compute Layer (EC2-based):
-  ┌────────────┐  ┌────────────┐  ┌────────────┐
-  │  Writer     │  │  Reader 1  │  │  Reader 2  │
-  │  (primary)  │  │  (replica) │  │  (replica) │
-  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘
-         │               │               │
-         └───────────────┼───────────────┘
-                         │
-         ┌───────────────▼───────────────────┐
-         │      Aurora Cluster Volume         │
-         │    (Virtual, up to 128TB)         │
-         │                                     │
-         │  ┌──────┐ ┌──────┐ ┌──────┐       │
-         │  │SSD   │ │SSD   │ │SSD   │ ...   │
-         │  │AZ-1  │ │AZ-1  │ │AZ-2  │       │
-         │  └──────┘ └──────┘ └──────┘       │
-         │  ┌──────┐ ┌──────┐ ┌──────┐       │
-         │  │SSD   │ │SSD   │ │SSD   │ ...   │
-         │  │AZ-2  │ │AZ-3  │ │AZ-3  │       │
-         │  └──────┘ └──────┘ └──────┘       │
-         └─────────────────────────────────────┘
-
-Key properties:
-  - 6 storage replicas across 3 AZs (6 copies of data)
-  - Writes: need 4/6 acknowledgments (write quorum)
-  - Reads: any 3/6 storage nodes (read quorum)
-  - Continuous backup to S3 (no backup window!)
-  - Crash recovery: <60 seconds (even for 128TB)
-  - Storage billing: $0.10/GB/month (vs $0.115/GB for RDS GP2)
+```
+writer ─────── redo log records ───────► 6 storage copies (2 per AZ × 3 AZs)
+readers ◄──── page cache invalidations      write quorum 4/6, read quorum 3/6 (used for repair)
+                                            10 GiB protection groups, repaired in parallel
+                                            continuous backup to S3 (PITR), up to 256 TiB
 ```
 
-**Aurora Write Path:**
+- Survives loss of an entire AZ plus one more node for reads (AZ+1), and an AZ for writes.
+- Normal reads go to the one storage node known to be current; quorum reads only happen during recovery.
+- The Aurora paper (SIGMOD 2017) reports far fewer I/Os per transaction than mirrored MySQL because only log records cross the network; don't quote a fixed multiplier for your workload.
+- Storage limit is 256 TiB on supported versions (raised from 128 TiB in July 2025).
 
-```yaml
-# Aurora doesn't write data pages. It writes REDO LOG records only.
+**Storage pricing models:** Aurora Standard ($0.10/GB-month + $0.20 per million I/Os) vs **Aurora I/O-Optimized** (~$0.225/GB-month, higher instance price, no I/O charges). Switch to I/O-Optimized when I/O exceeds roughly 25% of the Aurora bill.
 
-Writer instance:
-  ┌──────────────────────┐
-  │  BEGIN;              │
-  │  UPDATE balance = -100;│
-  │  COMMIT;             │
-  │                      │
-  │  → Write redo log    │
-  │    (NOT data pages!) │
-  └──────────┬───────────┘
-             │
-             ▼
-  ┌──────────────────────┐
-  │  Aurora Cluster Volume│
-  │                      │
-  │  Redo log → 4/6      │
-  │  storage nodes ack   │
-  │  → COMMIT complete!  │
-  │                      │
-  │  (Data pages lazily  │
-  │   materialized)      │
-  └──────────────────────┘
+**Serverless v2 vs provisioned:**
 
-# Performance impact:
-# - Only redo log written to storage (4KB vs 8KB data pages)
-# - 1/10th the I/O of traditional MySQL/PostgreSQL
-# - Write amplification: ~2x vs ~10x (traditional DB)
-# - 6-way replication at storage layer (no replication overhead on writer)
+| | Provisioned | Serverless v2 |
+|---|---|---|
+| Capacity | Fixed instance class | 0 (auto-pause) or 0.5 up to 256 ACU, in 0.5 ACU steps; 1 ACU ≈ 2 GiB RAM with matching CPU/network |
+| Scaling | Change class (failover to a resized reader, brief interruption) | In place, seconds, without dropping connections |
+| Auto-pause | No | Since Nov 2024: scales to 0 ACU after a configurable idle period; resume takes seconds (around 15 s), so not for latency-critical prod |
+| Price | Instance-hours (RIs available) | ~$0.12 per ACU-hour (Standard storage config) |
+| Best for | Steady, predictable load | Spiky, dev/test, multi-tenant fleets, unknown load |
 
-# Reader instances:
-# - Apply redo log from cluster volume (async)
-# - Reader lag: typically <10ms
-# - No storage writes on readers → no performance impact
-```
+You can mix both in one cluster (provisioned writer, Serverless v2 readers, or the reverse). Size the minimum ACU so the buffer cache isn't evicted at night; scaling up from a cold, tiny instance is slower and the cache needs re-warming.
 
-**Aurora Serverless v2:**
+**Meeting the stated requirements:**
 
-```yaml
-# Aurora Serverless v2 (vs provisioned):
+- 99.99%: writer plus at least one reader in another AZ (failover typically ~30 s, faster with RDS Proxy or the AWS JDBC/Python wrappers that track topology).
+- <10 ms in-Region writes: normal for Aurora; commit latency is a cross-AZ quorum write.
+- <100 ms cross-Region reads: **Aurora Global Database**: one primary Region plus up to **10 secondary Regions** (since May 2025), storage-level replication with typically sub-second lag, **write forwarding** from secondaries, a global writer endpoint, managed **switchover** (planned, RPO 0) and **failover** (unplanned, RPO = replication lag).
+- 100 → 100K TPS: reads scale with up to 15 replicas; writes scale vertically on one writer. If 100K TPS is mostly writes, consider **Aurora PostgreSQL Limitless Database** (transparent sharding with routers and shards, Serverless-based) or DynamoDB.
 
-Provisioned:
-  - Fixed instance size (e.g., r6g.4xlarge = 16 vCPU, 128GB RAM)
-  - Manual scaling: modify instance class (5-10 min downtime)
-  - Cost: hourly rate × hours (24/7 billing)
-  - Best for: predictable workloads
-
-Serverless v2:
-  - Auto-scaling: 0.5 ACU to 256 ACU (1 ACU = 2GB RAM + CPU)
-  - Scaling: instant (no downtime, no connection disruption)
-  - Scaling granularity: 0.5 ACU increments
-  - Cost: ACU-hours consumed (can scale to 0 for dev)
-  - Best for: variable/unknown workloads, dev/test
-
-# Scaling characteristics:
-# - Scale up: 30 seconds to 10× capacity
-# - Scale down: 30 seconds to minimum
-# - Pause: after 15 minutes of inactivity (no compute cost!)
-# - Resume: <30 seconds
-
-# Capacity planning:
-# 100 TPS → 2 ACU (night) → $0.25/hour
-# 100K TPS → 256 ACU (peak) → $32/hour
-# Average: 20 ACU → $2.50/hour → $1,800/month
-
-# ACU sizing guide:
-# 1 ACU ≈ 2GB RAM, moderate CPU
-# 1000 TPS (simple queries) ≈ 10 ACU
-# 1000 TPS (complex joins) ≈ 50 ACU
-```
-
-**Global Database:**
-
-```yaml
-# Aurora Global Database:
-# - Primary region: writer + local readers
-# - Secondary regions: up to 5 read-only replicas
-# - Replication: <1 second (AWS backbone)
-# - RTO: <1 minute (promote secondary to primary)
-# - RPO: <1 second (data loss in extreme failure)
-# - Cost: separate compute in each region + cross-region data transfer
-
-Global cluster:
-  Primary: us-east-1 (writer + 2 readers)
-  Secondary: eu-west-1 (1 reader) → promote if us-east-1 fails
-  Secondary: ap-southeast-1 (1 reader)
-
-# Failover:
-# 1. Detect primary region failure (health check)
-# 2. Promote eu-west-1 reader to writer
-# 3. Update application connection string
-# 4. Total: <1 minute RTO, <1 second RPO
-
-# Cross-region read latency:
-# US → EU: ~80ms (network round trip)
-# US → Asia: ~150ms
-# Local reads: <5ms (same region)
-```
+**Aurora DSQL (GA May 2025):** serverless, PostgreSQL-compatible, distributed SQL with active-active multi-Region strong consistency (optimistic concurrency; transactions can fail on conflict and must be retried). Trade-offs: a subset of PostgreSQL (no foreign keys, limited extensions, transaction size limits). Pick it for multi-Region active-active SQL; pick Aurora for full PostgreSQL/MySQL compatibility.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Storage architecture** | Explains 6-replica quorum, redo-log-only writes, crash recovery <60s |
-| **Serverless v2** | Understands ACU model, instant scaling, pause/resume for dev |
-| **Global Database** | Designs multi-region architecture with sub-1s replication |
-| **Write amplification** | Quantifies Aurora's 2x vs traditional DB's 10x write amplification |
+| **Storage architecture** | Explains 6-copy quorum, redo-log-only writes, shared storage for replicas |
+| **Serverless v2** | Understands ACU model, scaling behaviour, auto-pause trade-offs |
+| **Global Database** | Designs multi-Region reads with switchover vs failover semantics |
+| **Write scaling** | Knows single-writer limit and when to reach for Limitless, DSQL or DynamoDB |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -627,7 +346,7 @@ Global cluster:
     Your browser does not support the video tag.
   </video>
   <br/>
-  <em>🎬 Animated Aurora Serverless v2 — auto-scaling from 0.5-128 ACU in < 30 seconds, no cold start, shared storage with 6-replica quorum — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+  <em>🎬 Animated Aurora Serverless v2 — auto-scaling ACUs in seconds without dropping connections, shared storage with 6-copy quorum (current range: 0–256 ACU) — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
 ---
@@ -642,177 +361,87 @@ Global cluster:
 
 ### Answer
 
-**DynamoDB Partition Mechanics:**
+!!! tip "30-second answer"
+    Start from access patterns, not entities. Each physical partition serves at most **3,000 RCU and 1,000 WCU** (and holds about 10 GB); DynamoDB splits partitions automatically, including "split for heat", but a **single partition key value** can never exceed one partition's limits. So the design goal is high-cardinality keys with even traffic. For feeds, fan out on write into per-user feed items for normal authors, and fan out on **read** for celebrities (their posts are fetched and merged at read time and cached). A celebrity's post read by 1M followers is a single hot item: put a cache (DAX or ElastiCache) in front, not more partitions.
 
-```yaml
-# Each partition:
-# - Max storage: 10GB
-# - Max throughput: 3000 RCU or 1000 WCU
-# - Partition count = max(ceil(total RCU/3000), ceil(total WCU/1000), ceil(storage/10GB))
+**Partition mechanics in numbers:**
 
-# For 10K writes + 100K reads:
-#   Write partitions: 10,000 / 1000 = 10 partitions
-#   Read partitions: 100,000 / 3000 = 34 partitions
-#   Total partitions: max(10, 34) = 34 partitions
-#
-# Each partition gets: 294 WCU + 2941 RCU
+- 1 RCU = one strongly consistent read of up to 4 KB per second, or two eventually consistent reads. 1 WCU = one write of up to 1 KB.
+- One hot item read with eventual consistency tops out around 6,000 reads/s (3,000 RCU × 2); everything above that throttles, regardless of table capacity.
+- **Adaptive capacity** shifts throughput to hot partitions and isolates hot items onto their own partitions automatically. It fixes uneven *partitions*, not a single over-limit *key*.
+- **On-demand** mode (prices cut ~50% in November 2024) absorbs spikes up to double the previous peak instantly; **warm throughput** (Nov 2024) lets you pre-warm a table or index for a known launch. You can cap on-demand spend with maximum throughput settings.
 
-# Hot key = all traffic to single partition
-# If user "celebrity" has 1M followers:
-#   All 1M queries hit the same partition (if celebrity is sole partition key)
-#   That partition: 3000 RCU → only 3000 reads processed
-#   Remaining 997,000 reads: throttled!
+**Key design (single table):**
 
-# Prevention strategies:
-# 1. Shard the hot key (add suffix: celeb#1, celeb#2, ...)
-# 2. Use DAX cache (absorb reads)
-# 3. Adaptive capacity (DynamoDB can burst unused capacity to hot partitions)
+| Access pattern | Key condition |
+|---|---|
+| Get profile | `PK = USER#alice`, `SK = PROFILE` |
+| Author's posts, newest first | `PK = USER#alice`, `SK begins_with POST#`, `ScanIndexForward = false` |
+| Who follows Alice | `PK = USER#alice`, `SK begins_with FOLLOWER#` |
+| Whom Alice follows | GSI1: `GSI1PK = FOLLOWER#bob` (inverted edge), or store a `FOLLOWING#` edge item |
+| Alice's feed | `PK = FEED#alice`, `SK begins_with TS#` (Query, newest first, `Limit 50`) |
+
+```
+PK              SK                          attributes
+USER#alice      PROFILE                     name, avatar, followerCount
+USER#alice      POST#2026-10-07T10:30:00Z#p1 text, media
+USER#alice      FOLLOWER#bob                followedAt
+FEED#bob        TS#2026-10-07T10:30:00Z#p1  authorId=alice, postId=p1   (fan-out copy, TTL 30 days)
 ```
 
-**Single-Table Design (Social Feed):**
+**Hybrid fan-out:**
 
-```yaml
-# Single-table design for social media feed:
+```python
+CELEBRITY_THRESHOLD = 10_000
 
-# Access patterns:
-# 1. Get user profile by user_id
-# 2. Get posts by user_id (sorted by created_at DESC)
-# 3. Get feed for user (posts from followed users)
-# 4. Get followers of user
-# 5. Get users that user follows
+def create_post(author, post):
+    posts.put_item(Item=post_item(author, post))           # always store the post once
+    if author.follower_count < CELEBRITY_THRESHOLD:
+        # async: a Streams/SQS consumer writes FEED#<follower> items in batches of 25
+        enqueue_fanout(author.id, post.id)
 
-Table: social-feed
-  Partition Key: pk (string)
-  Sort Key: sk (string)
-  GSI1: gsi1pk (string) → gsi1sk (string)
-
-# Data model:
-pk                    | sk                    | type     | data
-----------------------|-----------------------|----------|-----------------------
-USER#alice            | PROFILE               | profile  | name, avatar, bio
-USER#alice            | POST#2024-01-15T10:30 | post     | content, likes, shares
-USER#alice            | POST#2024-01-14T08:00 | post     | content, likes, shares
-USER#alice            | FOLLOWER#bob          | follower | followed_at
-USER#alice            | FOLLOWING#charlie     | following| followed_at
-USER#bob              | PROFILE               | profile  | name, avatar, bio
-USER#bob              | POST#2024-01-15T09:00 | post     | content, likes, shares
-FEED#alice           | CHARLIE#2024-01-15    | feed     | post_id, author, content
-
-# Query patterns:
-
-# 1. Get user profile:
-Query: pk = "USER#alice" AND sk = "PROFILE"
-
-# 2. Get user's posts (sorted by date DESC):
-Query: pk = "USER#alice" AND sk BEGINS_WITH "POST#"
-  ScanIndexForward: false
-  Limit: 20
-
-# 3. Get followers (GSI on sk prefix):
-GSI1 pk: "FOLLOWER#alice" (inverted index)
-GSI1 sk: "USER#bob"
-# Actually: use GSI with pk = "FOLLOWER#alice", sk = followed_at
-
-# 4. Get feed for user:
-BatchGet: FEED#alice entries (pre-computed fan-out)
+def get_feed(user_id, limit=50):
+    items = query_feed(f"FEED#{user_id}", limit)            # pre-computed part
+    for celeb_id in followed_celebrities(user_id):          # usually a short list, cached
+        items += cached_recent_posts(celeb_id, limit=10)    # one hot read, served from cache
+    return sorted(items, key=lambda i: i["createdAt"], reverse=True)[:limit]
 ```
 
-**Fan-Out on Write (Celebrity Post Pattern):**
+Write math: 10K posts/s × average 200 followers = 2M feed writes/s if done synchronously. That's why fan-out is asynchronous, capped, and skipped for big accounts; feed items also get a TTL so the table doesn't grow forever.
 
-```yaml
-# When celebrity posts, 1M followers need feed update:
+**Hot key mitigations (pick by read vs write heat):**
 
-# Option 1: Fan-out on write (push model)
-# Pro: Read is fast (just query feed table)
-# Con: Write is expensive (1M writes for 1 post)
+```python
+import random
 
-# Option 2: Fan-out on read (pull model)
-# Pro: Write is cheap (1 write for post)
-# Con: Read is expensive (query all followed users' posts + merge)
+SHARDS = 10
 
-# Hybrid approach:
-# - Normal users: fan-out on write (< 1000 followers → manageable)
-# - Celebrities (> 100K followers): fan-out on read
-
-# Implementation:
-def create_post(post, user):
-    # 1. Write post to posts table
-    posts.put(post)
-    
-    # 2. Get follower count
-    followers = get_follower_count(user.id)
-    
-    if followers < 1000:
-        # Fan-out on write for small accounts
-        fanout_post_sync(post, followers)
-    else:
-        # Fan-out on read for celebrities
-        # Store post with flag: celebrity_content = true
-        # Readers will fetch celebrity posts separately
-        pass
-
-def get_feed(user_id):
-    # Get pre-computed feed (from followed users)
-    feed_items = feed_table.query(pk=f"FEED#{user_id}")
-    
-    # Also fetch celebrity posts
-    celebrity_ids = get_followed_celebrities(user_id)
-    for celeb_id in celebrity_ids:
-        celeb_posts = posts_table.query(
-            pk=f"USER#{celeb_id}",
-            sk_begins_with="POST#",
-            limit=5
-        )
-        feed_items.merge(celeb_posts)
-    
-    return feed_items.sorted(by_date, desc=True)
-```
-
-**Hot Key Mitigation:**
-
-```yaml
-# Strategies for dealing with hot keys:
-
-# Strategy 1: Shard the hot key
-# Instead of: pk = "ITEM#ABC123"
-# Use:        pk = "ITEM#ABC123#0" to "ITEM#ABC123#N"
-
-def get_item(id):
-    # Write: pick random shard
-    shard = random.randint(0, 9)
-    dynamodb.put(
-        pk=f"ITEM#{id}#{shard}",
-        data=item_data
+def increment_like_count(post_id):                 # write-hot key: shard it
+    shard = random.randrange(SHARDS)
+    table.update_item(
+        Key={"PK": f"LIKES#{post_id}#{shard}", "SK": "COUNT"},
+        UpdateExpression="ADD likeCount :one",
+        ExpressionAttributeValues={":one": 1},
     )
-    
-    # Read: read ALL shards and merge
-    for shard in range(10):
-        items.append(dynamodb.get(pk=f"ITEM#{id}#{shard}"))
-    
-    return merge(items)
 
-# Strategy 2: DAX cache (30-second TTL absorbs read spikes)
-# DynamoDB Accelerator: in-memory cache, microsecond latency
-# 1M reads/s: DAX handles 99% cache hit rate → 10K reads hit DynamoDB
-
-# Strategy 3: Adaptive capacity (DynamoDB built-in)
-# DynamoDB can temporarily burst unused capacity
-# If 34 partitions: each has 2941 RCU
-# If 33 partitions idle, 1 hot partition can use their unused capacity
-
-# Strategy 4: Exponential backoff + client-side caching
-# When throttled, cache the result locally for 1-2 seconds
-# Reduces read pressure on hot partition
+def get_like_count(post_id):                       # read: gather all shards (BatchGetItem)
+    keys = [{"PK": f"LIKES#{post_id}#{s}", "SK": "COUNT"} for s in range(SHARDS)]
+    resp = dynamodb.batch_get_item(RequestItems={"social": {"Keys": keys}})
+    return sum(i.get("likeCount", 0) for i in resp["Responses"]["social"])
 ```
+
+- **Read-hot** (celebrity profile, viral post): cache. DAX gives microsecond reads for eventually consistent `GetItem`/`Query`; ElastiCache gives you control over TTLs and invalidation. Request coalescing in the app avoids stampedes.
+- **Write-hot** (counters, a global leaderboard row): write sharding as above, or aggregate in a stream processor and write once per second.
+- Use **CloudWatch Contributor Insights** for DynamoDB to see the most-accessed and most-throttled keys.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Partition math** | Calculates partition count from throughput requirements |
-| **Hot key handling** | Uses sharding, DAX, adaptive capacity, or hybrid fan-out |
+| **Partition math** | Knows per-partition and per-key limits, and what adaptive capacity can and can't do |
+| **Hot key handling** | Uses caching for read heat, write sharding for write heat, hybrid fan-out |
 | **Single-table design** | Models access patterns with composite keys and GSIs |
-| **Fan-out trade-off** | Explains push vs pull for different scale users |
+| **Fan-out trade-off** | Explains push vs pull for different scale users, with the write math |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -835,169 +464,88 @@ def get_item(id):
 
 ### Answer
 
-**DynamoDB TTL:**
+!!! tip "30-second answer"
+    **TTL** is a background sweeper: set a Number attribute to an epoch-seconds expiry, and DynamoDB deletes expired items for free, *typically within a few days*, so filter expired items out of reads yourself. **Streams** give an ordered (per item) 24-hour change log; Lambda consumes it to keep OpenSearch in sync, or use the managed **zero-ETL integration** to OpenSearch Service. **Global tables** replicate across Regions: the default **MREC** mode is asynchronous (usually under a second) with last-writer-wins per item; **MRSC** mode (GA June 2025) gives multi-Region strong consistency and RPO 0 across exactly three Regions, at higher write latency and without transactions or TTL.
 
-```yaml
-# TTL automatically deletes items after a specified timestamp
+**TTL behaviour:**
 
-# 1. Add a TTL attribute to your item
-# 2. Enable TTL on the table pointing to that attribute
-# 3. DynamoDB deletes items when TTL expires
-
-{
-  "pk": "SESSION#abc123",
-  "sk": "TOKEN",
-  "data": "encrypted_token_data",
-  "ttl": 1705334400,       // Unix epoch timestamp (e.g., Jan 15, 2024)
-  "expires_at": "2024-01-15T12:00:00Z"  // Human-readable (not used for TTL)
-}
-
-# TTL behavior:
-# - DynamoDB checks items periodically (within 48 hours of expiry)
-# - Delete happens within 48 hours of TTL expiry (no guarantee on exact time)
-# - Deleted items appear in Streams (with userIdentity = "TTL_EXPIRY")
-# - TTL deletes consume no write capacity (FREE!)
-# - Table billing: no cost for TTL deletions
-
-# Use cases:
-# - Session management (delete expired sessions)
-# - Event sourcing (delete old events after retention period)
-# - Leaderboard (delete old scores)
-# - Temporary data (OTP codes, reset tokens)
-
-# Monitoring TTL:
-CloudWatch:
-  Metric: TimeToLiveDeletedItemCount
-  Alarm: if > 10,000/day → notify (normal cleanup volume)
+```json
+{ "PK": "SESSION#abc123", "SK": "TOKEN", "expiresAt": 1791331200 }
 ```
 
-**DynamoDB Streams:**
+- The attribute must be a Number in epoch **seconds**; anything else is ignored.
+- Expired-but-not-yet-deleted items are still returned by `GetItem`/`Query`/`Scan`: add `FilterExpression: expiresAt > :now` (or check in code).
+- TTL deletes consume no write capacity in the Region where they happen; in global tables, the replicated deletes are charged in the other Regions.
+- They appear in Streams as service deletions: `userIdentity = {"type": "Service", "principalId": "dynamodb.amazonaws.com"}`, which lets consumers tell expiry from a user delete (e.g. archive expired items to S3).
+- Metric: `TimeToLiveDeletedItemCount`.
 
-```yaml
-# DynamoDB Streams capture item-level changes:
-# - INSERT: new item created
-# - MODIFY: item updated
-# - REMOVE: item deleted (including TTL expiry)
+**Streams → search index:**
 
-# Stream record:
-{
-  "eventID": "1",
-  "eventName": "INSERT",          // INSERT, MODIFY, REMOVE
-  "eventSource": "aws:dynamodb",
-  "awsRegion": "us-east-1",
-  "dynamodb": {
-    "SequenceNumber": "123456",
-    "SizeBytes": 1024,
-    "StreamViewType": "NEW_AND_OLD_IMAGES",  // NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES, KEYS_ONLY
-    "Keys": {"pk": {"S": "USER#alice"}, "sk": {"S": "PROFILE"}},
-    "NewImage": {  // Present for INSERT and MODIFY
-      "pk": {"S": "USER#alice"},
-      "sk": {"S": "PROFILE"},
-      "name": {"S": "Alice"},
-      "ttl": {"N": "1705334400"}
-    },
-    "OldImage": {  // Present for MODIFY and REMOVE
-      "pk": {"S": "USER#alice"},
-      "sk": {"S": "PROFILE"},
-      "name": {"S": "Alice"},
-      "version": {"N": "1"}
-    }
-  },
-  "userIdentity": {
-    "principalId": "dynamodb.amazonaws.com",
-    "type": "Service",
-    // For TTL deletions: userIdentity = "TTL_EXPIRY"
-  }
-}
+```python
+from boto3.dynamodb.types import TypeDeserializer
 
-# Stream → Lambda → Elasticsearch:
-dynamodb_stream → lambda → elasticsearch.index(document)
+deser = TypeDeserializer()
 
-# Processor:
-def lambda_handler(event, context):
-    for record in event['Records']:
-        if record['eventName'] == 'INSERT' or record['eventName'] == 'MODIFY':
-            # Index to Elasticsearch
-            item = record['dynamodb']['NewImage']
-            es.index(
-                index='users',
-                id=item['pk']['S'],
-                body=item
-            )
-        elif record['eventName'] == 'REMOVE':
-            # Remove from search index
-            item = record['dynamodb']['Keys']
-            es.delete(
-                index='users',
-                id=item['pk']['S']
-            )
+def to_python(image):
+    return {k: deser.deserialize(v) for k, v in image.items()}
+
+def handler(event, context):
+    failures = []
+    for record in event["Records"]:
+        try:
+            keys = to_python(record["dynamodb"]["Keys"])
+            doc_id = f'{keys["PK"]}|{keys["SK"]}'
+            if record["eventName"] in ("INSERT", "MODIFY"):
+                doc = to_python(record["dynamodb"]["NewImage"])
+                opensearch.index(index="users", id=doc_id, body=doc)   # idempotent upsert
+            else:  # REMOVE (including TTL expiry)
+                opensearch.delete(index="users", id=doc_id, ignore=[404])
+        except Exception:
+            failures.append({"itemIdentifier": record["dynamodb"]["SequenceNumber"]})
+            break   # stop here to keep per-item ordering; retry from this record
+    return {"batchItemFailures": failures}
 ```
 
-**Global Tables:**
+- Stream images are DynamoDB JSON (`{"S": "..."}`); deserialize before indexing.
+- Records for the same item are ordered within a shard; Lambda processes shards in order, so a poison record blocks its shard. Use `ReportBatchItemFailures`, `BisectBatchOnFunctionError`, a max retry count and an on-failure destination.
+- Use the item's key as the document ID so retries are idempotent.
+- Alternatives: **Kinesis Data Streams for DynamoDB** (longer retention, more consumers, but no per-item ordering guarantee and possible duplicates), and the managed **DynamoDB zero-ETL integration with OpenSearch Service**.
 
-```yaml
-# DynamoDB Global Tables:
-# - Multi-region, multi-writer replication
-# - Active-active: writes in any region → replicated to all regions
-# - Conflict resolution: last writer wins (based on timestamp)
-# - Replication latency: <1 second (typically)
-# - No application changes needed (uses DynamoDB Streams internally)
+**Global tables:**
 
-Global table setup:
-  Table: users (us-east-1)  →  replica table (eu-west-1)
-                             →  replica table (ap-southeast-1)
+| | MREC (default) | MRSC |
+|---|---|---|
+| Replication | Async, typically ≤1 s | Synchronous to at least one other Region before ack |
+| Regions | Any number | Exactly 3 (three replicas, or two replicas + a witness) |
+| Conflicts | Last writer wins per item; conditions are evaluated against the local Region's copy | Concurrent writes to the same item fail with `ReplicatedWriteConflictException` (retryable) |
+| Strongly consistent reads | Only reflect writes made in that Region | Always latest, any Region |
+| RPO | Replication lag | Zero |
+| Not supported | — | Transactions, TTL, LSIs |
 
-# Replication flow:
-# 1. Client writes to us-east-1 table
-# 2. DynamoDB captures change via Streams
-# 3. DynamoDB Streams → cross-region replication → eu-west-1
-# 4. eu-west-1 replica receives the update
-# 5. Client in eu-west-1 can now read the update
+Availability SLA is 99.999% for global tables (99.99% single-Region). Writes bypass DAX in other Regions, so DAX caches there go stale until their TTL.
 
-# Conflict resolution (last writer wins):
-# Two clients update the same item simultaneously in different regions:
-#   us-east-1: update balance = 100 @ t1
-#   eu-west-1: update balance = 200 @ t2
-#   Last writer wins (t2 > t1) → balance = 200
-# This can cause DATA LOSS if both updates modify different fields!
-# Solution: Use conditional updates with version numbers
+**Conflict handling in MREC:** a version check like the one below protects you within a Region, but two Regions can each pass their local check and the later write silently wins.
 
-# Conditional writes with version:
-def update_balance(user_id, delta, expected_version):
-    response = table.update_item(
-        Key={'pk': f"USER#{user_id}"},
-        UpdateExpression="SET balance = balance + :delta, version = version + :inc",
-        ConditionExpression="version = :expected_version",
-        ExpressionAttributeValues={
-            ':delta': delta,
-            ':inc': 1,
-            ':expected_version': expected_version
-        }
-    )
-    return response['Attributes']['version']  # New version
-
-# Global Tables vs application-level replication:
-# Global Tables:
-#   - Managed replication (no code)
-#   - <1 second latency
-#   - Last-writer-wins conflict resolution
-#   - Cost: Streams + cross-region data transfer
-#
-# Application-level:
-#   - Custom conflict resolution
-#   - Higher latency (application logic)
-#   - More code complexity
-#   - Can do CRDT-style merging
+```python
+table.update_item(
+    Key={"PK": f"USER#{user_id}", "SK": "BALANCE"},
+    UpdateExpression="SET balance = balance + :d, version = version + :one",
+    ConditionExpression="version = :v",
+    ExpressionAttributeValues={":d": delta, ":one": 1, ":v": expected_version},
+    ReturnValues="UPDATED_NEW",
+)
 ```
+
+Practical patterns: give each item a **home Region** and route its writes there (e.g. by user's geography), design writes to be commutative or idempotent, or use MRSC for the items that must never diverge (balances, inventory). Application-level replication only makes sense when you need custom merge logic (CRDTs) or a different target store.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **TTL mechanics** | Knows TTL is free, deletions appear in streams, expiry within 48 hours |
-| **Stream processing** | Uses Streams → Lambda for real-time indexing, audit, notifications |
-| **Global Tables** | Understands multi-writer replication, last-writer-wins conflicts |
-| **Conflict handling** | Uses conditional writes with version numbers for safe concurrent updates |
+| **TTL mechanics** | Knows TTL is free, delayed (days), and expired items must be filtered on read |
+| **Stream processing** | Uses Streams → Lambda idempotently with ordered failure handling |
+| **Global Tables** | Understands MREC last-writer-wins vs MRSC strong consistency trade-offs |
+| **Conflict handling** | Knows conditional writes are Region-local under MREC; uses home-Region routing or MRSC |
 
 ---
 
@@ -1009,140 +557,66 @@ def update_balance(user_id, delta, expected_version):
 
 ### Answer
 
-**Redis Cluster Architecture:**
+!!! tip "30-second answer"
+    Redis Cluster maps every key to one of **16,384 hash slots** (`CRC16(key) mod 16384`) and each shard owns a range of slots, so a **single sorted set lives on one shard**. Adding shards doesn't speed up one global leaderboard key: you either keep it on one shard (a sorted-set `ZADD` is O(log N), and one shard can often take 100K/s, but check your node size) or split it (per-region/per-bucket boards merged for the top-K). On AWS the engine choice is now **Valkey** (the open-source Redis fork; cheaper on ElastiCache) or Redis OSS. **ElastiCache** is a cache: replicas are asynchronous and failover can lose the last writes. **MemoryDB** writes to a Multi-AZ transaction log before acknowledging, so it can be the system of record, at higher write latency (single-digit ms) and cost.
 
-```yaml
-# Redis Cluster: 16384 hash slots distributed across shards
-# Key → CRC16(key) % 16384 → hash slot → shard
+**Cluster sharding:**
 
-# Example: 6-node cluster, 3 shards (1 primary + 1 replica each)
+```
+3 shards × (1 primary + 1 replica), cluster mode enabled
+  shard 1: slots 0–5460        shard 2: 5461–10922        shard 3: 10923–16383
 
-Shard 1 (slots 0-5460):
-  Primary: redis-001.xxxxx.0001.use1.cache.amazonaws.com:6379
-  Replica: redis-001.xxxxx.0002.use1.cache.amazonaws.com:6379
-
-Shard 2 (slots 5461-10922):
-  Primary: redis-002.xxxxx.0001.use1.cache.amazonaws.com:6379
-  Replica: redis-002.xxxxx.0002.use1.cache.amazonaws.com:6379
-
-Shard 3 (slots 10923-16383):
-  Primary: redis-003.xxxxx.0001.use1.cache.amazonaws.com:6379
-  Replica: redis-003.xxxxx.0002.use1.cache.amazonaws.com:6379
-
-# For 100K score updates/second:
-# Each Redis primary: ~50K-100K ops/s (single-threaded!)
-# Need: 2-3 primaries (each handles ~35K ops/s)
-# With 3 shards: 3 × 50K = 150K ops/s (headroom)
-
-# Routing: client-side (Redis Cluster client library)
-# Client computes hash slot → connects to correct shard
-# MOVED redirect: if slot moved (resharding), client follows redirect
+key "leaderboard:global"          → one slot → one shard (all ZADDs land there)
+keys "{lb:2026-10-07}:eu", ":us"  → hash tag {…} forces the same slot, so multi-key ops work
 ```
 
-**Leaderboard Design (Sorted Sets):**
+- Clients cache the slot map and follow `MOVED`/`ASK` redirects during resharding.
+- Multi-key commands (`ZUNIONSTORE`, `MGET`, transactions) only work when all keys share a slot; use **hash tags** to co-locate related keys deliberately (and accept they share one shard's limits).
+
+**Leaderboard commands:**
 
 ```redis
-# Real-time leaderboard using Redis Sorted Sets:
+ZADD   lb:global 1500 user:alice                 # set score (or ZINCRBY to add)
+ZRANGE lb:global 0 9 REV WITHSCORES              # top 10 (ZREVRANGE is deprecated since 6.2)
+ZREVRANK lb:global user:alice                    # 0-based rank
+ZRANGE lb:global +inf -inf BYSCORE REV LIMIT 0 10  # by score range
 
-# Add/update score:
-ZADD leaderboard:global 1500 "user:alice"
-ZADD leaderboard:global 2000 "user:bob"  
-ZADD leaderboard:global 1800 "user:charlie"
-
-# Get top 10:
-ZREVRANGE leaderboard:global 0 9 WITHSCORES
-# Returns: bob(2000), charlie(1800), alice(1500)
-
-# Get user rank:
-ZREVRANK leaderboard:global "user:alice"
-# Returns: 2 (0-indexed, so 3rd place)
-
-# Get scores near user:
-ZREVRANGEBYSCORE leaderboard:global 2000 1500 WITHSCORES LIMIT 0 10
-
-# Daily leaderboard:
-ZADD leaderboard:2024-01-15 1500 "user:alice"
-
-# Weekly aggregation:
-ZUNIONSTORE leaderboard:week-3 7
-  leaderboard:2024-01-15 leaderboard:2024-01-16 ... leaderboard:2024-01-21
-  WEIGHTS 1 1 1 1 1 1 1
-  AGGREGATE SUM
-
-# For 10M users, 100K updates/s:
-# Memory: 10M × (user_id(20B) + score(8B) + overhead(40B)) ≈ 680MB
-# Update rate: 100K/s → 100K ZADD/s
-# With 3 shards: 33K ZADD/s per shard → within Redis capacity
+# weekly board from daily boards (same hash tag so they share a slot)
+ZUNIONSTORE {lb}:week41 7 {lb}:d1 {lb}:d2 {lb}:d3 {lb}:d4 {lb}:d5 {lb}:d6 {lb}:d7 AGGREGATE SUM
 ```
 
-**Persistence Options:**
+Sizing: a sorted set with 10M members uses roughly 1 GB or more (skiplist + hash overhead per member), so memory isn't the problem; the single-shard write rate and `ZUNIONSTORE` cost over millions of members are. Options at 100K updates/s: batch updates through a pipeline, coalesce frequent updates per user in the app, shard the board by user hash and compute the global top-K by merging each shard's top-K.
 
-```yaml
-RDB (Redis Database file):
-  - Snapshot: point-in-time dump of all data
-  - Schedule: every 5/15/60 minutes (configurable)
-  - File: dump.rdb (compressed binary)
-  - Recovery: load file on startup
-  - Data loss: up to 5 minutes of writes (if crash between snapshots)
-  - Performance impact: low (fork + background save)
-  - Use: cache (recoverable from source)
+**Persistence (self-managed Redis/Valkey) vs what ElastiCache gives you:**
 
-AOF (Append Only File):
-  - Log: every write operation appended
-  - fsync: every second (default), every write, or never
-  - File: appendonly.aof (text protocol)
-  - Recovery: replay log on startup
-  - Data loss: up to 1 second (with fsync=everysec)
-  - Performance impact: moderate (10-20% overhead)
-  - Rewrite: background rewrite (BGREWRITEAOF) to compact
+| | RDB snapshots | AOF | ElastiCache | MemoryDB |
+|---|---|---|---|---|
+| Mechanism | Periodic fork + dump | Append every write; fsync every second typical | In-memory replicas (async) + daily/manual snapshots to S3 | Multi-AZ durable transaction log, then memory |
+| Data loss on failure | Since last snapshot | ~1 s with `everysec` | Writes not yet replicated at failover | None for acknowledged writes |
+| Write latency | Sub-ms | Sub-ms (fsync in background) | Sub-ms | Single-digit ms |
 
-AOF + RDB combined (Redis 7+):
-  - RDB for fast startup + AOF for durability
-  - Best of both: fast recovery + minimal data loss
-
-# ElastiCache for Redis:
-# - Default: no persistence (cache only)
-# - Option: Multi-AZ with automatic failover
-# - Backup: snapshot to S3 (manual or scheduled)
-# - Data loss: up to 5 minutes if Multi-AZ not enabled
-# - RTO: 60-120 seconds (failover + recovery)
-
-# MemoryDB for Redis:
-# - Durable: data stored in Multi-AZ transaction log
-# - RPO: near-zero (data written to durable storage before ack)
-# - Recovery: automatic from transaction log
-# - 99.99% availability (vs 99.9% for ElastiCache)
-# - 3× cost multiplier vs ElastiCache
-# - Use: primary database, not just cache
-```
+ElastiCache doesn't offer AOF on current engine versions; durability there comes from replicas across AZs (Multi-AZ with automatic failover) plus snapshots. Both ElastiCache (Multi-AZ) and MemoryDB carry a 99.99% availability SLA.
 
 **ElastiCache vs MemoryDB:**
 
-```yaml
-Feature                | ElastiCache (Redis) | MemoryDB
------------------------|---------------------|-----------------
-Data durability        | Snapshot to S3      | Multi-AZ transaction log
-RPO (data loss)        | Up to 5 min        | Near-zero
-RTO (recovery)         | 60-120 sec         | <30 seconds
-Write throughput       | Same (Redis engine) | Same (Redis engine)
-Read replicas          | Up to 5 per shard   | Up to 5 per shard
-Multi-AZ               | Yes                 | Yes (built-in)
-Use case               | Cache, session store| Primary database
-Cost (node)            | 1x                  | 3x
+| | ElastiCache (Valkey / Redis OSS / Memcached) | MemoryDB (Valkey / Redis OSS) |
+|---|---|---|
+| Role | Cache, sessions, rate limiting, pub/sub | Primary database needing Redis data structures |
+| Durability | Lose recent writes on failover | Durable on ack |
+| Options | Node-based clusters or **ElastiCache Serverless** (pay per GB and ECPU) | Node-based; multi-Region active-active (2024) |
+| Read replicas | Up to 5 per shard | Up to 5 per shard |
+| Cost | Lower (Valkey ~20% below Redis OSS on nodes) | Higher per node plus per-GB data written |
 
-# When to use which:
-# ElastiCache: caching, session storage, rate limiting
-# MemoryDB: leaderboard (source of truth), real-time analytics, durable counters
-```
+**What they probe next:** cache-aside vs write-through and how you invalidate, thundering herds on a hot key expiry (jittered TTLs, request coalescing), big keys and hot keys (`--bigkeys`, `--hotkeys`), and Redis/Valkey licensing (Redis moved to source-available licences in 2024 and added AGPL in Redis 8; AWS standardised on Valkey).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Cluster sharding** | Explains 16384 hash slots, client-side routing, MOVED redirects |
-| **Sorted sets** | Uses ZADD/ZREVRANGE for real-time leaderboard |
-| **Persistence trade-offs** | Compares RDB (fast, up to 5min loss) vs AOF (durable, slower) |
-| **MemoryDB** | Knows when to choose durable Redis (MemoryDB) over cache-only (ElastiCache) |
+| **Cluster sharding** | Explains hash slots, hash tags, and that one key lives on one shard |
+| **Sorted sets** | Uses ZADD/ZRANGE REV for real-time leaderboard and plans for a hot key |
+| **Persistence trade-offs** | Compares RDB vs AOF and knows ElastiCache relies on replicas + snapshots |
+| **MemoryDB** | Knows when to choose durable MemoryDB over cache-only ElastiCache |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -1165,150 +639,93 @@ Cost (node)            | 1x                  | 3x
 
 ### Answer
 
-**The Connection Problem:**
+!!! tip "30-second answer"
+    First stop creating a connection per invocation: open it in init code so each execution environment reuses one. Then put **RDS Proxy** between Lambda and the database: clients open cheap connections to the proxy, and the proxy multiplexes them onto a small pool of database connections, reusing a DB connection between **transactions**. That works until a session **pins** (session-level state such as `SET`, temp tables, advisory locks or, for MySQL, certain statements), which ties a client to one DB connection. Authenticate apps to the proxy with **IAM tokens**; since September 2025 the proxy can also use IAM end-to-end to the database, removing the Secrets Manager secret.
 
-```yaml
-# Without RDS Proxy:
-# 1000 Lambda functions × 1 connection each = 1000 connections to DB
-# Each PostgreSQL connection: ~2MB memory
-# Total: 2GB for connections alone!
+**Why connections run out:**
 
-# Lambda cold start: Creates new connection (~500ms overhead)
-# Lambda hot: may reuse cached connection (if global scope)
-# But: Lambda execution environment may be recycled anytime
-# Result: many short-lived connections, high connection churn
+- Concurrency, not TPS, drives connections: 100 TPS × 0.5 s = 50 concurrent requests, but Lambda bursts and environment churn can create hundreds of short-lived connections, each a PostgreSQL backend process with several MB of memory.
+- PostgreSQL's default `max_connections` on RDS is `LEAST(DBInstanceClassMemory / 9531392, 5000)`, about 1,700 on a 16 GiB instance; MySQL's is memory-based too. Raising it trades memory for connections and often makes things worse.
 
-# RDS max_connections default:
-#   db.r6g.large: 648 connections (2 vCPU × 324)
-#   db.r6g.xlarge: 1296 connections (4 vCPU × 324)
-#   db.r6g.2xlarge: 2586 connections (8 vCPU × 324)
+**RDS Proxy:**
 
-# At 100 TPS with 500ms query time: 50 active connections
-# But connection storms can create 1000+ connections
-# → "FATAL: too many connections for role"
+```
+Lambda environments (hundreds) ──TLS──► RDS Proxy (multi-AZ, scales itself)
+                                          │  borrows a DB connection per transaction
+                                          ▼
+                                   DB pool (e.g. 20–50 connections) ──► RDS / Aurora writer
+                                                                      (read-only endpoint → readers)
 ```
 
-**RDS Proxy Architecture:**
+- During Aurora or RDS Multi-AZ failover the proxy keeps client connections open and routes to the new writer, cutting failover time (AWS cites up to ~66% faster) and avoiding DNS caching issues.
+- Pricing: per vCPU-hour of the underlying instance (or per ACU-hour for Aurora Serverless v2), with a minimum.
 
-```yaml
-# RDS Proxy sits between application and database:
-# Application → RDS Proxy (1000 connections) → Database (10 connections)
-# Multiplexing: 1000 app connections → 10 DB connections → 100× reduction!
-
-┌────────────────┐    ┌────────────────┐    ┌────────────────┐
-│ Lambda: 1 conn  │───▶│                 │───▶│                │
-│ Lambda: 1 conn  │───▶│  RDS Proxy      │───▶│  RDS Database  │
-│ Lambda: 1 conn  │───▶│                 │───▶│  (10 actual    │
-│ ...             │───▶│  Connection     │───▶│   connections) │
-│ Lambda: 1000    │───▶│  Pool (10-100)  │───▶│                │
-└────────────────┘    └────────────────┘    └────────────────┘
-
-# RDS Proxy features:
-# - Connection pool: configurable min/max connections
-# - Connection reuse: return connection to pool after transaction
-# - IAM auth: authenticate with IAM role (no password in config!)
-# - Failover: maintains proxy connections during Multi-AZ failover
-# - TLS: encrypted connections between proxy and DB
-```
-
-**IAM Authentication with RDS Proxy:**
+**Configuration (validated against the RDS API):**
 
 ```python
-# IAM authentication (no password in code!):
+rds.create_db_proxy(
+    DBProxyName="my-app-proxy",
+    EngineFamily="POSTGRESQL",
+    RoleArn="arn:aws:iam::123456789012:role/rds-proxy-role",
+    DefaultAuthScheme="IAM_AUTH",          # end-to-end IAM, no Secrets Manager secret
+    RequireTLS=True,
+    IdleClientTimeout=1800,
+    VpcSubnetIds=["subnet-a", "subnet-b", "subnet-c"],
+    VpcSecurityGroupIds=["sg-proxy"],
+)
+rds.modify_db_proxy_target_group(
+    DBProxyName="my-app-proxy",
+    TargetGroupName="default",
+    ConnectionPoolConfig={
+        "MaxConnectionsPercent": 80,        # leave headroom for admin/migration connections
+        "MaxIdleConnectionsPercent": 20,
+        "ConnectionBorrowTimeout": 30,      # seconds a client waits for a pooled connection
+        "SessionPinningFilters": ["EXCLUDE_VARIABLE_SETS"],   # MySQL only
+        "InitQuery": "SET application_name = 'my_app'",
+    },
+)
+```
 
+**IAM authentication:**
+
+```python
 import boto3
-import psycopg2
+import psycopg   # psycopg 3
 
-def get_db_connection():
-    # Generate IAM auth token (valid for 15 minutes)
-    rds_client = boto3.client('rds')
-    
-    token = rds_client.generate_db_auth_token(
-        DBHostname='my-proxy.proxy-xyz.us-east-1.rds.amazonaws.com',
-        Port=5432,
-        DBUsername='iam_user',
-        Region='us-east-1'
-    )
-    
-    # Connect using IAM token
-    conn = psycopg2.connect(
-        host='my-proxy.proxy-xyz.us-east-1.rds.amazonaws.com',
-        port=5432,
-        database='mydb',
-        user='iam_user',
-        password=token,               # IAM token as password!
-        sslmode='require'
-    )
-    
-    return conn
+PROXY = "my-app-proxy.proxy-abc123.us-east-1.rds.amazonaws.com"
+rds = boto3.client("rds")
 
-# IAM policy for Lambda execution role:
+def connect():
+    token = rds.generate_db_auth_token(DBHostname=PROXY, Port=5432,
+                                       DBUsername="app_user", Region="us-east-1")
+    return psycopg.connect(host=PROXY, port=5432, dbname="mydb", user="app_user",
+                           password=token, sslmode="verify-full", sslrootcert="global-bundle.pem")
+
+conn = connect()     # module scope: reused by warm invocations
+```
+
+```json
 {
-    "Effect": "Allow",
-    "Action": "rds-db:connect",
-    "Resource": "arn:aws:rds-db:us-east-1:123456789:dbuser:*/iam_user"
+  "Effect": "Allow",
+  "Action": "rds-db:connect",
+  "Resource": "arn:aws:rds-db:us-east-1:123456789012:dbuser:prx-0123456789abcdef0/app_user"
 }
-
-# Benefits:
-# - No database passwords in Lambda environment variables
-# - Credentials rotate automatically (IAM token expires after 15 min)
-# - Fine-grained access: each Lambda function has its own IAM role
-# - Audit trail: CloudTrail logs who connected and when
 ```
 
-**RDS Proxy Configuration:**
+- The token is a SigV4-signed string valid for 15 minutes, used only to *open* a connection; existing connections aren't cut when it expires.
+- The resource ARN uses the **proxy's resource ID** (`prx-…`) when connecting through a proxy.
+- Benefits: no passwords in config, per-function IAM roles, CloudTrail audit of who can connect. Without a proxy, direct IAM auth to the DB has a connection-rate limit (about 200 new connections/s for MySQL), another reason to pool.
 
-```yaml
-# RDS Proxy configuration for Lambda + RDS:
-
-RDSProxy:
-  DBProxyName: my-app-proxy
-  EngineFamily: POSTGRESQL
-  
-  # IAM role for proxy (to access Secrets Manager and RDS):
-  RoleARN: arn:aws:iam::123456789:role/rds-proxy-role
-  
-  Auth:
-    - AuthScheme: SECRETS
-      SecretArn: arn:aws:secretsmanager:us-east-1:123456789:secret:db-creds
-      IAMAuth: REQUIRED
-  
-  VpcSubnetIds:
-    - subnet-abc
-    - subnet-def
-    - subnet-ghi
-  
-  VpcSecurityGroupIds:
-    - sg-proxy
-  
-  IdleClientTimeout: 1800           # 30 min: close idle connections
-  RequireTLS: true                  # Enforce TLS
-  
-  ConnectionPoolConfigurationInfo:
-    MaxConnectionsPercent: 100      # % of RDS max_connections
-    MaxIdleConnectionsPercent: 50   # Keep 50% idle in pool
-    ConnectionBorrowTimeout: 5000   # 5s timeout waiting for connection
-    SessionPinningFilters:
-      - EXCLUDE_VARIABLE_SESSIONS   # Don't pin for SET commands
-    InitQuery: "SET application_name = 'my_app'"  # Run on new connections
-    
-# Connection pool sizing:
-# Max DB connections: 1000 (RDS max_connections)
-# MaxConnectionsPercent: 100 → pool can use up to 1000
-# MaxIdleConnectionsPercent: 50 → keep 500 idle
-# Actual active: whatever the workload needs (up to 1000)
-
-# Target: 10-20 active DB connections for 100 TPS
-```
+**Alternatives:** PgBouncer in transaction mode (cheaper, more control, you run it), the RDS Data API for Aurora (HTTP calls, no connections at all, good for Lambda), or DynamoDB if the access pattern fits.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Connection overhead** | Quantifies memory per connection (2MB PostgreSQL) |
-| **Multiplexing** | Explains how 1000 app connections → 10 DB connections |
-| **IAM auth** | Generates auth tokens without storing passwords |
-| **Pool sizing** | Configures connection pool based on workload and DB capacity |
+| **Connection overhead** | Explains concurrency-driven connection counts and per-backend memory |
+| **Multiplexing** | Explains transaction-level reuse and pinning |
+| **IAM auth** | Generates auth tokens without storing passwords; knows end-to-end IAM |
+| **Pool sizing** | Configures connection pool based on workload and DB capacity, leaving headroom |
 
 ---
 
@@ -1320,150 +737,69 @@ RDSProxy:
 
 ### Answer
 
-**DMS Migration Strategy:**
+!!! tip "30-second answer"
+    Convert the schema first with **DMS Schema Conversion** (the managed successor to the Schema Conversion Tool), fix the code it can't convert (PL/SQL packages, `CONNECT BY`, empty-string-is-NULL semantics), and create the target schema yourself. Then run a DMS task in **full load + CDC** mode: bulk copy with secondary indexes and FKs off, CDC from Oracle redo/archive logs starting at the load's start point, then add indexes and let CDC catch up. Validate with DMS data validation plus your own aggregate checks. Cut over by stopping writes, waiting for zero CDC lag, switching the app, and keeping a reverse replication task ready for rollback. Never split live writes across both databases.
 
-```yaml
-# Phase 1: Assessment
-# Use AWS Schema Conversion Tool (SCT) to analyze Oracle schema
-# Report: incompatible types, conversion complexity, effort estimation
+**Schema and type conversion (Oracle → PostgreSQL):**
 
-Oracle → PostgreSQL conversions:
-  Oracle Type      | PostgreSQL Type      | Notes
-  -----------------|----------------------|-----------------------
-  NUMBER(10)       | INTEGER              | Direct mapping
-  VARCHAR2(255)    | VARCHAR(255)         | Direct mapping
-  CLOB             | TEXT                 | Direct mapping
-  BLOB             | BYTEA                | Direct mapping
-  DATE             | TIMESTAMP            | Oracle DATE includes time!
-  SEQUENCE         | SERIAL/BIGSERIAL     | Auto-increment
-  SYNONYM          | VIEW                 | Manual creation
-  MATERIALIZED VIEW| MATERIALIZED VIEW    | Different refresh syntax
-  PACKAGE          | SCHEMA + FUNCTION    | Rewrite required
-  REF CURSOR       | REFCURSOR            | Syntax differences
-  
-  Common issues:
-  - Oracle: empty string = NULL, PostgreSQL: empty string ≠ NULL
-  - Oracle: NVL() → PostgreSQL: COALESCE()
-  - Oracle: DECODE() → PostgreSQL: CASE WHEN
-  - Oracle: ROWNUM → PostgreSQL: LIMIT/OFFSET
+| Oracle | PostgreSQL | Watch out |
+|---|---|---|
+| `NUMBER(10)` | `BIGINT` (or `NUMERIC(10)`) | 10 digits overflow `INTEGER` (max 2,147,483,647) |
+| `NUMBER(p,s)` / `NUMBER` | `NUMERIC(p,s)` / `NUMERIC` | Unconstrained `NUMBER` → `NUMERIC` is slow; map deliberately |
+| `VARCHAR2(n)` | `VARCHAR(n)` | Oracle `n` may be bytes, Postgres is characters |
+| `DATE` | `TIMESTAMP(0)` | Oracle `DATE` includes time |
+| `CLOB` / `BLOB` | `TEXT` / `BYTEA` | LOB handling mode in DMS (limited vs full) affects speed |
+| Sequences | Sequences or `IDENTITY` | Reset sequence values after the load |
+| Synonyms | `search_path` or views | No direct equivalent |
+| Packages | Schemas + functions | Package state needs redesign |
+| `''` treated as NULL | `''` is not NULL | Silent logic changes in `WHERE col IS NULL` |
+| `NVL`, `DECODE`, `ROWNUM`, `CONNECT BY` | `COALESCE`, `CASE`, `LIMIT`/`ROW_NUMBER()`, recursive CTE | Use the `orafce` extension sparingly |
 
-# Phase 2: Full Load
-# DMS creates target tables, loads all data
+**DMS task (created with `MigrationType: full-load-and-cdc`), task settings excerpt:**
 
-DMS Task:
-  MigrationType: full-load
-  TargetTablePrepMode: TRUNCATE_BEFORE_LOAD
-  
-  Mapping Rules:
-    - Include all tables from schema 'APP'
-    - Exclude: APP.TEMP_% (temporary tables)
-    - Rename: APP.USERS → APP.ACCOUNTS (if needed)
-  
-  Transformation Rules:
-    - Column: REMOVE (ORDERS.TEMP_COLUMN)
-    - Column: RENAME (USERS.USERNAME → USERS.NAME)
-
-  ParallelLoad:
-    MaxFullLoadSubTasks: 8  # Parallel table loads
-    Target:
-      - Table: ORDERS (range: 1-10M) → Task 1
-      - Table: ORDERS (range: 10M-20M) → Task 2
-  
-  Validation:
-    Enabled: true
-    ValidationOnly: false
-
-# Phase 3: Change Data Capture (CDC)
-# After full load, DMS captures ongoing changes
-
-  MigrationType: full-load-and-cdc
-  CdcStartPosition: '2024-01-15T00:00:00Z'  # From full load snapshot
-  
-  # DMS reads Oracle redo logs to capture changes
-  # Applies changes to PostgreSQL in near-real-time
-  # Source must enable: ARCHIVELOG mode, supplemental logging
-  # Latency: typically <1 second
-  
-  TaskSettings:
-    CdcMinBatchSize: 1000      # Min events in batch
-    CdcMaxBatchSize: 100000    # Max events in batch
-    CdcApplyBatches: true      # Apply in batch (faster)
-    CdcApplyStagingFileLimit: 10000  # Staging file size (MB)
+```json
+{
+  "TargetMetadata": {
+    "TargetSchema": "app",
+    "SupportLobs": true, "LimitedSizeLobMode": true, "LobMaxSize": 64,
+    "BatchApplyEnabled": true
+  },
+  "FullLoadSettings": { "TargetTablePrepMode": "DO_NOTHING", "MaxFullLoadSubTasks": 16, "CommitRate": 50000 },
+  "ChangeProcessingTuning": { "BatchApplyTimeoutMin": 1, "BatchApplyTimeoutMax": 30 },
+  "ValidationSettings": { "EnableValidation": true, "ThreadCount": 8 }
+}
 ```
 
-**Zero-Downtime Cutover:**
+- Table mappings: selection rules (include `APP.%`, exclude `APP.TMP_%`), transformation rules (rename, lowercase), and **table-settings** with `parallel-load` (by partition or by key ranges) to split big tables across subtasks.
+- Source prerequisites: ARCHIVELOG mode, supplemental logging (database and table level), retention of archive logs long enough for the full load plus catch-up. Binary Reader is usually faster than LogMiner for high change volumes.
+- DMS Serverless can replace sizing a replication instance yourself; otherwise size the instance for memory (CDC transactions are cached until commit) and test on a copy.
 
-```yaml
-# Cutover steps for minimal downtime:
+**Timeline:** 5 TB at a sustained 500 Mbit/s takes ~22 hours for the full load; plan the network (Direct Connect) and load from a standby or snapshot-restored copy to keep load off production.
 
-# 1. Setup phase (days before):
-DMS → Full load of existing data (5TB at 500Mbps → ~22 hours)
-DMS → CDC catches up to real-time (lag < 1 second)
+**Validation:**
 
-# 2. Validation phase:
-# Compare row counts between source and target:
-SELECT COUNT(*) FROM source.ORDERS;  -- 10,000,000
-SELECT COUNT(*) FROM target.ORDERS;  -- 10,000,000
+- **DMS data validation** compares rows between source and target after load and during CDC, and reports mismatches per table (`awsdms_validation_failures_v1`).
+- Your own checks per table or per partition: row counts, `SUM`/`MIN`/`MAX` of numeric and date columns, and counts of NULL vs empty strings, compared between engines. Hashes of concatenated rows rarely match across engines because of type formatting, so compare aggregates.
+- Application-level checks: replay a read-only sample of production queries against both and diff results.
 
-# Compare checksums:
-SELECT MD5(ARRAY_AGG(id || amount || created_at ORDER BY id))
-FROM source.ORDERS;
+**Cutover and rollback:**
 
-SELECT MD5(ARRAY_AGG(id || amount || created_at ORDER BY id))
-FROM target.ORDERS;
+1. CDC lag near zero for days; validation clean; performance tested on the target.
+2. Freeze writes (maintenance mode), wait for `CDCLatencySource`/`CDCLatencyTarget` to reach zero, run final validation.
+3. Reset sequences on the target, switch the app's connection config (or the RDS Proxy target / DNS name).
+4. Start a **reverse** DMS task (Aurora → Oracle) before reopening writes, so rollback doesn't lose new data.
+5. Keep Oracle read-only until you're confident, then decommission.
 
-# DMS validation: compares each table row by row
-# Reports: validation summary table with pass/fail per table
-
-# 3. Cutover (5-10 minute window):
-# a. Stop writes to source DB
-# b. Wait for DMS CDC to apply remaining changes (lag = 0)
-# c. Validate final row count and checksums
-# d. Switch application connection string to target
-# e. Resume writes on target
-
-# 4. Rollback plan:
-# Keep source DB running (read-only)
-# DMS reverse: target → source (if needed)
-# Application: revert connection string
-
-# Tools for cutover:
-# - Route53 weighted DNS: 5% → target, 95% → source (gradual)
-# - RDS Proxy: single connection string, swap target behind proxy
-```
-
-**DMS Performance Tuning:**
-
-```yaml
-# DMS replication instance sizing:
-# Large migrations: dms.r6g.4xlarge (16 vCPU, 128GB RAM)
-
-DMS instance:
-  - dms.r6g.large: 2 vCPU, 16GB → 10-50GB/hour
-  - dms.r6g.xlarge: 4 vCPU, 32GB → 50-150GB/hour
-  - dms.r6g.2xlarge: 8 vCPU, 64GB → 150-300GB/hour
-  - dms.r6g.4xlarge: 16 vCPU, 128GB → 300-500GB/hour
-
-# To achieve 500GB/hour for 5TB:
-# 5TB / 0.5TB/hour = 10 hours full load
-# 5TB / 10 hours = 500GB/hour → 4xlarge instance
-
-# Optimization:
-# - Target: disable triggers, indexes, foreign keys during load
-# - Target: increase maintenance_work_mem (PostgreSQL)
-# - Target: commit size = 10000 (configurable)
-# - Source: read from replica (avoid production load)
-# - Network: use Direct Connect if on-premises
-```
+Weighted DNS that sends some *writes* to each database creates two diverging sources of truth; only use gradual shifting for read-only traffic.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |----------|----------------------|
-| **Schema conversion** | Anticipates Oracle→PostgreSQL type mapping issues (NULL, sequences) |
-| **Full load + CDC** | Designs phased migration with ongoing change replication |
-| **Validation** | Compares row counts and checksums, uses DMS validation |
-| **Cutover** | Plans minimal-downtime cutover with rollback capability |
+| **Schema conversion** | Anticipates Oracle→PostgreSQL type mapping issues (NUMBER, DATE, NULL, sequences) |
+| **Full load + CDC** | Designs phased migration with ongoing change replication and source prerequisites |
+| **Validation** | Uses DMS validation plus aggregate comparisons that survive type differences |
+| **Cutover** | Plans minimal-downtime cutover with reverse replication for rollback |
 
 ---
 
@@ -1475,206 +811,114 @@ DMS instance:
 
 ### Answer
 
-**Glacier Storage Classes:**
+!!! tip "30-second answer"
+    **S3 Glacier Deep Archive** fits exactly: cheapest storage (~$1/TB-month), 180-day minimum, standard restores complete within 12 hours. Write objects to it directly (or after 30 days in Standard), aggregate small records into large objects first (each archived object carries ~40 KB of billing overhead), lock them with **Object Lock in compliance mode** for 7 years, and expire them by lifecycle afterwards. Restores are asynchronous: request them (individually or with **S3 Batch Operations**), get an EventBridge event when they complete, and read the temporary copy. Use the S3 storage classes; the original vault-based Amazon Glacier service stopped accepting new customers in December 2025.
 
-```yaml
-Glacier Instant Retrieval:
-  - Retrieval: milliseconds (instant)
-  - Min storage: 90 days
-  - Cost: $0.004/GB/month
-  - Retrieval cost: $0.01/GB
-  - Use: quarterly access data
+**Archive classes:**
 
-Glacier Flexible Retrieval:
-  - Retrieval: 1-5 min (expedited), 3-5 hours (standard), 5-12 hours (bulk)
-  - Min storage: 90 days
-  - Cost: $0.0036/GB/month
-  - Retrieval cost: $0.01/GB (standard), $0.03/GB (expedited)
-  - Use: semi-annual access data
+| | Glacier Instant Retrieval | Glacier Flexible Retrieval | Glacier Deep Archive |
+|---|---|---|---|
+| Storage $/GB-month | 0.004 | 0.0036 | 0.00099 |
+| Minimum duration | 90 days | 90 days | 180 days |
+| Retrieval time | Milliseconds | Expedited 1–5 min; Standard 3–5 h; Bulk 5–12 h | Standard within 12 h; Bulk within 48 h |
+| Retrieval $/GB | 0.03 | Expedited 0.03; Standard 0.01; Bulk free | Standard 0.02; Bulk 0.0025 |
+| Per-object overhead | 128 KB minimum billable | 40 KB (32 KB at Glacier rate + 8 KB at Standard rate) | 40 KB, same split |
 
-Glacier Deep Archive:
-  - Retrieval: 12 hours (standard), 48 hours (bulk)
-  - Min storage: 180 days
-  - Cost: $0.00099/GB/month
-  - Retrieval cost: $0.02/GB (standard), $0.0025/GB (bulk)
-  - Use: annual/rare access data, 7-year retention
+**7-year storage cost for 100 TB (storage only, 84 months):**
 
-Cost comparison for 100TB over 7 years:
-  Standard: 100TB × $0.023 × 84 months = $193,200
-  IA: 100TB × $0.0125 × 84 months = $105,000
-  Glacier Instant: 100TB × $0.004 × 84 months = $33,600
-  Glacier Flexible: 100TB × $0.0036 × 84 months = $30,240
-  Deep Archive: 100TB × $0.00099 × 84 months = $8,316
-
-Deep Archive saves $185K over Standard (96% reduction)!
+```
+S3 Standard          100,000 GB × $0.023   × 84 = $193,200
+Standard-IA          100,000 GB × $0.0125  × 84 = $105,000
+Glacier Instant      100,000 GB × $0.004   × 84 =  $33,600
+Glacier Flexible     100,000 GB × $0.0036  × 84 =  $30,240
+Deep Archive         100,000 GB × $0.00099 × 84 =   $8,316
 ```
 
-**Lifecycle with Archival:**
+Retrieving 1% a year (1 TB) from Deep Archive costs ~$20 at Standard or ~$2.50 at Bulk, negligible next to storage. The real cost risks are per-object fees: 100 TB as 1 KB records would be 100 billion objects, with transition and overhead charges that dwarf the storage bill. Pack records into daily or hourly files of 100 MB–1 GB.
+
+**Lifecycle and retention:**
 
 ```yaml
-# Lifecycle policy for 7-year retention:
-LifecycleRules:
-  - ID: "archive-transactions"
-    Filter:
-      Prefix: "transactions/"
-    
-    Transitions:
-      - Days: 0
-        StorageClass: STANDARD              # First 30 days: hot
-      - Days: 30
-        StorageClass: STANDARD_IA           # 1 month: warm
-      - Days: 90
-        StorageClass: GLACIER_INSTANT_RETRIEVAL  # 3 months: archive instant
-      - Days: 365
-        StorageClass: GLACIER_FLEXIBLE_RETRIEVAL  # 1 year: archive
-      - Days: 730
-        StorageClass: DEEP_ARCHIVE          # 2+ years: deep archive
-    
-    Expiration:
-      Days: 2555                            # 7 years: delete
-      ExpiredObjectDeleteMarker: true
-
-# Object Lock (compliance/WORM):
-# Required for regulatory retention
+# Bucket created with Object Lock enabled (versioning is required)
 ObjectLockConfiguration:
   ObjectLockEnabled: Enabled
   Rule:
-    DefaultRetention:
-      Mode: COMPLIANCE                     # Or GOVERNANCE (less strict)
-      Days: 2555                           # 7 years minimum
+    DefaultRetention: { Mode: COMPLIANCE, Years: 7 }
 
-# COMPLIANCE mode: object can't be deleted or overwritten by ANYONE
-# (including root user) until retention period expires
+LifecycleConfiguration:
+  Rules:
+    - ID: archive-transactions
+      Filter: { Prefix: "transactions/" }
+      Status: Enabled
+      Transitions:
+        - { Days: 30, StorageClass: DEEP_ARCHIVE }   # or upload with StorageClass=DEEP_ARCHIVE directly
+      Expiration: { Days: 2585 }                     # after the 7-year retention ends
+      NoncurrentVersionExpiration: { NoncurrentDays: 1 }
+    - ID: cleanup-delete-markers
+      Filter: { Prefix: "transactions/" }
+      Status: Enabled
+      Expiration: { ExpiredObjectDeleteMarker: true }   # can't be combined with Days in one rule
 ```
 
-**Retrieval Workflow:**
+- **Compliance mode**: nobody, including the root user, can shorten retention or delete a locked version until it expires. Test in **governance** mode first; a wrong compliance setting can only be fixed by waiting it out (or closing the account).
+- Lifecycle expiration of a locked object only adds a delete marker; the locked version stays until retention ends, then the noncurrent-version rule removes it.
+- Add cross-Region (and cross-account) replication if the regulation requires geographic separation.
+
+**Retrieval workflow:**
 
 ```python
 import boto3
 
-s3 = boto3.client('s3')
-glacier = boto3.client('glacier')
+s3 = boto3.client("s3")
 
-def initiate_retrieval(object_key, retrieval_type='Standard'):
-    """
-    Initiate retrieval from Glacier/Deep Archive.
-    
-    Args:
-        object_key: S3 key of archived object
-        retrieval_type: 'Expedited', 'Standard', or 'Bulk'
-    """
-    # Initiate restore
-    response = s3.restore_object(
-        Bucket='financial-transactions',
-        Key=object_key,
-        RestoreRequest={
-            'Days': 7,                          # Temporary copy for 7 days
-            'GlacierJobParameters': {
-                'Tier': retrieval_type          # Expedited, Standard, Bulk
-            }
-        }
+def request_restore(bucket: str, key: str, tier: str = "Standard") -> None:
+    """Start an async restore; a temporary copy is readable for `Days` once done."""
+    s3.restore_object(
+        Bucket=bucket, Key=key,
+        RestoreRequest={"Days": 7, "GlacierJobParameters": {"Tier": tier}},  # Standard | Bulk
     )
-    
-    # Check restore status (async)
-    status = s3.head_object(
-        Bucket='financial-transactions',
-        Key=object_key
-    )
-    # status['Restore'] = 'ongoing-request="true"' (if still restoring)
-    # status['Restore'] = 'ongoing-request="false", expiry-date="..."' (when ready)
-    
-    return response
 
-def check_restore_status(object_key):
-    """Check if Glacier restore is complete."""
-    response = s3.head_object(
-        Bucket='financial-transactions',
-        Key=object_key
-    )
-    
-    restore_status = response.get('Restore', '')
-    if 'ongoing-request="false"' in restore_status:
-        # Restore complete! Can read the object
-        return s3.get_object(
-            Bucket='financial-transactions',
-            Key=object_key
-        )
-    else:
-        # Still restoring
-        return None
-
-# Bulk retrieval (for compliance audits):
-# Use S3 Batch Operations to restore many objects at once
-
-def bulk_retrieve(prefix, date_range):
-    """Bulk retrieve all objects matching criteria."""
-    # Create inventory manifest
-    manifest = s3.create_inventory(...)
-    
-    # Batch restore
-    batch = s3.create_batch_job(
-        Operation={
-            'S3RestoreObject': {
-                'ExpirationInDays': 30,
-                'GlacierJobTier': 'Bulk'
-            }
-        },
-        Manifest={
-            'Spec': {
-                'Format': 'S3InventoryReportCsv',
-                'Fields': ['Key', 'VersionId']
-            },
-            'Location': {
-                'ObjectArn': manifest_arn,
-                'ETag': manifest_etag
-            }
-        },
-        Priority=10,
-        RoleArn='arn:aws:iam::123456789:role/s3-batch-restore'
-    )
-    
-    return batch['JobId']
+def is_restored(bucket: str, key: str) -> bool:
+    restore = s3.head_object(Bucket=bucket, Key=key).get("Restore", "")
+    return 'ongoing-request="false"' in restore
 ```
 
-**Cost Optimization for Archival:**
+Prefer events over polling: enable EventBridge notifications on the bucket and react to `Object Restore Completed`.
 
-```yaml
-# Optimizing archival costs:
+**Bulk restores for an audit (S3 Batch Operations):**
 
-# 1. Object size matters:
-# Glacier minimum billable size: 40KB (for Glacier Flexible)
-# If objects < 40KB: cost is based on 40KB
-# Solution: aggregate small objects into larger files (e.g., daily batch)
+```python
+s3control = boto3.client("s3control")
 
-# 2. Bulk retrieval pricing:
-# Deep Archive retrieval:
-#   Standard (12 hours): $0.02/GB
-#   Bulk (48 hours): $0.0025/GB (87% cheaper!)
-# If audit allows 48-hour window: use Bulk tier
-
-# 3. Early deletion fees:
-# Glacier Instant: min 90 days → delete at day 30 → pay 60 days
-# Deep Archive: min 180 days → delete at day 100 → pay 80 days
-# Fee = (min_days - used_days) × storage_rate × size
-
-# 4. S3 Inventory for tracking:
-# Generate daily inventory report
-# Helps identify large/unused objects for lifecycle optimization
-
-# 5. Compression before archival:
-# Text data: 10:1 compression ratio
-# 100TB → 10TB compressed → 90% storage cost reduction
-# Use gzip/bzip2 before uploading to S3
+job = s3control.create_job(
+    AccountId="123456789012",
+    ConfirmationRequired=False,
+    Operation={"S3InitiateRestoreObject": {"ExpirationInDays": 30, "GlacierJobTier": "BULK"}},
+    Manifest={
+        "Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": ["Bucket", "Key"]},
+        "Location": {"ObjectArn": "arn:aws:s3:::audit-manifests/2026-10/restore.csv",
+                     "ETag": manifest_etag},
+    },
+    Report={"Bucket": "arn:aws:s3:::audit-reports", "Format": "Report_CSV_20180820",
+            "Enabled": True, "Prefix": "restore-jobs", "ReportScope": "FailedTasksOnly"},
+    Priority=10,
+    RoleArn="arn:aws:iam::123456789012:role/s3-batch-restore",
+    ClientRequestToken="audit-2026-10-07",
+)
 ```
+
+Build the manifest from **S3 Inventory** queried with Athena (e.g. all objects for account X in 2023), or let Batch Operations generate it from a filter.
+
+**Cost levers recap:** compress (columnar formats or gzip typically shrink transaction data several-fold), aggregate small objects, choose Bulk retrieval when the deadline allows, avoid early deletion (180-day minimum), and keep an index of what's in each archive object (in DynamoDB or the S3 Metadata tables) so audits restore only what they need.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Storage class economics** | Quantifies 96% cost savings with Deep Archive vs Standard |
-| **Retrieval tiers** | Knows expedited (minutes), standard (hours), bulk (days) retrieval times |
-| **Object Lock** | Uses COMPLIANCE mode for regulatory retention enforcement |
-| **Bulk retrieval** | Uses S3 Batch Operations for mass restores during audits |
+| **Storage class economics** | Quantifies Deep Archive vs Standard and spots per-object overheads |
+| **Retrieval tiers** | Knows expedited (minutes), standard (hours), bulk (up to 48 h) retrieval times and prices |
+| **Object Lock** | Uses COMPLIANCE mode for regulatory retention enforcement and knows its irreversibility |
+| **Bulk retrieval** | Uses S3 Batch Operations and restore events for mass restores during audits |
 
 ---
 
