@@ -1,6 +1,6 @@
 # ☁️ AWS Security — Staff-Level Interview Questions
 
-> *8 questions covering IAM, KMS, Cognito, WAF, Secrets Manager, Security Hub, GuardDuty, and security architecture — every question expects principal engineer-level depth with production patterns.*
+> *8 questions covering IAM, KMS, Cognito, WAF, Secrets Manager, GuardDuty, Security Hub and multi-account security architecture. Each answer leads with the 30-second version, then the mechanism, trade-offs, failure modes and what interviewers probe next. Features and limits checked against AWS documentation, October 2026.*
 
 ---
 
@@ -25,119 +25,99 @@
 
 ### Answer
 
-**IAM Policy Evaluation Chain:**
+!!! tip "30-second answer"
+    Humans get no IAM users: they sign in through **IAM Identity Center** (federated to the corporate IdP) and receive short-lived role sessions via permission sets per account. Pipelines use **OIDC federation** (e.g. GitHub Actions → `AssumeRoleWithWebIdentity`) into deploy roles, never stored keys. Guardrails come from the organisation: **SCPs** cap what principals in an account can do, **RCPs** (Nov 2024) cap what can be done *to* resources, neither grants anything. **Permission boundaries** cap a single role, which is what lets teams create their own roles without escalating. Evaluation starts from implicit deny; any explicit deny wins; an action is allowed only if every applicable cap allows it and some policy grants it.
 
-```yaml
-# IAM policy evaluation (DENY always wins):
+**Policy evaluation (single account, simplified):**
 
-User → Groups → Roles → Permission Boundary → SCP → Resource Policy
-  │        │        │           │               │          │
-  └────────┴────────┴───────────┴───────────────┴──────────┘
-                        │
-                    Effective
-                    Permissions
-                        │
-                 ALLOW/ACCESS GRANTED
-                 (unless any DENY)
-
-# Evaluation order:
-# 1. Identity-based policies (User, Group, Role) → ALLOW by default
-# 2. Permission boundary → sets MAX allowed permissions
-# 3. SCP (Service Control Policy) → sets MAX at OU/account level
-# 4. Resource-based policies → ALLOW specific access
-# 5. Session policies (STS assume-role) → further restricts
-
-# DENY always overrides ALLOW — no matter where it's set
+```mermaid
+flowchart TD
+    A[Request] --> B{Explicit Deny in any policy?}
+    B -- yes --> X[DENY]
+    B -- no --> C{SCPs and RCPs allow?}
+    C -- no --> X
+    C -- yes --> D{Resource-based policy allows?}
+    D -- yes, names the role or user --> Y[ALLOW]
+    D -- no --> E{Identity policy allows?}
+    E -- no --> X
+    E -- yes --> F{Permission boundary allows?}
+    F -- no --> X
+    F -- yes --> G{Session policy allows, if any?}
+    G -- no --> X
+    G -- yes --> Y
 ```
 
-**Permission Boundaries:**
+- The default is **implicit deny**. SCPs, RCPs, boundaries and session policies only *limit*; identity and resource policies *grant*.
+- **Cross-account:** both sides must allow: the caller's identity policy *and* the resource policy (or role trust policy) in the other account.
+- SCPs don't affect the management account or service-linked roles. Since September 2025 SCPs support the full IAM policy language (conditions, resource ARNs, `NotResource`, `NotAction` with Allow).
 
-```yaml
-# Permission Boundary = Maximum permissions a role can have
-# Even if IAM policy allows more, boundary limits it
+**Permission boundaries for safe delegation:**
 
-# Example boundary: Developer can only use EC2 and S3
-PermissionBoundary:
-  Version: "2012-10-17"
-  Statement:
-    - Effect: Allow
-      Action:
-        - ec2:*
-        - s3:*
-      Resource: "*"
-
-# Role with this boundary:
-Role:
-  AssumeRolePolicy: (allow dev to assume)
-  PermissionsBoundary: arn:aws:iam::123456789:policy/developer-boundary
-  
-  # Even if role policy says:
-  ManagedPolicy: AdministratorAccess  # Allows ALL services
-  # The permission boundary restricts to EC2 + S3 only!
-
-# Use cases:
-# - Developers: can create roles but bounded (no IAM admin)
-# - Service teams: bounded to their service scope
-# - CI/CD pipelines: bounded to deployment permissions
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreateRolesOnlyWithBoundary",
+      "Effect": "Allow",
+      "Action": ["iam:CreateRole", "iam:PutRolePolicy", "iam:AttachRolePolicy"],
+      "Resource": "arn:aws:iam::*:role/app/*",
+      "Condition": {
+        "StringEquals": { "iam:PermissionsBoundary": "arn:aws:iam::123456789012:policy/app-boundary" }
+      }
+    },
+    {
+      "Sid": "NoBoundaryTampering",
+      "Effect": "Deny",
+      "Action": ["iam:DeleteRolePermissionsBoundary", "iam:PutRolePermissionsBoundary",
+                 "iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:SetDefaultPolicyVersion"],
+      "Resource": ["arn:aws:iam::123456789012:policy/app-boundary", "arn:aws:iam::*:role/app/*"]
+    }
+  ]
+}
 ```
 
-**Cross-Account Role Assumption:**
+A role created this way can be granted `AdministratorAccess` and still only do what `app-boundary` allows. Without the condition and the tamper-deny, "can create roles" equals "is admin" (create a role with admin, assume it).
 
-```yaml
-# Developer in Account A needs to access resources in Account B:
+**Cross-account role assumption:**
 
-Account A (Security)              Account B (Production)
-┌─────────────────────┐          ┌─────────────────────┐
-│ Developer            │          │                     │
-│  IAM User/Dev Role  │          │  ProductionRole     │
-│                     │          │  Trust Policy:       │
-│                     │          │   Principal:         │
-│  AssumeRole →       │─────────►│     AWS: Account-A   │
-│                     │          │   Action:            │
-│                     │          │     sts:AssumeRole   │
-│  Temporary          │◄─────────│   Condition:         │
-│  Credentials        │          │     MFA: true        │
-└─────────────────────┘          └─────────────────────┘
-
-# Trust policy in Account B:
+```json
 {
   "Version": "2012-10-17",
   "Statement": [{
     "Effect": "Allow",
-    "Principal": {
-      "AWS": "arn:aws:iam::ACCOUNT_A:root"
-    },
-    "Action": "sts:AssumeRole",
+    "Principal": { "AWS": "arn:aws:iam::111111111111:role/ci-deployer" },
+    "Action": ["sts:AssumeRole", "sts:TagSession"],
     "Condition": {
-      "Bool": {
-        "aws:MultiFactorAuthPresent": "true"
-      }
+      "StringEquals": { "aws:PrincipalOrgID": "o-abc123xyz" }
     }
   }]
 }
-
-# Assume role command:
-aws sts assume-role \
-  --role-arn "arn:aws:iam::ACCOUNT_B:role/ProductionRole" \
-  --role-session-name "dev-session" \
-  --serial-number "arn:aws:iam::ACCOUNT_A:mfa/dev-user" \
-  --token-code 123456
-
-# Temporary credentials (1 hour):
-# - AccessKeyId
-# - SecretAccessKey
-# - SessionToken
-# - Expiration
 ```
+
+```bash
+aws sts assume-role \
+  --role-arn arn:aws:iam::222222222222:role/prod-deploy \
+  --role-session-name "deploy-${GITHUB_RUN_ID}" \
+  --duration-seconds 3600
+```
+
+- Trust a specific role ARN, not the whole account (`:root` delegates the decision to every admin in that account).
+- Third-party (SaaS) access: require an `sts:ExternalId` to prevent the confused-deputy problem.
+- `aws:MultiFactorAuthPresent` works for IAM users with MFA but isn't set for federated or chained sessions; with Identity Center, enforce MFA at the IdP.
+- Sessions last 15 minutes to the role's maximum (up to 12 hours); role chaining is capped at 1 hour.
+- Source identity and session tags propagate who did what into CloudTrail across hops.
+
+**What they probe next:** RCPs for "nobody outside my organisation can access my S3/KMS/SQS resources" (`aws:PrincipalOrgID` in a Deny); centralised root access management (Nov 2024: remove root credentials from member accounts); ABAC with tags vs RBAC; and escalation paths like `iam:PassRole` + `lambda:CreateFunction`.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Evaluation chain** | Explains DENY overrides ALLOW, SCPs bound all accounts in OU |
-| **Permission boundaries** | Uses boundaries to delegate role creation without privilege escalation |
-| **Cross-account access** | Designs trust policies with conditions (MFA, source IP, VPC endpoint) |
-| **STS assume-role** | Understands temporary credentials, session duration limits |
+| **Evaluation chain** | Explains implicit deny, explicit deny wins, SCP/RCP/boundary as caps, cross-account needs both sides |
+| **Permission boundaries** | Uses boundaries with `iam:PermissionsBoundary` conditions to delegate role creation safely |
+| **Cross-account access** | Designs trust policies with specific principals and conditions (org ID, external ID) |
+| **STS assume-role** | Understands temporary credentials, session duration limits, role chaining |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -160,113 +140,90 @@ aws sts assume-role \
 
 ### Answer
 
-**IAM Role per Microservice:**
+!!! tip "30-second answer"
+    One role per service is fine when it's generated: each service's IaC module declares the resources it touches, and a shared module emits a role scoped to those ARNs, with a permission boundary and naming/path conventions. Reduce the count of hand-written policies with **ABAC** (tag-based conditions such as `aws:ResourceTag/service = ${aws:PrincipalTag/service}`). Shift checks left with **IAM Access Analyzer** policy validation and custom policy checks in CI, and keep shrinking with **unused access** findings and **policy generation** from CloudTrail. Off-AWS workloads use **IAM Roles Anywhere** (X.509) instead of access keys.
 
-```yaml
-# Pattern: One IAM role per microservice, auto-generated by CI/CD
+**Generated per-service role (Terraform-style pseudocode):**
 
-# CI/CD pipeline (Terraform/CloudFormation):
-Service: order-service
-  IAM Role: order-service-role
-    Trust: ECS/EKS/Lambda
-    Policies:
-      - service-specific-policy (auto-generated)
-      - managed policies (shared):
-        - CloudWatchLogsFullAccess
-        - X-RayWriteOnlyAccess
-
-# Auto-generated policy from code analysis:
-# CI/CD scans source code for AWS SDK calls:
-# Scan results:
-#   - dynamodb:GetItem
-#   - dynamodb:PutItem
-#   - sqs:SendMessage
-#   - sns:Publish
-
-Generated Policy:
-  Effect: Allow
-  Action:
-    - dynamodb:GetItem
-    - dynamodb:PutItem
-    - sqs:SendMessage
-    - sns:Publish
-  Resource:
-    - arn:aws:dynamodb:us-east-1:123456789:table/orders
-    - arn:aws:dynamodb:us-east-1:123456789:table/orders-index
-    - arn:aws:sqs:us-east-1:123456789:order-queue
-    - arn:aws:sns:us-east-1:123456789:order-events
+```hcl
+module "order_service_iam" {
+  source            = "./modules/service-role"
+  service           = "order-service"
+  runtime           = "ecs-tasks"                 # trust: ecs-tasks / lambda / pods.eks
+  boundary_arn      = "arn:aws:iam::123456789012:policy/app-boundary"
+  dynamodb_tables   = [aws_dynamodb_table.orders.arn, "${aws_dynamodb_table.orders.arn}/index/*"]
+  sqs_send_queues   = [aws_sqs_queue.order_events.arn]
+  sns_publish       = [aws_sns_topic.order_events.arn]
+  # module emits narrow actions (GetItem/PutItem/Query, SendMessage, Publish) on exactly these ARNs
+}
 ```
 
-**IAM Access Analyzer:**
+Logging and tracing permissions come from narrow shared policies (write to the service's own log group), not `CloudWatchLogsFullAccess`.
 
-```yaml
-# IAM Access Analyzer finds over-privileged policies:
+**ABAC to avoid per-resource policy sprawl:**
 
-# 1. Policy validation:
-# Checks for: too permissive, incorrect ARNs, missing conditions
-# Score: PASS/WARNING/ERROR/FATAL
+```json
+{
+  "Effect": "Allow",
+  "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"],
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": { "aws:ResourceTag/service": "${aws:PrincipalTag/service}" }
+  }
+}
+```
 
-# 2. Unused access analysis:
-# Identifies: roles/users with unused permissions
-# Reports:
-#   Role: order-service-role
-#   Unused: s3:ListAllMyBuckets (not used in 90 days)
-#   Unused: ec2:DescribeInstances (not used in 180 days)
-#   Recommendation: remove unused actions
+One policy serves every service, provided tags are protected (deny tag changes outside the pipeline, enforce with tag policies/SCPs). ABAC support varies by service, so check the "authorization based on tags" column per action.
 
-# 3. External access analysis:
-# Finds: roles that can be assumed by external entities
-# Critical: cross-account roles with too-permissive trust policies
+**IAM Access Analyzer capabilities:**
 
-# 4. Automated remediation:
-# - Generate least-privilege policy from CloudTrail logs
-# - IAM Access Analyzer → policy generation
+| Capability | What it does | Where it fits |
+|---|---|---|
+| Policy validation | Findings typed ERROR, SECURITY_WARNING, WARNING, SUGGESTION | CI lint for every policy |
+| Custom policy checks | `CheckNoNewAccess` (vs a reference), `CheckAccessNotGranted` (e.g. no `iam:PassRole` on `*`), `CheckNoPublicAccess` | CI gate on pull requests |
+| External access analysis | Resources shared outside your organisation or account | Continuous, free |
+| Internal access analysis (2025) | Which principals inside your organisation can reach critical resources | Continuous, paid |
+| Unused access analysis | Unused roles, keys, passwords and unused actions per role | Continuous, paid; feeds clean-up |
+| Policy generation | Builds a policy from CloudTrail activity for a role | Bootstrap least privilege for legacy roles |
 
-# Generate policy from CloudTrail:
+```bash
 aws accessanalyzer start-policy-generation \
-  --policy-generation-details '{"principalArn": "arn:aws:iam::123456789:role/order-service-role"}' \
-  --cloud-trail-details '{"trailArns": ["arn:aws:cloudtrail:us-east-1:..."], "startTime": "...", "endTime": "..."}'
-
-# Result: compressed policy with ONLY actions actually used
-# This is the gold standard for least privilege!
+  --policy-generation-details principalArn=arn:aws:iam::123456789012:role/order-service-role \
+  --cloud-trail-details '{
+    "trails": [{"cloudTrailArn": "arn:aws:cloudtrail:us-east-1:123456789012:trail/org-trail", "allRegions": true}],
+    "accessRole": "arn:aws:iam::123456789012:role/AccessAnalyzerMonitorServiceRole",
+    "startTime": "2026-07-01T00:00:00Z", "endTime": "2026-10-01T00:00:00Z"}'
 ```
 
-**IAM Roles Anywhere (Hybrid):**
+Generated policies reflect observed behaviour, including rare paths you didn't exercise in the window (quarterly jobs, error handlers), so review before enforcing.
 
-```yaml
-# IAM Roles Anywhere: on-premises servers get IAM credentials
-# Uses X.509 certificates for authentication
+**IAM Roles Anywhere for on-prem workloads:**
 
-# 1. Create trust anchor (CA certificate):
-aws rolesanywhere create-trust-anchor \
-  --name "corporate-ca" \
-  --type "CERTIFICATE_BUNDLE" \
-  --source '{"sourceData": {"x509CertificateData": "-----BEGIN CERTIFICATE-----..."}}'
+```bash
+aws rolesanywhere create-trust-anchor --name corporate-ca --enabled \
+  --source 'sourceType=CERTIFICATE_BUNDLE,sourceData={x509CertificateData=-----BEGIN CERTIFICATE-----...}'
+aws rolesanywhere create-profile --name on-prem-app --enabled \
+  --role-arns arn:aws:iam::123456789012:role/on-prem-app-role --duration-seconds 3600
 
-# 2. Create profile (maps certificate to IAM role):
-aws rolesanywhere create-profile \
-  --name "on-prem-app" \
-  --role-arns "arn:aws:iam::123456789:role/on-prem-app-role" \
-  --session-policy "..." \
-  --duration-seconds 3600
-
-# 3. On-prem server requests credentials:
-# Install rolesanywhere-credential-helper
-# Runs: AWS_RolesAnywhere_get_credentials
-# Returns: temporary AWS credentials!
-# On-prem server gets IAM role w/out long-term access keys!
-
-# Use: on-prem databases, legacy servers, hybrid deployments
+# ~/.aws/config on the server
+[profile onprem]
+credential_process = aws_signing_helper credential-process \
+  --certificate /etc/pki/app.pem --private-key /etc/pki/app.key \
+  --trust-anchor-arn arn:aws:rolesanywhere:...:trust-anchor/... \
+  --profile-arn arn:aws:rolesanywhere:...:profile/... \
+  --role-arn arn:aws:iam::123456789012:role/on-prem-app-role
 ```
+
+Certificates come from your PKI or AWS Private CA; the role trust policy can require certificate attributes (e.g. the CN) via conditions.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Per-service roles** | Generates IAM roles from code analysis, attaches least-privilege policies |
-| **Access Analyzer** | Uses CloudTrail analysis to generate least-privilege policies |
-| **Unused permissions** | Audits and removes unused permissions regularly |
-| **Roles Anywhere** | Extends IAM to on-premises with certificate-based auth |
+| **Per-service roles** | Generates roles from IaC declarations with boundaries, scoped to exact ARNs |
+| **Access Analyzer** | Uses validation and custom checks in CI, plus CloudTrail-based policy generation |
+| **Unused permissions** | Audits and removes unused permissions continuously |
+| **Roles Anywhere** | Extends IAM to on-premises with certificate-based auth instead of keys |
 
 ---
 
@@ -274,48 +231,39 @@ aws rolesanywhere create-profile \
 
 **Q:** "Design a KMS key hierarchy for a PCI-DSS compliant application. You need envelope encryption for data at rest in S3, EBS, and RDS. How does KMS key rotation work? How do you manage cross-account access to KMS keys? What is the difference between AWS managed keys and customer managed keys?"
 
-**What They're Really Testing:** Whether you understand KMS's key hierarchy — CMK, DEK, envelope encryption — and the operational aspects of key management for compliance.
+**What They're Really Testing:** Whether you understand KMS's key hierarchy — KMS key, data key, envelope encryption — and the operational aspects of key management for compliance.
 
 ### Answer
 
-**KMS Key Hierarchy:**
+!!! tip "30-second answer"
+    A **KMS key** (formerly "CMK") never leaves KMS's FIPS 140-3 validated HSMs; services call `GenerateDataKey` to get a **data key** in plaintext and encrypted form, encrypt locally with the plaintext key, discard it, and store the encrypted key next to the ciphertext (**envelope encryption**). Use **customer managed keys** for PCI: you control the key policy, grants, rotation and deletion, and every use is in CloudTrail. Automatic rotation keeps the same key ID and keeps old key material for decryption, so nothing needs re-encrypting; the period is configurable from **90 to 2,560 days**, and you can also rotate **on demand**. Cross-account use needs both the key policy and the caller's IAM policy, and works only with customer managed keys.
 
-```yaml
-# AWS KMS uses envelope encryption:
+**Envelope encryption:**
 
-┌─────────────────────────────────────┐
-│  Customer Master Key (CMK)           │
-│  - 256-bit AES symmetric            │
-│  - Stored in HSM (hardware)         │
-│  - Never leaves AWS KMS             │
-│  - Key rotation: annual (or auto)   │
-└──────────────────┬──────────────────┘
-                   │
-       ┌───────────┴───────────┐
-       │                       │
-       ▼                       ▼
-┌─────────────────┐   ┌─────────────────┐
-│ Data Encryption  │   │ Data Encryption  │
-│ Key (DEK)        │   │ Key (DEK)        │
-│ - 256-bit AES    │   │ - 256-bit AES    │
-│ - Generated per  │   │ - Generated per  │
-│   operation      │   │   operation      │
-│ - Encrypted by   │   │ - Encrypted by   │
-│   CMK            │   │   CMK            │
-│ (encrypted DEK   │   │ (encrypted DEK   │
-│  stored with     │   │  stored with     │
-│  data)           │   │  data)           │
-└─────────────────┘   └─────────────────┘
+```
+KMS key (in HSM)  ──encrypts──►  data key (AES-256)  ──encrypts──►  your data
+                                   │
+                                   └─ stored encrypted alongside the data;
+                                      plaintext copy discarded after use
+```
 
-# More detailed architecture for PCI-DSS:
+```python
+import boto3
 
-# Key hierarchy for PCI-DSS:
-# 1. Root KMS Key (CMK)
-# 2. Region-specific KMS keys (one per region)
-# 3. Service-specific keys (S3, EBS, RDS)
-# 4. Application-specific keys (per microservice)
+kms = boto3.client("kms")
+KEY = "alias/payments-prod"
+ctx = {"service": "payment", "env": "prod"}          # encryption context: bound to the ciphertext
 
-# Encrypt S3 object:
+dk = kms.generate_data_key(KeyId=KEY, KeySpec="AES_256", EncryptionContext=ctx)
+plaintext_key, encrypted_key = dk["Plaintext"], dk["CiphertextBlob"]
+# encrypt locally (AES-GCM), store encrypted_key with the ciphertext, then drop plaintext_key
+
+plaintext_key = kms.decrypt(CiphertextBlob=encrypted_key, EncryptionContext=ctx)["Plaintext"]
+```
+
+- Use the **AWS Encryption SDK** rather than hand-rolling this; it handles data key caching, framing and context.
+- `Encrypt` directly with a KMS key is limited to 4 KB of plaintext; that's for small secrets, not data.
+- KMS has per-Region request quotas for cryptographic operations (thousands to tens of thousands per second depending on the Region). High-volume S3 use needs **S3 Bucket Keys**, which cut KMS calls by up to 99%.
 
 ### 🎬 Animated Sequence Diagram
 
@@ -325,138 +273,70 @@ aws rolesanywhere create-profile \
     Your browser does not support the video tag.
   </video>
   <br/>
-  <em>🎬 Animated KMS Envelope Encryption — CMK encrypts DEK, DEK encrypts data, encrypted DEK stored alongside ciphertext — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
+  <em>🎬 Animated KMS Envelope Encryption — KMS key encrypts data key, data key encrypts data, encrypted data key stored alongside ciphertext — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
----
-kms_key = 'arn:aws:kms:us-east-1:123456789:key/abc-123'
-response = kms.generate_data_key(KeyId=kms_key, KeySpec='AES_256')
-plaintext_dek = response['Plaintext']      # Use for encryption, then discard!
-encrypted_dek = response['CiphertextBlob']  # Store with object
+**Key hierarchy for PCI:** a key per environment × data classification × service owner (e.g. `prod/pci/payments`), in the account that owns the data, with key administrators separated from key users (dual control). Too few keys means a blast radius you can't revoke selectively; too many means policy sprawl. Multi-Region keys only where you need to decrypt the same ciphertext in another Region (DR, global tables).
 
-# Decrypt:
-plaintext_dek = kms.decrypt(CiphertextBlob=stored_encrypted_dek)
-# Now use plaintext DEK to decrypt the data
+**Rotation:**
+
+| | What happens | Re-encrypt data? |
+|---|---|---|
+| Automatic rotation (customer managed) | New key material every N days (90–2,560, default 365); key ID, ARN and policy unchanged; old material kept for decrypting | No |
+| On-demand rotation (2024) | Same mechanism, triggered now (limited number per key) | No |
+| Manual rotation | New key, repoint the alias, re-encrypt if policy requires retiring the old key | Only if you must stop using old material |
+| AWS managed keys | Rotated automatically every year | No |
+| Imported key material / asymmetric / HMAC keys | No automatic rotation; rotate manually | Depends |
+
+```python
+kms.enable_key_rotation(KeyId=key_id, RotationPeriodInDays=180)
+kms.rotate_key_on_demand(KeyId=key_id)
 ```
 
-**Key Rotation:**
+PCI DSS asks you to define a cryptoperiod and rotate at its end; automatic rotation satisfies that for keys KMS generates. Re-encrypting S3 data in bulk (S3 Batch Operations copy in place with the new key) is only needed when you retire a key entirely.
 
-```yaml
-# KMS key rotation:
+**Deletion:** scheduled with a 7–30 day waiting period, cancellable until then; afterwards every ciphertext under that key is unrecoverable. Prefer *disabling* keys, alarm on `ScheduleKeyDeletion` in CloudTrail, and deny it via SCP except for a break-glass role.
 
-# Automatic rotation (once per year):
-# - Creates new backing key (new cryptographic material)
-# - Old backing key retained (for decryption of old data)
-# - Key ID stays the same (automatic for users)
-# - Annual rotation: enabled for customer managed keys
-# - Cannot: rotate keys more than once per year automatically
+**Cross-account access:**
 
-# Manual rotation (recommended for PCI-DSS):
-# - Create new KMS key (new ID)
-# - Update applications to use new key
-# - Re-encrypt data with new key
-# - Old key retained for decryption only
-# - Can rotate monthly or quarterly
-
-# Key rotation strategy:
-# 1. Enable automatic annual rotation
-# 2. For PCI-DSS: manual rotation every 6 months
-# 3. Re-encrypt S3 objects with new key:
-#    - Use S3 Batch Operation with KMS re-encrypt
-#    - Or: read → kms:decrypt → kms:encrypt → write
-
-# Key deletion:
-# - Schedule deletion (7-30 day waiting period)
-# - During waiting period: key is "pending deletion"
-# - Can cancel deletion during waiting period
-# - After deletion: ALL encrypted data becomes UNREADABLE
-
-# Best practice:
-# - NEVER delete a key that may have encrypted data
-# - Use key aliases (not key IDs) in application config
-# - Rotate alias to new key: all apps automatically use new key
-```
-
-**Cross-Account Key Access:**
-
-```yaml
-# Cross-account KMS access:
-
-# Account A (key owner): KMS key with cross-account policy
-KMS Key Policy:
-  Version: "2012-10-17"
-  Statement:
-    - Effect: Allow
-      Principal:
-        AWS: "arn:aws:iam::ACCOUNT_B:root"
-      Action:
-        - kms:Decrypt
-        - kms:GenerateDataKey
-      Resource: "*"
-    
-    - Effect: Allow
-      Principal:
-        AWS: "arn:aws:iam::ACCOUNT_B:role/app-role"
-      Action:
-        - kms:Decrypt
-      Resource: "*"
-      Condition:
-        StringEquals:
-          kms:EncryptionContext: {"service": "payment"}
-
-# Account B (user):
-IAM Policy for app-role:
-  Effect: Allow
-  Action:
-    - kms:Decrypt
-    - kms:GenerateDataKey
-  Resource: "arn:aws:kms:us-east-1:ACCOUNT_A:key/abc-123"
-
-# Encryption context (audit trail):
-# - Tied to each encryption operation
-# - Logged in CloudTrail
-# - Acts as additional authentication
+```json
 {
-  "service": "payment",
-  "environment": "production",
-  "data_type": "pci"
+  "Sid": "AllowPaymentsAppInAccountB",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::222222222222:role/payments-app" },
+  "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": {
+      "kms:EncryptionContext:service": "payment",
+      "kms:ViaService": "s3.us-east-1.amazonaws.com"
+    }
+  }
 }
 ```
 
-**AWS Managed vs Customer Managed Keys:**
+The role in account B also needs an IAM policy allowing those actions on the key's **ARN** (aliases don't work across accounts). `kms:ViaService` restricts use to calls made through a specific service; encryption-context conditions bind the key to a purpose, and the context appears in CloudTrail for audit.
 
-```yaml
-AWS Managed Keys:
-  - Created automatically (e.g., aws/s3, aws/ebs, aws/rds)
-  - Cannot: view key policy, rotate manually, disable
-  - Automatic rotation: every 3 years (default)
-  - Cost: free (no $1/month per key)
-  - Use: compliance-only encryption, non-critical data
+**AWS managed vs customer managed keys:**
 
-Customer Managed Keys:
-  - Created by you
-  - Full control: key policy, rotation, enable/disable
-  - Automatic rotation: configurable (annual)
-  - Cost: $1/month per key + $0.03/10,000 API requests
-  - Use: PCI-DSS, HIPAA, sensitive customer data
+| | AWS managed (`aws/s3`, `aws/ebs`, ...) | Customer managed |
+|---|---|---|
+| Key policy | Viewable, not editable | Yours |
+| Cross-account use | No | Yes |
+| Rotation | Yearly, automatic | Configurable, on demand |
+| Disable/delete | No | Yes |
+| Cost | No monthly fee (requests charged) | $1/month per key (rotations add up to $2/month more) + $0.03 per 10,000 requests |
 
-# For PCI-DSS:
-# - Use customer managed keys (control over rotation and access)
-# - Separate keys per environment (dev/staging/prod)
-# - Separate keys per data classification
-# - Enable key rotation (automatic + manual)
-# - Monitor key usage in CloudTrail
-# - Key deletion: never for prod (schedule for key retirement)
-```
+For maximum control: **external key store** (keys in your own HSM outside AWS) or CloudHSM-backed custom key stores, at the cost of availability you now own.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Envelope encryption** | Explains CMK encrypts DEK, DEK encrypts data, DEK stored with data |
-| **Key rotation** | Uses aliases for zero-downtime rotation, schedules deletion carefully |
-| **Cross-account** | Configures key policies with encryption context for audit |
-| **Managed vs customer** | Chooses customer managed for compliance (full control, rotation) |
+| **Envelope encryption** | Explains KMS key encrypts data key, data key encrypts data, encrypted data key stored with data |
+| **Key rotation** | Knows rotation keeps key ID and old material, no re-encryption, configurable periods |
+| **Cross-account** | Configures key policy + IAM policy, with encryption context and ViaService conditions |
+| **Managed vs customer** | Chooses customer managed for compliance (policy control, cross-account, deletion control) |
 
 ---
 
@@ -468,27 +348,22 @@ Customer Managed Keys:
 
 ### Answer
 
-**Cognito User Pools vs Identity Pools:**
+!!! tip "30-second answer"
+    A **user pool** is the OIDC identity provider: sign-up, sign-in, MFA, federation to customers' SAML/OIDC IdPs, and JWTs (ID, access, refresh). An **identity pool** exchanges those tokens for temporary AWS credentials, and is only needed when clients call AWS services directly. For B2B multi-tenancy, put the **tenant ID in the token** (an immutable attribute set at onboarding, or a claim added by the **pre token generation** trigger), authorise every request against it in the API layer, and keep fine-grained permissions in your app or **Amazon Verified Permissions** (Cedar) rather than in hundreds of Cognito groups. Choose the feature plan deliberately: **Lite, Essentials (default) or Plus** (Nov 2024) determines whether you get managed login, passkeys, access-token customisation and threat protection.
 
-```yaml
-Cognito User Pools (CUP):
-  - User directory (sign-up, sign-in)
-  - MFA (TOTP, SMS)
-  - Federation (Google, Apple, SAML, OIDC)
-  - JWT tokens (ID token, Access token, Refresh token)
-  - Groups and roles (within the app)
-  - Custom attributes (tenant_id, role)
-  - Lambda triggers (pre-signup, post-auth, etc.)
-  - Hosted UI (customizable login page)
+**User pools vs identity pools:**
 
-Cognito Identity Pools (CIP):
-  - AWS credential exchange (get AWS STS credentials)
-  - Map federated identities to IAM roles
-  - Guest/unauthenticated access
-  - Fine-grained IAM policies per user/group
-  - Used WITH User Pools (not instead of)
+| | User pool | Identity pool |
+|---|---|---|
+| Output | JWTs for your APIs | Temporary AWS credentials (STS) |
+| Features | Directory, MFA (TOTP, SMS, email), passwordless (passkeys, email/SMS OTP on Essentials+), federation, Lambda triggers, managed login UI | Role mapping by token claims, guest access |
+| Typical use | Web/mobile apps calling API Gateway/ALB/your services | Mobile clients uploading to S3 or reading DynamoDB directly |
 
-# Typical flow:
+```
+User → User pool (authenticate; SAML/OIDC federation to the customer IdP) → JWTs
+JWT  → API Gateway (Cognito authorizer) / ALB / service validates signature, aud, exp, tenant claim
+JWT  → Identity pool (optional) → STS credentials scoped by role mapping → S3/DynamoDB
+```
 
 ### 🎬 Animated Sequence Diagram
 
@@ -501,147 +376,69 @@ Cognito Identity Pools (CIP):
   <em>🎬 Animated Cognito Authentication & Authorization Flow — User Pool → JWT → Identity Pool → AWS credentials → Resources — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
----
-# User → User Pool (authenticate) → JWT tokens
-# JWT → Identity Pool (exchange for AWS credentials)
-# AWS credentials → access S3, DynamoDB, API Gateway
-```
+**Multi-tenant models:**
 
-**Multi-Tenant Configuration:**
+| Model | Isolation | Trade-offs |
+|---|---|---|
+| Pool per tenant | Strong; per-tenant password/MFA policy and IdP | Quotas (user pools per account), routing users to the right pool, per-pool ops |
+| App client per tenant | Medium; per-tenant IdP and callback URLs | Client quotas; shared directory |
+| **Shared pool + tenant claim** (most common) | Logical; enforced by your app | Simplest; app must check the tenant claim on every request |
 
-```yaml
-# Option 1: Pool-per-tenant
-# - Separate User Pool for each organization
-# - Complete isolation between tenants
-# - Max: 1000 User Pools per account
-# - Use: enterprise customers needing isolation
-# - Cost: higher (each pool has cost)
-# - Management overhead: complex
+- Store `custom:tenant_id` as **immutable** (set once at creation) or in your own tenant directory, so users can't change their own tenant. Remember app clients can be configured with write access to custom attributes; restrict it.
+- Roles: small fixed set of groups (`admin`, `member`) plus tenant in the token, not `tenant-123-admin` groups for every tenant (group quotas and token bloat).
+- Fine-grained authorisation: Verified Permissions with Cedar policies, or ABAC via identity pools (principal tags from claims → `aws:PrincipalTag/tenant_id` conditions) for direct AWS access, e.g. S3 prefixes per tenant.
 
-# Option 2: Group-based (recommended)
-# - Single User Pool, groups per tenant
-# - Group: tenant-{id}-{role}
-# - Custom attribute: custom:tenant_id
-# - Use: most B2B SaaS applications
-# - Isolation: app-level (Cognito is shared)
+**Federation:** each enterprise customer gets a SAML or OIDC IdP on the pool, with attribute mapping (email, name, groups) and IdP identifiers so users are routed by email domain. Federated users are created on first sign-in. SAML `memberOf` maps to a custom attribute; translate it into app roles in your pre-token trigger rather than trusting raw IdP group names.
 
-Cognito User Pool:
-  Schema:
-    - Name: custom:tenant_id
-      AttributeDataType: String
-      Mutable: true
-      Required: true
-
-  Groups:
-    - Name: tenant-123-admin
-      Description: "Admin for org 123"
-      Precedence: 10
-    
-    - Name: tenant-123-user
-      Description: "User for org 123"
-      Precedence: 20
-    
-    - Name: tenant-456-admin
-      ...
-  
-  # Each user is member of ONE group (tenant+role)
-
-# Authorization check:
-def authorize(user, requested_tenant_id):
-    # Extract tenant from JWT
-    token_tenant = user['custom:tenant_id']
-    
-    if token_tenant != requested_tenant_id:
-        return 403  # Cross-tenant access denied!
-    
-    # Extract role
-    groups = user['cognito:groups']
-    # e.g., ['tenant-123-admin']
-    
-    return 200  # Authorized
-```
-
-**Federation with SAML/OIDC:**
-
-```yaml
-# Enterprise federation with SAML:
-# User's company uses their own IdP (Okta, Azure AD, etc.)
-
-Cognito User Pool → SAML IdP → Okta/Azure AD
-
-# User flow:
-# 1. User clicks "Sign in with Company SSO"
-# 2. Cognito redirects to company's SAML IdP
-# 3. User authenticates with company credentials
-# 4. SAML assertion returned to Cognito
-# 5. Cognito creates/finds user and returns JWT
-# 6. JWT contains: name, email, groups, tenant_id
-
-# SAML attribute mapping:
-SAML Attribute:
-  - Name: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
-    Maps to: email
-  
-  - Name: "memberOf"
-    Maps to: cognito:groups
-    # AD groups → Cognito groups
-
-  - Name: "department"
-    Maps to: custom:tenant_id
-
-# OIDC federation (Google, Apple, etc.):
-Cognito User Pool → Google → Google token → Cognito JWT
-# Simpler than SAML, uses JSON web tokens
-```
-
-**Lambda Triggers for Custom Logic:**
+**Triggers, done right:**
 
 ```python
-def lambda_handler(event, context):
-    """
-    Pre sign-up Lambda trigger.
-    Auto-assigns tenant_id and group on registration.
-    """
-    if event['triggerSource'] == 'PreSignUp_SignUp':
-        # Extract tenant from email domain
-        email = event['request']['userAttributes']['email']
-        domain = email.split('@')[1]
-        
-        # Look up tenant by domain
-        tenant_id = tenant_table.get(domain)
-        if not tenant_id:
-            raise Exception("Unknown organization domain")
-        
-        # Auto-verify email (trusted domain)
-        event['response']['autoConfirmUser'] = True
-        event['response']['autoVerifyEmail'] = True
-        
-        # Add tenant_id to user attributes
-        event['response']['claimsOverrideDetails'] = {
-            'claimsToAddOrOverride': {
-                'custom:tenant_id': str(tenant_id),
-            }
-        }
-    
-    # Post-confirmation: add user to group
-    if event['triggerSource'] == 'PostConfirmation_ConfirmSignUp':
-        cognito.admin_add_user_to_group(
-            UserPoolId=event['userPoolId'],
-            Username=event['userName'],
-            GroupName=f"tenant-{tenant_id}-user"
-        )
-    
+import boto3
+
+cognito = boto3.client("cognito-idp")
+
+def pre_sign_up(event, context):
+    """PreSignUp: reject unknown domains. It can auto-confirm, but can't set attributes."""
+    email = event["request"]["userAttributes"]["email"]
+    if lookup_tenant_by_domain(email.split("@")[1]) is None:
+        raise Exception("Unknown organization")
+    return event
+
+def post_confirmation(event, context):
+    """PostConfirmation: persist the tenant link and default role."""
+    email = event["request"]["userAttributes"]["email"]
+    tenant_id = lookup_tenant_by_domain(email.split("@")[1])
+    cognito.admin_update_user_attributes(
+        UserPoolId=event["userPoolId"], Username=event["userName"],
+        UserAttributes=[{"Name": "custom:tenant_id", "Value": tenant_id}],
+    )
+    cognito.admin_add_user_to_group(
+        UserPoolId=event["userPoolId"], Username=event["userName"], GroupName="member"
+    )
+    return event
+
+def pre_token_generation(event, context):
+    """PreTokenGeneration V2 (Essentials/Plus): add claims to ID and access tokens."""
+    tenant_id = event["request"]["userAttributes"].get("custom:tenant_id")
+    event["response"]["claimsAndScopeOverrideDetails"] = {
+        "idTokenGeneration":     {"claimsToAddOrOverride": {"tenant_id": tenant_id}},
+        "accessTokenGeneration": {"claimsToAddOrOverride": {"tenant_id": tenant_id}},
+    }
     return event
 ```
+
+Don't auto-confirm or auto-verify email just because the domain matches: that lets anyone register `ceo@customer.com` without proving they own it.
+
+**What they probe next:** token lifetimes and revocation (refresh token revocation, short access tokens), machine-to-machine auth (client credentials grant, priced per token request), and Cognito's limits vs a dedicated CIAM product.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Pool vs identity** | Distinguishes user directory (CUP) from AWS credential exchange (CIP) |
-| **Multi-tenancy** | Uses group-based approach with tenant_id attribute for isolation |
-| **SAML federation** | Maps enterprise SAML assertions to Cognito attributes and groups |
-| **Lambda triggers** | Uses pre/post hooks for auto-verification, group assignment |
+| **Pool vs identity** | Distinguishes user directory (user pool) from AWS credential exchange (identity pool) |
+| **Multi-tenancy** | Puts an immutable tenant claim in tokens and enforces it on every request |
+| **SAML federation** | Maps enterprise SAML assertions to attributes and app roles |
+| **Lambda triggers** | Uses the right trigger for each job (pre sign-up, post confirmation, pre token generation) |
 
 ---
 
@@ -653,162 +450,95 @@ def lambda_handler(event, context):
 
 ### Answer
 
-**WAF Rule Groups:**
+!!! tip "30-second answer"
+    One web ACL on CloudFront (plus regional ACLs for anything not behind it), rules in priority order: allow-lists, IP reputation, rate limits, then managed rule groups (Core rule set, Known bad inputs, SQLi, plus language/OS sets matching your stack), Bot Control and fraud rule groups where needed. Deploy every new group in **Count**, study the logs, then fix false positives with **scope-down statements** and **rule action overrides** for the specific noisy rules, not by excluding whole paths. Log to S3 or CloudWatch Logs and query with Athena or Logs Insights. Managed rule groups cost WCUs; a web ACL's base capacity is 1,500 WCUs.
 
-```yaml
-# Managed rule groups (provided by AWS):
+**Managed rule groups worth knowing:**
 
-AWSManagedRulesCommonRuleSet (CRS):
-  - Generic web application protection
-  - 15+ rules: SQLi, XSS, LFI/RFI, SSRF, RFI
-  - Covers OWASP Top 10
-  - Rate: 0.001% false positive rate (well-tuned)
+| Group | Purpose | Notes |
+|---|---|---|
+| `AWSManagedRulesCommonRuleSet` | OWASP-style generic protections (XSS, LFI/RFI, size limits, EC2 metadata SSRF) | `SizeRestrictions_BODY` (8 KB) is the classic false positive for uploads/large JSON |
+| `AWSManagedRulesKnownBadInputsRuleSet` | Known exploit patterns (e.g. Log4j, Java deserialization) | Low false-positive rate; block early |
+| `AWSManagedRulesSQLiRuleSet` | SQL injection | Inspects body, query, URI, cookies |
+| `AWSManagedRulesAmazonIpReputationList` / `AnonymousIpList` | Known-bad IPs, VPNs/Tor/hosting providers | Anonymous list can hurt legitimate privacy users |
+| OS / language sets (Linux, Unix, Windows, PHP, WordPress) | Stack-specific | Enable only what you run |
+| Bot Control (COMMON / TARGETED) | Bot detection and management | Paid per request; use labels to act per path |
+| ATP / ACFP | Credential stuffing on login; fake account creation | You configure the login/registration path and field names; works on CloudFront, ALB, API Gateway |
+| Anti-DDoS rule group (2025) | Detects and mitigates L7 floods from traffic baselines | Complements rate-based rules |
 
-AWSManagedRulesSQLiRuleSet:
-  - SQL injection specific
-  - Detects: UNION, OR 1=1, comments, hex encoding
-  - Body, query string, URI path
+**Tuning without throwing away protection:**
 
-AWSManagedRulesKnownBadInputsRuleSet:
-  - Known attack patterns
-  - Log4j RCE, command injection
-  - Vendor-specific CVEs
-
-AWSManagedRulesWindowsRuleSet:
-  - Windows-specific: PowerShell, cmd.exe
-  - ASP.NET specific attacks
-
-AWSManagedRulesPHPRuleSet:
-  - PHP-specific: object injection, file inclusion
-
-AWSManagedRulesLinuxRuleSet:
-  - Linux-specific: /etc/passwd, /proc/self
-
-AWSManagedRulesBotControlRuleSet:
-  - Bot detection and mitigation
-  - Levels: COMMON (basic), TARGETED (advanced)
-  - Categories: verified (Googlebot), unverified, malicious
-
-AWSManagedRulesATPRuleSet (Account Takeover):
-  - Login brute force detection
-  - Stolen credential detection
-  - Requires integration with Cognito/ALB
+```json
+{
+  "Name": "AWS-CommonRuleSet",
+  "Priority": 30,
+  "OverrideAction": { "None": {} },
+  "Statement": {
+    "ManagedRuleGroupStatement": {
+      "VendorName": "AWS",
+      "Name": "AWSManagedRulesCommonRuleSet",
+      "RuleActionOverrides": [
+        { "Name": "SizeRestrictions_BODY", "ActionToUse": { "Count": {} } }
+      ],
+      "ScopeDownStatement": {
+        "NotStatement": { "Statement": { "ByteMatchStatement": {
+          "SearchString": "/webhooks/stripe",
+          "FieldToMatch": { "UriPath": {} },
+          "PositionalConstraint": "STARTS_WITH",
+          "TextTransformations": [{ "Priority": 0, "Type": "NONE" }]
+        } } }
+      }
+    }
+  },
+  "VisibilityConfig": { "SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "CRS" }
+}
 ```
 
-**WAF Rule Tuning:**
+- `RuleActionOverrides` set one noisy rule to Count while the rest keep blocking; the counted rule still adds a **label** (`awswaf:managed:aws:core-rule-set:SizeRestrictions_Body`), so a follow-up custom rule can block oversized bodies everywhere *except* the upload endpoint.
+- `ScopeDownStatement` exempts a narrow path (a signed webhook) from the whole group.
+- Process: Count for one to two weeks → review top-matching rules and sample requests → override/scope → Block, one group at a time, highest-confidence groups first. Use version pinning on managed groups and test new versions in Count.
 
-```yaml
-# Rule tuning methodology:
+**Logging and analytics:**
 
-# Phase 1: Count mode (ALLOW, monitor for 2 weeks)
-WAF WebACL:
-  Rules:
-    - Name: AWS-AWSManagedRulesCommonRuleSet
-      OverrideAction:
-        Count: {}          # Count only (don't block!)
-      VisibilityConfig:
-        SampledRequestsEnabled: true
-        CloudWatchMetricsEnabled: true
-
-# Phase 2: Analyze false positives
-# Query WAF logs in Athena:
-SELECT 
-  rule_name,
-  action,
-  COUNT(*) as matches,
-  COUNT(DISTINCT client_ip) as unique_ips
-FROM waf_logs
-WHERE action = 'COUNT'
-  AND rule_name LIKE 'AWS-AWSManagedRules%'
-GROUP BY rule_name, action
-ORDER BY matches DESC;
-
-# Phase 3: Create exceptions for false positives
-# If CRS blocks legitimate API calls:
-WAF WebACL:
-  Rules:
-    - Name: skip-path-api-exceptions
-      Statement:
-        NotStatement:
-          Statement:
-            ByteMatchStatement:
-              FieldToMatch:
-                UriPath: {}
-              SearchString: "/api/"    # API paths
-              TextTransformations: [{"Priority": 0, "Type": "NONE"}]
-      # CRS doesn't apply to /api/ paths (exempted)
-
-# Phase 4: Switch to BLOCK mode (gradually)
-# Enable blocking per rule group
-# Start with: KnownBadInputs (low false positive)
-# Then: CRS (after 2 weeks of tuning)
-# Then: SQLi, XSS (if applicable)
+```python
+wafv2.put_logging_configuration(LoggingConfiguration={
+    "ResourceArn": web_acl_arn,
+    "LogDestinationConfigs": ["arn:aws:firehose:us-east-1:123456789012:deliverystream/aws-waf-logs-prod"],
+    "RedactedFields": [{"SingleHeader": {"Name": "authorization"}}],
+})
 ```
 
-**WAF Security Analytics:**
+Destinations are CloudWatch Logs, S3 or Data Firehose, and their names must start with `aws-waf-logs-`. Logging filters can keep only BLOCK/COUNT records to cut cost.
 
-```yaml
-# WAF logs → S3 → Athena → QuickSight dashboard:
-
-# 1. Enable WAF logging to S3:
-waf.put_logging_configuration(
-    ResourceArn='arn:aws:wafv2:us-east-1:123456789:webacl/my-acl',
-    LogDestinationConfigs=['arn:aws:firehose:us-east-1:123456789:deliverystream/waf-logs'],
-    RedactedFields=[{'SingleHeader': {'Name': 'authorization'}}]  # Mask sensitive data
-)
-
-# 2. Top attack sources:
-SELECT 
-  http_source_ip,
-  COUNT(*) as requests,
-  COUNT(DISTINCT rule_name) as rules_triggered
+```sql
+-- Top terminating rules and clients blocked in the last day (Athena over WAF logs)
+SELECT terminatingruleid, httprequest.clientip, httprequest.country, COUNT(*) AS requests
 FROM waf_logs
-WHERE action IN ('BLOCK', 'COUNT')
-GROUP BY http_source_ip
+WHERE action = 'BLOCK' AND from_unixtime(timestamp / 1000) > now() - interval '1' day
+GROUP BY 1, 2, 3
 ORDER BY requests DESC
-LIMIT 100;
+LIMIT 50;
 
-# 3. Attack patterns over time:
-SELECT 
-  date_trunc('hour', timestamp) as hour,
-  rule_name,
-  COUNT(*) as matches
+-- Rules that only COUNT today: candidates to promote or tune
+SELECT r.ruleid, COUNT(*) AS matches, COUNT(DISTINCT httprequest.clientip) AS ips
 FROM waf_logs
-WHERE action = 'BLOCK'
-GROUP BY 1, 2
-ORDER BY 1;
-
-# 4. False positive monitoring:
-SELECT 
-  rule_name,
-  COUNT(*) as blocks,
-  COUNT(DISTINCT http_source_ip) as unique_ips,
-  COUNT(*) FILTER (WHERE http_request_uri LIKE '/api/') as api_hits
-FROM waf_logs
-WHERE action = 'BLOCK'
-  AND rule_vendor = 'AWS'
-GROUP BY rule_name
-ORDER BY blocks DESC;
-
-# 5. Bot analysis:
-SELECT 
-  rule_name,
-  http_user_agent,
-  COUNT(*) as requests
-FROM waf_logs
-WHERE rule_name LIKE 'AWSBotControl%'
-GROUP BY rule_name, http_user_agent
-ORDER BY requests DESC;
+CROSS JOIN UNNEST(rulegrouplist) AS t(rg)
+CROSS JOIN UNNEST(rg.nonterminatingmatchingrules) AS t2(r)
+WHERE r.action = 'COUNT'
+GROUP BY 1
+ORDER BY matches DESC;
 ```
+
+**What they probe next:** WAF on CloudFront vs ALB (edge blocks before you pay origin costs), body inspection limits (WAF inspects only the first 8 KB of a body on ALB; 16 KB by default on CloudFront and API Gateway, configurable up to 64 KB at extra cost) and the "oversize handling" setting, and centrally managing web ACLs across accounts with **Firewall Manager**.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Rule groups** | Knows which AWS managed rule groups to enable and in what order |
-| **Tuning methodology** | Phases from COUNT → analyze exceptions → BLOCK |
-| **False positives** | Creates path-based exemptions, analyzes logs for regressions |
-| **Security analytics** | Uses Athena for WAF log analysis and attack pattern detection |
+| **Rule groups** | Knows which AWS managed rule groups to enable for the stack and in what order |
+| **Tuning methodology** | Count → analyse → rule action overrides / scope-down → Block |
+| **False positives** | Uses labels and narrow exemptions rather than disabling groups |
+| **Security analytics** | Queries WAF logs (Athena/Logs Insights) for attack patterns and tuning |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -831,197 +561,104 @@ ORDER BY requests DESC;
 
 ### Answer
 
-**Secrets Manager Architecture:**
+!!! tip "30-second answer"
+    First, remove secrets you don't need: IAM auth for RDS/Aurora and RDS Proxy, IAM roles for AWS APIs, ACM for TLS certificates (public certs auto-renew; private certs via AWS Private CA). For what's left, use **Secrets Manager**: one secret per service per environment, encrypted with a customer managed KMS key, resource policies plus ABAC so a service can read only its own secrets, rotation on a schedule (as often as every 4 hours) using **managed rotation** for RDS/Redshift/DocumentDB or a rotation Lambda for others. Services cache secrets (Secrets Manager Agent, Lambda extension or caching client) and refresh on authentication failure. Audit with CloudTrail `GetSecretValue` events.
 
-```yaml
-# Secrets Manager architecture for 500 microservices:
+**Rotation mechanics:** every secret version carries staging labels: `AWSCURRENT`, `AWSPENDING`, `AWSPREVIOUS`. A rotation runs four steps:
 
-# Key features:
-# - Encryption at rest (KMS CMK)
-# - Automatic rotation (Lambda-based)
-# - Cross-region replication
-# - Fine-grained IAM access
-# - Secret versioning
-# - CloudTrail audit logging
-
-Secret: production/my-app/db-creds
-  Type: RDS Credentials
-  Value:
-    {
-      "username": "app_user",
-      "password": "auto-generated-rotated",
-      "engine": "postgres",
-      "host": "my-db.xyz.us-east-1.rds.amazonaws.com",
-      "port": 5432,
-      "dbInstanceIdentifier": "my-db"
-    }
-  
-  Rotation:
-    Enabled: true
-    RotationInterval: 30 days
-    RotationLambdaARN: arn:aws:lambda:...:rds-rotation-function
-    
-  VersionIds:
-    - v1: current
-    - v2: previous (still valid during rotation)
-    - v3: pending (being created)
-```
-
-**Automatic Rotation (Lambda):**
+| Step | Action |
+|---|---|
+| `createSecret` | Generate a new credential, store it as `AWSPENDING` |
+| `setSecret` | Apply it in the target system (e.g. `ALTER USER ... PASSWORD`) |
+| `testSecret` | Log in with the pending version |
+| `finishSecret` | Move `AWSCURRENT` to the new version (the old one becomes `AWSPREVIOUS`) |
 
 ```python
-import boto3
 import json
-import secrets
+import boto3
+
+sm = boto3.client("secretsmanager")
 
 def lambda_handler(event, context):
-    """Rotate RDS credentials."""
-    arn = event['SecretId']
-    token = event['ClientRequestToken']
-    step = event['Step']  # createSecret, setSecret, testSecret, finishSecret
-    
-    client = secretsmanager.client()
-    
-    if step == 'createSecret':
-        # Generate new password
-        password = secrets.token_urlsafe(32)
-        client.put_secret_value(
-            SecretId=arn,
-            ClientRequestToken=token,
-            SecretString=json.dumps({
-                'username': 'app_user',
-                'password': password,
-                # ... other fields
-            }),
-            VersionStages=['AWSPENDING']
-        )
-    
-    elif step == 'setSecret':
-        # Update database with new password
-        pending = json.loads(client.get_secret_value(
-            SecretId=arn,
-            VersionStage='AWSPENDING'
-        )['SecretString'])
-        
-        # Update RDS password
-        rds = boto3.client('rds')
-        rds.modify_db_instance(
-            DBInstanceIdentifier='my-db',
-            MasterUserPassword=pending['password']
-        )
-    
-    elif step == 'testSecret':
-        # Test new credentials work
-        pending = json.loads(client.get_secret_value(
-            SecretId=arn,
-            VersionStage='AWSPENDING'
-        )['SecretString'])
-        
-        # Test connection
-        # psycopg2.connect(...)
-    
-    elif step == 'finishSecret':
-        # Mark pending as current
-        client.update_secret_version_stage(
-            SecretId=arn,
-            VersionStage='AWSPENDING',
-            RemoveVersionStage='AWSCURRENT'
-        )
-        client.update_secret_version_stage(
-            SecretId=arn,
-            VersionStage='AWSCURRENT',
-            MoveToVersionId=token
-        )
+    arn, token, step = event["SecretId"], event["ClientRequestToken"], event["Step"]
+
+    if step == "createSecret":
+        current = json.loads(sm.get_secret_value(SecretId=arn, VersionStage="AWSCURRENT")["SecretString"])
+        try:
+            sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")
+        except sm.exceptions.ResourceNotFoundException:      # idempotent: only create once
+            pwd = sm.get_random_password(PasswordLength=32, ExcludeCharacters="/@\"'\\")["RandomPassword"]
+            sm.put_secret_value(SecretId=arn, ClientRequestToken=token,
+                                SecretString=json.dumps({**current, "password": pwd}),
+                                VersionStages=["AWSPENDING"])
+
+    elif step == "setSecret":
+        pending = json.loads(sm.get_secret_value(SecretId=arn, VersionId=token,
+                                                 VersionStage="AWSPENDING")["SecretString"])
+        set_db_password(pending)                  # ALTER USER app_user PASSWORD ... via an admin secret
+
+    elif step == "testSecret":
+        pending = json.loads(sm.get_secret_value(SecretId=arn, VersionId=token,
+                                                 VersionStage="AWSPENDING")["SecretString"])
+        test_login(pending)                       # raise on failure → rotation stops, CURRENT unchanged
+
+    elif step == "finishSecret":
+        meta = sm.describe_secret(SecretId=arn)
+        current_version = next(v for v, stages in meta["VersionIdsToStages"].items() if "AWSCURRENT" in stages)
+        if current_version != token:
+            sm.update_secret_version_stage(SecretId=arn, VersionStage="AWSCURRENT",
+                                           MoveToVersionId=token, RemoveFromVersionId=current_version)
 ```
+
+- **Single-user** rotation changes the password in place; apps with a cached old password fail until they refresh. **Alternating-users** rotation keeps two DB users and flips between them, so the previous credential still works during the transition.
+- For RDS, the simplest option is letting RDS manage the master password in Secrets Manager (managed rotation, no Lambda).
+- Rotation Lambdas need network access to both the database and the Secrets Manager endpoint (VPC endpoint in private subnets).
 
 **Secrets Manager vs Parameter Store vs Vault:**
 
-```yaml
-AWS Secrets Manager:
-  - Automatic rotation: ✅ (Lambda-based, 30+ services)
-  - Cross-region replication: ✅
-  - Encryption: KMS (always)
-  - Cost: $0.40/secret/month + $0.05/10K API calls
-  - Max secret size: 64KB
-  - Use: DB credentials, API keys, rotation required
+| | Secrets Manager | SSM Parameter Store | HashiCorp Vault |
+|---|---|---|---|
+| Rotation | Built in (managed or Lambda) | None | Dynamic secrets (per-lease credentials) |
+| Cross-Region | Replica secrets | No | Enterprise replication |
+| Size | 64 KB | 4 KB standard, 8 KB advanced | Configurable |
+| Price | $0.40 per secret-month + $0.05 per 10,000 calls | Standard free (10,000 params); advanced $0.05 per param-month | Self-run or HCP pricing; operational cost |
+| Best for | Credentials that rotate, cross-account sharing | Config, feature flags, non-rotating values (`SecureString` with KMS) | Multi-cloud, dynamic DB creds, PKI, existing Vault estates |
 
-AWS Parameter Store:
-  - Tiers: Standard (free, 10K params), Advanced ($0.05/param/month)
-  - Rotation: ❌ (manual only)
-  - Encryption: Optional (KMS)
-  - Cost: FREE (standard), $0.05/param (advanced)
-  - Max size: 8KB (standard), 8KB (advanced)
-  - Use: config, feature flags, non-sensitive parameters
-
-HashiCorp Vault:
-  - Dynamic secrets: ✅ (generate on-demand)
-  - Rotation: ✅ (automatic)
-  - Encryption: ✅
-  - Replication: ✅ (enterprise)
-  - Cost: free (OSS) or enterprise licensing
-  - Complexity: higher (separate infrastructure to manage)
-  - Use: dynamic secrets, multi-cloud, existing Vault investment
-
-# Recommendation:
-# Secrets Manager for: database credentials, API keys (need rotation)
-# Parameter Store for: configuration, feature flags (no rotation)
-# Vault: only if already using Vault elsewhere (don't add complexity)
-```
-
-**Secret Access Patterns:**
+**Caching:**
 
 ```python
-# Best practice: cache secrets in memory, don't fetch on every request
+import time
+import json
 
 class SecretCache:
-    def __init__(self):
-        self.cache = {}
-        self.ttl = 3600  # 1 hour cache (rotation takes effect)
-    
-    def get_secret(self, secret_name):
-        now = time.time()
-        
-        # Check cache
-        if secret_name in self.cache:
-            cached = self.cache[secret_name]
-            if now < cached['expires_at']:
-                return cached['value']
-        
-        # Fetch from Secrets Manager
-        response = secretsmanager.get_secret_value(
-            SecretId=secret_name
-        )
-        
-        value = json.loads(response['SecretString'])
-        
-        # Cache for 1 hour
-        # If rotation happens, application will get new secret
-        # within 1 hour (acceptable for most apps)
-        self.cache[secret_name] = {
-            'value': value,
-            'expires_at': now + self.ttl
-        }
-        
-        return value
-    
-    def force_refresh(self, secret_name):
-        """Force refresh (called if auth fails)."""
-        if secret_name in self.cache:
-            del self.cache[secret_name]
-        return self.get_secret(secret_name)
+    def __init__(self, client, ttl_seconds=300):
+        self.client, self.ttl, self.cache = client, ttl_seconds, {}
 
-# SecretManager is called ONCE per hour (not 1000× per request)
-# 500 services × 1 call/hour = 12K calls/day = $0.60/day in API costs
+    def get(self, name):
+        hit = self.cache.get(name)
+        if hit and time.monotonic() < hit[1]:
+            return hit[0]
+        value = json.loads(self.client.get_secret_value(SecretId=name)["SecretString"])
+        self.cache[name] = (value, time.monotonic() + self.ttl)
+        return value
+
+    def refresh(self, name):            # call when the DB rejects the cached credential
+        self.cache.pop(name, None)
+        return self.get(name)
 ```
+
+500 services × 12 calls an hour ≈ 144,000 calls a day ≈ $0.72/day; the cost is trivial. The real reasons to cache are latency, API throttling during mass restarts, and availability. Off the shelf: the **AWS Secrets Manager Agent** (local HTTP cache, 2024), the Parameters and Secrets Lambda extension, the ECS/EKS secret injection (env vars at task start, refreshed only on restart; the Secrets Store CSI driver can sync on EKS).
+
+**Audit and detection:** CloudTrail logs every `GetSecretValue` with the caller; alert on access from unexpected roles, on `DeleteSecret`/`PutResourcePolicy`, and on secrets that haven't rotated (Security Hub control, Config rule `secretsmanager-rotation-enabled-check`). Secrets Manager can block resource policies that grant broad access (`BlockPublicPolicy`).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Rotation mechanism** | Explains Lambda-based rotation with create/set/test/finish stages |
-| **Service comparison** | Compares Secrets Manager ($0.40/secret) vs Parameter Store (free) vs Vault (complexity) |
-| **Caching** | Caches secrets in memory to reduce API costs (10x reduction) |
-| **Monitoring** | Uses CloudTrail to audit secret access (who, when, which application) |
+| **Rotation mechanism** | Explains the four steps, staging labels, single vs alternating users |
+| **Service comparison** | Compares Secrets Manager vs Parameter Store vs Vault on features, not just price |
+| **Caching** | Caches secrets with refresh-on-auth-failure, explains why (latency, throttling) |
+| **Monitoring** | Uses CloudTrail and Config/Security Hub to audit access and rotation |
 
 ### 🎬 Animated Sequence Diagram
 
@@ -1044,35 +681,20 @@ class SecretCache:
 
 ### Answer
 
-**Multi-Account Architecture:**
+!!! tip "30-second answer"
+    Make a dedicated security-tooling account the **delegated administrator** for GuardDuty, Security Hub, Inspector, Macie, Detective and Access Analyzer, auto-enable them for every current and future account in every Region, and aggregate findings to one home Region. **GuardDuty** analyses CloudTrail, VPC flow logs and DNS logs (no need to enable them yourself) plus optional protection plans (S3, EKS, Runtime Monitoring, Malware Protection, RDS, Lambda), using threat intel and anomaly models; **Extended Threat Detection** (Dec 2024) correlates signals into multi-stage *attack sequence* findings rated Critical. **Security Hub** (re-launched as a unified console in Dec 2025, with the posture checks now called **Security Hub CSPM**) correlates threats, vulnerabilities and misconfigurations into exposure findings. Route findings through EventBridge: auto-remediate the unambiguous ones, ticket and page for the rest.
 
-```yaml
-# Security account (delegated administrator):
+**Architecture:**
 
-Security Account (111111111111) ← Delegated Admin
-├── GuardDuty (aggregated findings)
-├── Security Hub (cross-region aggregation)
-├── Detective (investigation)
-├── IAM Access Analyzer
-└── S3: centralized security logs
-
-Member Accounts (50 accounts, 3 regions each):
-├── GuardDuty (local, findings sent to admin)
-├── Security Hub (local, findings sent to admin)
-└── CloudTrail → S3 (centralized to security account)
-
-# Setup:
-# GuardDuty:
-#   - Enable in security account
-#   - Add member accounts (automated via Organizations)
-#   - Findings: aggregated in security account
-
-# Security Hub:
-#   - Enable in security account (delegated admin)
-#   - Enable cross-region aggregation
-#   - Enable CIS, PCI-DSS, AWS Foundational Best Practices standards
-
-# Centralized view:
+```
+Organization
+├── Management account          (enables delegated admin; nothing else runs here)
+├── Security tooling account    ← delegated admin: GuardDuty, Security Hub (+CSPM), Inspector,
+│                                  Macie, Detective, Access Analyzer; home-Region aggregation;
+│                                  EventBridge rules → Step Functions/Lambda, SNS, ticketing
+├── Log archive account         ← org CloudTrail, Config, flow logs, Security Lake (OCSF)
+└── Workload accounts (50 × Regions): detectors auto-enabled, findings flow to the admin
+```
 
 ### 🎬 Animated Sequence Diagram
 
@@ -1085,158 +707,67 @@ Member Accounts (50 accounts, 3 regions each):
   <em>🎬 Animated GuardDuty Multi-Account Threat Detection — 50 member accounts report to delegated admin with auto-remediation — Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
----
-# Security Hub → EventBridge → Auto-remediation
+Enable GuardDuty in **every** Region, including ones you don't use: attackers with stolen keys mine crypto in Regions nobody watches. (Or block unused Regions with an SCP, and still monitor.)
+
+**Example GuardDuty finding types:**
+
+| Tactic | Finding type |
+|---|---|
+| Reconnaissance | `Recon:EC2/Portscan`, `Recon:IAMUser/TorIPCaller` |
+| Compromised instance | `CryptoCurrency:EC2/BitcoinTool.B`, `Backdoor:EC2/C&CActivity.B`, `Behavior:EC2/NetworkPortUnusual` |
+| Credential misuse | `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS`, `Policy:IAMUser/RootCredentialUsage` |
+| Defense evasion | `Stealth:IAMUser/CloudTrailLoggingDisabled` |
+| Data access | `Exfiltration:S3/AnomalousBehavior`, `Exfiltration:S3/MaliciousIPCaller` |
+| Multi-stage | `AttackSequence:IAM/CompromisedCredentials`, `AttackSequence:S3/CompromisedData` |
+
+**Automated remediation (EC2 isolation):**
+
+```python
+import boto3
+
+ec2 = boto3.client("ec2")
+asg = boto3.client("autoscaling")
+
+def isolate_instance(instance_id: str, finding_id: str) -> None:
+    inst = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
+
+    # 1. Stop the ASG from replacing/terminating it (keeps evidence)
+    for tag in inst.get("Tags", []):
+        if tag["Key"] == "aws:autoscaling:groupName":
+            asg.detach_instances(InstanceIds=[instance_id], AutoScalingGroupName=tag["Value"],
+                                 ShouldDecrementDesiredCapacity=False)
+    ec2.modify_instance_attribute(InstanceId=instance_id, DisableApiTermination={"Value": True})
+
+    # 2. Quarantine security group: no inbound rules, egress revoked
+    sg = ec2.create_security_group(GroupName=f"quarantine-{instance_id}",
+                                   Description=f"Quarantine for {finding_id}", VpcId=inst["VpcId"])
+    ec2.revoke_security_group_egress(GroupId=sg["GroupId"],
+                                     IpPermissions=[{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+    ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[sg["GroupId"]])
+
+    # 3. Preserve evidence
+    ec2.create_snapshots(InstanceSpecification={"InstanceId": instance_id},
+                         TagSpecifications=[{"ResourceType": "snapshot",
+                                             "Tags": [{"Key": "forensic-finding", "Value": finding_id}]}])
 ```
 
-**GuardDuty Threat Detection:**
+Caveats a staff engineer should raise: changing security groups does **not** cut already-tracked connections, so isolation may also need a NACL deny on the subnet or stopping the instance; capture memory (via SSM) before stopping if forensics matter; revoke the instance role's sessions (`aws:TokenIssueTime` deny policy) because stolen credentials keep working elsewhere; and run the whole flow as an auditable Step Functions workflow rather than one Lambda. The AWS **Automated Forensic Orchestrator** and Security Hub automation rules are reference starting points.
 
-```yaml
-# GuardDuty detection types:
+**Prioritisation:**
 
-1. Reconnaissance:
-   - Unusual port scans from EC2 (Recon:EC2/Portscan)
-   - Unusual API calls from known bad IPs (Recon:IAMUser/TorIPCaller)
-   - DNS query for known malicious domains
-
-2. Compromised Instance:
-   - Crypto mining (CryptoCurrency:EC2/BitcoinTool.B)
-   - Outbound traffic to C2 servers (Backdoor:EC2/C2Activity.B)
-   - Unusual network traffic (Behavior:EC2/NetworkPortUnusual)
-
-3. Privilege Escalation:
-   - Disabling CloudTrail (Stealth:IAMUser/CloudTrailLoggingDisabled)
-   - Creating access keys (Persistence:IAMUser/UserWithKey)
-   - Unusual IAM role assumption (UnauthorizedAccess:IAMUser/RoleAssumption)
-
-4. Data Exfiltration:
-   - Large data upload (Exfiltration:S3/ObjectRead)
-   - Unusual S3 access patterns (Policy:IAMUser/RootCredentialUsage)
-   - S3 ACL modifications
-
-# Detection methods:
-# - Threat intelligence feeds (known bad IPs/domains)
-# - ML-based anomaly detection (unusual API patterns)
-# - Behavioral analysis (baseline of normal activity)
-```
-
-**Automated Remediation:**
-
-```yaml
-# Security Hub → EventBridge → Lambda (auto-remediation)
-
-# EventBridge rule:
-Security Hub Finding → EventBridge → Lambda
-
-# Finding: GuardDuty finds crypto mining on EC2 instance
-{
-  "source": ["aws.securityhub"],
-  "detail": {
-    "findings": [{
-      "Id": "arn:aws:guardduty:...",
-      "Title": "CryptoCurrency:EC2/BitcoinTool.B",
-      "Severity": {
-        "Label": "HIGH",
-        "Normalized": 70
-      },
-      "Resources": [{
-        "Type": "AwsEc2Instance",
-        "Id": "i-1234567890abcdef"
-      }],
-      "ProductFields": {
-        "aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4": "1.2.3.4"
-      }
-    }]
-  }
-}
-
-# Auto-remediation Lambda:
-def lambda_handler(event, context):
-    finding = event['detail']['findings'][0]
-    
-    if 'CryptoCurrency' in finding['Title']:
-        instance_id = finding['Resources'][0]['Id']
-        
-        # Isolate the instance
-        ec2 = boto3.client('ec2')
-        
-        # Create security group that denies all egress
-        sg = ec2.create_security_group(
-            GroupName=f"isolate-{instance_id}",
-            Description=f"Isolated {instance_id} for crypto mining"
-        )
-        
-        ec2.revoke_security_group_egress(
-            GroupId=sg['GroupId'],
-            IpPermissions=[{
-                'IpProtocol': '-1',
-                'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
-            }]
-        )
-        
-        # Attach isolation SG to instance
-        ec2.modify_instance_attribute(
-            InstanceId=instance_id,
-            Groups=[sg['GroupId']]
-        )
-        
-        # Capture forensic snapshot
-        ec2.create_snapshots(
-            InstanceSpecification={
-                'InstanceId': instance_id,
-                'ExcludeBootVolume': False
-            },
-            TagSpecifications=[{
-                'ResourceType': 'snapshot',
-                'Tags': [{'Key': 'Forensic', 'Value': finding['Id']}]
-            }]
-        )
-        
-        # Notify security team
-        sns.publish(
-            TopicArn='arn:aws:sns:...:security-alerts',
-            Message=f"Isolated {instance_id} for crypto mining"
-        )
-```
-
-**Finding Prioritization:**
-
-```yaml
-# Severity levels:
-# CRITICAL (90-100): active compromise, data exfiltration
-# HIGH (70-89): confirmed malicious activity
-# MEDIUM (40-69): suspicious activity needs investigation
-# LOW (1-39): informational, configuration issues
-
-# Prioritization criteria:
-# 1. Severity (HIGH+ → immediate)
-# 2. Resource criticality (prod vs dev)
-# 3. Data sensitivity (PII, PCI → higher priority)
-# 4. Attack chain position (initial access vs exfiltration)
-# 5. Time since first detected
-
-# Finding workflow:
-# 1. NEW → triage (auto-remediate where possible)
-# 2. IN_PROGRESS → investigate (GuardDuty + Detective)
-# 3. RESOLVED → confirmed fixed
-# 4. SUPPRESSED → false positive (add suppression rule)
-
-# Suppression rules (reduce noise):
-SuppressionRule:
-  - Criteria:
-      ResourceType: "AccessKey"
-      FindingType: "UnauthorizedAccess:IAMUser/RootCredentialUsage"
-    # Suppress: root credential usage if it's from known automation
-```
+- Severity: GuardDuty uses Low / Medium / High / Critical (Critical for attack sequences). Security Hub normalises to INFORMATIONAL → CRITICAL.
+- Context: production vs sandbox (account tags), data sensitivity (Macie classification), internet exposure (Security Hub exposure findings, Inspector network reachability).
+- Workflow states: NEW → NOTIFIED → RESOLVED or SUPPRESSED. Use **suppression rules** (GuardDuty filters with auto-archive) for known-benign patterns, e.g. a vulnerability scanner's port scans from a tagged instance, never for root credential usage.
+- Measure mean time to detect and respond, and the share of findings closed by automation.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Multi-account architecture** | Uses delegated admin in security account for centralized management |
-| **Threat detection** | Explains ML-based anomaly detection, threat intelligence, behavioral analysis |
-| **Auto-remediation** | Automatically isolates compromised instances, triggers incident response |
-| **Prioritization** | Triages findings by severity, resource criticality, and attack chain position |
+| **Multi-account architecture** | Uses delegated admin in a security account, auto-enable, all Regions |
+| **Threat detection** | Explains GuardDuty data sources, protection plans, attack sequences |
+| **Auto-remediation** | Isolates safely, preserves evidence, revokes credentials, knows SG tracking caveat |
+| **Prioritization** | Triages findings by severity, resource criticality, exposure and attack chain |
 
 ---
 
@@ -1248,191 +779,118 @@ SuppressionRule:
 
 ### Answer
 
-**AWS Organization Structure:**
+!!! tip "30-second answer"
+    Follow the AWS Security Reference Architecture: start from **Control Tower** (or an equivalent landing zone) for the account structure, organisation CloudTrail, Config and guardrails. Accounts are the primary blast-radius boundary: security tooling and log archive accounts separate from workloads, prod separate from non-prod. Identity flows through IAM Identity Center; root credentials are removed from member accounts. Preventive controls are SCPs (what principals can do), RCPs (who can touch your resources), declarative policies (e.g. block public AMI sharing, enforce IMDSv2) and permission boundaries. Detective controls are GuardDuty, Security Hub, Config, Inspector, Macie and Access Analyzer, aggregated in the security account. Data protection is KMS everywhere, Block Public Access, and backups vaulted in a separate account.
 
-```yaml
-AWS Organization: my-org
+**Organisation structure:**
 
-Root OU:
-├── Security OU:
-│   ├── Security Account (111111111111)
-│   │   ├── GuardDuty (delegated admin)
-│   │   ├── Security Hub
-│   │   ├── Detective
-│   │   ├── Macie
-│   │   └── CloudTrail (org trail)
-│   │
-│   ├── Log Archive Account
-│   │   ├── S3: Centralized logs
-│   │   └── Glacier: Long-term archive
-│   │
-│   └── Shared Services Account
-│       ├── IAM Identity Center (SSO)
-│       ├── Active Directory (or Managed AD)
-│       └── DNS (Route53 Resolver)
-│
-├── Infrastructure OU:
-│   ├── Network Account
-│   │   ├── Transit Gateway
-│   │   ├── Direct Connect
-│   │   └── VPN
-│   │
-│   └── Compute Account
-│       ├── EC2 (spot, reserved)
-│       └── ECS/EKS (container orchestration)
-│
-├── Application OU:
-│   ├── Dev Account
-│   ├── Staging Account
-│   └── Prod Account
-│       ├── Application services
-│       ├── RDS, DynamoDB, ElastiCache
-│       └── ALB, CloudFront
-│
-└── Sandbox OU:
-    └── Developer Accounts (1 per developer)
+```
+Root
+├── Security OU
+│   ├── Security tooling (delegated admin for security services, IR roles)
+│   └── Log archive (org CloudTrail, Config, flow logs; Object Lock, tight bucket policies)
+├── Infrastructure OU
+│   ├── Network (Transit Gateway / Cloud WAN, inspection VPC, egress, DNS, Direct Connect)
+│   └── Shared services (CI/CD, artifact repos, directory services)
+├── Workloads OU
+│   ├── Prod OU (prod accounts)
+│   └── Non-prod OU (dev, staging)
+├── Sandbox OU (individual experimentation; budget alerts, no connectivity to corporate network)
+└── Suspended OU (closing accounts; deny-all SCP)
 ```
 
-**Service Control Policies:**
+IAM Identity Center is administered from the management account or a delegated admin account; the management account itself runs no workloads.
 
-```yaml
-# SCPs at OU level enforce guardrails:
+**SCP examples (deny-list style, with break-glass exemptions):**
 
-# Root SCP: Deny sensitive actions at organization level
-DenyHighRiskActions:
-  Effect: Deny
-  Action:
-    - iam:CreateAccessKey
-    - iam:CreateUser
-    - iam:DeleteRolePermissionsBoundary
-    - cloudtrail:StopLogging
-    - cloudtrail:DeleteTrail
-    - ec2:DeleteFlowLogs
-    - config:DeleteConfigRule
-    - guardduty:DeleteDetector
-    - guardduty:DisassociateFromMasterAccount
-    - s3:PutBucketPublicAccessBlock
-    - s3:PutBucketAcl (with condition: public = true)
-  Resource: "*"
-
-# Infrastructure OU SCP: Only allow approved services
-DenyNonInfrastructureServices:
-  Effect: Deny
-  Action:
-    - ec2:*
-    - ecs:*
-    - eks:*
-    - autoscaling:*
-    - ebs:*
-    - vpc:*
-  Resource: "*"
-  # All other services denied
-
-# Production SCP: MFA must be enabled
-RequireMFADeny:
-  Effect: Deny
-  Action: "*"
-  Resource: "*"
-  Condition:
-    BoolIfExists:
-      "aws:MultiFactorAuthPresent": "false"
-  # All actions require MFA (except console login)
-
-# Sandbox SCP: Budget limit
-BudgetLimit:
-  Effect: Deny
-  Action:
-    - ec2:RunInstances
-  Resource: "arn:aws:ec2:*:*:instance/*"
-  Condition:
-    NumericGreaterThan:
-      "aws:RequestTag/cost-center": "developer-*"
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProtectSecurityTooling",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail",
+        "guardduty:DeleteDetector", "guardduty:DisassociateFromAdministratorAccount",
+        "config:StopConfigurationRecorder", "config:DeleteConfigurationRecorder",
+        "securityhub:DisableSecurityHub", "ec2:DeleteFlowLogs",
+        "s3:PutAccountPublicAccessBlock", "kms:ScheduleKeyDeletion"
+      ],
+      "Resource": "*",
+      "Condition": { "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/BreakGlass" } }
+    },
+    {
+      "Sid": "NoIAMUsersOrKeys",
+      "Effect": "Deny",
+      "Action": ["iam:CreateUser", "iam:CreateAccessKey"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ApprovedRegionsOnly",
+      "Effect": "Deny",
+      "NotAction": ["iam:*", "organizations:*", "sts:*", "support:*", "cloudfront:*",
+                    "route53:*", "budgets:*", "waf:*", "wafv2:*", "health:*"],
+      "Resource": "*",
+      "Condition": { "StringNotEquals": { "aws:RequestedRegion": ["us-east-1", "eu-west-1"] } }
+    }
+  ]
+}
 ```
 
-**Network Security Architecture:**
+- Allow-listing services per OU uses a Deny with `NotAction` (deny everything except the approved list), not a Deny on the services you want.
+- Don't write a blanket "deny unless `aws:MultiFactorAuthPresent`" SCP: it breaks AWS service roles, federated sessions and automation. Enforce MFA at the IdP / Identity Center.
+- Test SCPs in a non-prod OU first; a bad SCP can lock everyone out of every account below it.
 
-```yaml
-# Network security across accounts:
+**RCP example (data perimeter):**
 
-# One VPC per account, connected via Transit Gateway:
-┌─────────────────────────────────────────────────┐
-│                 Transit Gateway                  │
-│                                                   │
-│  Spoke VPCs:                                      │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
-│  │ Dev VPC  │  │ Stg VPC  │  │ Prod VPC │       │
-│  │ 10.0.0/16│  │ 10.1.0/16│  │ 10.2.0/16│       │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
-│       │              │              │            │
-│       └──────────────┼──────────────┘            │
-│                      │                           │
-│  ┌───────────────────▼───────────────────┐      │
-│  │          Inspection VPC                │      │
-│  │  ┌─────────────┐  ┌─────────────┐     │      │
-│  │  │ Firewall    │  │ IDS/IPS     │     │      │
-│  │  │ (Palo Alto) │  │ (GuardDuty) │     │      │
-│  │  └─────────────┘  └─────────────┘     │      │
-│  └───────────────────────────────────────┘      │
-└─────────────────────────────────────────────────┘
-
-# Security groups: least privilege per microservice
-# Network ACLs: subnet-level deny lists
-# VPC Endpoints: private access to AWS services
-# VPC Flow Logs: published to Security account S3
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "OnlyMyOrgCanAccessMyBuckets",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": "*",
+    "Condition": {
+      "StringNotEqualsIfExists": { "aws:PrincipalOrgID": "o-abc123xyz" },
+      "BoolIfExists": { "aws:PrincipalIsAWSService": "false" }
+    }
+  }]
+}
 ```
 
-**Monitoring & Incident Response:**
+Together with VPC endpoint policies (`aws:ResourceOrgID`) and SCPs, this forms a **data perimeter**: trusted identities, accessing trusted resources, from expected networks.
 
-```yaml
-# Centralized monitoring:
+**Network security:** hub-and-spoke via Transit Gateway with an inspection VPC (AWS Network Firewall) for east-west and egress; centralised egress so NAT and filtering live in one place; interface endpoints for AWS APIs; WAF + Shield on internet entry points; no direct internet access in data subnets; VPC Block Public Access as a guardrail; flow logs to the log archive.
 
-1. CloudTrail (Organization Trail):
-   - All accounts, all regions
-   - Management events + data events (S3, Lambda)
-   - Insights (unusual API activity)
-   - Logs → S3 (Log Archive account)
+**Data protection:** customer managed KMS keys per data classification; S3 Block Public Access at the account level (and organisation-level policies); Macie for discovering sensitive data; AWS Backup with cross-account, cross-Region copies into a **logically air-gapped vault** with vault lock for ransomware resilience.
 
-2. GuardDuty:
-   - All accounts (delegated admin in Security)
-   - Threat detection: compromised instances, crypto mining
-   - Findings → Security Hub
+**Monitoring and response:**
 
-3. Security Hub:
-   - All accounts (delegated admin)
-   - Standards: CIS, PCI-DSS, AWS Foundational
-   - Cross-region aggregation
-   - Findings → EventBridge → Auto-remediation
+| Layer | Service |
+|---|---|
+| Audit | Organisation CloudTrail (management events everywhere, data events for sensitive S3/Lambda/DynamoDB), CloudTrail Lake or Security Lake for queries |
+| Configuration | Config with conformance packs; Security Hub CSPM standards (AWS Foundational Security Best Practices, CIS) |
+| Threats | GuardDuty (all protection plans that match your workloads), Detective for investigation |
+| Vulnerabilities | Inspector for EC2, ECR images, Lambda; code scanning |
+| Response | Pre-provisioned IR roles in every account, runbooks (SSM documents/Step Functions), game days |
 
-4. Config:
-   - All accounts, all regions
-   - Rules: S3 public access, security group changes
-   - Conformance packs: compliance frameworks
+**Incident response tiers:**
 
-5. Incident Response Plan:
-   # Tier 1 (automated):
-   - Crypto mining: isolate instance
-   - S3 public access: block automatically
-   - Root user activity: notify security team
-   
-   # Tier 2 (playbook):
-   - Compromised IAM key: rotate key, review activity
-   - EC2 backdoor: snapshot forensic, terminate instance
-   - Ransomware: restore from backup, isolate affected resources
-   
-   # Tier 3 (escalation):
-   - Data exfiltration: full incident investigation
-   - Compliance breach: legal notification
-   - Cross-account compromise: emergency access revocation
-```
+- *Automated:* public S3 bucket → re-enable Block Public Access; exposed access key (AWS Health / `AWSCompromisedKeyQuarantine` policy applied by AWS) → deactivate key, revoke sessions; crypto mining → isolate instance.
+- *Playbook:* compromised role → deny sessions issued before now (`aws:TokenIssueTime`), rotate, investigate in CloudTrail Lake/Detective; ransomware → isolate, restore from air-gapped backups.
+- *Escalation:* data exfiltration, regulated data exposure → legal/compliance, AWS Customer Incident Response Team (CIRT) via support.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Organization structure** | Separates duties via OU structure (security, infrastructure, application) |
-| **SCP guardrails** | Enforces organization-wide policies (deny high-risk actions, require MFA) |
-| **Defense in depth** | Applies controls at every layer: network, identity, data, monitoring |
-| **Incident response** | Designs tiered response (automated → playbook → escalation) |
+| **Organization structure** | Separates duties via OU and account structure (security, log archive, network, workloads) |
+| **SCP guardrails** | Writes correct deny-list SCPs with break-glass, uses RCPs for data perimeters, avoids lock-out designs |
+| **Defense in depth** | Applies controls at every layer: identity, network, data, detection, backup |
+| **Incident response** | Designs tiered response (automated → playbook → escalation) with pre-provisioned access |
 
 ---
 
