@@ -4,7 +4,7 @@
 
 > **Prerequisites:** This file builds on the foundational Kubernetes content in [`INTERVIEW_QUESTIONS.md`](./INTERVIEW_QUESTIONS.md) (scheduler, networking, RBAC, storage, controllers), [`POD_LIFECYCLE_AND_MONITORING.md`](./POD_LIFECYCLE_AND_MONITORING.md) (pod lifecycle, probes, monitoring, eBPF), and Docker fundamentals in [`../docker/INTERVIEW_QUESTIONS.md`](../docker/INTERVIEW_QUESTIONS.md) (container runtime, namespaces, cgroups, images).
 >
-> **Storage deep-dive** in [Section 12](#12-storage-csi-volume-snapshots-backup-strategies) extends the PV/PVC/CSI/StatefulSet foundations from `INTERVIEW_QUESTIONS.md` Q6.
+> **Storage deep-dive** in [Section 12](#12-storage-csi-volume-snapshots-backup-strategies) extends the PV/PVC/CSI/StatefulSet foundations from `INTERVIEW_QUESTIONS.md` Q4.
 
 ---
 
@@ -32,6 +32,9 @@
 **What They're Really Testing:** Whether you understand GitOps principles — Git as the single source of truth, automated drift detection and reconciliation, and pull-based deployment for security.
 
 ### Answer
+
+!!! tip "30-second answer"
+    Keep desired state for every cluster in Git (a config repo separate from app code), let an in-cluster agent (Argo CD or Flux) pull and continuously reconcile it, and have CI only build, test, push an image and open or commit a change that bumps the image tag. Use one ApplicationSet (or a Flux Kustomization per cluster) to stamp the 200 services onto 5 clusters with per-environment overlays, promote by merging changes from env to env, and roll back with `git revert`. Trade-offs: Git becomes the bottleneck (concurrent tag-bump commits, repo size), secrets need SOPS/Sealed Secrets/External Secrets, and emergencies must also go through Git or self-heal will undo them.
 
 **GitOps Principles:**
 
@@ -102,13 +105,9 @@ spec:
   source:
     repoURL: https://github.com/company/k8s-manifests
     targetRevision: main               # Branch to follow
-    path: apps/payment-service/overlays/prod
-    helm:
-      valueFiles:
-      - values-prod.yaml
-      parameters:
-      - name: image.tag
-        value: v1.2.3                  # Or use :latest with Image Updater
+    path: apps/payment-service/overlays/prod   # Kustomize overlay (auto-detected)
+    # For a Helm chart instead: path: charts/payment-service + helm.valueFiles
+    # Image tag is pinned in the overlay (kustomization.yaml images:), bumped by CI
   destination:
     server: https://kubernetes.default.svc
     namespace: prod-payment
@@ -121,12 +120,13 @@ spec:
     - CreateNamespace=true             # Auto-create namespace
     - PruneLast=true                    # Prune after sync (safer)
     - ApplyOutOfSyncOnly=true          # Only apply out-of-sync resources
-  retry:
-    limit: 5
-    backoff:
-      duration: 5s
-      factor: 2
-      maxDuration: 3m
+    - ServerSideApply=true             # avoids the 256KB last-applied annotation limit
+    retry:                             # (lives under syncPolicy)
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
 ```
 
 **ArgoCD ApplicationSet (Multi-Cluster):**
@@ -187,9 +187,8 @@ jobs:
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
-    outputs:
-      image-tag: ${{ steps.meta.outputs.version }}
     steps:
+    - uses: actions/checkout@v4
     - name: Login to registry
       uses: docker/login-action@v3
       with:
@@ -198,7 +197,7 @@ jobs:
         password: ${{ secrets.REGISTRY_PASSWORD }}
 
     - name: Build and push
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         push: true
         tags: registry.example.com/payment-service:${{ github.sha }}
@@ -226,8 +225,11 @@ jobs:
         git config user.email "ci@example.com"
         git add .
         git commit -m "Update payment-service to ${{ github.sha }}"
-        git push
+        git pull --rebase && git push   # many services bump tags concurrently
     # ArgoCD detects the Git change and auto-syncs!
+    # For prod, open a PR instead of pushing to main: the merge is the approval gate.
+    # Alternatives to CI commits: Argo CD Image Updater / Flux image automation
+    # watch the registry and write the new tag back to Git themselves.
 ```
 
 **Flux v2 (Alternative to ArgoCD):**
@@ -260,7 +262,7 @@ spec:
     name: flux-system
   path: ./apps/production
   prune: true                            # Remove resources not in Git
-  validation: client                      # Client-side validation
+  wait: false
   healthChecks:
   - apiVersion: apps/v1
     kind: Deployment
@@ -287,10 +289,13 @@ Rollback              | Via UI, CLI, or Git revert| Git revert (automatic)
 Secret management     | External (Sealed Secrets,  | External (SOPS, Sealed Secrets,
                       | External Secrets)          | External Secrets)
 Learning curve        | Moderate                  | Steeper (CRD-based)
+Governance            | CNCF graduated            | CNCF graduated (continues after
+                      |                           | Weaveworks shut down in 2024)
 
 # Recommendation:
-# ArgoCD: When you need a UI, multi-cluster management, team accessibility
-# Flux: When you want Git-native, no-UI, security-first, single-cluster
+# ArgoCD: When you need a UI, central multi-cluster management, team self-service
+# Flux: When you want lightweight per-cluster agents, composable controllers,
+#       Kubernetes-RBAC-only access, no central control plane to secure
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -325,7 +330,10 @@ API Request (kubectl apply, API call)
                    │
                    ▼
 ┌─────────────────────────────────────────────┐
-│         Mutating Admission Webhooks          │
+│  Mutating admission                          │
+│  built-in plugins (LimitRanger, default SA,  │
+│  ...), MutatingAdmissionPolicy (CEL), then   │
+│  mutating webhooks                           │
 │  (Modify the resource BEFORE validation)     │
 │  Examples:                                   │
 │  - Inject sidecar (Istio, Linkerd)           │
@@ -335,20 +343,20 @@ API Request (kubectl apply, API call)
 └──────────────────┬──────────────────────────┘
                    │
                    ▼
-┌─────────────────────────────────────────────┐
-│         Validating Admission Webhooks        │
-│  (Allow or deny the resource)                │
-│  Examples:                                   │
-│  - Enforce pod security standards            │
-│  - Check image registry is allowed           │
-│  - Verify resource limits are set            │
-│  - Ensure required labels exist              │
-└──────────────────┬──────────────────────────┘
+   (object schema validation happens here)
                    │
                    ▼
 ┌─────────────────────────────────────────────┐
-│             Resource Quota                   │
-│  (Check namespace quotas)                    │
+│  Validating admission                        │
+│  built-in plugins (PodSecurity,              │
+│  ResourceQuota, ...), ValidatingAdmission-   │
+│  Policy (CEL, GA 1.30, in-process, no        │
+│  webhook to run), then validating webhooks   │
+│  (run in parallel; any deny rejects)         │
+│  Examples:                                   │
+│  - Check image registry is allowed           │
+│  - Verify resource limits are set            │
+│  - Ensure required labels exist              │
 └──────────────────┬──────────────────────────┘
                    │
                    ▼
@@ -361,16 +369,20 @@ API Request (kubectl apply, API call)
 
 ```yaml
 # Kyverno: policies as Kubernetes resources (no new language!)
-# Mutating, validating, and generate policies
+# Mutate, validate, generate and verifyImages rules.
+# Policies on Pods are auto-generated for Deployments, StatefulSets, Jobs, etc.,
+# so violations are reported on the workload, not only on its pods.
+# (Newer Kyverno releases also offer CEL-based ValidatingPolicy/MutatingPolicy types
+#  aligned with Kubernetes' built-in admission policies; ClusterPolicy below still works.)
 
-# ── 1. MUTATING: Add default resource limits if not set ──
+# ── 1. MUTATING: Add default resource requests/limits if not set ──
+# (A namespace LimitRange does the same natively; Kyverno helps when you need
+#  logic, e.g. different defaults per label.)
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: add-resource-limits
 spec:
-  validationFailureAction: Audit           # Audit mode first (don't block)
-  # Change to: Enforce after testing
   rules:
   - name: add-default-limits
     match:
@@ -391,13 +403,13 @@ spec:
                 +(cpu): "100m"
                 +(memory): "256Mi"
 
+---
 # ── 2. VALIDATING: Require specific labels ──
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: require-labels
 spec:
-  validationFailureAction: Enforce          # Block if invalid
   rules:
   - name: check-team-label
     match:
@@ -408,38 +420,40 @@ spec:
           - Deployment
           - Service
     validate:
+      failureAction: Audit                  # start in Audit, flip to Enforce later
+                                            # (per-rule field; the spec-level
+                                            #  validationFailureAction is deprecated)
       message: "Label 'team' is required for all resources"
       pattern:
         metadata:
           labels:
             team: "?*"                      # Must exist and not be empty
 
+---
 # ── 3. VALIDATING: Block latest image tag ──
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: block-latest-tag
 spec:
-  validationFailureAction: Enforce
-  background: false                         # Don't scan existing resources
   rules:
-  - name: block-latest
+  - name: require-explicit-non-latest-tag
     match:
       any:
       - resources:
           kinds:
           - Pod
     validate:
-      message: "Using 'latest' tag is not allowed"
-      foreach:
-      - list: request.object.spec.containers
-        deny:
-          conditions:
-            any:
-            - key: "{{ element.image }}"
-              operator: Equals
-              value: "*:latest"
+      failureAction: Enforce
+      message: "Images must have an explicit tag other than 'latest'"
+      pattern:
+        spec:
+          containers:
+          - image: "*:* & !*:latest"        # "nginx" (implicit latest) also fails
+          =(initContainers):
+          - image: "*:* & !*:latest"
 
+---
 # ── 4. GENERATE: Create NetworkPolicy for every namespace ──
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
@@ -454,16 +468,16 @@ spec:
           kinds:
           - Namespace
     generate:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      name: default-deny-ingress
+      namespace: "{{ request.object.metadata.name }}"
       synchronize: true                     # Keep in sync (recreate if deleted)
-      generate:
-        kind: NetworkPolicy
-        name: default-deny-ingress
-        namespace: "{{ request.object.metadata.name }}"
-        data:
-          spec:
-            podSelector: {}
-            policyTypes:
-            - Ingress
+      data:
+        spec:
+          podSelector: {}
+          policyTypes:
+          - Ingress
 ```
 
 **OPA/Gatekeeper (Rego-Based Policies):**
@@ -511,7 +525,9 @@ spec:
   match:
     kinds:
     - apiGroups: [""]
-      kinds: ["Pod", "Service", "Deployment"]
+      kinds: ["Pod", "Service"]
+    - apiGroups: ["apps"]
+      kinds: ["Deployment"]
     namespaces:
     - "production"
     - "staging"
@@ -521,6 +537,7 @@ spec:
     - "owner"
     - "environment"
 
+---
 # ── Block privileged containers ──
 apiVersion: templates.gatekeeper.sh/v1
 kind: ConstraintTemplate
@@ -546,6 +563,11 @@ spec:
         input.review.object.spec.containers[_].securityContext.capabilities.add[_] == "SYS_ADMIN"
         msg := "CAP_SYS_ADMIN is not allowed"
       }
+# Real policies must also check initContainers and ephemeralContainers.
+# The `rego:` field uses Rego v0 syntax; OPA 1.0 defaults to v1 syntax
+# (`violation contains {...} if {...}`), which Gatekeeper accepts via its `code:` field.
+# For checks this simple, built-in ValidatingAdmissionPolicy (CEL) avoids running a
+# webhook at all; PSA "baseline" already blocks both cases.
 ```
 
 **Kyverno vs OPA/Gatekeeper:**
@@ -601,6 +623,9 @@ spec:
     matchLabels:
       app: pod-validator
   template:
+    metadata:
+      labels:
+        app: pod-validator
     spec:
       containers:
       - name: webhook
@@ -642,6 +667,15 @@ webhooks:
   timeoutSeconds: 5
   failurePolicy: Fail                     # If webhook is down, reject requests
   # Or: Ignore (allow requests if webhook is down — risk but availability)
+  namespaceSelector:                      # never gate the namespaces the webhook needs
+    matchExpressions:                     # to recover itself (kube-system, admission)
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values: ["kube-system", "admission"]
+# Failure mode to name in interviews: a Fail-closed webhook whose pods are down
+# blocks creating ALL pods, including its own replacements → cluster-wide outage.
+# Mitigate: exclude system namespaces, 2+ replicas with a PDB, short timeouts,
+# alert on apiserver_admission_webhook_rejection_count / latency.
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -662,6 +696,9 @@ webhooks:
 **What They're Really Testing:** Whether you understand the deployment strategy trade-offs — speed vs safety, cost vs simplicity, and how to implement each with Kubernetes primitives (Deployments, Services, Ingress).
 
 ### Answer
+
+!!! tip "30-second answer"
+    A plain RollingUpdate can't do "5% of traffic" (its split is a pod ratio) and can't roll back in 10 seconds (rollback is another rolling update). For a payment service use a **canary with weighted routing** in a mesh or Gateway API `HTTPRoute`, with automated analysis (Argo Rollouts or Flagger). Rollback is then a routing change: set the canary's weight to 0 in seconds while stable pods keep running. Blue-green also gives instant rollback, at 2× capacity. Underneath any strategy: honest readiness probes, graceful shutdown, backward-compatible schema and API changes (both versions serve at once), and idempotent payment operations so client retries during a switch don't double-charge.
 
 **Strategy Comparison:**
 
@@ -715,6 +752,7 @@ spec:
             path: /health/ready
             port: 8080
 
+---
 # Service points to BLUE (current production)
 apiVersion: v1
 kind: Service
@@ -745,10 +783,48 @@ kubectl patch service payment-service -p '{"spec":{"selector":{"version":"green"
 # Cons: 2× resource cost during deployment, requires full environment
 ```
 
-**Ingress-Based Canary:**
+**Gateway API Canary (preferred for new setups):**
+
+The Ingress API only standardises host/path routing, so weights and header matches live in controller-specific annotations. **Gateway API** (GA since v1.0, current v1.5) makes them first-class, portable fields, and is the Kubernetes community's recommended successor to Ingress. The Ingress API itself (`networking.k8s.io/v1`) is GA and frozen, not removed.
 
 ```yaml
-# Canary using Ingress (nginx-ingress, contour, gloo)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: payment-service
+  namespace: prod
+spec:
+  parentRefs:
+  - name: public-gateway              # Gateway owned by the platform team
+    namespace: gateway-infra
+  hostnames: ["api.example.com"]
+  rules:
+  - matches:                          # A/B or internal testing: header → canary only
+    - path: {type: PathPrefix, value: /api/payments}
+      headers:
+      - name: x-canary
+        value: "true"
+    backendRefs:
+    - name: payment-service-canary
+      port: 8080
+  - matches:
+    - path: {type: PathPrefix, value: /api/payments}
+    backendRefs:                      # weighted split for everyone else
+    - name: payment-service-stable
+      port: 8080
+      weight: 95
+    - name: payment-service-canary
+      port: 8080
+      weight: 5                       # rollback = set to 0 (seconds, no pod churn)
+```
+
+**Ingress-Based Canary (legacy: Ingress-NGINX annotations):**
+
+!!! warning "Ingress-NGINX is retired"
+    The community `kubernetes/ingress-nginx` controller was retired in **March 2026**: no further releases, bug fixes or security patches (announced by Kubernetes SIG Network and the Security Response Committee in November 2025). Clusters still running it should migrate to a Gateway API implementation (the `ingress2gateway` tool converts manifests) or to another maintained Ingress controller. The annotations below are shown because many existing clusters and interview questions still use them. This does not affect F5's separately maintained NGINX Ingress Controller.
+
+```yaml
+# Canary using Ingress-NGINX annotations (controller-specific, not portable)
 # Route % of traffic to canary version based on weight
 
 apiVersion: networking.k8s.io/v1
@@ -758,7 +834,7 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/canary: "true"
     nginx.ingress.kubernetes.io/canary-weight: "5"     # 5% traffic to canary
-    nginx.ingress.kubernetes.io/canary-by-header: "x-canary"  # Or by header
+    nginx.ingress.kubernetes.io/canary-by-header: "x-canary"  # header wins over weight
     # nginx.ingress.kubernetes.io/canary-by-cookie: "canary_test"
 spec:
   ingressClassName: nginx
@@ -774,7 +850,8 @@ spec:
             port:
               number: 8080
 
-# Primary ingress (90% traffic to stable)
+---
+# Primary ingress (the remaining 95% goes to stable)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -809,7 +886,7 @@ spec:
 
 # For more sophisticated A/B with support for multiple experiments:
 
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: payment-service
@@ -860,7 +937,9 @@ spec:
 
 ```yaml
 # Flagger: automated canary deployments with metric analysis
-# Integrates with: Prometheus, Istio/Linkerd/NGINX/SMI, Slack, Teams
+# Routing providers: Istio, Linkerd, Gateway API, Contour, Gloo, Traefik, Kuma, APISIX,
+#   NGINX, or plain Kubernetes Services (blue-green only)
+# Metrics: Prometheus, Datadog, New Relic, CloudWatch, Graphite, ... via MetricTemplate
 
 apiVersion: flagger.app/v1beta1
 kind: Canary
@@ -896,48 +975,54 @@ spec:
   # Canary analysis settings
   analysis:
     interval: 30s                          # Check metrics every 30 seconds
-    iterations: 10                         # Run 10 iterations (10 × 30s = 5 min)
-    threshold: 5                           # Max 5% error rate
+    threshold: 5                           # Roll back after 5 FAILED checks (a count,
+                                           # not an error-rate %)
     maxWeight: 50                          # Max 50% traffic to canary
-    stepWeight: 5                          # Increase by 5% each iteration
-    # Progression: 5% → 10% → 15% → ... → 50%
-    # After all iterations pass: promote canary to primary
+    stepWeight: 5                          # +5% per passing interval
+    # Progression: 5% → 10% → ... → 50% (10 steps ≈ 5 min), then promote.
+    # (`iterations` is only for blue-green / A-B analysis, not weighted canaries.)
 
     metrics:
-    - name: request-success-rate           # Built-in metric
-      threshold: 99                        # 99% must succeed
+    - name: request-success-rate           # Built-in metric (from the mesh/ingress)
+      thresholdRange:
+        min: 99                            # ≥ 99% non-5xx
       interval: 1m                         # Evaluate over 1-minute window
     - name: request-duration               # Built-in metric
-      threshold: 500                       # p99 < 500ms
+      thresholdRange:
+        max: 500                           # p99 ≤ 500ms
       interval: 1m
-    - name: "database_connections_active"    # Custom Prometheus metric
-      templateRef:
+    - name: db-connections                 # Custom metric via MetricTemplate
+      templateRef:                         # (provider: prometheus, datadog, ...)
         name: database-connections
-      threshold: 50
+      thresholdRange:
+        max: 50
       interval: 1m
 
-    webhooks:
-    - name: load-test                      # Run load test during canary
+    webhooks:                              # Webhooks GATE the rollout: non-2xx = failed check
+    - name: load-test                      # Generate traffic so metrics are meaningful
+      type: rollout
       url: http://flagger-loadtester.prod/
       timeout: 5s
       metadata:
         cmd: "hey -z 2m -q 10 -host api.example.com http://gateway:80/api/payments"
-    - name: slack-notification
-      url: http://webhook.slack.com/...
-      timeout: 5s
-    - name: datadog-check                  # Custom metric from Datadog
-      url: http://datadog-webhook/api/v1/metrics
-      timeout: 10s
+
+    alerts:                                # Notifications go through AlertProviders,
+    - name: on-call-slack                  # not webhooks
+      severity: error
+      providerRef:
+        name: slack
+        namespace: flagger
 ```
 
 **Flagger Canary Lifecycle:**
 
 ```
-1. User updates Deployment (new image tag)
-2. Flagger detects change, creates:
-   - payment-service-primary (stable, current version)
-   - payment-service-canary (new version, starts at 0 replicas)
-3. Flagger scales canary to 1 replica
+0. Bootstrap (once): Flagger copies the Deployment to payment-service-primary,
+   creates the -primary/-canary Services and routing, and scales your Deployment
+   (now "the canary") to 0
+1. User updates the Deployment (new image tag), e.g. via GitOps
+2. Flagger detects the pod-template change
+3. Flagger scales the canary up (HPA-aware) and waits for it to be ready
 4. Traffic shift: 5% to canary
 5. Analysis iteration 1:
    - Check: request-success-rate ≥ 99%
@@ -946,20 +1031,22 @@ spec:
    - If ALL pass: continue to next step
 6. Traffic shift: 10% to canary
 7. ... repeat until maxWeight (50%)
-8. After all iterations pass:
-   - Promote: canary becomes primary
-   - Scale down old primary
-9. IF ANY iteration fails:
-   - Auto-rollback: traffic redirected to primary
-   - Canary scaled to 0
-   - Alert sent to Slack/PagerDuty
+8. At maxWeight with healthy checks:
+   - Promote: copy the canary's spec to the primary Deployment, which rolls out
+   - Route 100% back to primary, scale canary to 0
+9. If failed checks reach `threshold`:
+   - Auto-rollback: 100% to primary, canary scaled to 0
+   - Alert via the configured AlertProvider (Slack, Teams, PagerDuty...)
+   - Your Git still says "new version": fix forward or revert the commit
 ```
 
 **Argo Rollouts (Alternative to Flagger):**
 
 ```yaml
-# Argo Rollouts: native Kubernetes controller (no service mesh required)
-# Works with: Ingress controllers (NGINX, Contour), Service Mesh (Istio, Linkerd, SMI)
+# Argo Rollouts: a Deployment replacement (Rollout CRD) with canary/blue-green steps
+# Traffic routers: Istio, Linkerd/SMI, ALB, NGINX, Traefik, APISIX, Gateway API (plugin)...
+# WITHOUT a traffic router, setWeight is approximated by the replica ratio
+# (10% of 5 replicas = 1 pod) — fine for low-risk services, not for "exactly 5%".
 # Also supports: Blue-Green, Canary, and Experiment (A/B) strategies
 
 apiVersion: argoproj.io/v1alpha1
@@ -1022,9 +1109,11 @@ spec:
     provider:
       prometheus:
         address: http://prometheus.monitoring:9090
+        # Real templates take args (e.g. the canary's pod-template-hash) and filter on
+        # them; a namespace-wide ratio dilutes a bad canary with healthy stable traffic.
         query: |
           sum(rate(
-            http_requests_total{namespace="prod", status=~"2.."}[2m]
+            http_requests_total{namespace="prod", status!~"5.."}[2m]
           )) /
           sum(rate(
             http_requests_total{namespace="prod"}[2m]
@@ -1077,14 +1166,14 @@ kubectl argo rollouts abort payment-service
 ```yaml
 Feature               | Flagger                      | Argo Rollouts
 ----------------------|------------------------------|------------------------------
-Service mesh required | Yes (Istio, Linkerd, AppMesh)| No (works with NGINX, Contour)
-                       | or NGINX Ingress             | or Istio/Linkerd via plugins
+Traffic routing       | Mesh, Gateway API or ingress | Optional; mesh, ingress or
+                      | (or K8s Services: blue-green)| Gateway API (plugin) for exact %
 Analysis              | Built-in metric templates    | AnalysisTemplate CRD
-Webhooks              | Load testing, notifications  | Manual approval gates
+Gating                | Webhooks (load test, confirm)| Manual pause/promote steps
 Blue-Green            | Yes                          | Yes
 Canary                | Yes (weight-based)           | Yes (weight-based, mirroring)
 A/B testing           | Via Istio                    | Via Istio plugin
-Complexity            | Simpler (CRD-based)          | More flexible but complex
+Workload object       | Keeps your Deployment        | Replaces it with a Rollout
 Integration           | Prometheus, Datadog, NewRelic| Prometheus, Datadog, custom
 GitOps                | ArgoCD compatible            | ArgoCD native (same project)
 
@@ -1111,6 +1200,9 @@ GitOps                | ArgoCD compatible            | ArgoCD native (same proje
 **What They're Really Testing:** Whether you understand Kubernetes multi-tenancy — using namespaces, ResourceQuotas, LimitRanges, NetworkPolicies, and RBAC to provide strong isolation between teams running workloads on a shared cluster.
 
 ### Answer
+
+!!! tip "30-second answer"
+    Namespaces per team and environment, stamped out from a template (or Capsule / Hierarchical Namespaces): RBAC bound to IdP groups using the built-in `admin`/`edit` roles, a ResourceQuota plus LimitRange per namespace, default-deny NetworkPolicies with explicit allows for DNS, ingress and monitoring, and Pod Security Admission `restricted`. That is **soft** multi-tenancy for trusted internal teams: tenants still share the kernel, nodes, the API server and CRDs. For untrusted tenants add sandboxed runtimes (gVisor/Kata via RuntimeClass), dedicated node pools (taints plus a policy that forces tolerations), API Priority and Fairness, virtual clusters (vCluster), or separate clusters.
 
 **Multi-Tenancy Architecture:**
 
@@ -1194,21 +1286,36 @@ spec:
     # Object counts
     pods: 50
     services: 20
+    services.loadbalancers: 2      # each LB costs money
     configmaps: 30
     secrets: 30
-    deployments.apps: 20
-    statefulsets.apps: 5
-
-    # Other
+    count/deployments.apps: 20     # count/<resource>.<group> for non-core objects
+    count/statefulsets.apps: 5
     count/ingresses.networking.k8s.io: 5
     count/jobs.batch: 20
+# Once requests.cpu/memory are in a quota, pods WITHOUT requests are rejected,
+# which is why every quota'd namespace also needs a LimitRange with defaults.
 
+---
+# Scoped quotas are separate objects: e.g. cap how much of the high PriorityClass
+# a team may use, so nobody marks everything "critical". (Scopes only support
+# pod-level resources like cpu/memory/pods, so they can't share an object with the
+# object counts above.)
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-critical-quota
+  namespace: team-payment-prod
+spec:
+  hard:
+    requests.cpu: 8
+    pods: 10
   scopeSelector:
     matchExpressions:
     - operator: In
       scopeName: PriorityClass
       values:
-      - production-critical      # Only count production-critical pods
+      - production-critical
 ```
 
 **LimitRange (Namespace Defaults):**
@@ -1243,54 +1350,11 @@ spec:
 
 **Network Policy for Namespace Isolation:**
 
+Every tenant namespace gets the default-deny, DNS, ingress-controller and monitoring policies from [Section 7](#7-network-policies-micro-segmentation) (generate them at namespace creation, e.g. with the Kyverno generate rule in [Section 2](#2-admission-controllers-webhooks-opagatekeeper-kyverno)). The tenancy-specific piece is "same namespace only":
+
 ```yaml
-# Default deny ALL ingress (base policy for every namespace)
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: default-deny-ingress
-  namespace: team-payment-prod
-spec:
-  podSelector: {}                           # Apply to ALL pods
-  policyTypes:
-  - Ingress                                 # Deny ALL incoming traffic
-
-# Allow Ingress controller to route to services
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-ingress-controller
-  namespace: team-payment-prod
-spec:
-  podSelector: {}                           # All pods in namespace
-  ingress:
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: ingress-nginx  # Only from ingress namespace
-    ports:
-    - port: 8080
-    - port: 8443
-
-# Allow monitoring to scrape metrics
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-monitoring
-  namespace: team-payment-prod
-spec:
-  podSelector:
-    matchLabels:
-      app: payment-service                  # Only payment-service pods
-  ingress:
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: monitoring
-    ports:
-    - port: 8080
-
-# Allow inter-service communication within the same namespace
+# Pods may talk to pods in their own namespace; anything cross-tenant needs an
+# explicit policy on the receiving side.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -1298,72 +1362,38 @@ metadata:
   namespace: team-payment-prod
 spec:
   podSelector: {}                           # All pods
+  policyTypes: ["Ingress", "Egress"]
   ingress:
   - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: team-payment-prod  # Same namespace
+    - podSelector: {}                       # any pod in THIS namespace
   egress:
   - to:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: team-payment-prod
-
-# Allow DNS (CoreDNS) — required for service discovery
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-dns
-  namespace: team-payment-prod
-spec:
-  podSelector: {}
-  egress:
-  - to:
-    - namespaceSelector: {}
-      podSelector:
-        matchLabels:
-          k8s-app: kube-dns
-    ports:
-    - port: 53
-      protocol: UDP
-    - port: 53
-      protocol: TCP
+    - podSelector: {}
 ```
 
 **RBAC per Team:**
 
 ```yaml
-# Team A gets admin access to their own namespace and read-only to others
-
-# Role: full access in team's namespace
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  namespace: team-payment-prod
-  name: team-admin
-rules:
-- apiGroups: ["", "apps", "batch", "networking.k8s.io", "autoscaling"]
-  resources: ["*"]
-  verbs: ["*"]
-- apiGroups: [""]
-  resources: ["pods/exec", "pods/log", "pods/portforward"]
-  verbs: ["get", "list", "create"]
-
-# RoleBinding: bind team's ServiceAccount
+# Don't hand-roll a wildcard Role: resources ["*"] in the core group includes
+# resourcequotas and limitranges, so the team could delete its own quota.
+# The built-in "admin" ClusterRole (bound per namespace) covers workloads, RBAC
+# within the namespace and exec, but only READ on ResourceQuota/LimitRange.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   namespace: team-payment-prod
-  name: team-payment-binding
+  name: team-payment-admins
 subjects:
-- kind: Group
+- kind: Group                               # group from your OIDC identity provider
   name: team-payment-engineers
   apiGroup: rbac.authorization.k8s.io
 roleRef:
-  kind: Role
-  name: team-admin
+  kind: ClusterRole                         # cluster-wide definition,
+  name: admin                               # namespaced grant via RoleBinding
   apiGroup: rbac.authorization.k8s.io
+# In prod, many orgs bind "edit" or "view" to humans and let only GitOps write.
 
+---
 # ClusterRole: read-only across all namespaces (for SREs)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -1421,10 +1451,17 @@ spec:
             cpu: 500m
 
 # 2. vCluster (virtual clusters)
-# Each team gets a virtual cluster inside the physical cluster
-# Full Kubernetes API, CRDs, RBAC — isolated at the API level
-# Cost: 1 physical node can run 100+ virtual clusters
-# Trade-off: Resource overhead for API server per vCluster
+# Each team gets its own API server + datastore running as pods in a host namespace;
+# a syncer copies pods down to the host cluster to actually run.
+# Teams get cluster-admin-like freedom (own CRDs, operators, RBAC) without
+# touching the host API. Trade-off: one extra control plane per tenant (CPU/memory,
+# upgrades), and pods still share host nodes and kernels.
+
+# 3. Hard isolation options for untrusted tenants:
+# - RuntimeClass with gVisor or Kata Containers (sandboxed kernel / microVM)
+# - Dedicated node pools per tenant (taints + admission policy that injects tolerations)
+# - API Priority and Fairness (FlowSchemas) so one tenant can't starve the API server
+# - Separate clusters (strongest; highest cost and operational overhead)
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -1435,6 +1472,7 @@ spec:
 | **Resource allocation** | Sets hard quotas per namespace with LimitRange defaults |
 | **Network isolation** | Default deny, then selective allow for ingress, DNS, monitoring |
 | **Tools awareness** | Knows about Capsule (namespace-based multi-tenancy) and vCluster (virtual clusters) |
+| **Soft vs hard tenancy** | Knows namespaces share kernel, nodes and API server; picks sandboxed runtimes, node pools or separate clusters for untrusted tenants |
 
 ---
 
@@ -1446,16 +1484,20 @@ spec:
 
 ### Answer
 
+!!! tip "30-second answer"
+    A mesh puts a proxy in every traffic path: a sidecar per pod, or with **Istio ambient mode** (GA since Istio 1.24) a per-node `ztunnel` for L4 mTLS plus optional per-namespace `waypoint` proxies for L7. The control plane (istiod, or Linkerd's destination/identity) acts as a CA: it issues short-lived SPIFFE X.509 certificates per ServiceAccount and pushes routing config. Proxies do mTLS, retries, timeouts, outlier ejection and weighted routing, and emit golden-signal metrics without code changes. Istio offers more features (L7 authorization, fault injection, Wasm, ambient); Linkerd is simpler with a lighter Rust proxy. The costs are per-pod proxy memory and CPU, an extra hop of latency (usually around a millisecond, measure it), and a critical control plane to run and upgrade.
+
 **Service Mesh Architecture:**
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Service Mesh Control Plane                │
 │                                                              │
-│  Istio: Pilot (service discovery), Citadel (certificates),   │
-│         Galley (config), Mixer (telemetry — deprecated)      │
-│  Linkerd: Destination (service discovery), Identity (certs), │
-│           Proxy Injector                                     │
+│  Istio: istiod (single binary since 1.5: config/xDS, CA,    │
+│         injector; the old Pilot/Citadel/Galley/Mixer split   │
+│         is gone)                                             │
+│  Linkerd: destination (discovery/policy), identity (CA),     │
+│           proxy-injector                                     │
 └──────────┬──────────┬──────────┬──────────┬──────────────────┘
            │          │          │          │
       ┌────▼────┐┌────▼────┐┌────▼────┐┌────▼────┐
@@ -1486,10 +1528,12 @@ kind: Namespace
 metadata:
   name: prod
   labels:
-    istio-injection: enabled                # Inject Envoy sidecar to ALL pods
+    istio-injection: enabled                # Inject Envoy sidecar to ALL new pods
+    # Ambient mode instead: istio.io/dataplane-mode: ambient (no sidecars, no restarts)
 
+---
 # mTLS configuration (enforce mTLS for all services in namespace):
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
   name: default
@@ -1500,8 +1544,30 @@ spec:
     # PERMISSIVE = accept both TLS and plaintext (migration mode)
     # DISABLE = no mTLS
 
+---
+# Who may call whom (L7, identity-based; NetworkPolicy can't express this):
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: payment-allow-checkout
+  namespace: prod
+spec:
+  selector:
+    matchLabels:
+      app: payment-service
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/prod/sa/checkout"]
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/api/*/payments"]
+
+---
 # Istio VirtualService (traffic routing):
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: payment-service
@@ -1512,8 +1578,6 @@ spec:
   - match:
     - uri:
         prefix: /api/v2/payments
-    rewrite:
-      uri: /api/v2/payments
     route:
     - destination:
         host: payment-service
@@ -1523,13 +1587,22 @@ spec:
         host: payment-service
         subset: v1                          # Everything else goes to v1
 
-# Circuit breaker:
-apiVersion: networking.istio.io/v1beta1
+---
+# Subsets + circuit breaker. Keep ONE DestinationRule per host: Istio only merges
+# multiple DRs for the same host in limited cases, so split rules silently conflict.
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
-  name: payment-service-cb
+  name: payment-service
 spec:
   host: payment-service
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
   trafficPolicy:
     connectionPool:
       tcp:
@@ -1544,20 +1617,24 @@ spec:
       maxEjectionPercent: 50                # Eject max 50% of replicas
 
 # Istio mTLS certificate rotation:
-# Istio Citadel (or istiod) manages certificates
-# Each Envoy proxy gets a SPIFFE-compliant certificate
-# Cert format: spiffe://cluster.local/ns/prod/sa/payment-service
-# Certificate valid: 24 hours (auto-rotated by Envoy)
-# Rotation: Envoy periodically checks for new cert (configurable)
+# istiod is the CA (or plugs into an external CA such as cert-manager/Vault)
+# The istio-agent in each sidecar (ztunnel in ambient) creates a key, sends a CSR
+# authenticated with the pod's ServiceAccount token, and serves the cert to Envoy over SDS
+# Identity (SAN): spiffe://cluster.local/ns/prod/sa/payment-service
+# Default workload cert lifetime 24h, rotated automatically well before expiry;
+# no pod restarts and no app involvement
 ```
 
 **Linkerd Implementation:**
 
 ```yaml
-# Linkerd uses a Rust-based proxy (linkerd-proxy) instead of Envoy
-# Much smaller (~10MB vs ~50MB for Envoy), lower latency
+# Linkerd uses a purpose-built Rust micro-proxy (linkerd2-proxy) instead of Envoy:
+# smaller memory footprint and fewer knobs.
+# Note: since 2024 the Linkerd project publishes only edge releases; stable releases
+# come from vendors (Buoyant Enterprise for Linkerd).
 
 # Install:
+linkerd install --crds | kubectl apply -f -
 linkerd install | kubectl apply -f -
 linkerd inject deployment.yaml | kubectl apply -f -
 
@@ -1571,21 +1648,33 @@ metadata:
 
 # mTLS (enabled by default — no config needed!):
 # Linkerd automatically enables mTLS for ALL injected pods
-# Uses auto-rotated certificates (24h rotation)
-# Identity: spiffe://cluster.local/ns/prod/sa/payment-service
+# Proxy certs are short-lived (24h) and rotated automatically; YOU must rotate the
+# trust anchor and issuer certificate (often via cert-manager) or the mesh breaks
+# when they expire.
+# Identity: spiffe://cluster.local/ns/prod/sa/payment-service (SPIFFE-style)
 
-# Traffic split (canary):
-apiVersion: split.smi-spec.io/v1alpha4
-kind: TrafficSplit
+# Traffic split (canary): Linkerd uses Gateway API HTTPRoute (SMI TrafficSplit is
+# from the archived SMI project and no longer the recommended path)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
   name: payment-service-split
+  namespace: prod
 spec:
-  service: payment-service
-  backends:
-  - service: payment-service-v1
-    weight: 90                              # 90% to v1
-  - service: payment-service-v2
-    weight: 10                              # 10% to v2
+  parentRefs:
+  - name: payment-service                   # attach to the Service ("mesh" route)
+    kind: Service
+    group: ""
+    port: 8080
+  rules:
+  - backendRefs:
+    - name: payment-service-v1
+      port: 8080
+      weight: 90                            # 90% to v1
+    - name: payment-service-v2
+      port: 8080
+      weight: 10                            # 10% to v2
 
 # Observability (Linkerd Viz):
 # linkerd viz install
@@ -1603,22 +1692,28 @@ spec:
 ```yaml
 Feature               | Istio                       | Linkerd
 ----------------------|-----------------------------|---------------------------
-Proxy                 | Envoy (C++, 50MB)           | linkerd-proxy (Rust, 10MB)
-Latency overhead      | 2-5ms p99 (Envoy)           | 0.5-1ms p99 (Rust)
-CPU overhead          | 10-30% (Envoy)              | 5-10% (Rust)
-Memory per proxy      | 50-100MB                    | 10-20MB
-mTLS                  | STRICT/PERMISSIVE/DISABLE   | Auto-on (no config needed)
-Traffic routing       | VirtualService +            | TrafficSplit (SMI)
-                      | DestinationRule             |
-Circuit breaking      | Yes (outlierDetection)      | Yes (via ServiceProfile)
+Data plane            | Envoy sidecars, or ambient  | linkerd2-proxy sidecars (Rust)
+                      | (ztunnel + waypoints)       |
+Per-proxy footprint   | Larger; grows with mesh     | Smaller, fewer features
+                      | config size (scope it with  |
+                      | the Sidecar resource)       |
+mTLS                  | PERMISSIVE by default;      | On by default for meshed pods
+                      | set STRICT                  |
+Traffic routing       | VirtualService/DR or        | Gateway API HTTPRoute
+                      | Gateway API                 |
+Circuit breaking      | Yes (outlierDetection,      | Yes (failure accrual via
+                      | connection pools)           | Service annotations)
 Retries/timeouts      | Yes                         | Yes
-Fault injection       | Yes                         | No
-Envoy filter extens.  | Yes (WASM, Lua)             | No
-Authorization policy  | Yes (native K8s NetworkPolicies) | Yes (NetworkPolicies)
-Multi-cluster         | Yes (multicluster mesh)     | Yes (linkerd-multicluster)
-Ingress gateway       | Yes (Istio Gateway)         | No (use NGINX/Contour)
+Fault injection       | Yes                         | Limited
+Extensibility         | Wasm plugins, EnvoyFilter   | No
+Authorization policy  | AuthorizationPolicy (L4/L7) | Server/AuthorizationPolicy CRDs
+Multi-cluster         | Yes                         | Yes (linkerd-multicluster)
+Ingress               | Istio gateways / Gateway API| Bring your own ingress
 Learning curve        | Steep                       | Gentle
-Community             | Large (Google)              | Growing (Buoyant, CNCF)
+Project               | CNCF graduated              | CNCF graduated; stable builds
+                      |                             | vendor-provided
+# Overhead numbers vary a lot by version, payload and config. Benchmark your own
+# traffic instead of quoting vendor figures.
 
 # When to choose Istio:
 # - Need advanced traffic management (A/B testing, fault injection)
@@ -1636,34 +1731,21 @@ Community             | Large (Google)              | Growing (Buoyant, CNCF)
 **Service Mesh Overhead Considerations:**
 
 ```yaml
-# CPU overhead:
-# Istio/Envoy: 10-30% additional CPU per request
-# Linkerd: 5-10% additional CPU per request
+# Where the overhead comes from:
+# - Two extra proxy hops per call (client-side and server-side sidecar)
+# - TLS: handshakes are amortised by connection reuse; per-request crypto is cheap
+# - Proxy memory: Envoy holds config for every service it may talk to, so in big
+#   meshes restrict it (Istio Sidecar resource / discovery selectors)
+# - Per-pod requests add up: 1,000 pods × 100Mi = ~100Gi of cluster memory
 #
 # Mitigation:
-# - Use CPU limits on sidecar proxies
-# - Tune proxy resources:
-resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 256Mi
-
-# Latency overhead:
-# Istio: 2-5ms added to p99 latency
-# Linkerd: 0.5-1ms added to p99 latency
+# - Set proxy REQUESTS from measured usage. Be careful with CPU limits on proxies:
+#   a throttled proxy adds latency to every request through it
+# - Ambient mode (Istio) removes per-pod sidecars for L4-only workloads
+# - Size per-proxy resources via annotations, e.g.:
+#   sidecar.istio.io/proxyCPU: "100m", sidecar.istio.io/proxyMemory: "128Mi"
 #
-# Actual impact depends on:
-# - Request size (larger = less relative overhead)
-# - TLS handshake (mTLS adds ~1ms for initial connection)
-# - Connection reuse (keepalive reduces overhead)
-
-# Memory overhead:
-# - Envoy: 50-100MB per sidecar
-# - linkerd-proxy: 10-20MB per sidecar
-# For 100 pods: Istio=5-10GB, Linkerd=1-2GB
+# Measure: p50/p99 latency and CPU with and without the mesh under real load.
 
 # When NOT to use service mesh:
 # - Batch/offline workloads (no benefit)
@@ -1678,7 +1760,7 @@ resources:
 |-----------|----------------------|
 | **mTLS mechanics** | Understands SPIFFE identities, certificate rotation, and mTLS handshake |
 | **Istio vs Linkerd** | Can compare proxy overhead, feature set, and operational complexity |
-| **Sidecar injection** | Knows mutating webhook injects proxy, intercepts all traffic via iptables |
+| **Sidecar injection** | Knows mutating webhook injects proxy, traffic redirected via iptables (init container or Istio CNI); knows ambient mode and native sidecars fix startup/shutdown ordering |
 | **Overhead awareness** | Understands the CPU, memory, and latency costs of adding a service mesh |
 
 ---
@@ -1725,6 +1807,7 @@ spec:
   policyTypes:
   - Ingress
 
+---
 # Default deny ALL egress (apply to every namespace)
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1756,11 +1839,12 @@ spec:
   - from:
     - namespaceSelector:
         matchLabels:
-          kubernetes.io/metadata.name: ingress-nginx
+          kubernetes.io/metadata.name: gateway-infra   # Gateway/Ingress controller namespace
     ports:
     - port: 8080
     - port: 8443
 
+---
 # Allow web tier to call API tier
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1779,6 +1863,7 @@ spec:
     ports:
     - port: 8080
 
+---
 # ── API TIER ──
 
 # Allow web tier to call API
@@ -1799,6 +1884,7 @@ spec:
     ports:
     - port: 8080
 
+---
 # Allow API to call database
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1817,6 +1903,7 @@ spec:
     ports:
     - port: 5432
 
+---
 # ── DATABASE TIER ──
 
 # Allow only API tier to connect to database
@@ -1878,10 +1965,10 @@ spec:
       app: payment-service
   ingress:
   - from:
-    - ipBlock:
-        cidr: 10.0.0.0/16                   # Cluster CIDR (for node-exporter, kubelet)
-        except:
-        - 10.0.1.0/24                       # Except a specific subnet
+    - ipBlock:                              # ipBlock is meant for traffic from OUTSIDE the
+        cidr: 10.0.0.0/16                   # cluster (e.g. a VPC range with an external
+        except:                             # scraper). Pod IPs are ephemeral, and source IPs
+        - 10.0.1.0/24                       # may be SNATed, so select pods by labels instead.
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: monitoring
@@ -1892,27 +1979,21 @@ spec:
 **Network Policy Best Practices:**
 
 ```yaml
-# 1. Start with audit mode (if using Cilium or Calico)
-# Cilium allows policy audit mode without enforcement:
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: audit-mode
-spec:
-  endpointSelector:
-    matchLabels:
-      app: payment-service
-  ingress:
-  - fromEndpoints:
-    - matchLabels:
-        app: web
-  # No egress rules → traffic is logged, not blocked
-  # Enable: k8s:io.cilium.network.policy.audit-mode=true (annotation)
+# 1. Observe before you enforce
+# - Map real flows first (Hubble, Calico flow logs, VPC flow logs) and generate
+#   allow rules from them
+# - Cilium policy audit mode (agent setting policy-audit-mode, or per endpoint)
+#   evaluates policies and logs "would be denied" verdicts without dropping traffic
+# - Kubernetes NetworkPolicy itself has no dry-run/audit mode
 
-# 2. Use policy tiers (Calico Enterprise):
+# 2. Layer cluster-wide guardrails above team policies:
+# - Calico tiers / GlobalNetworkPolicy, CiliumClusterwideNetworkPolicy, or the
+#   upstream AdminNetworkPolicy / BaselineAdminNetworkPolicy CRDs (SIG Network
+#   network-policy-api, still alpha) which namespace admins can't override
 # - Platform: base policies (deny all, allow monitoring, allow DNS)
 # - Team: team-specific policies (allow service-to-service)
-# - Application: app-specific policies (allow specific ports)
+# Remember NetworkPolicies are additive allow-lists: there is no "deny" rule in the
+# core API, and a pod selected by any policy is default-deny for that direction.
 
 # 3. Allow DNS (CoreDNS) for service discovery — REQUIRED!
 apiVersion: networking.k8s.io/v1
@@ -1922,9 +2003,13 @@ metadata:
   namespace: prod
 spec:
   podSelector: {}
+  policyTypes:
+  - Egress
   egress:
   - to:
-    - namespaceSelector: {}
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
       podSelector:
         matchLabels:
           k8s-app: kube-dns
@@ -1934,9 +2019,8 @@ spec:
     - port: 53
       protocol: TCP
 
-# 4. Validate with network policy analyzer:
-# https://github.com/alcideio/policy-validator
-kubectl np-validator -f policy.yaml         # Check policy validity
+# 4. Visualise and validate: the Cilium network policy editor (editor.networkpolicy.io),
+#    connectivity test suites (e.g. cyclonus), and flow logs showing actual drops.
 
 # 5. Test policies:
 kubectl run test-$RANDOM --rm -it --image=nicolaka/netshoot -- /bin/bash
@@ -1951,8 +2035,8 @@ CNI Plugin    | NetworkPolicy Support | Network Policy Features
 --------------|-----------------------|--------------------------
 Calico        | Full                  | GlobalNetworkPolicy, policy tiers, DNS policy
 Cilium        | Full                  | CiliumNetworkPolicy (L7), HTTP-aware, Kafka-aware
-Flannel       | None                  | No policy support (use separate Calico for policies)
-Weave Net     | Full                  | Standard K8s NetworkPolicy only
+Flannel       | None                  | No policy support (pair with Calico = "Canal")
+Weave Net     | Full (unmaintained)   | Project abandoned after Weaveworks shut down (2024)
 Antrea        | Full                  | Standard + Antrea-native policies
 Kube-router   | Full                  | iptables/IPVS-based policies
 OVN-Kubernetes| Full                  | Standard policies, ACL-based
@@ -2072,20 +2156,23 @@ metadata:
   namespace: clusters
 spec:
   replicas: 3
-  version: v1.29.5
+  version: v1.36.4               # illustrative patch version
   machineTemplate:
     infrastructureRef:
       apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
       kind: AWSMachineTemplate
       name: prod-us-east-1-cp-template
   kubeadmConfigSpec:
-    clusterConfiguration:
-      apiServer:
-        extraArgs:
-          cloud-provider: aws
-      controllerManager:
-        extraArgs:
-          cloud-provider: aws
+    # In-tree cloud providers were removed (v1.31): nodes run with
+    # cloud-provider=external and the AWS cloud-controller-manager runs as an addon.
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+    joinConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
 
 ---
 # Worker nodes
@@ -2100,7 +2187,7 @@ spec:
   template:
     spec:
       clusterName: prod-us-east-1
-      version: v1.29.5
+      version: v1.36.4
       bootstrap:
         configRef:
           apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
@@ -2126,16 +2213,21 @@ spec:
   - kind: ConfigMap
     name: cilium-install
   - kind: ConfigMap
-    name: aws-ebs-csi-driver
+    name: aws-cloud-controller-manager
   - kind: ConfigMap
-    name: core-dns-config
+    name: aws-ebs-csi-driver
   strategy: ApplyOnce                               # Install once, not on every sync
+# (kubeadm installs CoreDNS and kube-proxy itself.) ClusterResourceSet is fine for
+# bootstrapping the CNI/CCM; for addons with a lifecycle, register the new cluster
+# with Argo CD/Flux, or use the Cluster API Add-on Provider for Helm (CAAPH).
 ```
 
 **Cluster Upgrades with Cluster API:**
 
 ```yaml
-# To upgrade a cluster from v1.29.x to v1.30.0:
+# To upgrade a cluster from v1.36.x to v1.37.x (one MINOR version at a time;
+# kubeadm can't skip minors; control plane first, then workers; workers may lag
+# the control plane by up to 3 minors):
 
 # 1. Update control plane version
 apiVersion: controlplane.cluster.x-k8s.io/v1beta1
@@ -2143,16 +2235,19 @@ kind: KubeadmControlPlane
 metadata:
   name: prod-us-east-1-cp
 spec:
-  version: v1.30.0           # Update from v1.29.5
+  version: v1.37.1           # Update from v1.36.4
   replicas: 3
-  rollingUpdate:
-    maxSurge: 1              # Upgrade 1 control plane at a time
+  rolloutStrategy:
+    rollingUpdate:
+      maxSurge: 1            # 1 = add a new node before removing an old one (0 or 1 only)
 
+---
 # Cluster API rolls control plane:
-# 1. Machine 1: create new node with v1.30.0, wait for ready, delete old
-# 2. Machine 2: create new node with v1.30.0, wait for ready, delete old
-# 3. Machine 3: same
-# Zero downtime if rolling strategy is set
+# 1. Create a new machine with v1.37.1, join it to etcd, wait for healthy
+# 2. Remove one old machine (etcd member removed first, so quorum holds)
+# 3. Repeat until all 3 are replaced
+# Before upgrading: check removed APIs used by your manifests (kubent, pluto,
+# apiserver_requested_deprecated_apis metric) and addon compatibility.
 
 # 2. Update worker node version
 apiVersion: cluster.x-k8s.io/v1beta1
@@ -2162,14 +2257,16 @@ metadata:
 spec:
   template:
     spec:
-      version: v1.30.0       # Update from v1.29.5
+      version: v1.37.1       # Update from v1.36.4
   strategy:
     rollingUpdate:
       maxSurge: 2             # 2 new nodes at a time
       maxUnavailable: 0       # Keep all workers available
 
-# Cluster API creates new Machine (with v1.30.0), waits for ready,
-# then deletes old Machine (v1.29.5) → Rolling update of nodes
+# Cluster API creates a new Machine (v1.37.1), waits for it to be ready, then
+# drains (respecting PDBs) and deletes an old one → rolling replacement of nodes.
+# Immutable infrastructure: nodes are replaced, never upgraded in place.
+# Note: Cluster API v1.11+ also serves v1beta2 versions of these APIs; v1beta1 still works.
 ```
 
 **Multi-Cluster Management Tools:**
@@ -2201,13 +2298,19 @@ spec:
       - prod-eu-west
       - prod-apac
     replicaScheduling:
+      replicaSchedulingType: Divided         # split spec.replicas across clusters
       replicaDivisionPreference: Weighted
-      replicaScheduling:
-        totalReplicas: 15
-        preferences:
-          prod-us-east: 5        # 5 replicas to us-east
-          prod-eu-west: 5        # 5 replicas to eu-west
-          prod-apac: 5           # 5 replicas to apac
+      weightPreference:
+        staticWeightList:                    # equal weights → 15 replicas = 5/5/5
+        - targetCluster:
+            clusterNames: [prod-us-east]
+          weight: 1
+        - targetCluster:
+            clusterNames: [prod-eu-west]
+          weight: 1
+        - targetCluster:
+            clusterNames: [prod-apac]
+          weight: 1
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -2229,144 +2332,72 @@ spec:
 
 ### Answer
 
+!!! tip "30-second answer"
+    Mutate safe defaults, validate the rest, and roll out in Audit before Enforce. (a) Resource limits: a namespace LimitRange or a Kyverno mutate rule adds defaults, then a validate rule requires them. (b) No privileged containers: Kyverno's built-in `podSecurity` subrule (or Pod Security Admission `baseline`/`restricted`). (c) No `latest`: a pattern requiring an explicit tag or digest. (d) Labels: a pattern on workload metadata. (e) Read-only root filesystem: validate, don't mutate, because forcing it silently breaks apps that write to disk; teams add `emptyDir` mounts for scratch paths. Report violations through PolicyReports, grant time-boxed PolicyExceptions, and test policies in CI with the `kyverno test` CLI.
+
 **Kyverno Policy Set for Production:**
 
+Policies for (a) default limits, (c) no `latest` tag, (d) required labels and per-namespace default-deny NetworkPolicy generation are in [Section 2](#2-admission-controllers-webhooks-opagatekeeper-kyverno); they apply unchanged here. The additions for this question:
+
 ```yaml
-# ── 1. MUTATE: Add default resource limits (don't block, fix automatically) ──
+# ── (b) VALIDATE: Pod Security Standards via Kyverno's built-in podSecurity subrule ──
+# Same checks as Pod Security Admission, but with Kyverno's Audit mode, PolicyReports
+# and fine-grained exclusions. Covers privileged, privilege escalation, capabilities,
+# hostPath/hostNetwork, runAsNonRoot, seccomp, for ALL container types.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: add-resource-limits
+  name: pod-security-restricted
 spec:
-  validationFailureAction: Audit
-  background: false
+  background: true                           # also report on existing resources
   rules:
-  - name: add-container-limits
+  - name: restricted
     match:
       any:
       - resources:
           kinds:
           - Pod
-    mutate:
-      patchStrategicMerge:
-        spec:
-          containers:
-          - (name): "*"
-            resources:
-              limits:
-                +(cpu): "500m"
-                +(memory): "512Mi"
-              requests:
-                +(cpu): "100m"
-                +(memory): "256Mi"
+    validate:
+      failureAction: Enforce
+      podSecurity:
+        level: restricted
+        version: latest
 
-# ── 2. VALIDATE: No privileged containers ──
+---
+# ── (e) VALIDATE: read-only root filesystem (not part of any PSS level) ──
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: disallow-privileged-containers
+  name: require-ro-rootfs
 spec:
-  validationFailureAction: Enforce
   background: true
   rules:
-  - name: privileged-containers
+  - name: validate-readOnlyRootFilesystem
     match:
       any:
       - resources:
           kinds:
           - Pod
     validate:
-      message: "Privileged containers are not allowed"
+      failureAction: Audit                   # Enforce once teams have added emptyDirs
+      message: "Root filesystem must be read-only; mount an emptyDir for scratch paths"
       pattern:
         spec:
           containers:
-          - name: "*"
-            securityContext:
-              =(privileged): false           # If set, must be false
-  - name: privileged-escalation
-    match:
-      any:
-      - resources:
-          kinds:
-          - Pod
-    validate:
-      message: "Privilege escalation is not allowed"
-      pattern:
-        spec:
-          containers:
-          - name: "*"
-            securityContext:
-              allowPrivilegeEscalation: false
+          - securityContext:
+              readOnlyRootFilesystem: true
 
-# ── 3. VALIDATE: No latest image tag ──
+---
+# ── MUTATE: fill in secure defaults ONLY where unset (+() = add if absent) ──
+# Gets most workloads compliant without manifest changes. Don't force runAsUser or
+# readOnlyRootFilesystem: those depend on the image and would break it silently.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: disallow-latest-tag
+  name: add-security-context-defaults
 spec:
-  validationFailureAction: Enforce
-  background: false
   rules:
-  - name: require-image-tag
-    match:
-      any:
-      - resources:
-          kinds:
-          - Pod
-    validate:
-      message: "A image tag is required (no 'latest' allowed)"
-      foreach:
-      - list: request.object.spec.[initContainers, containers][]
-        deny:
-          conditions:
-            any:
-            - key: "{{ element.image }}"
-              operator: NotEquals
-              value: "*@sha256:*"            # Allow digest references
-            - key: "{{ regex_match(':[^:]+$', '{{ element.image }}') }}"
-              operator: Equals
-              value: false                   # Must have a tag
-        preconditions:
-          any:
-          - key: "{{ regex_match(':', '{{ element.image }}') }}"
-            operator: Equals
-            value: false                    # Skip if already has a tag
-
-# ── 4. VALIDATE: Required labels ──
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: require-labels
-spec:
-  validationFailureAction: Enforce
-  rules:
-  - name: check-required-labels
-    match:
-      any:
-      - resources:
-          kinds:
-          - Pod
-          - Deployment
-          - Service
-          - PersistentVolumeClaim
-    validate:
-      message: "Labels 'app.kubernetes.io/name', 'app.kubernetes.io/component', and 'app.kubernetes.io/part-of' are required"
-      pattern:
-        metadata:
-          labels:
-            app.kubernetes.io/name: "?*"
-            app.kubernetes.io/component: "?*"
-            app.kubernetes.io/part-of: "?*"
-
-# ── 5. MUTATE: Set security context defaults ──
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: add-security-context
-spec:
-  validationFailureAction: Audit
-  rules:
-  - name: auto-add-security-context
+  - name: pod-and-container-defaults
     match:
       any:
       - resources:
@@ -2376,86 +2407,25 @@ spec:
       patchStrategicMerge:
         spec:
           securityContext:
-            runAsNonRoot: true
-            seccompProfile:
+            +(seccompProfile):
               type: RuntimeDefault
           containers:
           - (name): "*"
             securityContext:
-              allowPrivilegeEscalation: false
-              readOnlyRootFilesystem: true
-              capabilities:
+              +(allowPrivilegeEscalation): false
+              +(capabilities):
                 drop: ["ALL"]
-                add: ["NET_BIND_SERVICE"]
-      patchesJson6902: |-
-        # Also set runAsUser if not specified
-        - path: /spec/securityContext/runAsUser
-          op: add
-          value: 1000
-        - path: /spec/securityContext/runAsGroup
-          op: add
-          value: 3000
 
-# ── 6. GENERATE: NetworkPolicy for every new namespace ──
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: generate-default-network-policy
-spec:
-  rules:
-  - name: generate-deny-all
-    match:
-      any:
-      - resources:
-          kinds:
-          - Namespace
-    generate:
-      synchronize: true
-      apiVersion: networking.k8s.io/v1
-      kind: NetworkPolicy
-      name: default-deny-ingress
-      namespace: "{{ request.object.metadata.name }}"
-      data:
-        spec:
-          podSelector: {}
-          policyTypes:
-          - Ingress
-
-# ── 7. VALIDATE: Resource Quota enforcement ──
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: require-resource-quota
-spec:
-  validationFailureAction: Audit
-  rules:
-  - name: check-resource-quota
-    match:
-      any:
-      - resources:
-          kinds:
-          - Namespace
-    preconditions:
-      any:
-      - key: "{{ request.object.metadata.name }}"
-        operator: NotEquals
-        value: "kube-system"
-    validate:
-      message: "Namespaces must have a ResourceQuota before deploying workloads"
-      deny:
-        conditions:
-          any:
-          - key: "{{ request.object.metadata.name }}"
-            operator: NotIn
-            value: "{{ namespaces }}"
-      # This uses a context variable — in practice, check via API call
+# Namespace-level guardrails (ResourceQuota, LimitRange, default-deny NetworkPolicy)
+# are best GENERATED when a namespace is created (Kyverno generate rules, Capsule,
+# or your namespace-provisioning pipeline) rather than validated afterwards.
 ```
 
 **Kyverno Policy Testing Strategy:**
 
 ```yaml
 # Testing approach:
-# 1. Start in Audit mode (validationFailureAction: Audit)
+# 1. Start in Audit mode (validate.failureAction: Audit)
 #    - Reports policy violations in PolicyReport CRD
 #    - Doesn't block anything
 # 2. Review PolicyReport for false positives
@@ -2466,32 +2436,35 @@ spec:
 kubectl get policyreports -A
 kubectl describe policyreport -n prod polr-ns-prod
 
-# Example exception (Kyverno PolicyException):
+# Example exception (Kyverno PolicyException; must be enabled in Kyverno's config,
+# and usually restricted to a namespace the platform team controls):
 apiVersion: kyverno.io/v2
 kind: PolicyException
 metadata:
-  name: allow-istio-sidecar
-  namespace: istio-system
+  name: allow-node-agents
+  namespace: kyverno-exceptions
 spec:
   exceptions:
-  - policyName: disallow-privileged-containers
+  - policyName: pod-security-restricted
     ruleNames:
-    - privileged-containers
-  - policyName: add-security-context
+    - restricted
+  - policyName: require-ro-rootfs
     ruleNames:
-    - auto-add-security-context
+    - validate-readOnlyRootFilesystem
   match:
     any:
     - resources:
         kinds:
         - Pod
         namespaces:
-        - istio-system
+        - monitoring
         names:
-        - istio-*
+        - node-exporter-*                   # needs hostPID/hostNetwork/hostPath
+# (Istio's istio-init container needs NET_ADMIN/NET_RAW, which restricted forbids;
+#  the Istio CNI plugin or ambient mode removes that need.)
 
 # Background scanning (for existing resources):
-# Kyvernor scans existing resources and reports violations
+# Kyverno scans existing resources and reports violations
 # in PolicyReport CRDs — doesn't modify existing resources
 ```
 
@@ -2503,6 +2476,7 @@ spec:
 | **Audit-first approach** | Starts in Audit mode to discover existing violations safely |
 | **PolicyException** | Knows how to exempt legitimate cases (sidecars, system components) |
 | **Comprehensive coverage** | Covers: resources, security, images, labels, networking, storage |
+| **Policy as code** | Tests policies in CI (`kyverno test`, `kyverno apply` against manifests) before they reach the cluster |
 
 ---
 
@@ -2519,24 +2493,28 @@ spec:
 ```yaml
 Feature               | Calico                    | Cilium                  | Flannel
 ----------------------|---------------------------|-------------------------|-----------------------
-Data plane            | eBPF (or iptables)        | eBPF                    | VXLAN (or host-gw)
-Mode                  | BGP routing (no overlay)  | eBPF-based              | Overlay (VXLAN)
-                      | or VXLAN/IPIP overlay     |                         |
-Performance           | Native (BGP: line rate)   | Best (no overhead)      | Good (VXLAN: ~5% loss)
-                      | VXLAN: ~5% loss           | eBPF direct routing     |
-NetworkPolicy         | Full (L3-L4)              | Full (L3-L7)            | None (not supported)
-                      |                           | HTTP, gRPC, Kafka-aware |
-Encryption            | WireGuard (node-to-node)  | IPsec/WireGuard         | None
-Service mesh          | No                        | Yes (eBPF, no sidecar)  | No
-IPv6                  | Yes                       | Yes                     | Yes
-eBPF                  | Optional (eBPF data plane)| Required                 | No
-Complexity            | Medium                    | High                    | Low
-Scaling               | 500+ nodes (BGP)          | 1000+ nodes (eBPF)      | 200+ nodes (VXLAN)
+Data plane            | iptables (default),       | eBPF                    | Linux bridge + VXLAN
+                      | nftables or eBPF          |                         | (or host-gw)
+Routing               | BGP (no overlay) or       | Native routing or       | Overlay (VXLAN)
+                      | VXLAN/IP-in-IP overlay    | VXLAN/Geneve overlay    |
+Overlay cost          | None with BGP; VXLAN adds | Same trade-off          | ~50B header per packet,
+                      | ~50B/packet + MTU care    |                         | lower MTU
+NetworkPolicy         | Full (L3-L4) + Calico     | Full (L3-L4) + L7 (HTTP,| None (pair with Calico)
+                      | policies, tiers           | gRPC, Kafka, DNS/FQDN)  |
+Encryption            | WireGuard                 | IPsec / WireGuard       | WireGuard backend
+kube-proxy replacement| Yes (eBPF mode)           | Yes                     | No
+Service mesh          | No                        | Yes (per-node Envoy     | No
+                      |                           | for L7, no sidecars)    |
+Observability         | Flow logs                 | Hubble                  | Minimal
+Complexity            | Medium                    | Higher (kernel deps)    | Low
 
 # Recommendation:
-# Calico: Best all-around, BGP for performance, policy support
-# Cilium: eBPF-native, best for security + observability (Hubble)
-# Flannel: Simple, no policy, small clusters only
+# Calico: mature, flexible routing (BGP on-prem), strong policy model
+# Cilium: eBPF-native, L7/FQDN policy, Hubble, kube-proxy replacement
+#         (also the dataplane of GKE Dataplane V2 and "Azure CNI powered by Cilium")
+# Flannel: simple overlay, no policy, labs and small clusters
+# On managed clouds the default is often the provider's CNI (AWS VPC CNI gives pods
+# real VPC IPs), with Calico or Cilium added for policy.
 ```
 
 **Calico BGP Mode (No Overlay):**
@@ -2571,11 +2549,12 @@ metadata:
   name: default
 spec:
   logSeverityScreen: Info
-  nodeToNodeMeshEnabled: true              # Full mesh for < 50 nodes
-  # For > 50 nodes: use route reflectors (RR)
+  nodeToNodeMeshEnabled: true              # Full mesh: fine for small clusters
+  # Full mesh = N² BGP sessions; beyond ~100 nodes use route reflectors (RR)
   # nodeToNodeMeshEnabled: false
   # Route reflector: reduces BGP peering from N² to N
 
+---
 # BGP peer with route reflector for larger clusters:
 apiVersion: crd.projectcalico.org/v1
 kind: BGPPeer
@@ -2588,9 +2567,12 @@ spec:
 
 # Cross-AZ traffic:
 # BGP ensures each node knows the pod CIDR of every other node
-# Cross-AZ traffic goes through the underlying network layer
-# No overlay overhead → same performance as same-AZ
-# AZ-aware network policies can restrict cross-AZ traffic
+# Cross-AZ traffic goes through the underlying network: no encapsulation cost, but the
+# AZ hop itself adds latency and, on clouds, per-GB transfer charges.
+# Public clouds generally won't accept your BGP routes in the VPC, so there Calico
+# runs VXLAN (often "CrossSubnet": encapsulate only between subnets/AZs).
+# To keep traffic zone-local, use Service trafficDistribution: PreferClose
+# (GA in v1.33) or topology-aware routing, not NetworkPolicy.
 ```
 
 **Cilium eBPF Mode:**
@@ -2631,32 +2613,16 @@ spec:
         - method: "POST"
           path: "/api/v1/payments"
 
-# Cilium replaces kube-proxy (more efficient):
-# cilium install --set kubeProxyReplacement=true
-
-# Cilium Cluster Mesh (multi-cluster networking):
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideEnvoyConfig
-metadata:
-  name: cilium-cluster-mesh
-spec:
-  # Connect clusters across regions
-  # Pods in cluster A can reach pods in cluster B
-  # Uses: native routing + IPsec encryption across regions
-
-# Cilium WireGuard encryption:
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideEnvoyConfig
-metadata:
-  name: enable-wireguard
-spec:
-  encryption:
-    type: wireguard
-
-# Performance: Cilium is fastest CNI (eBPF bypasses iptables)
-# Latency: sub-millisecond pod-to-pod
-# Throughput: 95%+ of line rate
-# TCP connection rate: 10× faster than iptables-based CNIs
+# Cluster-level features are Helm values / CLI, not CRDs:
+#   cilium install --set kubeProxyReplacement=true      # Services in eBPF, no kube-proxy
+#   cilium install --set encryption.enabled=true --set encryption.type=wireguard
+#   cilium clustermesh enable && cilium clustermesh connect --destination-context <ctx>
+#     # Cluster Mesh: pod-to-pod and global Services across clusters
+#     # (requires non-overlapping pod CIDRs and unique cluster IDs)
+#
+# Performance: eBPF avoids long iptables chains, so Service lookup cost stays flat as
+# Services grow. Raw throughput differences between modern CNIs are usually small;
+# benchmark with your kernel, MTU and NICs rather than quoting marketing numbers.
 ```
 
 **Flannel VXLAN Mode (Simple Overlay):**
@@ -2674,7 +2640,7 @@ spec:
 # │  ┌───┐  │  ┌────────┐ │  ┌───┐  │
 # │  │Pod│  │  │VXLAN   │ │  │Pod│  │
 # │  │A  │──┼─►│encap   ├─┼─►│B  │  │
-# │  └───┘  │  │+5% loss│ │  └───┘  │
+# │  └───┘  │  │+50 B   │ │  └───┘  │
 # └─────────┘  └────────┘ └─────────┘
 
 # Data path (VXLAN):
@@ -2687,21 +2653,18 @@ spec:
 
 # Flannel backend types:
 # - vxlan: default, UDP encapsulation, works everywhere
-# - host-gw: direct routing (no overlay), same subnet only
+# - host-gw: direct routing (no overlay), nodes must share an L2 segment
 # - wireguard: encrypted overlay
-# - ipsec: encrypted overlay
 
-# Flannel configuration:
-apiVersion: flannel.k8s.io/v1beta1
-kind: FlannelConfig
+# Flannel configuration is a ConfigMap (net-conf.json), not a CRD:
+#   {"Network": "10.244.0.0/16", "Backend": {"Type": "vxlan"}}
 # Simplest installation:
-kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 
 # Pro: Dead simple to install and operate
 # Con: No NetworkPolicy support
-# Con: VXLAN overhead (~5% throughput loss)
-# Con: Not suitable for > 200 nodes (VXLAN flood learning)
-# Con: Cross-AZ traffic goes through tunnel (higher latency)
+# Con: Encapsulation overhead and reduced MTU
+# Con: Few features beyond connectivity (no L7, limited observability)
 ```
 
 **CNI Selection Decision Tree:**
@@ -2720,9 +2683,9 @@ Do you need NetworkPolicy?
     ├── YES → Cilium (Cluster Mesh)
     └── NO  → Calico (BGP, mature, stable)
 
-Performance ranking: Cilium (eBPF) > Calico (BGP) > Calico (VXLAN) > Flannel (VXLAN)
-Security ranking:    Cilium (L7) > Calico (L3-L4 + WireGuard) > Flannel (none)
-Simplicity ranking:  Flannel > Calico (VXLAN) > Cilium > Calico (BGP)
+Rough guide (verify with your own benchmarks):
+Policy features:  Cilium (L7, FQDN) ≈ Calico (tiers, global policy) > Flannel (none)
+Simplicity:       Flannel > Calico (VXLAN) > Cilium > Calico (BGP, needs network team)
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -2744,141 +2707,79 @@ Simplicity ranking:  Flannel > Calico (VXLAN) > Cilium > Calico (BGP)
 
 ### Answer
 
-**Descheduler Strategies:**
+!!! tip "30-second answer"
+    The scheduler only places pods once, so skew builds up as nodes come and go. The **descheduler** periodically **evicts** pods (through the Eviction API, honouring PDBs) that violate a policy, and the scheduler re-places them. Pick the plugin for the goal: **LowNodeUtilization** drains *over*-utilised nodes into under-utilised ones (balance), and **HighNodeUtilization** empties *under*-utilised nodes so Cluster Autoscaler can remove them (bin-packing, cost). Both measure **requests**, not live usage, by default. Guard it with eviction limits, a priority threshold and PDBs, and use it alongside the autoscaler, which already removes nodes below its utilisation threshold. On AWS, Karpenter's consolidation often replaces both jobs.
+
+**Descheduler Policy (v1alpha2: profiles + plugins):**
 
 ```yaml
-# Descheduler: evicts pods that violate scheduling policies
-# After eviction, pods are re-scheduled by the scheduler
-# NOT a scheduler — it's a eviction-trigger for rebalancing
-
-# Install descheduler:
-helm repo add descheduler https://kubernetes-sigs.github.io/descheduler/
-helm install descheduler descheduler/descheduler -f values.yaml
-
-# Descheduler strategies:
-
-# 1. LowNodeUtilization: rebalance pods from low-utilization to high-utilization nodes
-#    Actually: evicts pods from LOW utilization nodes so scheduler redistributes
-apiVersion: descheduler/v1alpha2
-kind: DeschedulerPolicy
-spec:
-  strategies:
-    LowNodeUtilization:
-      enabled: true
-      params:
-        nodeResourceUtilizationThresholds:
-          thresholds:
-            cpu: 20                    # Node below 20% CPU → underutilized
-            memory: 20
-            pods: 20
-          targetThresholds:
-            cpu: 50                    # Target: fill nodes to 50%
-            memory: 50
-            pods: 50
-
-# 2. HighNodeUtilization: evict pods from highly-utilized nodes
-#    Distributes load across more nodes
-    HighNodeUtilization:
-      enabled: true
-      params:
-        nodeResourceUtilizationThresholds:
-          thresholds:
-            cpu: 80                    # Node above 80% → overutilized
-            memory: 80
-            pods: 80
-
-# 3. RemoveDuplicates: evict redundant pod replicas on same node
-    RemoveDuplicates:
-      enabled: true
-
-# 4. RemovePodsViolatingNodeAffinity: evict pods that violate node affinity
-    RemovePodsViolatingNodeAffinity:
-      enabled: true
-      params:
-        nodeAffinityType:
-        - requiredDuringSchedulingIgnoredDuringExecution
-
-# 5. RemovePodsViolatingTopologySpreadConstraint:
-#    Evicts pods that violate topology spread
-    RemovePodsViolatingTopologySpreadConstraint:
-      enabled: true
-      params:
-        includeSoftConstraints: true
-
-# 6. RemovePodsViolatingInterPodAntiAffinity:
-#    Evicts pods that violate inter-pod anti-affinity
-    RemovePodsViolatingInterPodAntiAffinity:
-      enabled: true
-
-# 7. RemovePodsHavingTooManyRestarts:
-#    Evict pods with excessive restarts
-    RemovePodsHavingTooManyRestarts:
-      enabled: true
-      params:
-        podRestartThreshold: 100
-        includingInitContainers: false
-```
-
-**Descheduler Configuration Best Practices:**
-
-```yaml
-# Production descheduler configuration:
+# Descheduler: evicts pods that violate scheduling goals; the scheduler re-places them.
+# Runs as a CronJob or Deployment (Helm chart); it is NOT a scheduler.
+# Install:
+#   helm repo add descheduler https://kubernetes-sigs.github.io/descheduler/
+#   helm install descheduler descheduler/descheduler -f values.yaml
+#   (schedule, e.g. "*/10 * * * *", is a Helm value, not part of the policy)
 
 apiVersion: "descheduler/v1alpha2"
 kind: "DeschedulerPolicy"
-spec:
-  # Run every 10 minutes (not too frequent)
-  schedule: "*/10 * * * *"
+maxNoOfPodsToEvictPerNode: 5             # blast-radius limits
+maxNoOfPodsToEvictPerNamespace: 10
+nodeSelector: "node-role.kubernetes.io/worker="   # only rebalance worker nodes
+profiles:
+- name: rebalance
+  pluginConfig:
+  - name: DefaultEvictor                 # decides what is evictable at all
+    args:
+      evictLocalStoragePods: false       # don't lose emptyDir data
+      ignorePvcPods: true
+      priorityThreshold:
+        value: 100000                    # never evict pods at/above this priority
+      nodeFit: true                      # only evict if the pod fits somewhere else
+  - name: LowNodeUtilization
+    args:
+      thresholds:                        # below ALL of these = underutilised (target)
+        cpu: 20
+        memory: 20
+        pods: 20
+      targetThresholds:                  # above ANY of these = overutilised (source)
+        cpu: 60
+        memory: 60
+        pods: 60
+      evictableNamespaces:
+        exclude: ["kube-system", "monitoring"]
+  - name: RemovePodsViolatingTopologySpreadConstraint
+    args:
+      constraints: ["DoNotSchedule", "ScheduleAnyway"]  # include soft constraints
+  - name: RemovePodsViolatingNodeAffinity
+    args:
+      nodeAffinityType: ["requiredDuringSchedulingIgnoredDuringExecution"]
+  - name: RemovePodsHavingTooManyRestarts
+    args:
+      podRestartThreshold: 100
+      includingInitContainers: true
+  plugins:
+    balance:                             # extension point for balancing plugins
+      enabled:
+      - LowNodeUtilization
+      - RemovePodsViolatingTopologySpreadConstraint
+      - RemoveDuplicates                 # replicas of one owner stacked on one node
+    deschedule:                          # per-pod checks
+      enabled:
+      - RemovePodsViolatingNodeAffinity
+      - RemovePodsViolatingInterPodAntiAffinity
+      - RemovePodsHavingTooManyRestarts
 
-  # Node selector: only deschedule on worker nodes
-  nodeSelector: "node-role.kubernetes.io/worker"
+# Alternative goal: cost (bin-packing) instead of balance.
+# HighNodeUtilization evicts pods from UNDER-utilised nodes so they consolidate and
+# empty nodes can be removed by the autoscaler. Pair it with the scheduler's
+# MostAllocated scoring, or pods just land back on the same empty-ish nodes.
+#  - name: HighNodeUtilization
+#    args:
+#      thresholds: {cpu: 40, memory: 40}  # nodes below these are drained
 
-  # Eviction limits: don't evict too many pods at once
-  evictionLimits:
-    maxNoOfPodsToEvictPerNode: 5
-    maxNoOfPodsToEvictPerNamespace: 10
-
-  # Priority threshold: don't evict critical pods
-  priorityThreshold:
-    value: 100000                       # Don't evict pods with priority ≥ 100000
-
-  strategies:
-    LowNodeUtilization:
-      enabled: true
-      params:
-        nodeResourceUtilizationThresholds:
-          thresholds:
-            cpu: 20
-            memory: 20
-            pods: 20
-          targetThresholds:
-            cpu: 60
-            memory: 60
-            pods: 60
-        evictableNamespaces:
-          include:
-          - "*"                          # Include all namespaces
-          exclude:
-          - kube-system
-          - monitoring
-
-    RemovePodsViolatingTopologySpreadConstraint:
-      enabled: true
-      params:
-        includeSoftConstraints: true    # Enforce soft constraints
-        namespaces:
-          exclude:
-          - kube-system
-
-    RemoveDuplicates:
-      enabled: true
-
-  # Pod eviction filters:
-  # - Don't evict pods with PDB (unless PDB allows)
-  # - Don't evict critical pods (priority ≥ 100000)
-  # - Don't evict DaemonSet pods
-  # - Don't eviet mirror pods
-  # - Don't evict pods that are part of a statefulset with PDB
+# What the DefaultEvictor never evicts: DaemonSet pods, mirror/static pods,
+# pods without an owner (they'd be lost), system-critical pods, and anything whose
+# eviction a PDB refuses.
 ```
 
 **Cluster Autoscaler with Descheduler:**
@@ -2891,15 +2792,19 @@ spec:
 # ┌─────────────────────────────────────────────────────────────┐
 # │ Cluster Autoscaler + Descheduler Interaction                 │
 # │                                                              │
-# │ 1. Traffic spike → some pods pending (no node capacity)      │
+# │ 1. Traffic spike → HPA adds pods → some Pending              │
 # │ 2. Cluster Autoscaler: adds 3 nodes                          │
-# │ 3. Pods scheduled on new nodes (spread thin)                 │
-# │ 4. Traffic drops → descheduler detects low utilization       │
-# │ 5. Descheduler evicts pods from underutilized nodes          │
-# │ 6. Scheduler re-distributes pods to fewer nodes              │
-# │ 7. Cluster Autoscaler: removes empty nodes (scale down)      │
+# │ 3. Traffic drops → HPA removes pods → nodes half-empty       │
+# │ 4. CA by itself drains nodes whose requests are below        │
+# │    --scale-down-utilization-threshold IF their pods fit      │
+# │    elsewhere (respecting PDBs)                               │
+# │ 5. Descheduler (HighNodeUtilization) helps when CA can't     │
+# │    find such a node, e.g. after topology spread left every   │
+# │    node partially used                                       │
+# │ 6. Pods re-scheduled → empty nodes → CA scales down          │
 # │                                                              │
-# │ Result: Cost savings + Performance                           │
+# │ Watch out: LowNodeUtilization (balance) and CA scale-down    │
+# │ (pack) pull in opposite directions; pick one goal per pool   │
 # └─────────────────────────────────────────────────────────────┘
 
 # Cluster Autoscaler configuration (AWS):
@@ -2914,10 +2819,14 @@ spec:
     matchLabels:
       app: cluster-autoscaler
   template:
+    metadata:
+      labels:
+        app: cluster-autoscaler
     spec:
-      serviceAccountName: cluster-autoscaler
+      priorityClassName: system-cluster-critical
+      serviceAccountName: cluster-autoscaler     # IRSA / Pod Identity for ASG permissions
       containers:
-      - image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.29.3
+      - image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.36.0  # match your cluster's minor version
         name: cluster-autoscaler
         command:
         - ./cluster-autoscaler
@@ -2940,25 +2849,28 @@ spec:
             cpu: 500m
             memory: 1Gi
 
-# Descheduler with Cluster Autoscaler integration:
-# 1. Descheduler runs every 10 minutes
-# 2. Evicts pods from low-utilization nodes
-# 3. Cluster Autoscaler sees empty nodes → scales down
-# 4. Cost savings: 20-40% reduction in node count
+# Pods that block CA scale-down (common "why won't my cluster shrink?" answers):
+# - PDB with disruptionsAllowed = 0
+# - Pods with local storage (unless --skip-nodes-with-local-storage=false)
+# - Pods not backed by a controller, or annotated
+#   cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+# - kube-system pods without a PDB (unless --skip-nodes-with-system-pods=false)
+#
+# Karpenter (AWS, Azure) replaces node groups: it launches right-sized instances
+# straight from pending pods' requirements and continuously consolidates
+# (delete or replace underused nodes), covering much of the descheduler's cost role.
 ```
 
 **Descheduler Monitoring:**
 
 ```yaml
-# Descheduler metrics (Prometheus):
-# descheduler_pods_evicted_total{strategy="LowNodeUtilization", node="node-1"}
-# descheduler_pods_eviction_failed_total{reason="PDB violation"}
-# descheduler_evicted_pods_total{node="node-1"}
+# Descheduler metrics (Prometheus, names vary by version; check /metrics):
+# descheduler_pods_evicted{result="success|error", strategy=..., namespace=..., node=...}
 
 # Alert on excessive evictions:
 - alert: DeschedulerHighEvictionRate
   expr: |
-    rate(descheduler_pods_evicted_total[15m]) > 10
+    sum(increase(descheduler_pods_evicted{result="success"}[15m])) > 50
   for: 5m
   labels:
     severity: warning
@@ -2977,7 +2889,7 @@ spec:
 | **Descheduler vs Scheduler** | Understands scheduler assigns pods initially; descheduler rebalances after placement |
 | **Eviction safety** | Knows about priority thresholds, PDBs, and max eviction limits to prevent disruption |
 | **CA + Descheduler** | Explains how descheduler consolidates, CA scales down empty nodes |
-| **Strategy selection** | Can choose LowNodeUtilization for balancing, TopologySpread for AZ distribution |
+| **Strategy selection** | LowNodeUtilization for balance, HighNodeUtilization for bin-packing, TopologySpread for AZ distribution; knows both use requests, not live usage |
 
 ---
 
@@ -3030,19 +2942,21 @@ parameters:
   csi.storage.k8s.io/fstype: ext4
 allowVolumeExpansion: true                # Can resize PVC later
 
+---
 # AWS EBS (io2 — high performance, for databases)
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: io2
 provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
 parameters:
   type: io2
-  iops: "16000"
-  throughput: "500"
+  iops: "16000"                           # provisioned IOPS (throughput is gp3-only)
   encrypted: "true"
 allowVolumeExpansion: true
 
+---
 # GCP Persistent Disk (pd-ssd)
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -3055,17 +2969,20 @@ parameters:
   replication-type: none                  # Regional: regional-pd
 allowVolumeExpansion: true
 
+---
 # Azure Disk (Premium SSD)
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: azure-premium
 provisioner: disk.csi.azure.com
+volumeBindingMode: WaitForFirstConsumer
 parameters:
   skuname: Premium_LRS
   cachingMode: ReadOnly
 allowVolumeExpansion: true
 
+---
 # NFS (shared filesystem)
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -3095,6 +3012,7 @@ deletionPolicy: Delete                    # Delete snapshot when VolumeSnapshot 
 parameters:
   tags: "environment=prod,backup=daily"
 
+---
 # Create a snapshot:
 apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshot
@@ -3106,6 +3024,7 @@ spec:
   source:
     persistentVolumeClaimName: data-postgres-0   # PVC to snapshot
 
+---
 # Restore from snapshot (create new PVC from snapshot):
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -3124,7 +3043,9 @@ spec:
     requests:
       storage: 100Gi
 
-# VolumeClone: clone a PVC without snapshot
+---
+# Volume clone: copy a PVC without a snapshot (same namespace, same CSI driver,
+# driver must support cloning)
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -3147,23 +3068,25 @@ spec:
 ```yaml
 # Velero: backup and restore Kubernetes resources + PV snapshots
 
-# Install:
+# Install (CSI snapshot support is built into Velero core since 1.14, so the old
+# --features=EnableCSI flag is no longer needed):
 velero install \
   --provider aws \
   --bucket velero-backups \
   --backup-location-config region=us-east-1 \
   --snapshot-location-config region=us-east-1 \
-  --plugins velero/velero-plugin-for-aws:v1.9.0 \
-  --use-volume-snapshots=true \
-  --features=EnableCSI
+  --plugins velero/velero-plugin-for-aws:<version matching your Velero release> \
+  --use-volume-snapshots=true
 
-# Schedule daily backups:
+# Schedule daily backups at 2 AM, kept 30 days:
 velero schedule create daily-backup \
-  --schedule="0 2 * * *"                    # 2 AM daily
-  --ttl=720h                                # Keep for 30 days
-  --include-namespaces=prod,staging
+  --schedule="0 2 * * *" \
+  --ttl=720h \
+  --include-namespaces=prod,staging \
   --exclude-resources=events,events.events.k8s.io
-  --volume-snapshot-locations=us-east-1a
+# Snapshots live in the same region as the volume. For regional DR, copy them
+# (EBS snapshot copy / AWS Backup) or use Velero's file-system / data-mover backups,
+# which upload volume data to the object store.
 
 # On-demand backup:
 velero backup create pre-deploy-backup \
@@ -3176,8 +3099,9 @@ velero restore create --from-backup pre-deploy-backup \
 
 # Disaster Recovery: multi-region backup
 # Backup in us-east-1 → restore in us-west-2:
-# 1. Set up Velero in us-west-2 with same S3 bucket
-# 2. Restore:
+# 1. Replicate the bucket (S3 CRR) and the volume data (see above) to us-west-2
+# 2. Point Velero in us-west-2 at it as a read-only BackupStorageLocation
+# 3. Restore:
 velero restore create --from-backup daily-backup-20240115 \
   --namespace-mappings prod:prod-dr
 
@@ -3196,11 +3120,15 @@ velero restore create --from-backup daily-backup-20240115 \
 
 ```yaml
 # Strategy 1: Velero CSI Snapshots (crash-consistent)
-# Simple, fast, but NOT application-consistent for databases
-# Restore: filesystem-level, might need WAL replay
+# A snapshot is like pulling the power cord. PostgreSQL/MySQL recover from that
+# via WAL/redo replay, PROVIDED data and WAL are on the same volume (or all
+# volumes are snapshotted atomically). Fine as a baseline; no PITR.
 
-# Strategy 2: Pre/Post Hooks (application-consistent backup)
-# Velero hooks: quiesce database before snapshot, unquiesce after
+# Strategy 2: Pre/Post Hooks (freeze writes for a consistent multi-volume snapshot)
+# Note: the old pg_start_backup()/pg_stop_backup() hook trick doesn't work: they are
+# SQL functions (renamed pg_backup_start/stop in PG 15, which also removed the
+# exclusive mode), and non-exclusive mode needs ONE session open across the whole
+# backup, which separate exec hooks can't provide. Freeze the filesystem instead:
 apiVersion: velero.io/v1
 kind: Backup
 metadata:
@@ -3215,18 +3143,17 @@ spec:
       - prod-postgres
       pre:
       - exec:
-          container: postgres
-          command:
-          - pg_start_backup
-          - velero-backup
+          container: fsfreeze              # small sidecar with CAP_SYS_ADMIN
+          command: ["/sbin/fsfreeze", "--freeze", "/var/lib/postgresql/data"]
           onError: Fail
+          timeout: 30s
       post:
       - exec:
-          container: postgres
-          command:
-          - pg_stop_backup
-          onError: Fail
+          container: fsfreeze
+          command: ["/sbin/fsfreeze", "--unfreeze", "/var/lib/postgresql/data"]
+          onError: Continue
 
+---
 # Strategy 3: Application-level backup (pg_dump / WAL archiving)
 # For point-in-time recovery
 apiVersion: batch/v1
@@ -3240,33 +3167,38 @@ spec:
     spec:
       template:
         spec:
+          restartPolicy: OnFailure
           containers:
           - name: backup
-            image: postgres:16
+            image: registry.example.com/pg-backup:17   # postgres client + aws CLI
             command:
             - sh
             - -c
             - |
-              pg_dump postgres://$(DB_USER):$(DB_PASS)@postgres:5432/mydb \
-                | gzip \
-                | aws s3 cp - s3://backups/postgres/$(date +%Y/%m/%d)/dump.sql.gz
-            env:
-            - name: DB_USER
+              set -o pipefail
+              pg_dump -Fc -h postgres -U "$PGUSER" mydb \
+                | aws s3 cp - "s3://backups/postgres/$(date +%Y/%m/%d)/mydb.dump"
+            env:                                      # libpq reads PGUSER/PGPASSWORD;
+            - name: PGUSER                            # keeps the password out of argv
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
                   key: username
-            - name: DB_PASS
+            - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
                   key: password
+# pg_dump is a logical, consistent snapshot of one DB. RPO = time since last dump,
+# and restore of a large DB takes hours. Good as a portable second copy.
 
-# Strategy 4: WAL archiving (continuous backup, point-in-time recovery)
-# pg_wal_directory → S3 via pg_receivewal or WAL-G
-apiVersion: apps/v1
-kind: Sidecar
-# Wal-G sidecar for continuous WAL archiving
+# Strategy 4: Base backups + WAL archiving (continuous backup, point-in-time recovery)
+# The production answer for Postgres on Kubernetes: an operator such as CloudNativePG
+# (Barman Cloud) or tools like WAL-G/pgBackRest ship base backups and every WAL segment
+# to object storage. RPO ≈ seconds-minutes, restore to any timestamp.
+# CloudNativePG declares it on the Cluster resource, e.g.:
+#   spec.backup.barmanObjectStore.destinationPath: s3://backups/pg
+#   plus a ScheduledBackup for base backups
 ```
 
 **StatefulSet Disaster Recovery:**
@@ -3283,6 +3215,8 @@ kind: Sidecar
 
 # Recovery Time Objective (RTO) strategies:
 # 
+# Always state RTO (time to recover) AND RPO (data you can lose) separately.
+#
 # RTO < 1 minute: Active-Passive (cross-region replication)
 #   - Primary cluster + standby cluster in different region
 #   - Continuous replication
@@ -3290,10 +3224,11 @@ kind: Sidecar
 #   - Cost: 2× infrastructure
 #
 # RTO < 15 minutes: Velero + volume snapshots
-#   - Automated nightly backups
+#   - Automated backups (nightly or more often)
 #   - Volume snapshots (EBS snapshots)
-#   - Restore time: 5-15 minutes for 1TB volume
-#   - Data loss: up to 24 hours (or configure more frequent backups)
+#   - Restore: a volume from an EBS snapshot is usable in minutes, but blocks load
+#     lazily from S3 on first read (slow until warmed) unless Fast Snapshot Restore
+#   - Data loss (RPO): up to the backup interval
 #
 # RTO < 1 hour: Database native backup (pg_dump, mysqldump)
 #   - Scheduled dump to S3
@@ -3307,7 +3242,7 @@ kind: Sidecar
 |-----------|----------------------|
 | **CSI architecture** | Understands controller (create/delete) vs node (mount/unmount) plugins |
 | **Volume snapshot** | Knows VolumeSnapshotClass → VolumeSnapshot → PVC restore flow |
-| **Application-consistent backup** | Uses pre/post hooks (pg_start_backup/pg_stop_backup) for database snapshots |
+| **Application-consistent backup** | Knows snapshots are crash-consistent, when fsfreeze hooks are needed, and that PITR needs base backups + WAL archiving (e.g. CloudNativePG) |
 | **Disaster recovery** | Can design RTO-based backup strategies: active-passive, snapshots, or dump/restore |
 
 ---

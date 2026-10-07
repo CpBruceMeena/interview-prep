@@ -1,6 +1,6 @@
 # 🏗️ Terraform — Staff-Level Interview Questions
 
-> *8 questions covering Terraform state management, resource graph, modules, providers, CI/CD integration, HCL advanced patterns, and security — every question expects principal engineer-level depth with production patterns.*
+> *8 questions on Terraform state, the resource graph, modules, environments, providers, CI/CD, HCL and security. Versions referenced: Terraform 1.16 (current in October 2026) and OpenTofu 1.12. Several answers changed recently: S3 has native state locking (DynamoDB locking is deprecated), secrets can stay out of state with ephemeral values and write-only arguments, and `import`/`moved`/`removed` blocks replace most `terraform state` surgery.*
 
 ---
 
@@ -15,156 +15,135 @@
 7. [Advanced HCL: Functions, Dynamic Blocks, Expressions](#7-advanced-hcl-functions-dynamic-blocks-expressions)
 8. [Security: Secrets Management, IAM, Policy as Code](#8-security-secrets-management-iam-policy-as-code)
 
+!!! info "Licensing and the OpenTofu fork (know this cold)"
+    In August 2023 HashiCorp moved Terraform from MPL 2.0 to the **Business Source License 1.1** (from Terraform 1.6). You can use it freely, including commercially, but can't offer a competing hosted product. The community forked the last MPL version as **OpenTofu**, now a Linux Foundation project accepted into the CNCF in April 2025. IBM completed its acquisition of HashiCorp in February 2025, and Terraform Cloud was renamed **HCP Terraform** in 2024. OpenTofu stays CLI- and state-compatible for most configurations but has diverged: it shipped client-side **state encryption** (1.7), `for_each` on provider blocks (1.9), `-exclude` (1.9) and OCI registry support (1.10). Terraform has HCP-only features such as Stacks. Pick one per organisation and pin it.
+
 ---
 
 ## 1. State Management: Local vs Remote, Locking, Migration
 
 **Q:** "Your team of 10 engineers is managing AWS infrastructure with Terraform. Two engineers ran `terraform apply` simultaneously and caused a resource conflict. Design a remote state strategy with locking. How does Terraform state work? How do you migrate state from local to S3 without downtime?"
 
-**What They're Really Testing:** Whether you understand Terraform state as the source of truth for resource mapping — the difference between local and remote state, state locking mechanisms, and state migration procedures.
+**What They're Really Testing:** That you treat state as a critical, sensitive database: remote, locked, versioned, access-controlled, split by blast radius, and only modified through reviewed code.
+
+!!! tip "30-second answer"
+    State maps each resource address (`aws_instance.web`) to a real object ID plus the last-known attributes, so Terraform can compute diffs and order deletes. Put it in a remote backend with **locking** (S3 with `use_lockfile = true`, or HCP Terraform), turn on bucket versioning and encryption with a restricted KMS key, and split state by environment and component to limit blast radius. Concurrent applies are prevented by the lock; runs should only happen from CI. Moving local state to S3 is `terraform init -migrate-state`; it touches no infrastructure, so there's no downtime question at all.
 
 ### Answer
 
-**Terraform State Mechanics:**
+**What state contains:**
 
-```yaml
-# Terraform state: JSON file mapping logical resources to real-world resources
-# terraform.tfstate contains:
-
+```json
 {
   "version": 4,
-  "terraform_version": "1.7.0",
+  "terraform_version": "1.16.5",
   "serial": 42,
-  "lineage": "abc-123-def",
+  "lineage": "6f1c2a9e-...",
   "outputs": {},
   "resources": [
     {
-      "module": "root",
       "mode": "managed",
       "type": "aws_instance",
-      "name": "web_server",
+      "name": "web",
       "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
       "instances": [
         {
           "schema_version": 1,
-          "attributes": {
-            "id": "i-0abcd1234efgh5678",
-            "ami": "ami-0c55b159cbfafe1f0",
-            "instance_type": "t3.micro",
-            "private_ip": "10.0.1.42",
-            "subnet_id": "subnet-abc123",
-            "tags": {
-              "Name": "web-server-prod"
-            }
-          },
-          "dependencies": [
-            "aws_subnet.main",
-            "aws_security_group.web"
-          ]
+          "attributes": { "id": "i-0abcd1234efgh5678", "instance_type": "t3.micro" },
+          "dependencies": ["aws_security_group.web", "aws_subnet.main"]
         }
       ]
     }
   ]
 }
-
-# What state contains:
-# - Resource metadata: type, name, provider
-# - Resource attributes: all current attribute values
-# - Dependencies: what this resource depends on
-# - Private data: sensitive values (sometimes encrypted)
-# - Serial number: monotonic counter for state versioning
 ```
 
-**Remote State with Locking:**
+| Field | Purpose |
+|---|---|
+| `serial` | Incremented on every write; a saved plan records it, so applying a plan made against an older state fails as "stale" |
+| `lineage` | UUID fixed at state creation; stops you pushing an unrelated state over this one |
+| `attributes` | Every attribute the provider returned, **including secrets in plain text**. Terraform itself does not encrypt state (OpenTofu can) |
+| `dependencies` | Recorded so Terraform can destroy in the right order even after the config is deleted |
 
-```yaml
-# S3 backend with DynamoDB locking:
+**Remote state with locking (current recommendation):**
 
+```hcl
 terraform {
+  required_version = ">= 1.11"
+
   backend "s3" {
-    bucket         = "my-infra-terraform-state"
-    key            = "prod/network/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    dynamodb_table = "terraform-state-locks"
+    bucket       = "acme-tfstate-prod"
+    key          = "network/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    kms_key_id   = "alias/terraform-state"
+    use_lockfile = true # S3-native lock (conditional writes); GA since Terraform 1.11
   }
 }
-
-# DynamoDB table for state locking:
-# - Table: terraform-state-locks
-# - Partition key: LockID (string)
-# - When terraform apply runs:
-#   1. Create item: LockID = "my-infra-terraform-state/prod/network/terraform.tfstate.md5"
-#   2. If item exists → lock acquisition fails → TERRAFORM EXITS WITH ERROR
-#   3. When apply completes → delete item (release lock)
-#   4. If apply crashes → lock held for ~15 min (then released via S3 eventual consistency)
-#   5. Force unlock (if needed): terraform force-unlock <LOCK_ID>
-
-# Multiple backends comparison:
-Backend      | Locking | Encryption | History | Complexity
--------------|---------|------------|---------|-----------
-local        | ❌     | ❌         | ❌     | None
-S3 + DynamoDB| ✅     | ✅ (SSE)   | ✅ (versioning) | Low
-Terraform Cloud| ✅   | ✅         | ✅     | Medium
-Consul       | ✅     | ❌ (optional) | ❌   | High (run Consul)
-pg (Postgres)| ✅     | ✅ (TLS)   | ❌     | Medium
-
-# State versioning (S3):
-# Enable S3 versioning on the state bucket
-# If state is corrupted: restore previous version
-# If state is deleted: restore from version history
-# Audit trail: who modified state and when (CloudTrail)
 ```
 
-**State Migration:**
+- **Locking:** with `use_lockfile`, Terraform creates `network/terraform.tfstate.tflock` using an S3 conditional write (`If-None-Match`), which fails if the object already exists. `dynamodb_table` locking still works but is **deprecated since 1.11**; migrate by enabling both for a while, then removing DynamoDB.
+- **A crashed run keeps the lock.** Nothing expires it. Check that no run is still active (CI logs), then `terraform force-unlock <LOCK_ID>`. Forcing a lock that's actually in use is how state gets corrupted.
+- **Bucket settings:** versioning on (recovery), public access blocked, SSE-KMS with a key policy limited to the CI role and break-glass admins, access logging/CloudTrail data events, and ideally a separate AWS account for state.
+- **Split state** by environment × component (`prod/network`, `prod/data`, `prod/app`). Smaller states plan faster, lock less contention, and a mistake touches fewer resources. Share outputs via `terraform_remote_state` or, better, SSM parameters/data sources so consumers don't need read access to the whole state.
 
-```yaml
-# Migrating from local to remote state:
+| Backend | Locking | Notes |
+|---|---|---|
+| local | Only on one machine | Never for teams |
+| S3 (`use_lockfile`) | Yes | Most common on AWS; DynamoDB no longer needed |
+| GCS / azurerm | Yes (native) | Equivalent on GCP/Azure |
+| HCP Terraform / Terraform Enterprise | Yes | Plus run queue, RBAC, policy, audit; pricing is per resource under management |
+| Spacelift, env0, Scalr | Yes | Commercial TACOS (Terraform automation and collaboration software) that also run OpenTofu |
+| pg, consul, kubernetes | Yes | Niche |
 
-# Step 1: Initialize remote backend (without state)
-terraform init -migrate-state
-# Terraform detects: current backend = local, new backend = s3
-# Prompt: "Do you want to copy existing state to the new backend?"
-# Answer: yes
-# Terraform: copies terraform.tfstate → s3://bucket/prod/network/terraform.tfstate
-#           renames local terraform.tfstate → terraform.tfstate.backup
+**Migrating local → S3:**
 
-# Step 2: Verify remote state
-terraform state list
-# Should show all resources (confirm state was copied)
-
-# Step 3: Remove local state (after verification)
-rm terraform.tfstate.backup
-
-# State recovery (if state is corrupted):
-# 1. Restore from S3 versioning
-aws s3api get-object-version \
-  --bucket my-infra-terraform-state \
-  --key prod/network/terraform.tfstate \
-  --version-id <PREVIOUS_VERSION_ID> \
-  terraform.tfstate.recovered
-
-# 2. Import resources (if no backup)
-# terraform import aws_instance.web_server i-0abcd1234efgh5678
-# Problem: must know every resource's ID
-# Better: use terraform state rm + terraform import for each resource
-
-# State operations:
-  terraform state list                # List all resources in state
-  terraform state show aws_instance.web  # Show resource attributes
-  terraform state mv aws_instance.web aws_instance.web_v2  # Rename resource
-  terraform state rm aws_instance.old   # Remove resource from state (not destroy!)
-  terraform import aws_instance.new i-123456  # Add existing resource to state
+```bash
+# 1. Add the backend block, then:
+terraform init -migrate-state      # copies state to S3 after confirmation
+terraform plan                     # must show "No changes" - proves nothing was lost
+# 2. Delete local terraform.tfstate* files: they hold secrets
 ```
+
+**Recovery and refactoring without `terraform state` surgery:**
+
+| Need | Old way | Since Terraform 1.x |
+|---|---|---|
+| Rename/move a resource or into a module | `terraform state mv` | `moved { from = ..., to = ... }` block (1.1), reviewed in a PR and applied by CI |
+| Adopt existing infrastructure | `terraform import` per resource | `import { to = ..., id = ... }` block (1.5), with `-generate-config-out=generated.tf` to draft the HCL; `for_each` on imports (1.7) |
+| Stop managing without destroying | `terraform state rm` | `removed { from = ...; lifecycle { destroy = false } }` (1.7) |
+| Find unmanaged resources to import | Manual inventory | `terraform query` with list resources (1.14), which can generate import config |
+| Restore corrupted state | — | Previous S3 object version, then `terraform plan` to confirm |
+
+```hcl
+import {
+  to = aws_s3_bucket.logs
+  id = "acme-prod-logs"
+}
+
+moved {
+  from = aws_instance.web
+  to   = module.web.aws_instance.this
+}
+
+removed {
+  from = aws_iam_user.legacy
+  lifecycle {
+    destroy = false
+  }
+}
+```
+
+**What they probe next:** "Someone ran apply from a laptop with an old provider version and now CI fails. What happened?" (state was written with a newer provider schema; pin versions in `required_providers`, commit `.terraform.lock.hcl`, and block laptop applies with IAM). "Who should be able to read state?" (only the identities that run Terraform for that stack, because state is a secrets store).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **State mechanics** | Understands state as JSON mapping with serial number for versioning |
-| **Locking mechanism** | Knows DynamoDB item-based lock with Force-Unlock for crash recovery |
-| **Backend selection** | Can compare S3+DynamoDB vs Terraform Cloud vs Consul for different team sizes |
-| **State recovery** | Has recovery plan: S3 versioning restore → import fallback |
+| **State mechanics** | Serial, lineage, secrets in plain text, dependencies |
+| **Locking** | S3 `use_lockfile` (DynamoDB deprecated), locks never expire, careful `force-unlock` |
+| **Blast radius** | Splits state by environment and component; restricts state access |
+| **Modern refactoring** | `import`, `moved`, `removed` blocks instead of CLI state edits |
 
 ---
 
@@ -172,145 +151,109 @@ aws s3api get-object-version \
 
 **Q:** "You have 100 Terraform resources with complex interdependencies. `terraform plan` takes 5 minutes to compute. How does Terraform's dependency graph work? How do implicit and explicit dependencies differ? How do you optimize plan time and avoid dependency cycles?"
 
-**What They're Really Testing:** Whether you understand Terraform's core execution model — the DAG (Directed Acyclic Graph) that determines resource creation, update, and destruction order.
+**What They're Really Testing:** The DAG walk (refresh, plan, apply), why plans are slow in practice, and how cycles arise.
+
+!!! tip "30-second answer"
+    Terraform builds a DAG from references between blocks (implicit dependencies) plus `depends_on` (explicit), then walks it with up to 10 concurrent operations (`-parallelism`). Plan time is dominated by **refreshing** every resource and evaluating data sources through provider API calls, so 5 minutes for 100 resources usually means API throttling, slow data sources, or a state that's simply too big. Fix by splitting state, removing unnecessary data sources, and (with care) `-refresh=false` for fast feedback. Cycles usually come from two resources referencing each other; break them by splitting the mutual part into a separate resource.
 
 ### Answer
 
-**Dependency Graph Mechanics:**
+**Implicit vs explicit dependencies:**
 
-```yaml
-# Terraform builds a DAG (Directed Acyclic Graph) from resource references
-
-# Implicit dependencies (auto-detected by Terraform):
+```hcl
 resource "aws_instance" "web" {
-  ami           = data.aws_ami.ubuntu.id       # ← implicit dependency on data.aws_ami
-  instance_type = "t3.micro"
-  subnet_id     = aws_subnet.main.id            # ← implicit dependency on aws_subnet.main
-  security_groups = [aws_security_group.web.name] # ← implicit dependency on aws_sg.web
+  ami                    = data.aws_ami.ubuntu.id # implicit: data source
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.main.id          # implicit
+  vpc_security_group_ids = [aws_security_group.web.id] # implicit
 }
 
-# Terraform infers: web depends on (data.aws_ami, aws_subnet.main, aws_security_group.web)
-# Graph: data.aws_ami → aws_instance.web ← aws_subnet.main
-#                                         ← aws_security_group.web
-
-# Explicit dependencies (when Terraform can't auto-detect):
-resource "aws_s3_bucket" "data" {
-  bucket = "my-data-lake"
-}
-
-resource "aws_s3_bucket_object" "config" {
-  bucket = aws_s3_bucket.data.bucket
+# Explicit: a hidden dependency Terraform can't see from references.
+# The function reads config.json from S3 at startup, so the object must exist first.
+resource "aws_s3_object" "config" {
+  bucket = aws_s3_bucket.data.id
   key    = "config.json"
   source = "config.json"
-  
-  # Even though no reference to aws_lambda_function.processor
-  # This object must be created BEFORE the Lambda function
-  depends_on = [aws_lambda_function.processor]
 }
 
-# Use depends_on when:
-# 1. Provisioner dependencies (Terraform can't see into the script)
-# 2. Side-effect dependencies (e.g., DNS propagation before cert validation)
-# 3. Module-level dependencies (Terraform doesn't inspect module internals for depends_on)
+resource "aws_lambda_function" "processor" {
+  function_name = "processor"
+  role          = aws_iam_role.lambda.arn
+  runtime       = "python3.13"
+  handler       = "app.handler"
+  filename      = "build/processor.zip"
+
+  depends_on = [aws_s3_object.config]
+}
 ```
 
-**Plan Time Optimization:**
+Use `depends_on` only for real hidden dependencies (IAM policy attachments needed before a service uses the role, side effects of another resource). It's coarse: `depends_on` on a **module** makes every data source inside it wait until apply, which often turns a clean plan into "known after apply" noise.
 
-```yaml
-# Why plan takes 5 minutes for 100 resources:
+**What the graph walk does:**
 
-# Serial operations:
-# Terraform must refresh state for EACH resource
-# Each refresh = API call to AWS
-# 100 resources × 500ms avg API latency = 50 seconds
-# But: depends_on creates chains: one resource must complete before next starts
+1. **Refresh** (inside plan): call `ReadResource` for every managed resource in state, and read every data source.
+2. **Plan:** for each resource, the provider's `PlanResourceChange` computes create/update/replace/delete; unknown values propagate along edges.
+3. **Apply:** execute changes in dependency order; independent branches run in parallel (default 10). With `create_before_destroy`, replacements create the new object before destroying the old one, which reverses some edges.
 
-# Parallelism:
-terraform plan -parallelism=20  # Default: 10
-# Higher parallelism = faster plan (but more API rate limit risk)
+**Why plans are slow and what to do:**
 
-# Optimization strategies:
+| Cause | Fix |
+|---|---|
+| API rate limiting (AWS throttling, GitHub/Datadog APIs) | Lower `-parallelism`, not higher; provider retry settings |
+| Huge state (thousands of resources) | Split into smaller states by component; this is the real fix |
+| Many or slow data sources | Pass IDs between stacks via outputs or parameters instead of lookups |
+| Need fast feedback while iterating | `terraform plan -refresh=false` (trusts state; misses drift, so never for the final apply) |
+| Emergency targeted change | `-target=...` (Terraform warns: plans can be incomplete; don't make it routine) |
 
-# 1. Target specific resources (for quick plans)
-terraform plan -target=aws_instance.web
-# Only plans the targeted resource + its dependencies
-# RISK: can create partial plans that miss dependency updates!
+`terraform plan -refresh-only` is not a speed-up: it shows drift between state and reality and, with `apply -refresh-only`, writes the real values into state.
 
-# 2. Use data sources sparingly
-# Data sources are REFRESHED every plan/apply
-# data "aws_secretsmanager_secret" "db_pass"  # API call every plan!
-# Solution: use static values or SSM Parameter Store with caching
+**Dependency cycles:**
 
-# 3. Split into multiple state files
-# Instead of 1 state with 100 resources:
-# - state-1: network (10 resources)
-# - state-2: database (20 resources)
-# - state-3: application (70 resources)
-# Each plans independently (faster!)
-# Data exchange: terraform_remote_state data source
-
-# 4. Use -refresh-only for independent refresh
-terraform plan -refresh-only  # Refresh state without changing resources
-terraform apply -refresh-only  # Update state to match real world (no resource changes)
-
-# 5. Parallelism tuning:
-# Small infra (< 50 resources): parallelism = 10 (default)
-# Medium infra (50-200): parallelism = 20
-# Large infra (200+): parallelism = 30-50 (watch API rate limits)
-```
-
-**Dependency Cycles & Resolution:**
-
-```yaml
-# Dependency cycle example (DAG cycle):
-resource "aws_security_group" "web" {
-  name = "web-sg"
-  ingress {
-    security_groups = [aws_security_group.lb.id]  # → depends on lb
-  }
+```hcl
+# Cycle: each group's inline rule references the other group
+resource "aws_security_group" "app" {
+  name   = "app"
+  vpc_id = aws_vpc.main.id
 }
 
-resource "aws_security_group" "lb" {
-  name = "lb-sg"
-  ingress {
-    security_groups = [aws_security_group.web.id]  # → depends on web
-  }
+resource "aws_security_group" "db" {
+  name   = "db"
+  vpc_id = aws_vpc.main.id
 }
-# Cycle: web → lb → web (CIRCULAR DEPENDENCY!)
-# Error: "Cycle: aws_security_group.web, aws_security_group.lb"
 
-# Solutions:
-# 1. Use self-referencing ingress (avoid mutual SG references)
-# 2. Break the cycle by using IP-based ingress instead of SG IDs
-# 3. Use separate state files (import one SG ID as data source)
-# 4. Use "lifecycle" to create one SG with known CIDR, then update
+# Fix: groups have no inline rules; rules are separate resources that reference both,
+# so the graph is groups → rules with no loop.
+resource "aws_vpc_security_group_ingress_rule" "db_from_app" {
+  security_group_id            = aws_security_group.db.id
+  referenced_security_group_id = aws_security_group.app.id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+}
 
-# Good practice: tiered security groups
-# Tier 1: ALB SG (allow 0.0.0.0/0:443)
-# Tier 2: App SG (allow ALB SG → no cycle!)
-# Tier 3: DB SG (allow App SG → no cycle!)
+resource "aws_vpc_security_group_egress_rule" "app_to_db" {
+  security_group_id            = aws_security_group.app.id
+  referenced_security_group_id = aws_security_group.db.id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+}
 ```
 
-**Graph Visualization:**
+Other common cycle sources: `create_before_destroy` on one resource but not its dependents, modules whose outputs feed back into their own inputs via another module, and provider configurations that depend on resources in the same state (e.g. configuring the Kubernetes provider from an EKS cluster created in the same apply). The last one is better solved by splitting into two stacks (or Terraform Stacks/Terragrunt dependencies).
 
-```bash
-# Visualize the dependency graph:
-terraform graph | dot -Tpng > graph.png
-# Install Graphviz: brew install graphviz
-# Output: PNG file showing all resources and their dependencies
-# Red edges: dependencies
-# Blue nodes: resources
-# Green nodes: data sources
-```
+**Inspecting the graph:** `terraform graph -type=plan | dot -Tsvg > graph.svg` (Graphviz). On large configs it's unreadable; `terraform plan -json` plus tooling, or reading the cycle error message, is usually more useful.
+
+**What they probe next:** "Why does a change to a tag show the whole instance as 'known after apply'?" (an upstream value became unknown, e.g. a replaced resource or a `depends_on` on a module). "When does parallelism > 10 help?" (large numbers of independent, slow-to-create resources, if the API's rate limits allow it).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Implicit vs explicit** | Knows Terraform auto-detects references, depends_on for provisioners/side-effects |
-| **Plan optimization** | Can tune parallelism, split state, and use -target correctly |
-| **Cycle resolution** | Can break circular dependencies with IP-based references or tiered structure |
-| **Graph visualization** | Uses terraform graph + Graphviz to debug complex dependency chains |
+| **Implicit vs explicit** | References build the graph; `depends_on` only for hidden dependencies, with its module-level cost |
+| **Plan cost** | Refresh and data sources dominate; splitting state is the real fix |
+| **Flags** | `-refresh=false` vs `-refresh-only` vs `-target`, and their risks |
+| **Cycles** | Separate rule resources, `create_before_destroy` interactions, provider-from-resource cycles |
 
 ---
 
@@ -318,175 +261,147 @@ terraform graph | dot -Tpng > graph.png
 
 **Q:** "Your team manages 50 infrastructure components using Terraform modules. Design a module strategy for reusability across 3 environments (dev, staging, prod). How do you version modules? How do you publish to a private registry? When should you NOT use a module?"
 
-**What They're Really Testing:** Whether you understand Terraform modules as the unit of composition — input/output contracts, versioning strategies, and the trade-offs between abstraction and flexibility.
+**What They're Really Testing:** Module API design, versioning and testing discipline, and judgement about abstraction.
+
+!!! tip "30-second answer"
+    Treat a module like a library: a small, typed, validated input interface, documented outputs, provider version constraints (but no provider configuration inside), semantic versions published as Git tags or to a private registry, and automated tests (`terraform test`). Environments consume pinned versions, and promote a new version dev → staging → prod. Don't wrap a single resource just to rename its arguments, and avoid deep module nesting that makes plans unreadable.
 
 ### Answer
 
-**Module Design Principles:**
+**Module layout:**
 
-```yaml
-# Module structure:
-modules/
-  ├── networking/
-  │   ├── main.tf          # VPC, subnets, NAT gateway, route tables
-  │   ├── variables.tf     # Input variables with type constraints
-  │   ├── outputs.tf       # Outputs for consuming modules
-  │   └── README.md        # Documentation
-  ├── compute/
-  │   ├── main.tf          # ASG, launch template, ALB
-  │   ├── variables.tf
-  │   ├── outputs.tf
-  │   └── README.md
-  ├── database/
-  │   ├── main.tf          # RDS, replica, security group
-  │   ├── variables.tf
-  │   ├── outputs.tf
-  │   └── README.md
-  └── kubernetes/
-      ├── main.tf          # EKS cluster, node groups, add-ons
-      ├── variables.tf
-      ├── outputs.tf
-      └── README.md
+```
+modules/network/
+├── main.tf          # VPC, subnets, route tables, NAT
+├── variables.tf     # typed inputs with validation
+├── outputs.tf       # documented outputs
+├── versions.tf      # required_version + required_providers (constraints only)
+├── README.md        # generated with terraform-docs
+└── tests/
+    └── network.tftest.hcl
+```
 
-# Module interface (variables.tf):
+```hcl
+# variables.tf
 variable "environment" {
   type        = string
-  description = "Environment name (dev, staging, prod)"
+  description = "Environment name."
   validation {
     condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "Environment must be dev, staging, or prod."
+    error_message = "environment must be dev, staging or prod."
   }
 }
 
 variable "vpc_cidr" {
   type        = string
-  description = "CIDR block for the VPC"
-  default     = "10.0.0.0/16"
+  description = "CIDR block for the VPC."
+  validation {
+    condition     = can(cidrhost(var.vpc_cidr, 0))
+    error_message = "vpc_cidr must be a valid CIDR block."
+  }
 }
 
-variable "tags" {
-  type        = map(string)
-  description = "Tags to apply to all resources"
-  default     = {}
+variable "nat" {
+  type = object({
+    enabled    = optional(bool, true)
+    single_nat = optional(bool, false) # one NAT for all AZs: cheaper, less resilient
+  })
+  default = {}
 }
 
-# Module outputs (outputs.tf):
-output "vpc_id" {
-  description = "ID of the created VPC"
-  value       = aws_vpc.main.id
-}
-
-output "private_subnet_ids" {
-  description = "IDs of private subnets"
-  value       = aws_subnet.private[*].id
+# versions.tf
+terraform {
+  required_version = ">= 1.11"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 6.0, < 7.0"
+    }
+  }
 }
 ```
 
-**Module Versioning Strategy:**
+Rules that keep modules composable:
 
-```yaml
-# Source: git tags, registry versions, or local paths
+- **No `provider` blocks inside reusable modules.** The caller configures providers and passes aliases via `providers = { aws = aws.us_east_1 }`. A module with its own provider block can't be used with `for_each` or `count`, and removing it orphans resources.
+- **Typed object inputs with `optional()` defaults** instead of 40 loose string variables.
+- **Outputs are the contract.** Removing or renaming an output, or changing a resource address without a `moved` block, is a breaking change → major version.
 
-# Option 1: Git tags (recommended for internal)
-module "networking" {
-  source = "git::https://github.com/my-org/tf-modules.git//networking?ref=v1.2.0"
-  # ref: branch (main), tag (v1.2.0), or commit (abc123)
-  environment = var.environment
+**Versioning and distribution:**
+
+```hcl
+module "network_git" {
+  source      = "git::https://github.com/acme/terraform-aws-network.git?ref=v1.4.2"
+  environment = "prod"
   vpc_cidr    = "10.0.0.0/16"
 }
 
-# Option 2: Terraform Registry (public or private)
-module "networking" {
-  source  = "my-org/network/aws"
-  version = "~> 1.2"  # >= 1.2, < 2.0
-  # version constraints:
-  #   >= 1.2.0        = at least 1.2.0
-  #   ~> 1.2.0        = >= 1.2.0, < 1.3.0 (pessimistic)
-  #   ~> 1.2          = >= 1.2.0, < 2.0.0
-  #   >= 1.0, < 2.0   = range
-  environment = var.environment
+module "network_registry" {
+  source      = "app.terraform.io/acme/network/aws" # private registry
+  version     = "~> 1.4"                            # >= 1.4.0, < 2.0.0
+  environment = "prod"
+  vpc_cidr    = "10.0.0.0/16"
 }
-
-# Option 3: Local path (for development)
-module "networking" {
-  source      = "../../modules/networking"
-  environment = var.environment
-}
-
-# Versioning workflow:
-# 1. Develop module: source = "./modules/networking" (local)
-# 2. Test: run terraform plan/apply in dev environment
-# 3. Tag: git tag v1.2.0 && git push --tags
-# 4. Publish: push to private registry (Terraform Cloud / JFrog)
-# 5. Consume: source = "my-org/network/aws", version = "~> 1.2"
-# 6. Major change: bump to v2.0.0 (breaking change alert!)
 ```
 
-**Private Module Registry (Terraform Cloud):**
+| Constraint | Allows |
+|---|---|
+| `= 1.4.2` | Exactly that version (prod, if you want explicit upgrades) |
+| `~> 1.4.2` | ≥ 1.4.2, < 1.5.0 (patches only) |
+| `~> 1.4` | ≥ 1.4.0, < 2.0.0 (minor and patch) |
+| `>= 1.4, < 2.0` | Same as above, explicit |
 
-```yaml
-# Terraform Cloud private registry:
-# 1. Connect VCS provider (GitHub, GitLab, Bitbucket)
-# 2. Define module repository naming:
-#    terraform-<PROVIDER>-<NAME>
-#    Example: terraform-aws-networking, terraform-aws-compute
-# 3. Tag a release: git tag v1.0.0
-# 4. Registry auto-imports the tag
-# 5. Team can browse module docs in Terraform Cloud UI
+- Git sources ignore `version`; the `ref` is the version. Pin to tags or commit SHAs, never branches.
+- Private registries (HCP Terraform, Terraform Enterprise, Artifactory, GitLab, Spacelift; OCI registries in OpenTofu 1.10+) need repos named `terraform-<PROVIDER>-<NAME>` and semver tags.
+- Since Terraform 1.15, `source` and `version` can reference variables and locals, which helps centralise version pins.
+- Automate upgrades with Renovate or Dependabot, which open PRs for new module and provider versions.
 
-# Requirements for module registry:
-# - README.md required (auto-displayed in registry)
-# - variables.tf with descriptions (auto-generated inputs)
-# - outputs.tf with descriptions (auto-generated outputs)
-# - Semantic versioning: vMAJOR.MINOR.PATCH
+**Testing modules (`terraform test`, 1.6+):**
 
-# Without Terraform Cloud: use git source with ref:
-# source = "git::https://github.com/my-org/terraform-aws-networking?ref=v1.2.0"
-```
-
-**When NOT to Use Modules:**
-
-```yaml
-# Over-abstracting is a common anti-pattern:
-
-# DON'T use a module for:
-# 1. Unique or one-off resources
-#    - A module with one resource and 20 variables is over-engineering
-#    - Just write the resource directly
-
-# 2. Resources that change frequently
-#    - If you update the module every week, consumers can't keep up
-#    - Prefer direct resource definitions for frequently changing infra
-
-# 3. Simple wrappers (passthrough anti-pattern):
-# BAD: Module that just passes variables through
-module "s3_bucket" {
-  source     = "./modules/s3"
-  bucket     = var.bucket      # ← Just passes through!
-  acl        = var.acl         # ← No logic!
-  tags       = var.tags        # ← No value added!
-  versioning = var.versioning
+```hcl
+# tests/network.tftest.hcl
+variables {
+  environment = "dev"
+  vpc_cidr    = "10.10.0.0/16"
 }
-# Instead: use the resource directly! (less indirection)
 
-# 4. Cross-cutting concerns that need coordination
-# Module can't share state between instances
-# Example: VPC module should not also create subnets (separate module or resource)
+run "rejects_bad_environment" {
+  command = plan
+  variables {
+    environment = "qa"
+  }
+  expect_failures = [var.environment]
+}
 
-# Good module candidates:
-# - Resources that always appear together (VPC + subnets + route tables + NAT GW)
-# - Resources with complex setup that should be consistently configured
-# - Standardized patterns used across 10+ environments
+run "creates_vpc_with_requested_cidr" {
+  command = plan
+  assert {
+    condition     = aws_vpc.this.cidr_block == "10.10.0.0/16"
+    error_message = "VPC CIDR does not match input."
+  }
+}
 ```
+
+`command = plan` tests are fast and need no real infrastructure when combined with `mock_provider` (1.7+); `command = apply` runs create real resources in a sandbox account and destroy them afterwards, which catches provider/API behaviour that mocks can't.
+
+**When NOT to use a module:**
+
+- **Passthrough wrappers:** a module that exposes every argument of one `aws_s3_bucket` adds indirection and a release cycle without encoding any decision. Either encode the decision (encryption, public-access block, lifecycle, logging always on) or use the resource directly.
+- **Deep nesting** (module → module → module): plan output and debugging become painful, and `moved` refactors get hard. Two levels is usually enough.
+- **Before you have three real uses.** Premature modules freeze the wrong interface.
+
+Good candidates encode **organisation policy and related resources that always travel together**: a VPC with its subnets, routes and NAT; a service with its IAM role, log group, alarms and DNS record.
+
+**What they probe next:** "How do you roll a breaking module change across 60 consumers?" (major version, `moved` blocks inside the module, upgrade guide, Renovate PRs, deprecate old versions with a date). "How do you test modules against real AWS cheaply?" (`command = apply` tests in an ephemeral account, nightly rather than per commit).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Module interface** | Designs clear input variables with types/validation, outputs with descriptions |
-| **Version constraints** | Uses semantic versioning with pessimistic constraint (~> 1.2) |
-| **Private registry** | Knows Terraform Cloud registry or git tag ref pattern for internal modules |
-| **When NOT to module** | Identifies passthrough modules and one-off resources as bad candidates |
+| **Interface design** | Typed objects, `optional()` defaults, validation, no provider blocks inside |
+| **Versioning** | Semver, pinned refs, constraint semantics, automated upgrades |
+| **Testing** | `terraform test`, `mock_provider`, plan vs apply tests |
+| **Judgement** | Avoids passthrough and deep nesting; modules encode decisions |
 
 ---
 
@@ -494,185 +409,92 @@ module "s3_bucket" {
 
 **Q:** "Design a Terraform directory structure for 3 environments (dev, staging, prod) with shared modules. Compare workspaces vs directory layouts. How do you manage environment-specific variables? How do you prevent a staging change from affecting production?"
 
-**What They're Really Testing:** Whether you understand workspace mechanics — the difference between Terraform Cloud workspaces and CLI workspaces — and can design a safe multi-environment deployment strategy.
+**What They're Really Testing:** Isolation of credentials and state between environments, and a promotion flow that makes prod changes boring.
+
+!!! tip "30-second answer"
+    Use **one root configuration per environment and component** (directories, or HCP Terraform workspaces/Stacks deployments), each with its own state, its own backend location and, crucially, **its own cloud account and credentials**. CLI workspaces share one backend and one set of credentials, so they're fine for short-lived copies (feature branches, test stacks) but not for separating prod from dev. Promote the same module version through environments, and let only CI apply, using OIDC-issued, environment-scoped roles.
 
 ### Answer
 
-**Workspaces vs Directory Layout:**
+**CLI workspaces vs separate roots:**
 
-```yaml
-# Option 1: Terraform CLI Workspaces (single directory, multiple states)
+| | CLI workspaces | Directory per environment |
+|---|---|---|
+| State | Same backend, path `env:/<workspace>/<key>` | Separate keys or buckets, can be separate accounts |
+| Credentials | Same backend credentials for all | Per environment |
+| Visibility | Current workspace is invisible in the code | The path says `prod/` |
+| Divergence between envs | Only via variables and `terraform.workspace` conditionals | Explicit, reviewable |
+| Good for | Ephemeral copies of one stack | Long-lived environments |
 
-environments/
-  └── network/
-      ├── main.tf
-      ├── variables.tf
-      └── outputs.tf
+HashiCorp's own docs say CLI workspaces are not suitable for strong separation between environments, because they share the backend and its credentials.
 
-# Same Terraform code, different state files:
-# terraform workspace new dev      → state: env:/dev/network
-# terraform workspace new staging  → state: env:/staging/network  
-# terraform workspace new prod     → state: env:/prod/network
+**Layout:**
 
-# Variables: use terraform.tfvars per workspace
-terraform workspace select dev
-terraform apply -var-file=dev.tfvars
-
-# Pros: single codebase, no duplication
-# Cons: easy to forget which workspace you're in!
-#       can accidentally: `terraform apply` in prod while thinking you're in dev
-
-# Option 2: Directory Layout (recommended for teams)
-
-environments/
-  ├── dev/
-  │   ├── network/
-  │   │   ├── main.tf
-  │   │   └── terraform.tfvars     # Environment-specific values
-  │   └── database/
-  │       ├── main.tf
-  │       └── terraform.tfvars
-  ├── staging/
-  │   ├── network/
-  │   │   ├── main.tf
-  │   │   └── terraform.tfvars
-  │   └── database/
-  │       └── main.tf
-  └── prod/
-      ├── network/
-      │   ├── main.tf
-      │   └── terraform.tfvars
-      └── database/
-          └── main.tf
-
+```
 modules/
-  ├── networking/
-  │   ├── main.tf
-  │   ├── variables.tf
-  │   └── outputs.tf
-  └── database/
-      ├── main.tf
-      ├── variables.tf
-      └── outputs.tf
-
-# Each environment directory has its OWN state file (S3 key: env/network/dev)
-# Separation: physical directory prevents cross-environment mistakes
-# CI/CD: each environment has its own pipeline step
-# Required: CI checks that prod apply only happens after staging verification
+  network/  database/  service/
+live/
+  dev/
+    network/   main.tf  backend.tf  terraform.tfvars
+    database/  ...
+  staging/
+    network/   ...
+  prod/
+    network/   main.tf  backend.tf  terraform.tfvars
+    database/  ...
 ```
 
-**Variable Management Strategy:**
-
-```yaml
-# Environment-specific variables using YAML or terraform.tfvars:
-
-# environments/prod/network/terraform.tfvars:
-environment     = "prod"
-vpc_cidr        = "10.0.0.0/16"
-private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
-instance_type   = "t3.large"
-min_size        = 3
-max_size        = 20
-
-# environments/staging/network/terraform.tfvars:
-environment     = "staging"
-vpc_cidr        = "10.1.0.0/16"
-private_subnets = ["10.1.1.0/24", "10.1.2.0/24"]
-public_subnets  = ["10.1.101.0/24", "10.1.102.0/24"]
-instance_type   = "t3.medium"
-min_size        = 1
-max_size        = 5
-
-# environments/dev/network/terraform.tfvars:
-environment     = "dev"
-vpc_cidr        = "10.2.0.0/16"
-private_subnets = ["10.2.1.0/24"]
-public_subnets  = ["10.2.101.0/24"]
-instance_type   = "t3.micro"
-min_size        = 1
-max_size        = 2
-
-# Shared variables (for all environments):
-# environments/shared/common.tfvars:
-region          = "us-east-1"
-tags            = { Owner = "platform-team", ManagedBy = "terraform" }
-```
-
-**Terraform Cloud Workspaces:**
-
-```yaml
-# Terraform Cloud: remote workspaces with RBAC
-
-# Each environment = separate workspace in TFC:
-Workspaces:
-  - net-dev      → AWS dev account, us-east-1
-  - net-staging  → AWS staging account, us-east-1
-  - net-prod     → AWS prod account, us-east-1
-
-# Variables scoped to workspace:
-# Terraform variables: vpc_cidr, instance_type, ...
-# Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (sensitive)
-
-# Run workflow:
-# 1. PR to environments/dev → plan (auto) → apply (manual)
-# 2. PR to environments/staging → plan (auto) → apply (manual)
-# 3. PR to environments/prod → plan (manual) → apply (manual, requires approval)
-
-# Teams & permissions:
-# - dev: developers can plan + apply
-# - staging: developers can plan, senior can apply
-# - prod: only platform team can plan + apply (requires approval gate)
-```
-
-**Preventing Cross-Environment Mistakes:**
-
-```yaml
-# Safety mechanisms:
-
-# 1. Environment-specific AWS profiles/roles
-# ~/.aws/config:
-[profile dev]
-role_arn = arn:aws:iam::DEV_ACCOUNT:role/TerraformRole
-
-[profile prod]
-role_arn = arn:aws:iam::PROD_ACCOUNT:role/TerraformRole
-
-# Provider config:
+```hcl
+# live/prod/network/main.tf
 provider "aws" {
-  profile = "dev"  # Can't accidentally use prod creds
+  region = "us-east-1"
+  assume_role {
+    role_arn = "arn:aws:iam::111122223333:role/terraform-prod-network"
+  }
+  default_tags {
+    tags = {
+      Environment = "prod"
+      ManagedBy   = "terraform"
+      Stack       = "network"
+    }
+  }
 }
 
-# 2. Directory structure: CI/CD only runs apply for the changed directory
-# No: manual terraform apply in environments/prod
-# Yes: CI pipeline applies prod after PR merge + staging verification
-
-# 3. terraform plan validation:
-# Run plan for ALL environments on every PR
-# Visual diff shows what changes in each environment
-# Prevents: "I thought this was staging but it changed prod"
-
-# 4. State file separate per environment:
-# S3 key: dev/network/terraform.tfstate
-# S3 key: staging/network/terraform.tfstate
-# S3 key: prod/network/terraform.tfstate
-# Different DynamoDB lock items → no cross-environment lock conflicts
-
-# 5. CI gating:
-# - Auto-plan on PR (all environments)
-# - Auto-apply for dev (fast feedback)
-# - Manual approval for staging
-# - Manual approval + 2 reviewers for prod
+module "network" {
+  source      = "app.terraform.io/acme/network/aws"
+  version     = "1.4.2" # promoted here only after dev and staging ran it
+  environment = "prod"
+  vpc_cidr    = var.vpc_cidr
+}
 ```
+
+```hcl
+# live/prod/network/terraform.tfvars
+vpc_cidr = "10.0.0.0/16"
+```
+
+- **Duplication** of the small root files is the price of explicitness. Tools reduce it: **Terragrunt** (DRY backend/provider config, dependencies between stacks, `run --all`), or **Terraform Stacks** in HCP Terraform (GA since September 2025), which define components once and deploy them to many "deployments" (environments, regions) with orchestrated dependencies.
+- **Environment-specific values** go in `terraform.tfvars` per root (non-secret), or HCP Terraform variable sets. Secrets never go in tfvars (Q8).
+- `default_tags` on the provider tags everything consistently without per-resource code.
+
+**Preventing staging changes from reaching prod:**
+
+1. **Separate AWS accounts** per environment (AWS Organizations). A staging role physically can't touch prod.
+2. **Only CI applies**, with short-lived credentials via OIDC (GitHub Actions → AWS role, or HCP Terraform dynamic provider credentials), and the role's trust policy restricted to the right repo, branch and GitHub environment. Humans get read-only in prod.
+3. **Promotion by version:** a module change is a new version; prod's root bumps the pin in its own PR after staging has been running it.
+4. **Plan visible in the PR** for each affected root, and **apply the reviewed plan file**, not a fresh plan (Q6).
+5. **Drift detection** (scheduled `plan -detailed-exitcode`, or HCP Terraform health assessments) so console changes don't surprise the next deploy.
+
+**What they probe next:** "Your prod and staging configs have drifted apart in 40 small ways. How do you converge?" (move differences into explicit variables, upgrade both to the same module version, diff the plans). "How do you handle a resource shared across environments, such as a Route 53 zone?" (a separate `shared/` stack owned by the platform team, exposing IDs to others).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Workspace vs directory** | Recommends directory layout for teams (safer, clearer ownership) |
-| **Variable separation** | Uses per-environment tfvars files with shared common vars |
-| **CI/CD gating** | Designs approval gates per environment (auto dev → manual staging → gated prod) |
-| **Safety** | Uses separate AWS profiles, separate state files, and CI/CD to prevent cross-env mistakes |
+| **Workspace vs directory** | Knows CLI workspaces share credentials and backend, and where they're still useful |
+| **Isolation** | Separate accounts, state and OIDC-scoped CI roles per environment |
+| **Promotion** | Same module version moves dev → staging → prod |
+| **Tooling awareness** | Terragrunt, Terraform Stacks, drift detection |
 
 ---
 
@@ -680,202 +502,190 @@ provider "aws" {
 
 **Q:** "You need to manage a third-party SaaS API (e.g., Datadog, PagerDuty) with Terraform. How does a Terraform provider work? Walk through the CRUD lifecycle. How would you build a custom provider for an internal API?"
 
-**What They're Really Testing:** Whether you understand Terraform's provider model — the gRPC-based provider protocol, the resource lifecycle (CRUD), and the abstraction between provider implementation and user-facing HCL.
+**What They're Really Testing:** The plugin protocol, the plan/apply split for providers, and good provider design (correct `Read`, import support, computed attributes).
+
+!!! tip "30-second answer"
+    A provider is a separate Go binary that Terraform launches and talks to over **gRPC** (plugin protocol v5/v6). Core asks it for schemas, validates config, and during plan calls `ReadResource` (refresh) and `PlanResourceChange`; during apply it calls `ApplyResourceChange`, which the SDK maps to your `Create`/`Update`/`Delete`. Build new providers with the **Terraform Plugin Framework**. The most important method is `Read`: it must reflect reality and remove the resource from state on 404, or drift detection is broken.
 
 ### Answer
 
-**Provider Architecture:**
+**Protocol flow:**
 
-```yaml
-# Terraform provider architecture:
-
-┌─────────────────────────────────────────────────────────────┐
-│  Terraform Core (HCL parser, graph, state engine)           │
-│                                                              │
-│  gRPC connection to provider process                         │
-│  Provider runs as SEPARATE BINARY (not embedded in TF)       │
-│  Communication: protocol buffers over gRPC                   │
-│  Provider binary: terraform-provider-<NAME>_vX.Y.Z           │
-└────────────────────┬────────────────────────────────────────┘
-                     │ gRPC
-┌────────────────────▼────────────────────────────────────────┐
-│  Provider Plugin                                            │
-│                                                              │
-│  ├── Provider Config (authentication, region, endpoints)    │
-│  │                                                           │
-│  ├── Resources (CRUD operations)                             │
-│  │   ├── Create: POST /api/v1/resources                    │
-│  │   ├── Read:   GET  /api/v1/resources/{id}               │
-│  │   ├── Update: PUT  /api/v1/resources/{id}               │
-│  │   └── Delete: DELETE /api/v1/resources/{id}             │
-│  │                                                           │
-│  └── Data Sources (read-only queries)                       │
-│      └── Read: GET /api/v1/resources                        │
-└─────────────────────────────────────────────────────────────┘
-
-# Provider lifecycle:
-# 1. Core starts provider process (separate binary)
-# 2. Core calls: ConfigureProvider (auth, region)
-# 3. Core calls: ValidateResourceConfig, PlanResourceChange, ApplyResourceChange
-# 4. On completion: Kill provider process
+```mermaid
+sequenceDiagram
+  participant Core as Terraform Core
+  participant P as Provider plugin
+  participant API as Remote API
+  Core->>P: GetProviderSchema
+  Core->>P: ValidateProviderConfig / ConfigureProvider
+  Core->>P: ReadResource (refresh each resource in state)
+  P->>API: GET /services/{id}
+  Core->>P: PlanResourceChange (prior state + config → proposed new state)
+  Note over Core: user reviews plan
+  Core->>P: ApplyResourceChange
+  P->>API: POST / PUT / DELETE
+  P-->>Core: new state (all computed values known)
 ```
 
-**Resource CRUD Lifecycle:**
+- Providers are downloaded by `terraform init` from a registry, checksum-verified against `.terraform.lock.hcl`, and run as child processes.
+- **Plan vs apply contract:** values unknown at plan time are "(known after apply)"; after apply, the provider must return a state consistent with the plan, or Core reports "Provider produced inconsistent result" (a provider bug).
+- Other RPCs worth knowing: `ImportResourceState`, `UpgradeResourceState` (schema version migrations), `MoveResourceState` (moving between resource types), ephemeral resources (`OpenEphemeralResource`, 1.10+), and list resources for `terraform query` (1.14+).
+
+**A resource with the Plugin Framework:**
 
 ```go
-// Go example (Terraform Plugin Framework):
+package provider
 
-func (r *resourceService) Create(ctx context.Context,
-    req tfsdk.CreateResourceRequest, resp *tfsdk.CreateResourceResponse,
-) {
-    var plan ServiceModel
-    req.Plan.Get(ctx, &plan)
-    
-    // 1. Build API request from plan attributes
-    apiReq := api.CreateServiceRequest{
-        Name:     plan.Name.ValueString(),
-        Team:     plan.Team.ValueString(),
-        Enabled:  plan.Enabled.ValueBool(),
-    }
-    
-    // 2. Call API
-    apiResp, err := r.client.CreateService(ctx, apiReq)
-    if err != nil {
-        resp.Diagnostics.AddError("Failed to create service", err.Error())
-        return
-    }
-    
-    // 3. Set ID from API response
-    plan.ID = types.StringValue(apiResp.ID)
-    
-    // 4. Set computed attributes (from API, not from config)
-    plan.CreatedAt = types.StringValue(apiResp.CreatedAt)
-    plan.UpdatedAt = types.StringValue(apiResp.UpdatedAt)
-    
-    // 5. Save to state
-    resp.State.Set(ctx, &plan)
+import (
+	"context"
+	"errors"
+
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"example.com/internal/api" // your API client
+)
+
+var (
+	_ resource.Resource                = (*serviceResource)(nil)
+	_ resource.ResourceWithImportState = (*serviceResource)(nil)
+)
+
+type serviceResource struct{ client *api.Client }
+
+type serviceModel struct {
+	ID        types.String `tfsdk:"id"`
+	Name      types.String `tfsdk:"name"`
+	Team      types.String `tfsdk:"team"`
+	CreatedAt types.String `tfsdk:"created_at"`
 }
 
-func (r *resourceService) Read(ctx context.Context,
-    req tfsdk.ReadResourceRequest, resp *tfsdk.ReadResourceResponse,
-) {
-    var state ServiceModel
-    req.State.Get(ctx, &state)
-    
-    // 1. Get resource by ID from API
-    apiResp, err := r.client.GetService(ctx, state.ID.ValueString())
-    if err != nil {
-        // Handle 404 → remove from state (resource deleted outside Terraform)
-        if errors.Is(err, api.ErrNotFound) {
-            resp.State.RemoveResource(ctx)
-            return
-        }
-        resp.Diagnostics.AddError("Failed to read service", err.Error())
-        return
-    }
-    
-    // 2. Refresh state with latest API values
-    state.Name      = types.StringValue(apiResp.Name)
-    state.Team      = types.StringValue(apiResp.Team)
-    state.Enabled   = types.BoolValue(apiResp.Enabled)
-    state.UpdatedAt = types.StringValue(apiResp.UpdatedAt)
-    
-    // 3. Save refreshed state
-    resp.State.Set(ctx, &state)
+func (r *serviceResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_service"
 }
 
-func (r *resourceService) Update(ctx context.Context,
-    req tfsdk.UpdateResourceRequest, resp *tfsdk.UpdateResourceResponse,
-) {
-    var plan, state ServiceModel
-    req.Plan.Get(ctx, &plan)   // Desired state
-    req.State.Get(ctx, &state) // Current state
-    
-    // 1. Only call API if something changed
-    if plan.Name != state.Name || plan.Team != state.Team {
-        apiReq := api.UpdateServiceRequest{
-            ID:       state.ID.ValueString(),
-            Name:     plan.Name.ValueString(),
-            Team:     plan.Team.ValueString(),
-        }
-        _, err := r.client.UpdateService(ctx, apiReq)
-        if err != nil {
-            resp.Diagnostics.AddError("Failed to update service", err.Error())
-            return
-        }
-    }
-    
-    // 2. Read back updated state
-    apiResp, _ := r.client.GetService(ctx, state.ID.ValueString())
-    plan.UpdatedAt = types.StringValue(apiResp.UpdatedAt)
-    
-    resp.State.Set(ctx, &plan)
+func (r *serviceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{
+				Computed:      true,
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"name": schema.StringAttribute{
+				Required:      true,
+				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}, // API can't rename
+			},
+			"team": schema.StringAttribute{Required: true},
+			"created_at": schema.StringAttribute{
+				Computed:      true,
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+		},
+	}
 }
 
-func (r *resourceService) Delete(ctx context.Context,
-    req tfsdk.DeleteResourceRequest, resp *tfsdk.DeleteResourceResponse,
-) {
-    var state ServiceModel
-    req.State.Get(ctx, &state)
-    
-    // 1. Call API to delete
-    err := r.client.DeleteService(ctx, state.ID.ValueString())
-    if err != nil {
-        // If already deleted (404), just remove from state
-        if !errors.Is(err, api.ErrNotFound) {
-            resp.Diagnostics.AddError("Failed to delete service", err.Error())
-            return
-        }
-    }
-    
-    // 2. State is automatically removed
+func (r *serviceResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var plan serviceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	out, err := r.client.CreateService(ctx, api.Service{Name: plan.Name.ValueString(), Team: plan.Team.ValueString()})
+	if err != nil {
+		resp.Diagnostics.AddError("Creating service failed", err.Error())
+		return
+	}
+	plan.ID = types.StringValue(out.ID)
+	plan.CreatedAt = types.StringValue(out.CreatedAt)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+func (r *serviceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var state serviceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	out, err := r.client.GetService(ctx, state.ID.ValueString())
+	if errors.Is(err, api.ErrNotFound) {
+		resp.State.RemoveResource(ctx) // deleted outside Terraform: plan will recreate it
+		return
+	}
+	if err != nil {
+		resp.Diagnostics.AddError("Reading service failed", err.Error())
+		return
+	}
+	state.Name = types.StringValue(out.Name) // write what the API says, so drift shows up in plan
+	state.Team = types.StringValue(out.Team)
+	state.CreatedAt = types.StringValue(out.CreatedAt)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+func (r *serviceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state serviceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	// Core only calls Update when the plan differs from state.
+	if err := r.client.UpdateServiceTeam(ctx, state.ID.ValueString(), plan.Team.ValueString()); err != nil {
+		resp.Diagnostics.AddError("Updating service failed", err.Error())
+		return
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+func (r *serviceResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var state serviceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	err := r.client.DeleteService(ctx, state.ID.ValueString())
+	if err != nil && !errors.Is(err, api.ErrNotFound) { // already gone is success
+		resp.Diagnostics.AddError("Deleting service failed", err.Error())
+	}
+	// On success the framework removes the resource from state.
+}
+
+func (r *serviceResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 ```
 
-**When to Build a Custom Provider:**
+Design points that interviewers look for:
 
-```yaml
-# Custom provider thresholds:
+- **Config vs computed:** `name`/`team` come from the user; `id`/`created_at` come from the API. `UseStateForUnknown` keeps stable computed values from showing as "(known after apply)" on every update.
+- **`RequiresReplace`** for fields the API can't change in place, so the plan says "must be replaced" up front instead of failing at apply.
+- **Idempotent delete** and **404 handling in Read** make the provider robust to out-of-band changes.
+- **Eventual consistency:** many APIs return before an object is readable; retry reads after create, or Terraform reports inconsistent results.
 
-# < 5 API calls: use null_resource + local-exec with curl/API calls
-resource "null_resource" "register_service" {
-  triggers = {
-    name = var.service_name
-  }
-  provisioner "local-exec" {
-    command = "curl -X POST https://api.internal.com/services -d '{\"name\": \"${var.service_name}\"}'"
-  }
-}
+**Build vs alternatives:**
 
-# 5-20 API calls: use Terraform provider (hashicorp/random, http data source)
-# data "http" "api_response" { ... }
-# resource "random_id" "name" { ... }
+| Option | When |
+|---|---|
+| Existing provider (official, partner or community, e.g. Datadog, PagerDuty) | Almost always for SaaS |
+| `terraform_data` + `local-exec` provisioner calling a script | One-off side effects (successor to `null_resource` since 1.4); no drift detection, no real Read, last resort |
+| Generic REST provider (e.g. community `restapi`) | Simple JSON CRUD APIs, prototypes |
+| Custom provider with Plugin Framework | An internal platform API many teams will manage declaratively; you need plan diffs, import and drift detection |
 
-# 20+ API calls: build custom provider
-# Benefits:
-# - Type safety: HCL validation catches errors before API calls
-# - State management: CRUD lifecycle automatically handles drift
-# - Documentation: terraform docs output from schema
-# - Team adoption: standard Terraform workflow
+Workflow for a custom provider: scaffold from `terraform-provider-scaffolding-framework`, generate schemas from OpenAPI with the provider code generator if available, test with `terraform-plugin-testing` acceptance tests against a real or fake API, use `dev_overrides` in `~/.terraformrc` for local development, and publish signed releases (GoReleaser + GPG) to a private or public registry.
 
-# Building a custom provider:
-# 1. Use Terraform Plugin Framework (recommended)
-# 2. Define provider schema (auth, endpoints)
-# 3. Define resource/data source schemas
-# 4. Implement CRUD handlers
-# 5. Compile: go build -o terraform-provider-myapi_v1.0.0
-# 6. Install: copy to ~/.terraform.d/plugins/...
-# 7. Publish: upload to Terraform Registry
-```
+**What they probe next:** "A user changes a setting in the SaaS UI. What does Terraform do?" (Read picks it up, plan proposes to revert it). "How do you evolve a resource's schema without breaking existing state?" (schema `Version` + `UpgradeState`).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **gRPC provider model** | Understands provider runs as separate process, communicates via gRPC |
-| **CRUD lifecycle** | Knows the 4 operations and how state is saved/read after each |
-| **Computed attributes** | Distinguishes config attributes (from HCL) from computed (from API response) |
-| **Custom provider threshold** | Can articulate when to build a provider vs use null_resource (20+ API calls) |
+| **Protocol** | Separate process over gRPC; plan-time vs apply-time RPCs |
+| **CRUD semantics** | Read reflects reality, 404 removes from state, idempotent delete |
+| **Schema design** | Computed vs configured, `UseStateForUnknown`, `RequiresReplace`, import |
+| **Judgement** | When a custom provider is worth it vs existing or generic options |
 
 ---
 
@@ -883,230 +693,172 @@ resource "null_resource" "register_service" {
 
 **Q:** "Design a CI/CD pipeline for Terraform infrastructure changes. How does Atlantis automate terraform plan/apply on pull requests? Compare Terraform Cloud vs Atlantis vs GitHub Actions. How do you handle concurrent PRs that modify the same resources?"
 
-**What They're Really Testing:** Whether you understand the operational challenges of infrastructure CI/CD — plan output in PR comments, concurrent change management, and the state locking problem.
+**What They're Really Testing:** Plan/apply integrity (apply exactly what was reviewed), credential handling (OIDC, no static keys), and concurrency control across PRs.
+
+!!! tip "30-second answer"
+    On every PR: `fmt`, `validate`, lint/policy checks, and a `plan` per affected root posted to the PR. After approval, **apply the saved plan file** that was reviewed, from CI only, with short-lived OIDC credentials scoped to that environment. Concurrency is handled at two levels: the state lock stops simultaneous applies, and a **per-project PR lock** (Atlantis) or a run queue (HCP Terraform) stops two PRs from planning against the same state. A saved plan becomes **stale** if state changes after it was made, and Terraform refuses to apply it, so the second PR re-plans.
 
 ### Answer
 
-**Atlantis Workflow:**
+**Atlantis (self-hosted, PR-native):**
 
-```yaml
-# Atlantis: PR-driven Terraform automation
-# Architecture:
-
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  GitHub PR   │────►│  Atlantis    │────►│  Terraform   │
-│  (terraform  │     │  (Webhook)   │     │  (State in   │
-│   plan/apply)│     │              │     │   S3)        │
-└─────────────┘     └──────┬───────┘     └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │  Pull        │
-                    │  Request     │
-                    │  Comment     │
-                    │  (plan/apply │
-                    │   output)    │
-                    └─────────────┘
-
-# Workflow:
-# 1. Developer creates PR with Terraform changes
-# 2. GitHub webhook → Atlantis
-# 3. Atlantis runs: terraform plan
-# 4. Atlantis comments on PR: plan output
-# 5. Reviewer checks plan, approves PR
-# 6. Developer comments: "atlantis apply"
-# 7. Atlantis runs: terraform apply
-# 8. PR merges (apply was already done!)
+```
+PR opened ─▶ webhook ─▶ Atlantis: plan each affected project ─▶ plan posted as PR comment
+                                   (project is now LOCKED to this PR)
+reviewer approves ─▶ comment "atlantis apply" ─▶ apply saved plan ─▶ merge PR ─▶ lock released
 ```
 
-**Atlantis Configuration:**
+Atlantis applies **before** merge, so `main` always reflects what's deployed only if you require "mergeable" and keep branches up to date.
 
 ```yaml
-# atlantis.yaml (repo-level config):
+# atlantis.yaml (repo level)
 version: 3
+automerge: true                  # merge the PR after all applies succeed
+parallel_plan: true
 projects:
   - name: dev-network
-    dir: environments/dev/network
-    terraform_version: v1.7.0
-    workflow: default
+    dir: live/dev/network
     autoplan:
-      enabled: true
-      when_modified: ["*.tf", "*.tfvars"]
-    
-  - name: staging-network
-    dir: environments/staging/network
-    terraform_version: v1.7.0
-    workflow: default
-    autoplan:
-      enabled: true
-      when_modified: ["*.tf", "*.tfvars"]
-    apply_requirements: ["approved"]  # Require PR approval before apply
-
+      when_modified: ["*.tf", "*.tfvars", "../../../modules/network/**/*.tf"]
   - name: prod-network
-    dir: environments/prod/network
-    terraform_version: v1.7.0
-    workflow: production
+    dir: live/prod/network
+    workflow: prod
     autoplan:
-      enabled: true
-      when_modified: ["*.tf", "*.tfvars"]
-    apply_requirements: ["approved", "mergeable"]  # Require approval + mergeable
+      when_modified: ["*.tf", "*.tfvars", "../../../modules/network/**/*.tf"]
+    apply_requirements: [approved, mergeable, undiverged]
 
 workflows:
-  production:
+  prod:
     plan:
       steps:
         - init
         - plan:
-            extra_args: ["-lock-timeout=300s"]  # Wait 5 min for lock
+            extra_args: ["-lock-timeout=5m"]
     apply:
       steps:
-        - apply:
-            extra_args: ["-lock-timeout=300s"]
-
-# Server config (server-side):
-repos:
-  - id: /.*/
-    branch: /main/
-    plan_requirements: [approved]
-    apply_requirements: [approved, mergeable]
+        - apply
 ```
 
-**GitHub Actions for Terraform:**
+```yaml
+# repos.yaml (server side: what repos may override)
+repos:
+  - id: github.com/acme/infra
+    apply_requirements: [approved, mergeable]
+    allowed_overrides: [apply_requirements, workflow]
+    allow_custom_workflows: false
+```
+
+**GitHub Actions (plan on PR, apply the reviewed plan after merge):**
 
 ```yaml
-# .github/workflows/terraform.yml
-name: Terraform
-
+name: terraform-prod-network
 on:
   pull_request:
-    paths:
-      - 'environments/**/*.tf'
-      - 'modules/**/*.tf'
+    paths: ["live/prod/network/**", "modules/network/**"]
   push:
     branches: [main]
-    paths:
-      - 'environments/**/*.tf'
-      - 'modules/**/*.tf'
+    paths: ["live/prod/network/**", "modules/network/**"]
+
+permissions:
+  contents: read
+  id-token: write        # OIDC token for AWS
+  pull-requests: write   # plan comment
+
+concurrency:
+  group: tf-prod-network # one run at a time for this root
+  cancel-in-progress: false
 
 env:
-  TF_VERSION: '1.7.0'
+  TF_IN_AUTOMATION: "true"
+  WORKDIR: live/prod/network
 
 jobs:
   plan:
-    name: Terraform Plan
     runs-on: ubuntu-latest
-    
-    strategy:
-      matrix:
-        environment: [dev, staging, prod]
-    
+    environment: prod-plan                       # role trust policy: plan-only role
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: ${{ env.TF_VERSION }}
-      
-      - name: Terraform Init
-        working-directory: environments/${{ matrix.environment }}/network
-        run: terraform init
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      
-      - name: Terraform Plan
-        id: plan
-        working-directory: environments/${{ matrix.environment }}/network
-        run: terraform plan -no-color -detailed-exitcode
-        continue-on-error: true
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      
-      - name: Post Plan Comment
-        uses: actions/github-script@v7
-        if: github.event_name == 'pull_request'
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
-          script: |
-            const output = `## Terraform Plan (${{ matrix.environment }})
-            \`\`\`\n${{ steps.plan.outputs.stdout }}\n\`\`\``;
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: output
-            });
-  
+          role-to-assume: arn:aws:iam::111122223333:role/gha-terraform-plan
+          aws-region: us-east-1
+      - run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+      - run: terraform plan -input=false -lock-timeout=5m -out=tfplan
+        working-directory: ${{ env.WORKDIR }}
+      - run: terraform show -no-color tfplan > plan.txt
+        working-directory: ${{ env.WORKDIR }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ${{ env.WORKDIR }}/tfplan
+      # (post plan.txt to the PR with a comment action; truncate to the 65k comment limit)
+
   apply:
-    name: Terraform Apply
-    needs: [plan]
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: plan
     runs-on: ubuntu-latest
-    
-    environment: production  # Requires manual approval in GitHub Environments
-    
-    strategy:
-      matrix:
-        environment: [dev, staging, prod]
-    
+    environment: prod                            # required reviewers gate here
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-      
-      - name: Terraform Apply
-        working-directory: environments/${{ matrix.environment }}/network
-        run: terraform apply -auto-approve
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::111122223333:role/gha-terraform-apply
+          aws-region: us-east-1
+      - uses: actions/download-artifact@v8
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ${{ env.WORKDIR }}
+      - run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+      - run: terraform apply -input=false tfplan  # exactly the plan the approver saw
+        working-directory: ${{ env.WORKDIR }}
 ```
 
-**Concurrent PRs & State Locking:**
+- **Approve the plan, not just the diff.** In this design the reviewer approves at the `prod` environment gate after seeing the plan generated from `main`. Applying a fresh plan with `-auto-approve` applies something nobody reviewed.
+- **OIDC, no static keys:** the AWS role trust policy should require `token.actions.githubusercontent.com:sub` = `repo:acme/infra:environment:prod` so only that repo and environment can assume the apply role.
+- **Plan files contain secrets** (they include state values); keep artifact retention short and access restricted.
 
-```yaml
-# Problem: Two PRs modify the same Terraform resources
-# PR1: change VPC CIDR (environments/prod/network/main.tf)
-# PR2: add subnet (environments/prod/network/main.tf)
+**Comparison:**
 
-# Scenario:
-# 1. PR1's plan runs: shows VPC CIDR change
-# 2. PR2's plan runs: uses OLD state (PR1 not applied yet!)
-#    Plan shows: add subnet to OLD VPC CIDR
-# 3. PR1 merges: apply succeeds, VPC CIDR changes
-# 4. PR2 merges: apply FAILS!
-#    State serial mismatch: state was updated by PR1
-#    terraform detects drift: "planned state doesn't match current state"
+| | HCP Terraform / TFE | Atlantis | GitHub Actions (DIY) | Spacelift / env0 / Scalr |
+|---|---|---|---|---|
+| Hosting | SaaS or self-hosted (TFE) | Self-hosted | Your CI | SaaS |
+| Plan/apply UX | Runs UI + VCS checks | PR comments | Whatever you build | Runs UI + PR checks |
+| Concurrency | Run queue per workspace | Per-project PR lock | `concurrency` groups + state lock | Run queue, stack locks |
+| Policy | Sentinel and OPA | Conftest via custom steps | Any tool you add | OPA |
+| Credentials | Dynamic provider credentials (OIDC) | Server's credentials (big blast radius) | OIDC per job | OIDC |
+| OpenTofu | No | Yes | Yes | Yes |
+| Cost model | Resources under management | Free (ops cost) | Runner minutes | Per seat/run |
 
-# Solutions:
-# 1. Locking (DynamoDB): prevents concurrent applies
-#    - PR1 acquires lock → applies → releases lock
-#    - PR2 tries to acquire lock → WAITS for lock-timeout (e.g., 5 min)
-#    - Lock timeout: PR2 fails with timeout (not corrupt!)
-#    - PR2 must re-run plan against latest state
+**Concurrent PRs on the same root:**
 
-# 2. Plan in isolation + Apply sequentially
-#    Each PR's plan is valid ONLY for the state at plan time
-#    If another PR applied, plan is stale → re-plan required
-#    Atlantis: auto-detects stale plan and rejects apply
+1. PR A and PR B both plan against state serial 42.
+2. Atlantis: PR B can't plan at all while PR A holds the project lock ("locked by PR A"). Without Atlantis, both plans exist.
+3. PR A applies → state serial 43.
+4. PR B tries to apply its saved plan → Terraform refuses: **"Saved plan is stale"**, because the plan recorded serial 42. B must rebase and re-plan, and the reviewer sees the new plan.
+5. If B's pipeline doesn't use saved plans (`apply -auto-approve` without a plan file), Terraform silently re-plans and applies whatever is now needed. That's the failure mode to design out.
 
-# 3. Branch isolation (Terraform Cloud):
-#    Each branch gets a temporary workspace
-#    Plan runs in isolation (no interference)
-#    Apply merges to main workspace
+The state lock (`-lock-timeout=5m`) only serialises **simultaneous** operations; it doesn't detect that a plan was made against old state. Saved plans and PR-level locks do.
 
-# 4. State locking with DynamoDB:
-#    Lock timeout: terraform plan -lock-timeout=5m
-#    If lock held: wait up to 5 minutes
-#    After 5 min: fail with error (not silent failure!)
-```
+**What they probe next:** "Atlantis runs with admin credentials for every account. How do you limit blast radius?" (one Atlantis per environment or account, per-project roles assumed from the server, or move to OIDC-based CI). "How do you detect drift between deploys?" (scheduled plans with `-detailed-exitcode`: exit 2 means changes).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Atlantis workflow** | Explains webhook → plan comment → apply comment flow |
-| **CI/CD gating** | Designs environment-specific approval requirements (auto dev → gated prod) |
-| **Concurrency handling** | Explains state locking and stale plan detection for concurrent PRs |
-| **Tool comparison** | Can compare Atlantis (PR-native) vs GitHub Actions (customizable) vs TFC (managed) |
+| **Plan integrity** | Applies the reviewed saved plan; knows about stale-plan rejection |
+| **Credentials** | OIDC roles per environment; no static keys; plan vs apply roles |
+| **Concurrency** | State lock vs PR/project locks vs CI concurrency groups |
+| **Tool comparison** | HCP Terraform vs Atlantis vs DIY vs other TACOS, including OpenTofu support |
 
 ---
 
@@ -1114,252 +866,172 @@ jobs:
 
 **Q:** "You need to create 50 security group rules from a list of ports and protocols. Using HCL functions and dynamic blocks, write a Terraform configuration that creates these rules without repeating code. How do for_each, count, and dynamic blocks differ?"
 
-**What They're Really Testing:** Whether you understand Terraform's configuration language deeply — the meta-arguments for repetition (count, for_each), dynamic blocks for nested schemas, and HCL functions for data transformation.
+**What They're Really Testing:** Stable resource addressing, data reshaping with `for` expressions, and knowing when the "clever" HCL is the wrong answer.
+
+!!! tip "30-second answer"
+    `count` creates N copies addressed by **index**, so removing an item from the middle shifts and recreates everything after it; use it only for "0 or 1" toggles or truly identical copies. `for_each` addresses instances by **stable keys** from a map or set, so adds and removals touch only that key. `dynamic` blocks generate repeated **nested blocks** inside one resource. For 50 security group rules, prefer a separate `aws_vpc_security_group_ingress_rule` resource per rule with `for_each` (AWS's recommended pattern) over 50 inline `ingress` blocks.
 
 ### Answer
 
-**Dynamic Blocks:**
+**Rules as individual resources (recommended):**
 
-```yaml
-# Problem: Create 50 security group rules without repeating code
-
-# Data: List of ingress rules
+```hcl
 variable "ingress_rules" {
-  type = list(object({
+  type = map(object({
     port        = number
-    protocol    = string
-    cidr_blocks = list(string)
-    description = optional(string)
+    protocol    = optional(string, "tcp")
+    cidr        = string
+    description = optional(string, "Managed by Terraform")
   }))
-  default = [
-    { port = 80,  protocol = "tcp", cidr_blocks = ["10.0.0.0/8"], description = "HTTP" },
-    { port = 443, protocol = "tcp", cidr_blocks = ["10.0.0.0/8"], description = "HTTPS" },
-    { port = 22,  protocol = "tcp", cidr_blocks = ["10.10.0.0/16"], description = "SSH" },
-    { port = 5432, protocol = "tcp", cidr_blocks = ["10.20.0.0/16"], description = "PostgreSQL" },
-    # ... 46 more rules
-  ]
+  default = {
+    https    = { port = 443, cidr = "10.0.0.0/8" }
+    ssh      = { port = 22, cidr = "10.10.0.0/16", description = "Bastion SSH" }
+    postgres = { port = 5432, cidr = "10.20.0.0/16" }
+  }
 }
 
-# Solution: dynamic block
 resource "aws_security_group" "app" {
-  name        = "app-sg"
-  description = "Application security group"
-  vpc_id      = aws_vpc.main.id
+  name   = "app"
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "app" {
+  for_each = var.ingress_rules
+
+  security_group_id = aws_security_group.app.id
+  ip_protocol       = each.value.protocol
+  from_port         = each.value.port
+  to_port           = each.value.port
+  cidr_ipv4         = each.value.cidr
+  description       = each.value.description
+}
+```
+
+Each rule is `aws_vpc_security_group_ingress_rule.app["ssh"]`: removing `ssh` deletes one rule; nothing else moves. Inline rules, by contrast, are one big attribute set on the group: a change rewrites the set, and mixing inline and standalone rule resources on the same group makes them fight.
+
+**Dynamic blocks (when the API only offers nested blocks):**
+
+```hcl
+resource "aws_security_group" "legacy" {
+  name   = "legacy"
+  vpc_id = aws_vpc.main.id
 
   dynamic "ingress" {
-    for_each = var.ingress_rules  # Iterates over the list
-
+    for_each = var.ingress_rules
     content {
       from_port   = ingress.value.port
       to_port     = ingress.value.port
       protocol    = ingress.value.protocol
-      cidr_blocks = ingress.value.cidr_blocks
-      description = try(ingress.value.description, "Managed by Terraform")
+      cidr_blocks = [ingress.value.cidr]
+      description = ingress.value.description
     }
-  }
-
-  dynamic "egress" {
-    for_each = var.egress_rules
-    content {
-      from_port   = 0
-      to_port     = 0
-      protocol    = "-1"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  }
-
-  tags = {
-    Name = "app-sg"
   }
 }
-
-# Dynamic blocks are useful for:
-# - Security group rules
-# - Load balancer listener rules
-# - Auto-scaling tag specifications
-# - IAM policy statements
-# Any nested block that repeats with similar structure
 ```
+
+The iterator is named after the block (`ingress.key`, `ingress.value`), or set `iterator = rule`. Overusing dynamic blocks hides the shape of a resource; use them for genuinely variable nested blocks (listener rules, IAM statements, settings lists).
 
 **count vs for_each:**
 
-```yaml
-# count: create N instances of a resource (when N is small and stable)
-
-# Create 3 IAM users
-variable "user_names" {
-  type    = list(string)
-  default = ["alice", "bob", "charlie"]
-}
-
-resource "aws_iam_user" "this" {
+```hcl
+# Index-addressed: aws_iam_user.by_index[0], [1], [2]
+resource "aws_iam_user" "by_index" {
   count = length(var.user_names)
-  name  = var.user_names[count.index]  # 0, 1, 2
+  name  = var.user_names[count.index]
+}
+# Removing the first name shifts every index: [1] becomes [0], and Terraform
+# plans changes to every user after the removed one.
+
+# Key-addressed: aws_iam_user.by_name["alice"]
+resource "aws_iam_user" "by_name" {
+  for_each = toset(var.user_names)
+  name     = each.key
 }
 
-# Problem with count:
-# If you insert a user at index 1: alice(0), bob(1), charlie(2)
-# → The list shifts: alice(0), NEW_USER(1), bob(2), charlie(3)
-# Terraform sees: user[1] changed from bob → NEW_USER
-#                 user[2] changed from charlie → bob
-#                 user[3] created (charlie)
-# This DESTROYS and RECREATES existing users!
-# count.index is positional → fragile!
-
-# for_each: create resources with stable keys
-
-resource "aws_iam_user" "this" {
-  for_each = toset(var.user_names)  # Create a set (deduplicates)
-  name     = each.key               # "alice", "bob", "charlie"
+# count is still right for an on/off toggle
+resource "aws_cloudwatch_log_group" "debug" {
+  count = var.enable_debug_logs ? 1 : 0
+  name  = "/app/debug"
 }
-
-# With map (more attributes):
-variable "users" {
-  type = map(object({
-    groups   = list(string)
-    tags     = map(string)
-  }))
-  default = {
-    alice = { groups = ["engineering"], tags = { role = "senior" }}
-    bob   = { groups = ["sre"], tags = {} }
-  }
-}
-
-resource "aws_iam_user" "this" {
-  for_each = var.users
-  name     = each.key                  # "alice", "bob"
-  tags     = each.value.tags
-}
-
-resource "aws_iam_user_group_membership" "this" {
-  for_each = var.users
-  user     = aws_iam_user.this[each.key].name
-  groups   = each.value.groups
-}
-
-# Inserting "dave" to the map: only dave is created (no recreation!)
-# Removing "bob": only bob is destroyed (no cascading!)
-# for_each uses stable keys → safe for production
 ```
 
-**HCL Functions for Data Transformation:**
+- `for_each` keys must be **known at plan time**: you can't key on an attribute that's only known after apply (e.g. a generated ID). Key on input values or names.
+- Migrate from `count` to `for_each` without recreation using `moved` blocks (`from = aws_iam_user.by_index[0]`, `to = aws_iam_user.by_name["alice"]`).
+- Sets of objects can't be `for_each` keys; build a map with a `for` expression.
 
-```yaml
-# Common HCL functions for infrastructure transformation:
+**Reshaping data:**
 
-# 1. Merge tags from multiple sources
+```hcl
 locals {
-  default_tags = {
-    Environment = var.environment
-    ManagedBy   = "Terraform"
-    Project     = "interview-prep"
-  }
-  extra_tags = {
-    CostCenter = var.cost_center
-    Team       = var.team
-  }
-  all_tags = merge(local.default_tags, local.extra_tags, var.custom_tags)
-  # merge: later maps override earlier ones for duplicate keys
-}
+  # Flatten nested input into one map with stable composite keys
+  sg_rules = merge([
+    for sg_name, sg in var.security_groups : {
+      for rule in sg.rules :
+      "${sg_name}-${rule.port}" => merge(rule, { sg_name = sg_name })
+    }
+  ]...)
 
-# 2. CIDR manipulation
-locals {
-  vpc_cidr    = "10.0.0.0/16"
-  subnet_bits = 8  # /16 + 8 = /24 subnets
-  az_count    = 3
-  
-  # Generate subnet CIDRs:
-  # cidrsubnet("10.0.0.0/16", 8, 0) → "10.0.0.0/24"
-  # cidrsubnet("10.0.0.0/16", 8, 1) → "10.0.1.0/24"
-  # cidrsubnet("10.0.0.0/16", 8, 2) → "10.0.2.0/24"
-  subnet_cidrs = [
-    for i in range(local.az_count) :
-    cidrsubnet(local.vpc_cidr, local.subnet_bits, i)
-  ]
-}
+  # Subnet CIDRs: /16 + 8 bits = /24 per AZ
+  subnet_cidrs = [for i in range(3) : cidrsubnet("10.0.0.0/16", 8, i)]
+  # ["10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24"]
 
-# 3. Flatten nested structures
-locals {
-  # Convert a list of maps into a flat list for for_each
-  ingress_rules = flatten([
-    for sg_name, sg in var.security_groups : [
-      for rule in sg.ingress_rules : {
-        sg_name   = sg_name
-        port      = rule.port
-        protocol  = rule.protocol
-        cidr      = rule.cidr
-      }
-    ]
-  ])
-  # flat list: [{sg_name="web", port=80}, {sg_name="web", port=443}, ...]
-}
-
-# 4. String formatting
-locals {
-  name_prefix = "${var.environment}-${var.service_name}"
-  
-  # formatlist
-  instance_names = formatlist("%s-instance-%02d", [local.name_prefix], range(3))
+  instance_names = formatlist("%s-instance-%02d", "${var.environment}-web", range(3))
   # ["prod-web-instance-00", "prod-web-instance-01", "prod-web-instance-02"]
-}
 
-# 5. Conditional expressions
-locals {
-  instance_type = var.environment == "prod" ? "t3.large" : "t3.micro"
-  
-  # Advanced: conditional with coalesce
-  description = coalesce(var.description, "Managed by Terraform")
-  # Returns first non-null/non-empty value
-  
-  # try/catch (safe attribute access)
-  # Instead of: var.config.endpoint (may fail)
-  # Use: try(var.config.endpoint, "default-endpoint")
+  tags = merge(var.default_tags, { Service = "web" }, var.extra_tags) # later maps win
+
+  endpoint = try(var.config.endpoint, "https://default.internal") # safe lookup
 }
 ```
 
-**Best Practices for HCL Complexity:**
+The `merge([...]...)` idiom (expanding a list of maps into arguments) is how you build a single map for `for_each` from nested structures; the older `flatten()` returns a list, which you then still have to convert into a map with unique keys.
 
-```yaml
-# 1. Use locals for complex expressions (don't inline in resources)
-# BAD:
-resource "aws_instance" "web" {
-  tags = merge(
-    { Name = format("%s-%s", var.environment, "web") },
-    var.common_tags,
-    var.environment == "prod" ? { Backup = "true" } : {}
-  )
+**Guardrails in HCL:**
+
+```hcl
+resource "aws_db_instance" "main" {
+  identifier          = "orders"
+  engine              = "postgres"
+  instance_class      = var.db_instance_class
+  allocated_storage   = 100
+  username            = "app"
+  storage_encrypted   = true
+  skip_final_snapshot = false
+
+  manage_master_user_password = true # AWS stores and rotates it in Secrets Manager
+
+  lifecycle {
+    prevent_destroy = true
+    precondition {
+      condition     = var.environment != "prod" || startswith(var.db_instance_class, "db.r")
+      error_message = "Production databases must use a memory-optimised (db.r*) class."
+    }
+  }
 }
 
-# GOOD:
-locals {
-  instance_name = "${var.environment}-web"
-  backup_tag    = var.environment == "prod" ? { Backup = "true" } : {}
-  instance_tags = merge({ Name = local.instance_name }, var.common_tags, local.backup_tag)
+check "orders_api_healthy" {
+  data "http" "health" {
+    url = "https://orders.internal.example.com/health"
+  }
+  assert {
+    condition     = data.http.health.status_code == 200
+    error_message = "Orders API health check failed after apply."
+  }
 }
-
-resource "aws_instance" "web" {
-  tags = local.instance_tags
-}
-
-# 2. Prefer for_each over count for lists that may change
-# 3. Use dynamic blocks only for genuinely repeated nested blocks
-# 4. Keep HCL expressions simple — move complex logic to external data sources
-# 5. Test HCL expressions with terraform console:
-terraform console
-> var.environment == "prod" ? "t3.large" : "t3.micro"
-"t3.micro"
-> merge({a=1}, {b=2})
-{ "a" = 1, "b" = 2 }
 ```
+
+`precondition`/`postcondition` fail the plan or apply; `check` blocks (1.5+) only warn, which suits post-deploy health checks and drift signals. Use `terraform console` to try expressions interactively.
+
+**What they probe next:** "Why does `for_each = toset(aws_instance.web[*].id)` fail on first apply?" (keys unknown until apply). "When would you move logic out of HCL?" (complex transformations belong in a typed input file or a small program generating JSON; HCL has no tests for local functions, though Terraform 1.15 added `convert()` and provider-defined functions help).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Dynamic blocks** | Uses for repeated nested blocks (SG rules, LB listeners) |
-| **for_each vs count** | Knows for_each uses stable keys, count uses fragile indices |
-| **HCL functions** | Uses merge, flatten, cidrsubnet, format, try for safe data transformation |
-| **locals organization** | Moves complex expressions from resources to locals for readability |
+| **Addressing** | `count` index shifting vs `for_each` stable keys; keys known at plan time |
+| **Resource design** | Separate rule resources over inline blocks; dynamic blocks only where needed |
+| **Data reshaping** | `for` expressions, `merge(...)` expansion, `cidrsubnet`, `try`, `optional()` |
+| **Guardrails** | `moved` for migrations, `prevent_destroy`, pre/postconditions, `check` blocks |
 
 ---
 
@@ -1367,279 +1039,179 @@ terraform console
 
 **Q:** "Design a secure Terraform workflow for managing secrets across environments. How do you avoid storing secrets in state files? Compare Vault, AWS Secrets Manager, and SOPS for secrets management. How do you enforce policies like 'no public S3 buckets' using Sentinel or OPA?"
 
-**What They're Really Testing:** Whether you understand the security challenges of IaC — secrets in state files, sensitive output handling, and policy enforcement as part of the CI/CD pipeline.
+**What They're Really Testing:** Whether you know what actually ends up in state (and what newer Terraform features keep out of it), how to scope Terraform's own credentials, and where policy checks belong.
+
+!!! tip "30-second answer"
+    Anything Terraform reads through a data source or sets on a normal resource argument is written to state in plain text, and `sensitive = true` only hides it from CLI output. Keep secrets out of state by (1) letting the service generate and own them (`manage_master_user_password` on RDS), (2) using **ephemeral resources** (1.10+) to fetch secrets and **write-only arguments** (1.11+, e.g. `password_wo`) to pass them on without persisting them, and (3) treating state as a secret anyway (KMS, tight IAM; OpenTofu can encrypt state client-side). Terraform runs with OIDC-issued, least-privilege roles, and policy-as-code (OPA/Conftest, Sentinel, Checkov/Trivy) runs on the plan JSON in CI before apply.
 
 ### Answer
 
-**Secrets in State Files:**
+**What leaks into state, and the fixes:**
 
-```yaml
-# Problem: Terraform state contains ALL resource attributes
-# Including: database passwords, API keys, private keys
+| Pattern | Secret in state? | Notes |
+|---|---|---|
+| `password = var.db_password` | **Yes** | Also lives wherever the variable came from |
+| `data "aws_secretsmanager_secret_version"` | **Yes** | Data source results are stored in state |
+| `sensitive = true` on a variable or output | **Yes** | Only redacts CLI/plan output |
+| `random_password` resource | **Yes** | Generated value is a resource attribute |
+| `manage_master_user_password = true` (RDS) | No | AWS generates, stores and rotates the password in Secrets Manager |
+| `ephemeral` resource + write-only argument | No | Value exists only during the run |
 
-# Example state (vulnerable):
-{
-  "resources": [
-    {
-      "type": "aws_db_instance",
-      "instances": [{
-        "attributes": {
-          "password": "SuperSecretP@ssw0rd!",  # PLAINTEXT!
-          "username": "admin"
-        }
-      }]
-    }
-  ]
+**Ephemeral values and write-only arguments:**
+
+```hcl
+ephemeral "random_password" "db" {
+  length  = 32
+  special = true
 }
 
-# Anyone with S3 read access to the state file can see all secrets!
-# State bucket permissions = secret access permissions!
-
-# Solutions:
-
-# 1. State encryption at rest (S3 SSE)
-terraform {
-  backend "s3" {
-    encrypt = true  # AES-256 server-side encryption
-    # BUT: Terraform decrypts during operations (still visible in process memory)
-  }
+resource "aws_secretsmanager_secret" "db" {
+  name = "prod/orders/db-password"
 }
 
-# 2. Use Secrets Manager (reference, don't store)
-resource "aws_db_instance" "main" {
-  username = "admin"
-  password = data.aws_secretsmanager_secret_version.db_pass.secret_string
-  # Password is fetched at runtime (not stored in state as plaintext)
-  # BUT: state still stores the password! (terraform reads it and writes to state)
+resource "aws_secretsmanager_secret_version" "db" {
+  secret_id                = aws_secretsmanager_secret.db.id
+  secret_string_wo         = ephemeral.random_password.db.result
+  secret_string_wo_version = 1 # bump to rotate: write-only values can't be diffed
 }
 
-# 3. Use dynamic secrets (Vault)
-resource "aws_db_instance" "main" {
-  username = "admin"
-  # Vault generates temporary password
-  password = vault_dynamic_secret.db.password
-  # Password changes on every apply!
-  # State stores different password each time (but it's short-lived)
-}
-
-# 4. Mark as sensitive (HCL only, not state!)
-output "db_password" {
-  value     = aws_db_instance.main.password
-  sensitive = true  # Hides from CLI output
-  # BUT: state still stores the password!
-  # sensitive just prevents display in terraform output
+resource "aws_db_instance" "orders" {
+  identifier          = "orders"
+  engine              = "postgres"
+  instance_class      = "db.r7g.large"
+  allocated_storage   = 100
+  username            = "app"
+  password_wo         = ephemeral.random_password.db.result
+  password_wo_version = 1
+  storage_encrypted   = true
+  skip_final_snapshot = false
 }
 ```
 
-**Secrets Management Integration:**
+- **Ephemeral resources** (Terraform 1.10, OpenTofu 1.11) are opened during the run and never stored in state or plan files. Providers offer them for things like Secrets Manager secret versions, Vault secrets and generated passwords.
+- **Write-only arguments** (`*_wo`, Terraform 1.11) accept ephemeral values and are sent to the API but not stored. Terraform can't see their value to detect changes, so a companion `*_wo_version` argument triggers updates.
+- Only use them where the provider supports them; check the resource docs.
 
-```yaml
-# Option 1: AWS Secrets Manager (for AWS-native)
-data "aws_secretsmanager_secret" "db" {
-  name = "prod/db/credentials"
-}
+**Secret stores compared:**
 
-data "aws_secretsmanager_secret_version" "db" {
-  secret_id = data.aws_secretsmanager_secret.db.id
-}
+| | AWS Secrets Manager / SSM Parameter Store | HashiCorp Vault / OpenBao | SOPS (age/KMS-encrypted files in Git) |
+|---|---|---|---|
+| Best for | AWS-native apps, rotation of AWS credentials | Multi-cloud, dynamic short-lived credentials (DB, cloud) | GitOps; secrets versioned with code |
+| How Terraform reads it | Ephemeral resource or data source | `vault` provider, ephemeral resources | `sops` provider (ephemeral support) or decrypt in CI |
+| Rotation | Built-in for RDS/Redshift/DocumentDB, Lambda for others | Native leases and revocation | Manual re-encrypt and commit |
+| Main risk | IAM policy sprawl | Operating Vault itself (or its licence: Vault is also BSL; OpenBao is the open fork) | Key management; plaintext copies on disk |
 
-resource "aws_db_instance" "main" {
-  username = jsondecode(data.aws_secretsmanager_secret_version.db.secret_string).username
-  password = jsondecode(data.aws_secretsmanager_secret_version.db.secret_string).password
-}
+Often the best answer is that **Terraform shouldn't handle the secret at all**: it creates the secret container and IAM permissions, and the application or a rotation function populates and reads the value.
 
-# Option 2: HashiCorp Vault (multi-cloud)
-provider "vault" {
-  address = "https://vault.internal.com:8200"
-  token   = var.vault_token  # From environment variable!
-}
+**Terraform's own credentials:**
 
-data "vault_kv_secret_v2" "db" {
-  mount = "kv-v2"
-  name  = "environments/prod/database"
-}
+- **CI only, via OIDC** (GitHub Actions, GitLab, HCP Terraform dynamic credentials): no long-lived access keys anywhere.
+- **Separate plan and apply roles:** plan needs read access (and state read); apply needs write. PR plans from forks must not get the apply role.
+- **Per-stack roles** scoped to the services that stack manages, rather than one admin role for everything.
+- **Privilege escalation guard:** a role that can `iam:CreateRole` and `iam:AttachRolePolicy` can grant itself admin. Require a permissions boundary on everything it creates:
 
-resource "aws_db_instance" "main" {
-  username = data.vault_kv_secret_v2.db.data["username"]
-  password = data.vault_kv_secret_v2.db.data["password"]
-}
-
-# Option 3: SOPS (Mozilla SOPS) + git
-# Encrypt secrets file with age/gpg:
-# sops --encrypt prod.enc.tfvars → prod.tfvars (encrypted)
-# Decrypt at plan time:
-# sops --decrypt prod.tfvars > prod.decrypted.tfvars
-# terraform plan -var-file=prod.decrypted.tfvars
-# rm prod.decrypted.tfvars  # Clean up!
-
-# Option 4: Terraform Cloud variable sets
-# Variables marked "sensitive" in TFC:
-# - Encrypted at rest and in transit
-# - Not visible in UI
-# - Not logged in run output
-# - Injected as environment variables to Terraform runs
-```
-
-**Policy as Code (Sentinel / OPA):**
-
-```yaml
-# Sentinel (HashiCorp's policy language, requires Terraform Cloud/Enterprise):
-
-# Policy: No public S3 buckets
-import "tfplan/v2" as tfplan
-
-# Find all aws_s3_bucket_public_access_block resources
-public_access_blocks = filter tfplan.resource_changes as _, rc {
-  rc.type is "aws_s3_bucket_public_access_block"
-}
-
-# Check that block_public_acls is true for all
-main = rule {
-  all public_access_blocks as _, block {
-    block.change.after.block_public_acls is true
-  }
-}
-
-# Policy: Restrict instance types
-allowed_types = ["t3.micro", "t3.small", "t3.medium", "t3.large", "m5.large"]
-
-aws_instances = filter tfplan.resource_changes as _, rc {
-  rc.type is "aws_instance"
-}
-
-main = rule {
-  all aws_instances as _, instance {
-    instance.change.after.instance_type in allowed_types
-  }
-}
-
-# Policy: Mandatory tags
-main = rule {
-  all tfplan.resource_changes as _, rc {
-    # Skip resources that don't support tagging
-    rc.mode is "data" or
-    # Check required tags exist
-    "Environment" in rc.change.after.tags and
-    "Owner" in rc.change.after.tags and
-    "CostCenter" in rc.change.after.tags
-  }
-}
-
-# Enforcement levels:
-# - advisory: warn only
-# - soft mandatory: warn + requires override
-# - mandatory: BLOCK the apply
-```
-
-**OPA (Open Policy Agent) for Terraform:**
-
-```yaml
-# OPA: CNCF policy engine, works with ANY Terraform (not just TFC)
-
-# Step 1: Generate plan JSON
-terraform plan -out=plan.tfplan
-terraform show -json plan.tfplan > plan.json
-
-# Step 2: Evaluate with OPA
-opa eval --data policy/s3.rego --input plan.json "data.terraform.deny"
-
-# Step 3: Rego policy (s3.rego):
-package terraform
-
-# Deny public S3 buckets
-deny[msg] {
-  resource := input.resource_changes[_]
-  resource.type == "aws_s3_bucket_public_access_block"
-  resource.change.after.block_public_acls == false
-  msg := sprintf("S3 bucket %v must block public ACLs", [resource.change.after.bucket])
-}
-
-deny[msg] {
-  resource := input.resource_changes[_]
-  resource.type == "aws_s3_bucket_public_access_block"
-  resource.change.after.block_public_policy == false
-  msg := sprintf("S3 bucket %v must block public policies", [resource.change.after.bucket])
-}
-
-# Deny instances without encryption
-deny[msg] {
-  resource := input.resource_changes[_]
-  resource.type == "aws_db_instance"
-  resource.change.after.storage_encrypted == false
-  msg := sprintf("RDS instance %v must be encrypted", [resource.change.after.identifier])
-}
-
-# Step 4: Add to CI/CD pipeline
-# - plan → plan.json → OPA evaluation → block apply if policy violations
-
-# OPA advantages over Sentinel:
-# - Works with ANY Terraform (OSS, Cloud, Enterprise)
-# - Open source (no licensing costs)
-# - Can use same policies for Kubernetes, APIs, etc.
-```
-
-**IAM Least Privilege for Terraform:**
-
-```yaml
-# Principle: Terraform should use the MINIMUM permissions needed
-
-# BAD: Terraform using AdministratorAccess
-# If terraform credentials leaked → attacker has full AWS access
-
-# GOOD: Scoped IAM policy for Terraform
+```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "CreateRolesOnlyWithBoundary",
       "Effect": "Allow",
-      "Action": [
-        "ec2:Describe*",
-        "ec2:CreateSecurityGroup",
-        "ec2:AuthorizeSecurityGroupIngress",
-        "ec2:DeleteSecurityGroup",
-        "ec2:RunInstances",
-        "ec2:TerminateInstances",
-        "ec2:CreateTags"
-      ],
-      "Resource": "*"
+      "Action": ["iam:CreateRole", "iam:PutRolePermissionsBoundary"],
+      "Resource": "arn:aws:iam::111122223333:role/app/*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/AppWorkloadBoundary"
+        }
+      }
     },
     {
+      "Sid": "StateAccess",
       "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject"
-      ],
-      "Resource": "arn:aws:s3:::my-terraform-state/*"
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::acme-tfstate-prod/network/*"
     },
     {
+      "Sid": "StateList",
       "Effect": "Allow",
-      "Action": [
-        "dynamodb:GetItem",
-        "dynamodb:PutItem",
-        "dynamodb:DeleteItem"
-      ],
-      "Resource": "arn:aws:dynamodb:*:*:table/terraform-state-locks"
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::acme-tfstate-prod"
     }
   ]
 }
-
-# Use IAM permission boundaries:
-# Set a boundary on the Terraform role:
-# "PermissionsBoundary": "arn:aws:iam::xxx:policy/TerraformBoundary"
-# Even if terraform creates a role with Admin permissions,
-# the boundary limits it to the boundary's maximum
 ```
+
+A permissions boundary on the Terraform role itself limits only that role; it's the **condition on role creation** that stops it minting more powerful roles. Service control policies (SCPs) in AWS Organizations add a further ceiling per account.
+
+**Policy as code on the plan:**
+
+```bash
+terraform plan -out=tfplan
+terraform show -json tfplan > plan.json
+conftest test plan.json --policy policy/      # OPA/Rego via Conftest
+```
+
+```rego
+# policy/s3.rego  (OPA 1.0 syntax: "contains" and "if" are required)
+package main
+
+import rego.v1
+
+deny contains msg if {
+	rc := input.resource_changes[_]
+	rc.type == "aws_s3_bucket_public_access_block"
+	some setting in ["block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"]
+	rc.change.after[setting] == false
+	msg := sprintf("%s: %s must be true", [rc.address, setting])
+}
+
+deny contains msg if {
+	rc := input.resource_changes[_]
+	rc.type == "aws_db_instance"
+	rc.change.after.storage_encrypted == false
+	msg := sprintf("%s: RDS storage must be encrypted", [rc.address])
+}
+```
+
+Sentinel (HCP Terraform / Terraform Enterprise only):
+
+```sentinel
+import "tfplan/v2" as tfplan
+
+allowed_types = ["t3.micro", "t3.small", "t3.medium", "m7g.large"]
+
+instances = filter tfplan.resource_changes as _, rc {
+	rc.type is "aws_instance" and
+	(rc.change.actions contains "create" or rc.change.actions contains "update")
+}
+
+main = rule {
+	all instances as _, rc {
+		rc.change.after.instance_type in allowed_types
+	}
+}
+```
+
+| | OPA / Conftest | Sentinel | Static scanners (Checkov, Trivy (formerly tfsec), KICS) |
+|---|---|---|---|
+| Input | Plan JSON (or HCL) | Plan, config, state, run data | HCL source |
+| Runs in | Any CI; HCP Terraform supports OPA policy sets too | HCP Terraform / TFE | Any CI, pre-commit |
+| Strength | One language for Terraform, Kubernetes admission, APIs | Enforcement levels (advisory / soft-mandatory / hard-mandatory), tight TFC integration | Hundreds of ready-made rules |
+| Weakness | Rego learning curve | Proprietary | Can't see computed values; source only |
+
+Layer them: static scanning in pre-commit and PRs for fast feedback, plan-based policy as the merge gate, and cloud-side guardrails (SCPs, S3 Block Public Access at the account level, AWS Config) as the backstop for anything created outside Terraform.
+
+**What they probe next:** "A plan file was uploaded as a CI artifact. Is that a problem?" (yes, plan files contain prior state values; restrict access and retention). "How do you rotate a DB password managed by Terraform with zero downtime?" (prefer service-managed rotation; otherwise dual-user rotation, then bump `password_wo_version`).
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Secrets in state** | Knows state stores all attributes including secrets, proposes Vault or dynamic secrets |
-| **Sentinel vs OPA** | Can compare: Sentinel (TFC-only) vs OPA (open, works with any Terraform) |
-| **Policy enforcement** | Designs CI/CD pipeline to evaluate OPA policies before terraform apply |
-| **IAM least privilege** | Creates scoped IAM roles for Terraform with permission boundaries |
+| **Secrets in state** | Knows data sources and `sensitive` still persist values; ephemeral + write-only; service-managed secrets |
+| **Credentials** | OIDC, plan vs apply roles, privilege-escalation guard via boundary conditions |
+| **Policy as code** | Plan JSON + OPA (1.0 syntax) or Sentinel as a merge gate, layered with scanners and SCPs |
+| **State hygiene** | State and plan files treated as secrets; OpenTofu state encryption as an option |
 
 ---
 
-> *All 8 questions cover the full breadth of Terraform — from state mechanics and dependency graphs to custom providers, Atlantis CI/CD, and security policy enforcement.*
+> *If you remember one thing per question: state is a secret-bearing database, locked natively in S3 now; plans are slow because of refresh, so split state; modules are versioned, tested libraries; environments are separate accounts, not CLI workspaces; providers live or die by `Read`; apply the plan you reviewed; key on `for_each`, not `count`; and keep secrets out of state with ephemeral values and write-only arguments.*

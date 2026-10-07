@@ -30,49 +30,56 @@
 
 ### Answer
 
-**Scheduling Pipeline (Kubernetes Scheduler):**
+!!! tip "30-second answer"
+    The scheduler takes one pod at a time off a priority queue, **filters** nodes that can't run it (resources, taints, affinity, ports, volumes), **scores** the survivors with weighted plugins, picks the highest, reserves the resources in its cache and **binds** asynchronously through the API server. The scheduler only ever compares the pod's **requests** against node **allocatable** minus other pods' requests; it never looks at real usage. If nothing fits, it tries **preemption** of lower-priority pods; otherwise the pod stays `Pending` and the Cluster Autoscaler or Karpenter reacts to it.
+
+**Scheduling Pipeline (scheduling framework, extension points in order):**
 
 ```
-Scheduling cycle (for each unscheduled pod):
+Scheduling cycle (one pod at a time, serial):
 
-1. Queue: unscheduled pods in SchedulingQueue
-   - Priority-based: higher priority pods scheduled first
-   - Pod groups: gang scheduling (all-or-nothing)
+1. Queue (activeQ → backoffQ → unschedulablePods)
+   - Ordered by pod priority (PriorityClass), then creation time
+   - Gang / all-or-nothing scheduling is NOT default behaviour: use Kueue, Volcano or the
+     coscheduling plugin. A native Workload API for gang scheduling is alpha since v1.35.
 
-2. Filtering (Predicates):
-   Test ALL nodes (50 nodes) → reduce to feasible nodes
-   
-   Filters (examples):
-   - PodFitsResources:  Requested(CPU,Mem) ≤ Allocatable(Node)
-   - PodFitsHost:       spec.nodeName matches
-   - PodFitsHostPorts:  Requested port not in use
-   - NodeSelector:      node labels match pod's nodeSelector
-   - NodeAffinity:      requiredDuringScheduling... matches
-   - TaintToleration:   pod tolerates all node taints
-   - CheckVolumeBinding: PVC can be bound
-   - NodeUnschedulable:  spec.unschedulable? (cordoned)
-   
+2. PreFilter + Filter (formerly "predicates"):
+   Feasible-node search. In big clusters the scheduler stops after finding enough feasible
+   nodes (percentageOfNodesToScore, adaptive, minimum 100 nodes), so with 50 nodes it checks all.
+
+   Filter plugins (current names):
+   - NodeResourcesFit:   sum of requests (CPU, memory, extended resources) ≤ allocatable
+   - NodeName:           spec.nodeName matches
+   - NodePorts:          requested hostPort not in use
+   - NodeAffinity:       nodeSelector + requiredDuringScheduling... terms
+   - TaintToleration:    pod tolerates all NoSchedule/NoExecute taints
+   - VolumeBinding / VolumeZone / NodeVolumeLimits: PVCs bindable in this zone, attach limits
+   - NodeUnschedulable:  node is cordoned
+   - PodTopologySpread, InterPodAffinity: hard spread/affinity rules
+   - DynamicResources:   DRA ResourceClaims (GPUs etc.) can be allocated (GA in v1.34)
+
    Result: 50 → 12 feasible nodes
 
-3. Scoring (Priorities):
-   Score each feasible node (0-100)
-   
-   Plugins (examples):
-   - NodeResourcesFit:  MostAllocated (50) or LeastAllocated (100)
-   - ImageLocality:     Node has image cached (higher score)
-   - InterPodAffinity:  Prefer co-location
-   - NodeAffinity:      preferredDuringScheduling weight
-   - TaintToleration:   Score for tolerated taints
-   
-   Example scores:
-   Node A: Resources(75) + Image(10) + Affinity(5) = 90
-   Node B: Resources(80) + Image(5) + Affinity(0) = 85
-   
-   Winner: Node A (highest score)
+3. PreScore + Score (formerly "priorities"):
+   Each plugin returns 0-100 per node; final score = Σ (plugin score × plugin weight)
 
-4. Binding:
-   - Write binding to etcd: Pod scheduled to Node A
-   - kubelet on Node A detects bound pod → pulls image → starts container
+   Score plugins (examples):
+   - NodeResourcesFit:  LeastAllocated (default, spreads) | MostAllocated (bin-packs)
+                        | RequestedToCapacityRatio
+   - NodeResourcesBalancedAllocation: balance CPU vs memory usage on the node
+   - ImageLocality:     image already cached on node
+   - InterPodAffinity, NodeAffinity (preferred terms), PodTopologySpread (ScheduleAnyway)
+   - TaintToleration:   fewer PreferNoSchedule taints scores higher
+
+   Highest score wins (ties broken randomly).
+
+4. Reserve → Permit → (binding cycle, async) PreBind → Bind → PostBind
+   - Reserve: assume the pod on the node in the scheduler's cache so the next pod
+     sees those resources as used
+   - PreBind: e.g. provision/bind PVCs (WaitForFirstConsumer volumes)
+   - Bind: POST pods/<name>/binding to the API server (the API server persists to etcd;
+     the scheduler never talks to etcd)
+   - kubelet on that node sees the pod via its watch → pulls image → starts containers
 ```
 
 **Advanced Scheduling:**
@@ -84,10 +91,14 @@ spec:
   topologySpreadConstraints:
   - maxSkew: 1                    # Max 1 pod difference between zones
     topologyKey: topology.kubernetes.io/zone
-    whenUnsatisfiable: DoNotSchedule  # or ScheduleAnyway
+    whenUnsatisfiable: DoNotSchedule  # or ScheduleAnyway (soft: only affects scoring)
     labelSelector:
       matchLabels:
         app: my-app
+    matchLabelKeys: ["pod-template-hash"]  # compute skew per ReplicaSet revision, so a
+                                           # rollout's new pods are spread on their own
+  # Spread is only checked at scheduling time. Scale-down and node loss can leave pods
+  # skewed; the descheduler's RemovePodsViolatingTopologySpreadConstraint fixes that.
 
 # Pod Disruption Budget
 # Ensure minimum availability during voluntary disruptions:
@@ -117,7 +128,7 @@ spec:
       - weight: 80
         preference:
           matchExpressions:
-          - key: instance-type
+          - key: node.kubernetes.io/instance-type
             operator: In
             values:
             - c5.4xlarge       # Prefer this instance type (weight=80)
@@ -129,31 +140,36 @@ spec:
 When a pod can't be scheduled:
 
 1. Failed Filtering:
-   - Pod stays in SchedulingQueue
-   - Backoff: exponential backoff (100ms → 200ms → 400ms → ... → 5min max)
-   - Periodic retry: every 5 minutes (after backoff cap)
-   - Events: "0/50 nodes available: 25 insufficient CPU, 25 insufficient memory"
+   - Pod condition PodScheduled=False, reason Unschedulable; event
+     "0/50 nodes are available: 25 Insufficient cpu, 25 node(s) had untolerated taint ..."
+   - Pod moves to unschedulablePods. It is retried when a relevant cluster event happens
+     (node added, pod deleted, PVC bound; filtered by plugin "queueing hints"),
+     or at the latest after 5 minutes (podMaxInUnschedulablePodsDuration)
+   - Retries go through backoffQ: exponential, 1s initial → 10s max by default
 
 2. Reasons:
-   - Insufficient resources (CPU/Mem/GPU)
+   - Insufficient requests headroom (CPU/memory/GPU), even if nodes look idle
    - Taints that no toleration matches
-   - Node selector no node matches
-   - PVC not found or not bound
-   - Port conflicts
+   - nodeSelector / required affinity matches no node
+   - PVC unbound, or volume pinned to another zone
+   - hostPort conflicts, hard topology spread or anti-affinity unsatisfiable
 
-3. Solutions:
-   a. Descheduler: Evict pods to rebalance
-   b. Cluster Autoscaler: Add nodes (must be configured!)
-   c. Priority-based eviction: Lower-priority pods preempted
-   d. Pod suspend: SuspendJob (batch workloads)
+3. Escalation paths:
+   a. Preemption (PostFilter): evict lower-priority pods to make room
+   b. Node autoscaling: Cluster Autoscaler or Karpenter sees the Pending pod and adds a node
+   c. Fix the spec: requests too high, missing toleration, wrong zone affinity
+   (The descheduler does not help Pending pods; it rebalances already-running ones.)
 
 # Priority-based preemption:
-# If high-priority pod can't fit:
-# 1. Identify nodes where preempting lower-priority pods would help
-# 2. Select victim pods (lowest priority first)
-# 3. Terminate victim pods (graceful shutdown)
-# 4. Schedule high-priority pod on freed resources
+# 1. Find nodes where evicting lower-priority pods would make the pod fit
+# 2. Choose victims: lowest priority first, minimising PDB violations (best effort, PDBs
+#    can still be violated if there is no other choice)
+# 3. Set pod.status.nominatedNodeName, delete victims (they get their graceful termination)
+# 4. Pod is scheduled on a later cycle once resources free up
+#    (preemptionPolicy: Never opts a pod out of preempting others)
 ```
+
+**What they probe next:** "Why is a pod Pending on a node that shows 20% CPU usage?" (requests, not usage); "How do you bin-pack for cost?" (MostAllocated scoring plus Karpenter consolidation); "How do you schedule GPU pods?" (extended resources or DRA `ResourceClaim`s, taints on GPU nodes); "What about a 64-pod training job that needs all pods at once?" (gang scheduling via Kueue/Volcano).
 
 ### 🔍 Staff-Level Evaluation
 
@@ -174,20 +190,23 @@ When a pod can't be scheduled:
 
 ### Answer
 
-**Kubernetes Networking Model (4 Requirements):**
+!!! tip "30-second answer"
+    The CNI plugin gives each pod a routable IP; a Service is a stable virtual IP whose backends come from **EndpointSlices**; kube-proxy (or Cilium's eBPF replacement) programs every node to DNAT the virtual IP to a ready pod; CoreDNS answers `<svc>.<ns>.svc.cluster.local` from its API watch. For "DNS fails across namespaces" check, in order: is the name namespace-qualified (`svc.other-ns`)? Can the pod reach kube-dns on UDP **and** TCP 53 (a default-deny egress NetworkPolicy is the classic culprit)? Are CoreDNS pods healthy and not throttled? Does the target Service have ready endpoints?
+
+**Kubernetes Networking Model (the rules every CNI must satisfy):**
 
 ```
-1. Pod-to-Pod: All pods can reach each other (no NAT)
-2. Pod-to-Node: Pods can reach all nodes
-3. Node-to-Pod: Nodes can reach all pods
-4. External-to-Service: Outside world reaches pods via Services
+1. Every pod gets its own IP, and pods can reach every other pod without NAT
+2. Agents on a node (kubelet, system daemons) can reach all pods on that node
+3. Services give a stable virtual IP / DNS name in front of a changing set of pods
+   (exposed outside via NodePort, LoadBalancer, Ingress or Gateway API)
 
 Networking implementations (CNI plugins):
-  - Calico: BGP-based, network policies, VXLAN/IP-in-IP/DSR
-  - Cilium: eBPF-based, transparent encryption, Hubble observability
-  - Flannel: overlay (VXLAN), simple, no network policies
-  - AWS VPC CNI: native VPC IPs, direct ENI attachment
-  - Weave: mesh topology, encryption, multicast
+  - Calico: BGP routing or VXLAN/IP-in-IP overlay, NetworkPolicy, optional eBPF dataplane
+  - Cilium: eBPF dataplane, can replace kube-proxy, WireGuard/IPsec encryption, Hubble
+  - Flannel: simple VXLAN overlay, no NetworkPolicy enforcement on its own
+  - AWS VPC CNI: pods get real VPC IPs from ENIs (watch IP exhaustion / max pods per node)
+  (Weave Net is unmaintained since Weaveworks shut down in 2024; don't pick it for new clusters.)
 ```
 
 **CNI Plugin Lifecycle:**
@@ -247,28 +266,30 @@ spec:
 **kube-proxy Modes:**
 
 ```
-1. userspace (legacy):
-   - kube-proxy listens on port, proxies to pods
-   - User space → kernel → user space → kernel → pod
-   - High overhead, rarely used
+kube-proxy watches Services + EndpointSlices and programs each node's kernel.
+(The old Endpoints API is deprecated since v1.33; EndpointSlices are the source of truth.)
 
-2. iptables (default):
-   - kube-proxy programs iptables rules
-   - Service IP → random pod IP (NAT)
-   - Each service = ~100 iptables rules
-   - 10K services = 1M rules → rule evaluation latency!
-   
+1. userspace: REMOVED in v1.26. Only mention it as history.
+
+2. iptables (still the default on Linux):
+   - Per Service: a KUBE-SVC chain; per backend: a KUBE-SEP chain with DNAT
+   - Backend chosen by "statistic --mode random --probability" rules
+   - Rule count grows with services × endpoints; first-packet lookup is a linear walk
+     and full-table rewrites get slow at tens of thousands of endpoints
+
    iptables -t nat -L KUBE-SERVICES
-   # Chain KUBE-SERVICES (1 references)
-   # KUBE-SVC-XXXXX  tcp -- 0.0.0.0/0 10.96.0.1 match tcp dpt:443
-   # → KUBE-SEP-XXXXX (statistical probability: 33% each backend)
+   # KUBE-SVC-XXXXX  tcp -- 0.0.0.0/0 10.96.0.1 tcp dpt:443
+   # → KUBE-SEP-XXXXX (probability 0.333 / 0.5 / 1.0 across 3 backends)
 
-3. IPVS (recommended for large clusters):
-   - Uses Linux IP Virtual Server (kernel module)
-   - O(1) lookups (hash table, not linear chain)
-   - Supports: rr, wrr, lc, wlc, sh, dh, lblc
-   - Scales to 10K+ services
-   - Must: modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh
+3. nftables (GA in v1.33, the recommended Linux mode today):
+   - Uses nftables maps/sets: lookups are O(1)-ish and updates are incremental
+   - Fixes iptables' scaling problems without IPVS's feature gaps
+
+4. IPVS: DEPRECATED in v1.35 (KEP-5495); logs a warning, will be removed later.
+   Was popular for hash-based O(1) lookups and rr/lc/sh algorithms, but lags on
+   features and has no active maintainers. Migrate IPVS clusters to nftables.
+
+5. No kube-proxy: Cilium (and Calico eBPF) implement Services in eBPF at the socket/TC layer.
 ```
 
 **CoreDNS & DNS Resolution:**
@@ -278,18 +299,26 @@ spec:
 # my-service.my-namespace.svc.cluster.local
 
 # Resolution flow:
-pod → /etc/resolv.conf → CoreDNS → Kubernetes API → resolved IP
+pod → /etc/resolv.conf → CoreDNS (answers from its in-memory cache of Services and
+EndpointSlices, kept fresh by a watch; it does NOT call the API per query) → ClusterIP
 
 # /etc/resolv.conf inside pod:
 search my-namespace.svc.cluster.local svc.cluster.local cluster.local
-nameserver 10.96.0.10     # CoreDNS ClusterIP
-options ndots:5            # Try DNS with search domains first
+nameserver 10.96.0.10     # kube-dns Service ClusterIP
+options ndots:5            # names with < 5 dots try every search domain first
 
 # Why cross-namespace resolution fails:
-# my-service (short name): searched as:
-#   1. my-service.my-namespace.svc.cluster.local → found! (same ns)
-#   2. NOT my-service.other-ns.svc.cluster.local (doesn't search other ns)
-# Solution: use FQDN: my-service.other-ns.svc.cluster.local
+# "my-service" expands only to my-service.<own-ns>.svc.cluster.local
+# Fix: "my-service.other-ns" (expanded via the svc.cluster.local search entry)
+#      or the full FQDN "my-service.other-ns.svc.cluster.local."
+# ndots:5 cost: "api.stripe.com" (2 dots) first tries 3 search domains → extra lookups.
+# Use a trailing dot, or lower ndots via pod dnsConfig, for external-heavy apps.
+
+# Other common causes of "DNS fails":
+# - Default-deny egress NetworkPolicy without an allow rule to kube-dns on UDP+TCP 53
+# - CoreDNS CPU-throttled or OOMKilled; conntrack races on UDP (use NodeLocal DNSCache)
+# - Headless Service with no ready pods returns no A records; a ClusterIP Service with no
+#   ready endpoints still resolves, but connections are rejected or time out
 
 # CoreDNS configuration (ConfigMap):
 apiVersion: v1
@@ -319,7 +348,7 @@ data:
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **CNI model** | Understands veth pair, IP allocation, and overlay vs direct routing |
-| **kube-proxy modes** | Compares iptables vs IPVS (scalability, O(1) vs O(N)) |
+| **kube-proxy modes** | Compares iptables vs nftables (scalability), knows IPVS is deprecated (v1.35) and eBPF can replace kube-proxy |
 | **Service types** | Knows ClusterIP, NodePort, LoadBalancer, Headless differences |
 | **DNS resolution** | Explains search domains, ndots, and why cross-namespace needs FQDN |
 
@@ -365,8 +394,11 @@ rules:
   resources: ["horizontalpodautoscalers"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
-  resources: ["events", "pods/log", "pods/exec"]
-  verbs: ["get", "list", "watch"]    # Read-only for diagnostics
+  resources: ["events", "pods/log"]
+  verbs: ["get", "list", "watch"]    # Read-only diagnostics
+# Deliberately NOT granted: pods/exec. Exec is a write (the verb is "create") and gives a
+# shell with the pod's ServiceAccount token, so treat it like admin access.
+# Also note: "list"/"watch" on secrets returns full secret contents, not just names.
 
 ---
 # RoleBinding: Bind Role to Team A's ServiceAccount
@@ -415,11 +447,16 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
+In real clusters humans are bound as **Groups** from your OIDC provider (`kind: Group, name: team-a-devs`), and ServiceAccounts are reserved for workloads and CI. For many namespaces, prefer reusing the built-in `admin`/`edit`/`view` ClusterRoles through namespaced RoleBindings over copying Roles. RBAC is additive only: there are no deny rules. Watch for privilege escalation through `create pods` (a pod can mount any Secret or ServiceAccount in its namespace), `escalate`/`bind` on roles, and `impersonate`.
+
 **Pod Security Standards (Pod Security Admission — PSA, replacing PSP):**
 
 ```yaml
-# Deprecated: PodSecurityPolicy (removed in 1.25)
-# New: Pod Security Admission (built-in, no webhook!)
+# PodSecurityPolicy was deprecated in 1.21 and REMOVED in 1.25 (policy/v1beta1 is gone).
+# Replacement: Pod Security Admission, a built-in admission plugin (GA in 1.25, no webhook)
+# enforcing the three Pod Security Standards per namespace via labels.
+# For anything finer-grained (allowed registries, required labels) add Kyverno/Gatekeeper
+# or built-in ValidatingAdmissionPolicy (CEL, GA in 1.30).
 
 # Namespace-level enforcement:
 apiVersion: v1
@@ -432,16 +469,20 @@ metadata:
     pod-security.kubernetes.io/warn: baseline        # Warn on violations
 
 # Levels:
-# privileged:    No restrictions (system components)
-# baseline:      Minimal restrictions (typical workloads)
-# restricted:    Full hardening (PCI/HIPAA compliance)
+# privileged:    No restrictions (CNI, CSI node plugins, other system DaemonSets)
+# baseline:      Blocks known escalations: privileged, hostNetwork/hostPID, hostPath, added caps
+# restricted:    Baseline + hardening best practice
 
-# Example restricted requirements:
-# - RunAsNonRoot: true
-# - Seccomp profile: RuntimeDefault or Localhost
-# - Capabilities: drop ALL, add only NET_BIND_SERVICE
-# - readOnlyRootFilesystem: true
+# restricted requires:
+# - runAsNonRoot: true
+# - seccompProfile.type: RuntimeDefault or Localhost
+# - capabilities: drop ["ALL"], may add back only NET_BIND_SERVICE
 # - allowPrivilegeEscalation: false
+# - only safe volume types (configMap, secret, emptyDir, PVC, projected, ...)
+# readOnlyRootFilesystem is good practice but NOT required by restricted.
+
+# Rollout tip: label with warn/audit first, check `kubectl label --dry-run=server` output,
+# then flip enforce. Enforce only checks pods; warn/audit also check workload templates.
 ```
 
 **ServiceAccount & Pod Identity:**
@@ -453,22 +494,27 @@ kind: ServiceAccount
 metadata:
   name: my-app-sa
   namespace: team-a
-automountServiceAccountToken: true   # Mount token in pod
+automountServiceAccountToken: false  # Opt in per pod only if the app calls the API
 
-# Token mounted at: /var/run/secrets/kubernetes.io/serviceaccount/token
-# Pod uses this token to authenticate to API server
+---
+# When mounted: /var/run/secrets/kubernetes.io/serviceaccount/token
+# It is a projected, bound token (TokenRequest API): audience-scoped, bound to the pod,
+# expires (1h by default, kubelet rotates it). Since 1.24 Kubernetes no longer auto-creates
+# long-lived Secret-based tokens for ServiceAccounts.
 
-# Workload Identity (cloud-specific):
-# AWS:     ServiceAccount annotation → IAM role
-# GKE:     Workload Identity → GCP SA
-# Azure:   Azure AD Pod Identity → Azure AD managed identity
+# Workload identity to cloud IAM (the token is exchanged via OIDC federation):
+# AWS:     IRSA (annotation below) or the newer EKS Pod Identity (association, no annotation)
+# GKE:     Workload Identity Federation for GKE
+# Azure:   Microsoft Entra Workload ID (AAD Pod Identity is deprecated)
 
-# AWS EKS example:
+# AWS IRSA example:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  name: my-app-sa
+  namespace: team-a
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/my-app-role
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/my-app-role
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -477,7 +523,7 @@ metadata:
 |-----------|----------------------|
 | **RBAC model** | Understands Role vs ClusterRole, Binding vs ClusterRoleBinding |
 | **Least privilege** | Grants minimum verbs/resources per role |
-| **PSA over PSP** | Knows PodSecurityPolicy is deprecated, Pod Security Admission is current |
+| **PSA over PSP** | Knows PodSecurityPolicy was removed in 1.25 and Pod Security Admission (plus Kyverno/Gatekeeper/ValidatingAdmissionPolicy) replaces it |
 | **ServiceAccount identity** | Understands pod identity via tokens for cloud IAM integration |
 
 ---
@@ -515,22 +561,28 @@ metadata:
          claimName: my-pvc
 
 4. Pod runs on node → kubelet mounts volume:
-   - CSI node plugin attaches device
-   - Formats (if first use)
-   - Mounts to pod's filesystem
+   - Attach: external-attacher → ControllerPublishVolume (e.g. EBS AttachVolume)
+   - NodeStageVolume: format (first use) + mount to a global staging path
+   - NodePublishVolume: bind-mount into the pod's volume directory
 
 5. Pod deleted → PVC still exists → data persists!
-6. PVC deleted → PV deleted (unless retain policy configured)
+6. PVC deleted → PV handled per reclaimPolicy: Delete (default for dynamic PVs, backing
+   disk deleted too) or Retain (PV becomes Released, data kept for manual recovery)
+
+Zonal disks (EBS, PD): use volumeBindingMode: WaitForFirstConsumer so the volume is created
+in the zone where the pod is scheduled. With Immediate binding the disk can land in a zone
+the pod can never be scheduled to, leaving it Pending.
 ```
 
 **CSI (Container Storage Interface):**
 
 ```
 CSI plugin architecture:
-  Controller Plugin (deployment):
-    - CreateSnapshot, DeleteSnapshot
+  Controller Plugin (Deployment, with sidecars external-provisioner/attacher/
+  snapshotter/resizer that watch Kubernetes objects and call the driver over gRPC):
     - CreateVolume, DeleteVolume
-    - ControllerPublishVolume, ControllerUnpublishVolume
+    - ControllerPublishVolume, ControllerUnpublishVolume (attach/detach)
+    - CreateSnapshot, DeleteSnapshot, ControllerExpandVolume
   
   Node Plugin (DaemonSet):
     - NodeStageVolume (mount device, format)
@@ -545,9 +597,10 @@ Example: EBS CSI Driver flow:
   1. Create PVC with storageClassName: ebs-sc
   2. CSI Controller.CreateVolume → EC2.CreateVolume (100Gi gp3)
   3. Pod scheduled to EC2 instance
-  4. CSI Node.NodeStageVolume → Attach EBS volume to EC2
-  5. CSI Node.NodePublishVolume → mount /dev/xvdh to /var/lib/kubelet/...
-  6. Pod sees the volume at mount path
+  4. CSI Controller.ControllerPublishVolume → EC2.AttachVolume (VolumeAttachment object)
+  5. CSI Node.NodeStageVolume → mkfs (first use) + mount to staging dir
+  6. CSI Node.NodePublishVolume → bind-mount into /var/lib/kubelet/pods/<uid>/volumes/...
+  7. Pod sees the volume at mount path
 ```
 
 **StatefulSet Storage Guarantee:**
@@ -566,9 +619,13 @@ spec:
     matchLabels:
       app: postgres
   template:
+    metadata:
+      labels:
+        app: postgres            # must match spec.selector
     spec:
       containers:
       - name: postgres
+        image: postgres:17
         volumeMounts:
         - name: data
           mountPath: /var/lib/postgresql/data
@@ -593,21 +650,29 @@ spec:
 # 3. If pod-1 is deleted: PVC survives (data preserved)
 # 4. To delete everything: delete StatefulSet, then delete PVCs manually
 
-# Issue: manual PVC cleanup needed when scaling DOWN
-# Pod postgres-2 deleted → PVC still exists → must delete manually!
+# By default PVCs are kept on scale-down and on StatefulSet deletion (safe default).
+# persistentVolumeClaimRetentionPolicy (GA in 1.32) changes that:
+#   persistentVolumeClaimRetentionPolicy:
+#     whenDeleted: Retain   # or Delete
+#     whenScaled: Delete    # delete data-postgres-2 when scaling 3 → 2
+# Ordering: pods are created 0,1,2 and removed 2,1,0 (podManagementPolicy: OrderedReady);
+# a StatefulSet does not do replication or failover for you: that is the operator's job.
 ```
 
 **Storage Best Practices:**
 
 ```yaml
 # Retain policy for critical data:
-apiVersion: v1
-kind: StorageClass
 apiVersion: storage.k8s.io/v1
+kind: StorageClass
 metadata:
   name: premium-ssd-retain
 provisioner: ebs.csi.aws.com
 reclaimPolicy: Retain          # Default: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+
+---
 # Retain: PV persists after PVC deleted (manual cleanup)
 # Delete: PV and underlying storage are removed
 
@@ -633,7 +698,7 @@ spec:
           resources:
             requests:
               storage: 10Gi
-# Pod-created-on-demand, deleted with pod
+# PVC is created with the pod and deleted with it (generic ephemeral volume)
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -677,8 +742,12 @@ kubectl apply -f deployment.yaml (replicas: 5)
 
 4. kubelet:
    - Watches: pods scheduled to its node
-   - Creates containers (CRI: containerd), mounts volumes (CSI)
+   - Creates containers through the CRI (gRPC) to containerd or CRI-O, mounts
+     volumes (CSI), sets up networking (CNI via the runtime)
    - Reports pod status back to API server
+   (dockershim was removed in 1.24, so Docker Engine is no longer a runtime option
+    without cri-dockerd; Docker-built images still run fine, they're just OCI images.
+    v1.35 was the last release to support containerd 1.x: v1.36+ needs containerd 2.x.)
 
 Reflection:
   Deployment → 1 ReplicaSet → 5 Pods
@@ -715,12 +784,19 @@ spec:
       maxSurge: 1          # Max 1 extra pod during update (5+1=6 total)
       maxUnavailable: 0     # Min 5 pods always available (0 unavailable)
 
-# Result: NO DOWNTIME!
-# Min available = replicas - maxUnavailable = 5 - 0 = 5
-# Always 5 pods serving traffic → zero-downtime deployment
+# Defaults if omitted: maxSurge 25%, maxUnavailable 25%.
+# With maxUnavailable: 0 the controller never drops below 5 READY pods.
+# That is necessary but not sufficient for zero downtime. You also need:
+#  - a readiness probe that is honest (otherwise "Ready" means "process started")
+#  - graceful shutdown: preStop delay + SIGTERM handling, because endpoint removal
+#    and SIGTERM happen in parallel (see POD_LIFECYCLE_AND_MONITORING.md §3)
+#  - a PDB so node drains during the rollout don't take extra pods down
+#  - backward-compatible changes (old and new versions serve side by side)
+# progressDeadlineSeconds (default 600) marks a stuck rollout as failed; it does NOT
+# roll back automatically: `kubectl rollout undo` or Argo Rollouts/Flagger do that.
 ```
 
-**Kuberentes Operator Pattern:**
+**Kubernetes Operator Pattern:**
 
 ```yaml
 # Operator = Controller + Custom Resource Definition (CRD)
@@ -761,38 +837,39 @@ spec:
 **Custom Controller Code Pattern:**
 
 ```go
-// Simplified controller reconcile loop (Go)
+// Reconcile is level-triggered: it is called with only a key (namespace/name), must be
+// idempotent, and recomputes everything from current state each time.
 func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    // 1. Fetch the custom resource
+    // 1. Fetch the custom resource (from the informer cache)
     var app myappv1.MyApp
     if err := r.Get(ctx, req.NamespacedName, &app); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
+        return ctrl.Result{}, client.IgnoreNotFound(err) // deleted: owned objects are GC'd
     }
 
-    // 2. Observe current state (what exists now?)
-    var currentDeploy appsv1.Deployment
-    err := r.Get(ctx, types.NamespacedName{Name: app.Name}, &currentDeploy)
-
-    // 3. Compute desired state (what should exist?)
-    desiredDeploy := buildDesiredDeployment(&app)
-
-    // 4. Reconcile (make current → match desired)
+    // 2+3+4. Observe, compute desired, converge. CreateOrUpdate does Get → mutate →
+    // Create or Update, carrying resourceVersion so concurrent writers get a 409 Conflict
+    // instead of silently overwriting each other.
+    deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+        Name: app.Name, Namespace: app.Namespace}}
+    _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deploy, func() error {
+        mutateDeployment(deploy, &app) // set replicas, template, labels from app.Spec
+        // OwnerReference → garbage collection on delete, and Owns() watches re-trigger us
+        return controllerutil.SetControllerReference(&app, deploy, r.Scheme)
+    })
     if err != nil {
-        // Does not exist → create it
-        return ctrl.Result{}, r.Create(ctx, desiredDeploy)
-    }
-    
-    // Exists → update it if different
-    if !deploymentsEqual(&currentDeploy, desiredDeploy) {
-        return ctrl.Result{}, r.Update(ctx, desiredDeploy)
+        return ctrl.Result{}, err // returned errors are requeued with rate-limited backoff
     }
 
-    // 5. Update status
-    app.Status.Ready = currentDeploy.Status.ReadyReplicas
-    r.Status().Update(ctx, &app)
+    // 5. Report observed state in status (a separate subresource)
+    app.Status.ReadyReplicas = deploy.Status.ReadyReplicas
+    app.Status.ObservedGeneration = app.Generation
+    if err := r.Status().Update(ctx, &app); err != nil {
+        return ctrl.Result{}, err
+    }
 
-    // 6. Requeue for next reconciliation (periodic recheck)
-    return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    // 6. No timed requeue needed: watches on MyApp and owned Deployments trigger us.
+    // Use RequeueAfter only when polling something outside the cluster.
+    return ctrl.Result{}, nil
 }
 ```
 
@@ -815,6 +892,9 @@ func (r *MyAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 ### Answer
 
+!!! tip "30-second answer"
+    Scale pods on a metric that leads load (RPS, queue depth, or CPU for CPU-bound services) with HPA, scale nodes with Cluster Autoscaler or Karpenter, and right-size requests with VPA in recommendation mode. HPA computes `desired = ceil(current × currentMetric / target)` every 15s, ignores changes within a 10% tolerance, takes the **max** across metrics, and is smoothed by `behavior` (stabilization windows, rate policies). Peak readiness depends on how fast a new pod becomes Ready plus node provisioning time, so keep headroom (target ~60-70%) or schedule pre-scaling for known peaks. Prove it with load tests and chaos experiments that respect PDBs.
+
 **Horizontal Pod Autoscaler (HPA):**
 
 ```yaml
@@ -836,13 +916,9 @@ spec:
       target:
         type: Utilization
         averageUtilization: 70    # Target 70% CPU utilization
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
-  - type: Pods
+  # Memory is rarely a good HPA signal: JVM/Go runtimes don't give memory back,
+  # so adding pods doesn't lower per-pod usage and the HPA never scales down.
+  - type: Pods                   # needs a custom metrics adapter (prometheus-adapter / KEDA)
     pods:
       metric:
         name: requests_per_second
@@ -862,6 +938,16 @@ spec:
       - type: Percent
         value: 100                   # Double pods per minute
         periodSeconds: 60
+
+# Notes:
+# - Defaults if behavior is omitted: scale-down uses a 300s stabilization window
+#   (acts on the highest recommendation of the last 5 min); scale-up has no window and
+#   may add max(100% of current, 4 pods) every 15s
+# - Utilization is a % of REQUESTS, so pods without CPU requests can't use CPU targets
+# - Not-yet-ready pods and pods missing metrics are treated conservatively
+#   (assumed 0% on scale-up, 100% on scale-down) to avoid flapping
+# - minReplicas: 0 (scale to zero) is beta and on by default since v1.37, only with
+#   Object/External metrics; before that it needed KEDA
 ```
 
 **VPA (Vertical Pod Autoscaler):**
@@ -880,9 +966,11 @@ spec:
     kind: Deployment
     name: my-app
   updatePolicy:
-    updateMode: "Auto"          # Recommends AND applies
-    # Alternative: "Initial" (apply on new pod creation)
-    #              "Off" (recommend only)
+    updateMode: "InPlaceOrRecreate"  # resize running pods in place, evict only if needed
+    # Other modes: "Off" (recommend only, the safe start), "Initial" (only at pod creation),
+    #              "Recreate" (evict to apply), "InPlace" (never evict)
+    # "Auto" is deprecated since VPA 1.5 (it behaved like Recreate).
+    # In-place resize relies on Kubernetes in-place pod resize (GA in v1.35).
   resourcePolicy:
     containerPolicies:
     - containerName: '*'
@@ -893,6 +981,10 @@ spec:
         cpu: 4
         memory: 4Gi
       controlledResources: ["cpu", "memory"]
+
+# Don't let VPA and HPA act on the same metric (both on CPU fight each other:
+# VPA raises requests → utilization % drops → HPA scales in). Common combo: HPA on
+# RPS/queue depth, VPA on memory; or VPA in "Off" mode feeding request sizing reviews.
 ```
 
 **Production Readiness:**
@@ -902,25 +994,28 @@ spec:
 
 apiVersion: v1
 kind: Pod
+metadata:
+  name: my-app
 spec:
   containers:
   - name: my-app
+    image: registry.example.com/my-app:1.4.2
     resources:
-      requests:              # Minimum reservation (used by scheduler)
+      requests:              # What the scheduler reserves; basis for HPA utilization %
         cpu: 500m
         memory: 512Mi
-      limits:                # Hard cap (used by kubelet)
-        cpu: 2
-        memory: 2Gi
+      limits:                # Enforced by the kernel via cgroups
+        cpu: 2               # CPU over limit → throttled (many teams omit CPU limits)
+        memory: 2Gi          # memory over limit → OOMKilled
     
-    # Startup probe: for slow-starting containers (e.g., JVM)
+    # Startup probe: for slow-starting containers (e.g., JVM).
+    # Liveness and readiness don't run until it succeeds.
     startupProbe:
       httpGet:
         path: /healthz
         port: 8080
-      initialDelaySeconds: 10
       periodSeconds: 5
-      failureThreshold: 30    # 30 × 5 = 150s max startup time!
+      failureThreshold: 30    # 30 × 5 = 150s max startup time
     
     # Readiness probe: is this pod ready to serve traffic?
     readinessProbe:
@@ -929,7 +1024,8 @@ spec:
         port: 8080
       periodSeconds: 10
     
-    # Liveness probe: restart pod if unresponsive
+    # Liveness probe: restart the CONTAINER if it's wedged (deadlock).
+    # Never check dependencies (DB, downstream APIs) here: a DB blip would restart every pod.
     livenessProbe:
       httpGet:
         path: /live
@@ -937,12 +1033,14 @@ spec:
       periodSeconds: 30
       failureThreshold: 3
 
-    # Lifecycle hooks (graceful shutdown)
+    # Graceful shutdown: endpoints removal and SIGTERM happen in parallel, so delay
+    # SIGTERM until kube-proxy/LBs stop routing new requests to this pod.
     lifecycle:
       preStop:
-        exec:
-          command: ["/bin/sh", "-c", "sleep 10"]
-          # Wait 10s for load balancer to drain connections
+        sleep:
+          seconds: 10          # native sleep action (GA in v1.34), no shell needed in image
+  # preStop time counts against terminationGracePeriodSeconds (default 30s); then SIGKILL
+  terminationGracePeriodSeconds: 45
 ```
 
 **Chaos Engineering (Litmus/ChaosMesh):**
@@ -988,13 +1086,14 @@ spec:
 ```yaml
 # Cluster Autoscaler: add/remove NODES when pods can't schedule
 
-# Config (AWS EKS):
+# Config (AWS EKS). On AWS many teams now use Karpenter instead: it provisions
+# right-sized instances directly (no node groups) and consolidates underused nodes.
 deployment:
   command:
   - ./cluster-autoscaler
   - --node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled
   - --scale-down-delay-after-add=10m       # Wait 10 min after scale up
-  - --scale-down-delay-after-delete=10s    # 
+  - --scale-down-delay-after-delete=10s    # Wait after a node deletion before the next
   - --scale-down-unneeded-time=10m          # 10 min idle before scale down
   - --max-node-provision-time=15m           # Max 15 min for new node
   - --balance-similar-node-groups=true      # Balance across AZs
@@ -1017,7 +1116,8 @@ resource "aws_autoscaling_group" "workers" {
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
 | **HPA tuning** | Sets stabilization windows, scale-up/down policies, multiple metrics |
-| **Probes** | Differentiates startup (slow boot) vs readiness (traffic) vs liveness (health) |
+| **Probes** | Differentiates startup (slow boot) vs readiness (traffic) vs liveness (deadlock only, no dependency checks) |
+| **VPA/HPA interplay** | Knows not to run both on the same metric; knows VPA modes and in-place resize |
 | **Chaos engineering** | Uses Litmus or ChaosMesh for controlled failure injection |
 | **Cluster autoscaler** | Understands node-level autoscaling as complement to HPA (pod-level) |
 

@@ -1,6 +1,16 @@
 # 📨 Kafka — Staff-Level Interview Questions
 
-> *12 questions covering Kafka internals, producer/consumer design, replication, and operational excellence — every question expects principal engineer-level depth with production code and failure analysis.*
+> *12 questions covering Kafka internals, producer/consumer design, replication, and operations. Each answer leads with a 30-second version, then the mechanism, then failure modes and what the interviewer probes next.*
+
+!!! info "Version baseline (October 2026)"
+    Current Apache Kafka is the **4.x** line (4.0 March 2025, 4.1 September 2025, 4.2 February 2026, 4.3 May 2026). Things that changed and that interviewers now expect you to know:
+
+    - **KRaft only.** ZooKeeper mode was removed in 4.0. Metadata lives in the `__cluster_metadata` Raft log managed by a controller quorum. Upgrading from a ZooKeeper cluster means migrating to KRaft on 3.x (3.9 is the bridge release) first.
+    - **New consumer rebalance protocol (KIP-848)** is GA since 4.0 (`group.protocol=consumer`). The assignment moves to the broker-side group coordinator, and there's no global "stop the world" barrier.
+    - **Queues for Kafka / share groups (KIP-932):** early access in 4.0, preview in 4.1, **production-ready in 4.2**.
+    - **Tiered storage (KIP-405)** has been production-ready since 3.9.
+    - **Eligible Leader Replicas (KIP-966):** available in 4.0, on by default for new clusters since 4.1.
+    - 4.0 also removed MirrorMaker 1, the v0/v1 message formats and `AclAuthorizer` (replaced by `StandardAuthorizer`), changed the `linger.ms` default from 0 to 5 ms (KIP-1030), and requires Java 17 for brokers (Java 11 for clients).
 
 ---
 
@@ -23,77 +33,71 @@
 
 ## 1. Log Segment Structure & Storage Internals
 
-**Q:** "Trace the lifecycle of a Kafka message from producer send to consumer read. What happens at the storage layer? How does Kafka achieve 1GB/s+ write throughput on commodity hardware?"
+**Q:** "Trace the lifecycle of a Kafka message from producer send to consumer read. What happens at the storage layer? How does Kafka sustain very high write throughput on commodity hardware?"
 
-**What They're Really Testing:** Whether you understand Kafka's storage model — it's not a message queue, it's a write-ahead log. The performance comes from sequential I/O and zero-copy transfers.
+**What They're Really Testing:** Whether you understand that Kafka is a partitioned, replicated append-only log rather than a queue, and that its speed comes from sequential I/O, batching, the OS page cache and zero-copy reads.
+
+!!! tip "30-second answer"
+    A partition is an append-only log split into segment files. The producer sends compressed **batches**. The leader appends each batch as-is to the active segment through the page cache, with no fsync per write, and followers fetch it. Consumers read by offset, and plaintext reads are served with `sendfile()` straight from the page cache to the socket. Throughput comes from **batching + sequential appends + page cache + zero-copy**. Durability comes from **replication**, not fsync.
 
 ### Answer
 
-**Message Lifecycle (Storage Layer):**
+**Message lifecycle (storage layer):**
 
 ```
 Producer → Topic "orders", Partition 0
 
-Logical view:
-┌─────────────────────────────────────────────────────────────┐
-│ Partition 0 (immutable, ordered sequence of records)         │
-│ Offset:  0         1         2         3         4         5 │
-│         ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐
-│         │ msg1 │  │ msg2 │  │ msg3 │  │ msg4 │  │ msg5 │  │ ... │
-│         └─────┘  └─────┘  └─────┘  └─────┘  └─────┘  └─────┘
-│                                                     ↑
-│                                               Tail (active writes)
-└─────────────────────────────────────────────────────────────┘
+Logical view: an ordered, immutable sequence addressed by offset
+  offset:  0     1     2     3     4     5
+          [m1]  [m2]  [m3]  [m4]  [m5]  [..]  ← appends only at the tail
 
-Physical storage (on disk):
+Physical storage (one directory per partition replica):
 /data/kafka/orders-0/
-├── 00000000000000000000.log        ← Segment 1 (offsets 0-999)
-├── 00000000000000000000.index      ← Offset → file position mapping
-├── 00000000000000000000.timeindex  ← Timestamp → offset mapping
-├── 00000000000000001000.log        ← Segment 2 (offsets 1000-1999)
+├── 00000000000000000000.log        ← segment: record batches, base offset 0
+├── 00000000000000000000.index      ← sparse offset → byte position index
+├── 00000000000000000000.timeindex  ← sparse timestamp → offset index
+├── 00000000000000001000.log        ← next segment starts at offset 1000
 ├── 00000000000000001000.index
 ├── 00000000000000001000.timeindex
-└── 00000000000000002000.log        ← Active segment (currently writing)
+├── 00000000000000002000.log        ← active segment (only one receiving writes)
+└── leader-epoch-checkpoint         ← epoch → start offset, used for truncation after failover
 ```
 
-**How Kafka Achieves 1GB/s+ Write Throughput:**
+The indexes are **sparse** (one entry per `log.index.interval.bytes`, 4 KB by default) and memory-mapped. A fetch for offset N does a binary search on the index, then a short scan forward in the `.log` file.
 
-```yaml
-1. Sequential I/O:
-   - Writes go to the END of the active segment (sequential, not random!)
-   - On HDD: ~150MB/s sequential, ~1MB/s random
-   - On NVMe: ~5GB/s sequential, ~500MB/s random
+**Why it's fast:**
 
-2. Page cache utilization:
-   - Kafka reads/writes through the OS page cache (does NOT call fsync on every write!)
-   - Producer writes → page cache (microseconds) → background flush (ms)
+| Technique | Mechanism | Caveat |
+|---|---|---|
+| **Batching** | Producer groups records per partition into batches. The broker validates and appends the batch without unpacking each record. | Small batches mean lots of requests. Batching is the #1 throughput lever. |
+| **Sequential I/O** | All writes are appends to the active segment. Spinning disks do sequential I/O roughly 100× faster than random I/O. SSDs benefit less, but still gain from large writes. | Many partitions per disk turn "sequential" back into interleaved I/O. |
+| **Page cache** | Writes land in the OS page cache. The kernel flushes them in the background. Tail reads by up-to-date consumers are served from memory. | Durability relies on replication (`acks=all` + `min.insync.replicas`), not on fsync. |
+| **Zero-copy** | `sendfile()` moves data page cache → socket without copying it into the JVM. That saves two CPU copies and the user/kernel context switches for the data. | **Doesn't apply with TLS**, because the broker must encrypt in user space (kTLS isn't used by Kafka). TLS clusters pay a noticeable CPU cost. |
+| **Compression end to end** | The producer compresses the batch. The broker stores it compressed (if the topic's `compression.type=producer`). Consumers decompress. | If the topic's compression type differs from the producer's, the broker must **recompress**, which costs a lot of CPU. |
 
-3. Zero-copy transfer (sendfile):
-   - Consumer read WITHOUT zero-copy: Disk → Page Cache → App Buffer → Socket Buffer → NIC (4× copy)
-   - Consumer read WITH sendfile(): Page Cache → NIC via DMA (1× copy, 0 context switches!)
-
-4. Batch compression:
-   - Producer compresses batches BEFORE sending (CPU for network savings)
-   - zstd typically gives 5-10× compression ratio for JSON
-```
-
-**Segment Rolling Configuration:**
+**Segment rolling and retention:**
 
 ```properties
-log.segment.bytes=1073741824          # 1GB (default), or
-log.roll.ms=604800000                 # 7 days (whichever comes first)
-log.retention.hours=168               # 7 days (default)
-log.cleanup.policy=delete             # Delete old segments; or "compact"
+log.segment.bytes=1073741824     # 1 GiB (default): roll when the active segment reaches this size
+log.roll.hours=168               # or roll after 7 days, whichever comes first
+log.retention.hours=168          # 7 days (default). Retention deletes whole closed segments.
+log.cleanup.policy=delete        # or "compact" (keep latest value per key), or "compact,delete"
 ```
+
+Retention and compaction work on **closed segments only**. On a low-volume topic, data can therefore outlive `retention.ms` until the active segment rolls. This is a classic GDPR or "why is old data still here" gotcha.
+
+**Tiered storage (KIP-405, production-ready since 3.9):** closed segments are copied to object storage (S3/GCS/Azure) through a pluggable `RemoteStorageManager`. Local disk keeps only a hot tail (`local.retention.ms`). The result is long retention without big disks, and much faster reassignment and broker replacement because there's less local data to move. Fetches for old offsets are served from the remote tier, at higher latency.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Sequential I/O** | Explains WHY sequential writes are so much faster (no seek, full stripe width) |
-| **Zero-copy** | Can diagram sendfile() vs traditional read/write path with copy counts |
-| **Page cache** | Understands that Kafka doesn't fsync on every write — relies on OS page cache |
-| **Segment lifecycle** | Explains segment rolling, index files, and compaction vs deletion |
+| **Sequential I/O + batching** | Explains *why* appends are cheap, and that batching (not the disk) is usually the first lever |
+| **Zero-copy** | Knows `sendfile()` avoids user-space copies, **and that TLS disables it** |
+| **Page cache** | Durability = replication, not fsync. Knows lagging consumers cause cold disk reads. |
+| **Segment lifecycle** | Rolling, sparse indexes, retention on closed segments only, compaction vs deletion, tiered storage |
+
+**What they probe next:** "How does compaction work?" The cleaner thread rewrites dirty segments, keeping the latest record per key. Tombstones (null values) are kept for `delete.retention.ms` so consumers see the deletion. "What happens to page cache when one consumer replays 3 days of data?" It evicts the hot tail and hurts everyone else. Tiered storage or separate replay clusters help.
 
 ---
 
@@ -101,105 +105,134 @@ log.cleanup.policy=delete             # Delete old segments; or "compact"
 
 **Q:** "You're running a Kafka cluster with replication.factor=3, min.insync.replicas=2. A broker fails. Walk through what happens: leader election, ISR changes, and data durability guarantees."
 
-**What They're Really Testing:** Whether you understand the ISR protocol in detail — the precise conditions for committed writes, leader election, and the durability vs availability trade-off.
+**What They're Really Testing:** Whether you know the exact condition under which a write counts as committed, who elects leaders (the KRaft controller), and the durability vs availability trade-off.
+
+!!! tip "30-second answer"
+    The leader tracks the **ISR**, the replicas that are caught up. With `acks=all`, a write is acknowledged once every current ISR member has it, and the leader refuses writes if the ISR is smaller than `min.insync.replicas`. A slow or dead follower is dropped from the ISR after `replica.lag.time.max.ms` (30 s). If the **leader** dies, the KRaft controller picks a new leader from the ISR, so no acknowledged write is lost. RF=3 / min.isr=2 survives one broker failure with no loss and no downtime. A second failure makes the partition read-only for `acks=all` producers instead of losing data.
 
 ### Answer
 
-**ISR Protocol:**
+**Terms:** **LEO** (log end offset) is the next offset a replica will write. **HW** (high watermark) is the highest offset replicated to all ISR members. Consumers only see up to the HW.
 
 ```
-Topic: orders, Partition: 0, Replicas: [Broker1(leader), Broker2, Broker3]
+Topic: orders, Partition: 0, Replicas: [1 (leader), 2, 3], ISR = {1,2,3}
 
-Normal state:
-  ISR={1,2,3}  HW=10  LEO=11 (leader and followers all at LEO 11)
+Write path (acks=all):
+  1. Producer sends a batch to the leader (broker 1). The leader appends and advances its LEO.
+  2. Followers send FETCH requests. The fetch offset tells the leader how far each follower has replicated.
+  3. Leader advances HW = min(LEO over ISR members).
+  4. Once HW passes the batch, the leader acks the producer and consumers can read it.
 
-Write flow:
-  1. Producer sends to leader (Broker1)
-  2. Leader appends to its log, advances LEO
-  3. Followers pull new data via FETCH requests, append, send ACK
-  4. Leader advances HW = min(LEO of all ISR members)
-  5. Leader returns ACK to producer when HW ≥ required offset
-  6. Consumers can only read up to HW (not LEO!)
+Follower (broker 2) dies:
+  After replica.lag.time.max.ms (30 s default) the leader shrinks ISR → {1,3}.
+  |ISR| = 2 ≥ min.insync.replicas → writes continue. No data loss.
 
-Broker2 crashes:
-  After replica.lag.time.max.ms (default 30s) → removed from ISR
-  ISR={1,3} → min.insync.replicas=2 is satisfied (2 replicas in ISR)
-  If Broker1 also fails → ISR={...nothing} → min.isr can't be met
-  → Writes return NotEnoughReplicasException (blocked!)
-
-Unclean leader election (unclean.leader.election.enable=true):
-  If NO replicas are in-sync, pick any replica (even if far behind)
-  → Can cause data LOSS from the chosen replica's gap
-  → Can cause data DIVERGENCE (ordering violation)
+Leader (broker 1) dies next:
+  The KRaft controller notices (missed broker heartbeats → broker fenced) and elects broker 3
+  from the ISR. Leader epoch is bumped. ISR = {3}.
+  |ISR| = 1 < min.insync.replicas → acks=all produces fail with NOT_ENOUGH_REPLICAS
+  (retriable: the producer keeps retrying until delivery.timeout.ms).
+  Reads still work. acks=0/1 producers can still write (min.isr only applies to acks=all).
 ```
 
-**Diagnostic Commands:**
+**Why no acknowledged write is lost:** every acked record was on every ISR member, and the new leader always comes from the ISR (or ELR, below). Followers that come back **truncate** to the leader's log using the **leader epoch** history (KIP-101). This drops any unacked tail they wrote under the old leader, instead of trusting the high watermark.
+
+**Eligible Leader Replicas (KIP-966, default on new clusters since 4.1):** the "last replica standing" problem was this: if the ISR shrinks to just the leader and that leader then dies with an unclean disk, there was no clean candidate left. With ELR, the ISR can't shrink below `min.insync.replicas`. Replicas that drop out but are guaranteed to hold everything committed up to the HW go into an **ELR** set, which the controller can elect from safely. This shrinks the cases where you'd need unclean election.
+
+**Unclean leader election** (`unclean.leader.election.enable=true`, default false): if no ISR/ELR replica is available, the controller elects any replica. The partition comes back sooner, but **acknowledged writes the new leader never received are lost**. Consumers may also have already read offsets that get reused for different records. Use it per topic only where availability beats correctness (metrics, logs).
+
+**Diagnostic commands:**
 
 ```bash
-kafka-topics --describe --topic orders --bootstrap-server kafka:9092
-# Look for ISR list (Isr: 1,3 instead of 1,2,3)
+kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic orders
+# Leader: 3  Replicas: 1,2,3  Isr: 3   ← shrunken ISR
 
-kafka-topics --describe --under-replicated-partitions --bootstrap-server kafka:9092
+kafka-topics.sh --bootstrap-server kafka:9092 --describe --under-replicated-partitions
+kafka-topics.sh --bootstrap-server kafka:9092 --describe --under-min-isr-partitions
+kafka-metadata-quorum.sh --bootstrap-server kafka:9092 describe --status   # KRaft controller quorum health
 ```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **ISR mechanics** | Explains HW, LEO, and the ack condition precisely |
-| **min.isr behavior** | Knows that writes are REJECTED (not queued) when min.isr can't be met |
-| **Unclean election** | Can articulate the exact danger: data loss AND ordering violation |
-| **Diagnosis** | Knows which metrics/CLI commands to check for ISR issues |
+| **ISR mechanics** | Defines HW and LEO precisely. With acks=all, the ack waits on the *current* ISR, gated by min.isr. |
+| **min.isr behavior** | Writes are **rejected** (retriable error), not queued. Only applies to `acks=all`. |
+| **Election** | KRaft controller elects from ISR (then ELR). Leader epochs drive follower truncation. |
+| **Unclean election** | Names the danger exactly: loss of acknowledged data and offset reuse |
+| **Diagnosis** | Under-replicated vs under-min-ISR vs offline partitions, and controller quorum status |
+
+**What they probe next:** "Why RF=3 and min.isr=2, not min.isr=3?" With 3, a single slow follower blocks all writes. "Rack awareness?" `broker.rack` spreads replicas across AZs. Consumers can use `client.rack` to fetch from the closest replica (KIP-392) and save cross-AZ cost. "What does `acks=1` lose?" Writes the leader acked but never replicated before it died.
 
 ---
 
 ## 3. Consumer Group Rebalancing
 
-**Q:** "A 50-node Kafka consumer group experiences a 30-second processing pause every time a new consumer joins or leaves. How did cooperative rebalancing (KIP-429) improve this? What about static group membership (KIP-345)?"
+**Q:** "A 50-node Kafka consumer group experiences a 30-second processing pause every time a new consumer joins or leaves. How did cooperative rebalancing (KIP-429) improve this? What about static group membership (KIP-345)? What changed with KIP-848?"
 
-**What They're Really Testing:** Whether you understand consumer group rebalancing at the protocol level — including the stop-the-world problem and the incremental solutions.
+**What They're Really Testing:** Whether you understand rebalancing at the protocol level: the stop-the-world problem in the classic protocol, the incremental fixes, and the new broker-driven protocol in Kafka 4.x.
+
+!!! tip "30-second answer"
+    The classic **eager** protocol makes every member revoke every partition, then waits at a group-wide barrier while one client computes the new assignment. **Cooperative** rebalancing (KIP-429, 2.4) only revokes partitions that actually move, so the rest keep processing. **Static membership** (KIP-345, 2.3) lets a restarting consumer reclaim its partitions without a rebalance if it returns within `session.timeout.ms`. In Kafka 4.x the real answer is **KIP-848** (`group.protocol=consumer`, GA in 4.0). The broker computes assignments, members reconcile on their own through heartbeats, and there's no global sync barrier at all.
 
 ### Answer
 
-**Eager Rebalancing (Pre-KIP-429):**
-ALL consumers stop processing → revoke ALL partitions → reassign → ALL resume. 30s pause.
+**Classic protocol, eager (the old default):**
 
-**Cooperative Rebalancing (KIP-429, Kafka 2.4+):**
-Phase 1: Consumers revoke ONLY partitions they give up → Phase 2: Only affected partitions reassigned. If 1 new consumer joins 50-consumer group, only ~2 consumers pause (~0.5s).
+```
+1. A member joins or leaves, or a heartbeat times out → coordinator starts a rebalance.
+2. Every member revokes ALL partitions (commit offsets, onPartitionsRevoked) and sends JoinGroup.
+3. Coordinator waits for every member (bounded by max.poll.interval.ms / rebalance timeout),
+   picks one member as group leader and sends it all subscriptions.
+4. The leader runs the client-side assignor (range, round-robin, sticky) → SyncGroup.
+5. The coordinator distributes assignments. Everyone resumes.
+→ The whole group stops for the duration of the slowest member's revoke + rejoin.
+```
 
-**Static Group Membership (KIP-345, Kafka 2.3+):**
+The 30 s pause usually comes from step 3: one member is stuck in a long `poll()` loop and the group waits for it.
+
+**Classic protocol, cooperative (KIP-429, `CooperativeStickyAssignor`):**
+
+```
+Rebalance 1: members rejoin while KEEPING their partitions. The leader computes the
+             target assignment, and any partition that must move is left out of its
+             current owner's assignment → that owner revokes just those partitions.
+Rebalance 2: triggered automatically, assigns the now-free partitions to their new owners.
+→ Partitions that don't move are never paused. Costs two rounds instead of one.
+```
+
+**Static membership (KIP-345):**
 
 ```properties
-group.instance.id=consumer-1     # Stable ID
+group.instance.id=orders-consumer-7   # stable per pod (e.g. StatefulSet ordinal)
+session.timeout.ms=45000              # default 45 s since 3.0. Raise it to cover a restart.
 ```
 
-Rolling restart: same group.instance.id → NO rebalance! Consumer rejoins within session.timeout.ms → resumes processing immediately.
+A restarting member with the same `group.instance.id` gets its old assignment back with no rebalance. The trade-off: a member that **really dies** isn't detected until the session timeout, so its partitions sit unprocessed that long.
 
-**Protocol Detail:**
+**KIP-848: the new consumer group protocol (GA in Kafka 4.0):**
 
-```
-Standard rebalance protocol:
-  1. Consumer sends JoinGroup request to Group Coordinator
-  2. Coordinator picks first joiner as leader (collects all subscriptions)
-  3. Leader computes assignment (range, round-robin, sticky)
-  4. Leader sends SyncGroup with assignment to coordinator
-  5. Coordinator broadcasts assignment to all consumers
-  6. All consumers receive → start/stop partition processing
+| | Classic protocol | KIP-848 (`group.protocol=consumer`) |
+|---|---|---|
+| Who assigns | Client-side leader | Broker group coordinator (`uniform` or `range` server-side assignors) |
+| Coordination | JoinGroup/SyncGroup rounds with a global barrier | `ConsumerGroupHeartbeat` only. Each member converges on its target independently. |
+| Effect of one member joining | Whole group (eager) or two rounds (cooperative) | Only the members whose partitions move do any work |
+| Client config | `partition.assignment.strategy`, `session.timeout.ms` on the client | `group.remote.assignor`. Session timeout and heartbeat interval are group configs on the broker. |
 
-Cooperative rebalance (KIP-429):
-  Step 3: Leader computes "revocation only" assignment
-  Step 4-5: Consumers revoke only the partitions they lose
-  Step 6: Second JoinGroup → leader computes final assignment
-  → Total partitions revoked = Total_new_assignments - Total_consumers_needing_revocation
-```
+Migration: on 4.x brokers, a group can be converted online from classic to consumer protocol during a rolling upgrade of the clients. Kafka Streams has its own equivalent, the streams rebalance protocol (KIP-1071), introduced as early access in 4.1.
+
+**Share groups (KIP-932, production-ready in 4.2):** a different consumption model, not a rebalance fix. Many consumers can read the **same partition**, with per-record acknowledgement, delivery counts and redelivery. This gives queue semantics (worker pools) without being capped at one consumer per partition. You lose per-partition ordering.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Eager vs cooperative** | Can diagram the two protocols and explain the pause difference |
-| **Static membership** | Knows group.instance.id eliminates rebalance during planned restarts |
-| **Sticky assignor** | Mentions that cooperative needs the StickyAssignor |
+| **Eager vs cooperative** | Explains *why* eager pauses everyone, and that cooperative takes two rounds |
+| **Static membership** | Knows `group.instance.id` avoids rebalances on restarts, and the cost: slower detection of real failures |
+| **KIP-848** | Knows assignment moved server-side in 4.x and the barrier is gone |
+| **Root cause** | Checks `max.poll.interval.ms` violations (slow processing) before blaming the protocol |
+
+**What they probe next:** "How do you avoid duplicates during a rebalance?" Commit offsets in `onPartitionsRevoked`, or make processing idempotent. "When would you pick share groups over more partitions?" When work items are independent, ordering doesn't matter, and per-message processing time varies widely.
 
 ---
 
@@ -207,179 +240,179 @@ Cooperative rebalance (KIP-429):
 
 **Q:** "Design a payment processing pipeline where each transaction must be processed exactly once. How does Kafka's exactly-once semantics work? Walk through the transaction protocol: coordinators, transaction markers, and zombie fencing."
 
-**What They're Really Testing:** Whether you understand the EOS protocol at the transport level — idempotent producer, transactional coordinator, zombie fencing with epochs.
+**What They're Really Testing:** Whether you know the EOS building blocks (idempotent producer, transactions, transactional offset commits, read_committed), **and where EOS ends**.
+
+!!! tip "30-second answer"
+    Kafka EOS covers **read from Kafka → process → write to Kafka**. The idempotent producer removes duplicates caused by retries (producer ID + per-partition sequence numbers). Transactions make writes to several partitions **and the consumer offset commit** atomic, using a transaction coordinator, a two-phase commit and commit/abort markers. Epochs on the `transactional.id` fence zombie instances. Consumers must use `isolation.level=read_committed`. Calling a payment gateway or writing to a database is **outside** Kafka's transaction, so those side effects still need idempotency keys or an outbox pattern.
 
 ### Answer
 
 ```
-Kafka EOS = idempotent producer + transactions + consumer offset transactional store
+Layer 1: Idempotent producer (default since 3.0: enable.idempotence=true, acks=all)
+  Broker assigns a producer ID (PID). Each batch carries (PID, epoch, partition sequence number).
+  The broker remembers the last 5 batches per PID per partition. A retried duplicate is acked
+  but not appended. A gap in sequence numbers is an error.
+  → This is why max.in.flight.requests.per.connection must be ≤ 5. Ordering is preserved.
+  Scope: one producer session, retries only. Doesn't cover an app that calls send() twice.
 
-Idempotent Producer:
-  producer.id + sequence_number per partition (stored in log)
-  Duplicate → broker detects sequence number already seen → silently drops
+Layer 2: Transactions (transactional.id = stable identity across restarts)
+  1. initTransactions(): find the transaction coordinator (a leader of a __transaction_state
+     partition), get the PID and bump the epoch → any older instance with the same
+     transactional.id is now FENCED. Any open transaction it left behind is aborted.
+  2. beginTransaction() (client-local).
+  3. send(...) to partitions; the producer registers each new partition with the
+     coordinator (AddPartitionsToTxn).
+  4. sendOffsetsToTransaction(offsets, groupMetadata): the consumer offsets become part of the txn.
+  5. commitTransaction():
+       a. coordinator writes PREPARE_COMMIT to __transaction_state  ← commit point
+       b. coordinator writes COMMIT markers into every involved partition (incl. __consumer_offsets)
+       c. coordinator writes COMPLETE_COMMIT
+  If the coordinator crashes after (a), the new coordinator finishes writing markers from its log.
 
-Transaction Protocol:
-  1. Producer sends InitProducerId to Transaction Coordinator
-  2. Producer starts transaction: begin_transaction()
-  3. All messages in this transaction include a marker:
-     - transactional_id (unique producer instance)
-     - producer_epoch (monotonically increasing, fences zombies!)
-  4. Producer sends messages to multiple partitions
-  5. Producer commits: EndTransaction(commit)
-  6. Transaction coordinator writes COMMIT/PREPARE markers to __transaction_state
-  7. Coordinator writes markers to ALL affected partitions
-  8. Consumers see COMMIT marker → make messages visible
-
-Zombie fencing:
-  If producer crashes and restarts with same transactional_id:
-  - New producer gets higher producer_epoch
-  - Old producer (zombie) has lower epoch → broker REJECTS its messages
-  - Prevents duplicate writes from crashed-but-still-running producers
-
-Consumer read_committed:
-  isolation.level=read_committed
-  Consumer filters out messages between BEGIN and COMMIT/ABORT markers
+Layer 3: Consumers with isolation.level=read_committed
+  Only read up to the Last Stable Offset (LSO): the first offset of any still-open transaction.
+  Records from aborted transactions are filtered out using the abort index.
+  → One long-running open transaction stalls read_committed consumers on that partition.
 ```
 
-**Write Path Code:**
+Kafka 4.0 also shipped **Transactions V2 / server-side defense (KIP-890)**. The epoch is bumped on every transaction, and partitions are added to the transaction implicitly. This closes a class of "hanging transaction" bugs where a late write from an aborted transaction slipped into the next one.
+
+**Consume-transform-produce loop (confluent-kafka Python client):**
 
 ```python
-from kafka import KafkaProducer
+from confluent_kafka import Consumer, Producer, KafkaException
 
-producer = KafkaProducer(
-    bootstrap_servers='kafka:9092',
-    transactional_id='payment-pipeline-1',
-    acks='all',
-    batch_size=16384,
-    linger_ms=5,
-    compression_type='zstd'
-)
-
-# Initialize the transaction coordinator
+consumer = Consumer({
+    "bootstrap.servers": "kafka:9092",
+    "group.id": "payment-processor",
+    "enable.auto.commit": False,
+    "isolation.level": "read_committed",
+})
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "transactional.id": "payment-processor-1",  # stable per instance/shard, not random
+    "compression.type": "zstd",
+})
+consumer.subscribe(["payment-requests"])
 producer.init_transactions()
 
-def process_payment(payment_event: dict):
+while True:
+    msgs = consumer.consume(num_messages=500, timeout=1.0)
+    if not msgs:
+        continue
+    producer.begin_transaction()
     try:
-        producer.begin_transaction()
-
-        # Send to payment processing topic
-        producer.send('payment-events', payment_event)
-
-        # Send to audit trail
-        producer.send('audit-trail', {'type': 'payment', 'data': payment_event})
-
-        # Commit transaction atomically across both partitions
+        for m in msgs:
+            if m.error():
+                raise KafkaException(m.error())
+            result = process(m.value())          # must be deterministic, no external side effects
+            producer.produce("payment-events", key=m.key(), value=result)
+            producer.produce("audit-trail", key=m.key(), value=result)
+        producer.send_offsets_to_transaction(
+            consumer.position(consumer.assignment()),
+            consumer.consumer_group_metadata())
         producer.commit_transaction()
-    except Exception:
+    except KafkaException:
         producer.abort_transaction()
-        raise
+        # rewind to last committed offsets so the batch is reprocessed
+        # (a partition with no committed offset needs auto.offset.reset handling instead)
+        for tp in consumer.committed(consumer.assignment()):
+            if tp.offset >= 0:
+                consumer.seek(tp)
 ```
+
+If `commit_transaction()` raises a **fatal** error (for example, the producer was fenced), close the producer and exit rather than aborting. Another instance now owns this `transactional.id`.
+
+**The payment-specific part:** charging a card is an external side effect. Kafka can't roll it back. Standard designs:
+
+- Use the **payment ID as an idempotency key** at the payment provider. A retry after a crash then can't double-charge.
+- Or write the intent to Kafka transactionally, and have a separate consumer call the provider with the idempotency key and record the outcome.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **EOS building blocks** | Explains idempotent producer + transactions as layered solutions |
-| **Epoch fencing** | Understands producer_epoch prevents zombie writes |
-| **Read-committed isolation** | Knows consumer must set isolation.level=read_committed |
-| **Failure scenarios** | Can describe what happens when coordinator crashes mid-transaction |
+| **EOS building blocks** | Idempotence (retries) vs transactions (atomic multi-partition + offsets) |
+| **Epoch fencing** | `initTransactions()` bumps the epoch, and zombies get `ProducerFencedException` |
+| **Read-committed** | LSO, and how a stuck transaction blocks consumers |
+| **Failure scenarios** | Coordinator crash after PREPARE_COMMIT is completed by the new coordinator. `transaction.timeout.ms` aborts abandoned transactions. |
+| **Boundary** | States clearly that external side effects need idempotency keys or an outbox |
+
+**What they probe next:** "Cost of transactions?" Extra round trips and markers per commit, so commit every N records or every 100 ms rather than per record. "How does Kafka Streams do this?" `processing.guarantee=exactly_once_v2`, one producer per stream thread.
 
 ---
 
 ## 5. Producer: Batching, Compression, Idempotency
 
-**Q:** "Your Kafka cluster processes 500K messages/second through a single topic. Each message is ~1KB JSON. The producer is CPU-bound at 30% utilization but write throughput is capped at 100MB/s. Diagnose and fix. Walk through every producer tuning knob."
+**Q:** "Your Kafka cluster needs to process 500K messages/second through a single topic. Each message is ~1KB JSON. The producer is at 30% CPU but write throughput is capped at 100MB/s. Diagnose and fix. Walk through every producer tuning knob."
 
-**What They're Really Testing:** Whether you understand the Kafka producer's internal batching pipeline — accumulator, compression, and the thread model.
+**What They're Really Testing:** Whether you understand the producer pipeline (accumulator → sender → in-flight requests) and diagnose with metrics instead of turning knobs at random.
+
+!!! tip "30-second answer"
+    A producer with spare CPU but flat throughput is **waiting**, not computing. Usually the cause is batches too small (many requests, each paying a round trip), too few partitions or in-flight requests to pipeline, or a slow broker ack path with `acks=all`. Check `batch-size-avg`, `records-per-request-avg`, `record-queue-time-avg`, `request-latency-avg` and `bufferpool-wait-ratio`. The usual fix is bigger `batch.size` + `linger.ms` + compression, enough partitions, and checking broker produce latency. Only scale out producer instances once a single producer is proven saturated.
 
 ### Answer
 
-**Producer Internal Architecture:**
+**Producer internals:**
 
 ```
-Application thread(s)
-        │
-        └─→ send(record) → RecordAccumulator (per-partition batches)
-                │
-                ├─→ batch.ready() → if batch.size full OR linger.ms expired
-                │        │
-                │        └─→ Sender thread (one per producer)
-                │                │
-                │                ├─→ Compress batch (zstd/gzip/lz4/snappy)
-                │                ├─→ Attach sequence number (idempotent mode)
-                │                │       │
-                │                └─→ broker.send(request)
-                │                        │
-                │                        └─→ Response callback → dequeue batch
-                │
-                └─→ Producer.send() doesn't block! (unless buffer.memory exhausted)
+app thread: send(record)
+   │  serialize → partition → append to RecordAccumulator (one deque of batches per partition)
+   │  returns immediately with a Future, and blocks only if buffer.memory is full (max.block.ms)
+   ▼
+Sender thread (one per producer instance):
+   - drains batches that are full (batch.size) or old enough (linger.ms)
+   - groups ready batches by destination broker → one ProduceRequest per broker
+   - keeps up to max.in.flight.requests.per.connection unacked requests per broker
+   - completes Futures / callbacks when acks arrive, retries retriable errors
+Compression happens per batch when the batch is closed. With the Java client
+that work runs on the sender path.
 ```
 
-**Diagnosis:** 100MB/s cap on a 1KB message topic means 100K messages/s — 5× below target. The 30% CPU is NOT the bottleneck.
+**Diagnosis:** 100 MB/s of 1 KB records is ~100K records/s, 5× short of the target.
 
-**Root cause:** Single producer sender thread can't keep up. Each 1KB message with headers = 1.2KB on wire. 100MB/s / 1.2KB ≈ 85K msg/s. Sender thread saturates.
+| Metric (producer JMX) | What it tells you |
+|---|---|
+| `batch-size-avg` far below `batch.size` | Batches ship nearly empty: raise `linger.ms`, or there are too many partitions per producer |
+| `records-per-request-avg` low | Each request round trip carries little data |
+| `request-latency-avg` high | The broker side is slow (`acks=all` waiting on followers, disk, or request queue) |
+| `record-queue-time-avg` high + `bufferpool-wait-ratio` > 0 | The accumulator is backed up: the sender can't drain fast enough |
+| `compression-rate-avg` | Compressed size ÷ uncompressed size. Shows whether compression is earning its CPU. |
 
-**Solution:** Increase batch size + parallelism:
+**Typical fix (Java client property names):**
 
-```python
-# Optimized producer config
-producer = KafkaProducer(
-    bootstrap_servers='kafka:9092',
-
-    # Batch tuning
-    batch_size=131072,        # 128KB (default: 16KB) - larger batches = fewer requests
-    linger_ms=10,             # Wait 10ms for batch to fill (tunable latency)
-    buffer_memory=134217728,  # 128MB total buffer (default: 32MB)
-    max_request_size=1048576, # 1MB max request
-
-    # Compression
-    compression_type='zstd',  # CPU for network savings: 1KB → ~200B (5:1)
-    # zstd.3 (default) vs lz4 (faster CPU, less compression)
-
-    # Throughput
-    acks='all',               # Wait for ISR replication
-    max_in_flight_requests=5, # Pipeline 5 batches before waiting
-
-    # Idempotency (enables EOS)
-    enable_idempotence=True,
-
-    # TCP tuning
-    connections_max_idle_ms=600000,  # 10 min (avoid reconnects)
-    request_timeout_ms=30000,
-    retries=5,               # Retry on transient broker failures
-
-    # Async parallelism
-    # NOTE: A single producer has ONE sender thread
-    # To scale beyond ~300MB/s, run multiple producers per machine
-    # partition N producers across topic partitions
-)
+```properties
+batch.size=262144                 # 256 KB per partition batch (default 16 KB)
+linger.ms=20                      # wait up to 20 ms to fill a batch (default 5 ms since 4.0)
+compression.type=zstd             # or lz4 for lower CPU. Typically 3-10× on JSON, depending on data.
+buffer.memory=268435456           # 256 MB accumulator (default 32 MB)
+acks=all                          # keep durability. Fix latency elsewhere.
+enable.idempotence=true           # default since 3.0
+max.in.flight.requests.per.connection=5   # max allowed with idempotence. Ordering still kept.
+delivery.timeout.ms=120000        # upper bound on send + retries (prefer this over tuning retries)
 ```
 
-**Scaling Strategy:**
+Then check the other side:
 
-```
-Single producer thread cap: ~200-300 MB/s (depending on batch size)
+- **Partition count**: one producer request carries one batch per partition, so a few partitions cap batching.
+- **Broker produce latency**: `RemoteTimeMs` covers follower replication, `LocalTimeMs` covers the append.
+- **Topic compression**: it must match the producer's, or be `producer`, so the broker doesn't recompress.
+- **Network**: are you hitting the NIC limit? Compression is the fix there.
 
-Options when exceeding this:
-  1. Multiple producers in process: pool of producers, each handling subset of partitions
-  2. Increase partition count: more parallelism on broker side
-  3. Larger batches: 512KB-1MB batches hit 80%+ of network throughput
-  4. Compression: zstd level 3 typically 4-5:1 on JSON = 5× effective throughput
+**When to scale out:** a single Java producer instance can push hundreds of MB/s with good batching. If one instance really is saturated, with the sender thread busy and the queue backed up, run several producer instances (processes or instances per thread) over disjoint keys. Don't share one producer across hundreds of app threads and then blame Kafka.
 
-Benchmarks (single producer, batch_size=128KB, zstd):
-  - 1KB messages: ~250K msg/s, ~250 MB/s
-  - 10KB messages: ~100K msg/s, ~1 GB/s
-  - 100KB messages: ~20K msg/s, ~2 GB/s
-```
+**Partitioner note:** since 3.3 (KIP-794), records **without a key** use a "sticky" partitioner that fills one partition's batch before moving on. This gives much larger batches than the old round-robin. Keyed records still hash with murmur2 on the key.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Accumulator model** | Understands send() queues, sender thread processes batches asynchronously |
-| **Sender thread limit** | Knows there's ONE sender thread per producer — cannot parallelize within a single instance |
-| **Compression trade-off** | Can compare zstd (5:1, CPU heavy) vs lz4 (2:1, CPU light) |
-| **Batch sizing** | Knows that under-filled batches cause excessive requests, over-filled cause latency |
+| **Accumulator model** | `send()` is async, the sender drains per-broker requests, and `buffer.memory` is the back-pressure point |
+| **Metric-driven diagnosis** | Uses batch size, queue time and request latency to find the actual bottleneck |
+| **Compression trade-off** | zstd = better ratio, more CPU. lz4 = fastest. Ratio depends on the data, so measure it. |
+| **Idempotence + ordering** | Knows why in-flight ≤ 5 keeps ordering with idempotence |
+
+**What they probe next:** "Effect of `acks=all` on latency?" Roughly one follower fetch round trip. Producers pipeline around it, so throughput needn't suffer. "Why does a key hot spot cap throughput?" One partition = one leader = one disk/log. You need key salting, or a better key.
 
 ---
 
@@ -387,315 +420,278 @@ Benchmarks (single producer, batch_size=128KB, zstd):
 
 **Q:** "Design a Kafka Connect source connector that ingests from a PostgreSQL CDC stream using logical replication. How do you handle schema evolution, exactly-once delivery, and connector restart after 3 days of downtime?"
 
-**What They're Really Testing:** Whether you understand Kafka Connect's framework — REST API, offset management, converters, and the single message transform (SMT) pipeline.
+**What They're Really Testing:** Whether you understand Connect's framework (workers, tasks, offset storage, converters, SMTs), Postgres replication slots, and schema compatibility rules.
+
+!!! tip "30-second answer"
+    Use Debezium on a distributed Connect cluster. Each source record carries a `sourcePartition` and `sourceOffset` (the Postgres LSN). Connect stores these in the `connect-offsets` topic and resumes from them. For exactly-once, enable `exactly.once.source.support` (KIP-618, Kafka 3.3+), which writes records and offsets in one Kafka transaction. For schema evolution, use Schema Registry with BACKWARD compatibility and only make additive changes with defaults. After 3 days down, the **replication slot** has kept 3 days of WAL on the primary. Either the disk survived and the connector catches up, or the slot was invalidated (`max_slot_wal_keep_size`) and you must re-snapshot.
 
 ### Answer
 
-**Connector Architecture:**
+**Connector architecture:**
 
 ```
-Source Connector (running in Connect worker):
-  poll() → SourceRecord list → Offset commit → Repeat
+Connect worker cluster (distributed mode, group of workers, internal topics):
+  connect-configs  connect-offsets  connect-status
 
-  Each SourceRecord contains:
-  - topic: target Kafka topic
-  - key: row primary key (optional)
-  - value: row payload (after Debezium-like transform)
-  - sourcePartition: { "schema": "public", "table": "orders" }
-  - sourceOffset:  { "lsn": "12345678", "txId": "42" }
+Source task loop: poll() → List<SourceRecord> → producer → offsets flushed periodically
+  SourceRecord:
+    topic, key (row PK), value (Debezium envelope: before/after/op/source/ts_ms)
+    sourcePartition: {"server": "pg-main"}       ← which stream
+    sourceOffset:    {"lsn": 123456789, "txId": 42}  ← where we are in it
 
-  Connect framework:
-  - Auto-commits offsets periodically (offset.flush.interval.ms)
-  - Exactly-once: Connect tracks offset per partition
-  - Restart: resumes from last committed offset
-
-Debezium pattern:
-  PostgreSQL logical replication slot → WAL decoder → change events
-    CREATE/UPDATE/DELETE → SourceRecord with operation type + before/after
+Debezium for Postgres:
+  logical replication slot (pgoutput plugin) + publication
+  → initial snapshot (or incremental snapshot via signal table)
+  → streaming WAL changes
+  → periodically confirms the flushed LSN back to Postgres so it can recycle WAL
 ```
 
-**Schema Evolution Handling:**
+**Delivery guarantees:**
 
-```python
-# Using Avro + Schema Registry
+- **Default is at-least-once.** Offsets are flushed every `offset.flush.interval.ms`. A crash between producing records and flushing the offset replays records, so downstream consumers must deduplicate. The Debezium LSN plus the primary key give a natural key for that.
+- **Exactly-once source (KIP-618, Kafka 3.3+):** set `exactly.once.source.support=enabled` on workers and `exactly.once.support=required` on the connector. Each batch of records and its offsets go out in one transaction, and zombie tasks are fenced. Consumers must read with `read_committed`. Check that your Debezium version lists exactly-once support for the connector you use.
+- **Sinks:** exactly-once depends on the sink. Either the sink store keeps the Kafka offsets in the same transaction as the data (the JDBC sink with upsert by PK is idempotent), or writes are idempotent upserts.
 
-# Schema evolution rules (Avro):
-#   BACKWARD: new schema can read data written by old schema (default)
-#   FORWARD: old schema can read data written by new schema
-#   FULL: both directions
-#   NONE: no compatibility checks
+**Schema evolution (Avro/Protobuf + Schema Registry):**
 
-# Config for schema evolution:
-converter.schema.registry.url=http://schema-registry:8081
+```properties
+key.converter=io.confluent.connect.avro.AvroConverter
+key.converter.schema.registry.url=http://schema-registry:8081
 value.converter=io.confluent.connect.avro.AvroConverter
 value.converter.schema.registry.url=http://schema-registry:8081
-
-# Multi-step schema evolution (safe):
-# 1. ADD field with default value → BACKWARD compatible
-# 2. REMOVE field → FORWARD compatible
-# 3. Change field type → NEED intermediary schema (e.g., string→union[string,int]→int)
 ```
 
-**Restart After 3 Days Downtime:**
+| Compatibility | Guarantee | Allowed changes (Avro) | Upgrade order |
+|---|---|---|---|
+| **BACKWARD** (Confluent default) | New schema can read data written with the previous schema | Delete fields; add fields **with defaults** | Consumers first |
+| **FORWARD** | Previous schema can read data written with the new schema | Add fields; delete fields **that had defaults** | Producers first |
+| **FULL** | Both | Add/delete only fields with defaults | Any order |
+| `*_TRANSITIVE` | Checked against **all** previous versions, not just the latest | Same | Same |
 
-```python
-# Challenge: PostgreSQL replication slot may have grown during 3 days
-# pg_replication_slots shows confirmed_flush_lsn far behind
+Type changes such as `int` → `string` aren't compatible. Use a new field (dual-write, migrate, then drop the old one) or a new topic. For CDC this is the real risk: a DBA's `ALTER TABLE` becomes a schema change in production. Gate DDL through review, and choose whether the registry should reject incompatible changes (which stalls the connector) or allow them (which breaks consumers).
 
-# Recovery strategy:
-# 1. Check slot lag:
-SELECT slot_name, pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)
+**Restart after 3 days of downtime:**
+
+```sql
+-- How much WAL is the slot holding back on the primary?
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS retained
 FROM pg_replication_slots;
-
-# 2. If lag > disk capacity:
-#    a. Create NEW replication slot
-#    b. Snapshot current table state
-#    c. Start connector from new slot + snapshot offset
-#    d. Drop old slot
-
-# 3. If lag is manageable:
-#    - Connector resumes from saved offset (confirmed_flush_lsn)
-#    - WAL segments between offset and current LSN must still exist
-#    - wal_keep_size = 1GB (or more) for short downtimes
 ```
 
-**Single Message Transforms (SMTs):**
+- **The slot pins WAL indefinitely.** `wal_keep_size` is irrelevant to slots. An inactive slot can fill the primary's disk and **take down the database**. Set `max_slot_wal_keep_size` (PG 13+) to cap it, and alert on retained WAL.
+- **Slot still valid** (`wal_status` = `reserved`/`extended`): restart the connector. It resumes from the stored LSN and replays 3 days of changes. Expect a big lag spike, and throttle downstream if needed.
+- **Slot invalidated** (`wal_status = lost`): the changes are gone. Drop and recreate the slot, then **re-snapshot**: a Debezium incremental snapshot (chunked, runs alongside streaming) or a full snapshot. Downstream must tolerate duplicates.
+- Plan this up front. A heartbeat (`heartbeat.interval.ms` + `heartbeat.action.query`) keeps the slot advancing on quiet databases. Failover slots (PG 17 `failover = true` slots synced to standbys) let CDC survive a primary failover.
 
-```python
-# Lightweight ETL without Kafka Streams
-transforms=RenameField,InsertCountry,TimestampConverter
-transforms.RenameField.type=org.apache.kafka.connect.transforms.ReplaceField$Value
-transforms.RenameField.renames=order_id:id,customer_id:cid
-transforms.InsertCountry.type=org.apache.kafka.connect.transforms.InsertField$Value
-transforms.InsertCountry.static.field=country
-transforms.InsertCountry.static.value=US
-transforms.TimestampConverter.type=org.apache.kafka.connect.transforms.TimestampConverter$Value
-transforms.TimestampConverter.field=created_at
-transforms.TimestampConverter.target.type=unix
+**Single Message Transforms (SMTs):** per-record, stateless transforms applied in order before the converter (source) or after it (sink). Use them for routing, masking, renaming and flattening (`io.debezium.transforms.ExtractNewRecordState`). Anything stateful, or a join, belongs in Streams or Flink.
+
+```properties
+transforms=unwrap,rename
+transforms.unwrap.type=io.debezium.transforms.ExtractNewRecordState
+transforms.rename.type=org.apache.kafka.connect.transforms.ReplaceField$Value
+transforms.rename.renames=order_id:id,customer_id:cid
 ```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Offset management** | Understands sourcePartition/sourceOffset pair for restart semantics |
-| **Schema Registry** | Knows Avro evolution rules and how Connect handles schema changes |
-| **CDC mechanics** | Explains PG logical replication slots, WAL, and the snapshot/bootstrap flow |
-| **SMT pipeline** | Understands transforms run in order on each record before producing |
+| **Offset management** | `sourcePartition` / `sourceOffset`, the `connect-offsets` topic, at-least-once by default |
+| **Exactly-once** | KIP-618 transactional source tasks. Sink-side idempotence. |
+| **Schema Registry** | Gets BACKWARD vs FORWARD right, including upgrade order |
+| **CDC mechanics** | Replication slots pin WAL, `max_slot_wal_keep_size`, re-snapshot path |
+| **SMT pipeline** | Stateless, per record, in order |
+
+**What they probe next:** "Outbox pattern vs table CDC?" An outbox gives you a stable event contract that isn't tied to table shape. "How do you handle a 500 GB initial snapshot?" Incremental snapshots, a read replica, and throttling.
 
 ---
 
 ## 7. Kafka Streams: Stateful Processing
 
-**Q:** "You need to implement a 1-hour rolling window aggregate that tracks user session duration across 50M daily active users. How would you implement this with Kafka Streams? How do you handle state store recovery when a Streams instance crashes?"
+**Q:** "You need to implement a 1-hour windowed aggregate that tracks user session duration across 50M daily active users. How would you implement this with Kafka Streams? How do you handle state store recovery when a Streams instance crashes?"
 
-**What They're Really Testing:** Whether you understand Kafka Streams' stateful processing model — RocksDB-backed state stores, changelog topics, interactive queries, and the threading model.
+**What They're Really Testing:** Whether you understand Streams' model: tasks per input partition, RocksDB state stores backed by changelog topics, standby replicas, interactive queries, and choosing the right window type.
+
+!!! tip "30-second answer"
+    Group by user ID and aggregate in a windowed state store. If "session" means activity bursts separated by idle time, use **session windows**. Use time/hopping windows only for fixed hourly buckets. Each task owns one input partition and a local RocksDB store, and every update is also written to a compacted **changelog** topic. On a crash, another instance restores the store by replaying the changelog from its last checkpoint. **Standby replicas** keep a warm copy, so failover only needs to replay the small gap.
 
 ### Answer
 
-**Architecture:**
+**Topology (Java):**
 
-```python
-# Kafka Streams topology:
-# Input: "user-activity" (key: userId, value: ActivityEvent with timestamp)
-# Output: "session-duration" (key: userId, value: SessionDuration)
-
+```java
 StreamsBuilder builder = new StreamsBuilder();
 
-KTable<Windowed<String>, Duration> sessionDurations = builder
-    .stream("user-activity")
+builder.stream("user-activity", Consumed.with(Serdes.String(), activitySerde))  // key = userId
     .groupByKey()
-    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofHours(1)))
+    // "session" = activity separated by >30 min of inactivity → session windows
+    .windowedBy(SessionWindows.ofInactivityGapAndGrace(Duration.ofMinutes(30), Duration.ofMinutes(5)))
     .aggregate(
-        SessionDuration::new,  # Initializer
-        (key, value, aggregate) -> aggregate.add(value),  # Aggregator
-        Materialized.<String, SessionDuration, WindowStore<Bytes, byte[]>>as(
-                "session-store")          # RocksDB-backed state store
-            .withRetention(Duration.ofDays(3))  # Keep 3 days of windows
-    );
+        SessionStats::new,                                          // initializer
+        (userId, event, agg) -> agg.add(event),                     // aggregator
+        (userId, left, right) -> left.merge(right),                 // session merger
+        Materialized.<String, SessionStats, SessionStore<Bytes, byte[]>>as("session-store")
+            .withValueSerde(sessionStatsSerde)
+            .withRetention(Duration.ofDays(1)))
+    .toStream()
+    .to("session-duration", Produced.with(windowedSerde, sessionStatsSerde));
 
-sessionDurations.toStream().to("session-duration-output");
-
-# Internal state stores:
-#   - session-store (RocksDB): local state for aggregations
-#   - session-store-changelog (compact, compact-delete): fault tolerance
-#     → Every state mutation also produces to changelog topic
-#     → On restart: replay changelog from last checkpoint
+// For fixed hourly buckets instead:
+//   .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofHours(1), Duration.ofMinutes(5)))
 ```
 
-**State Store Recovery:**
+Internal topics created automatically: `<app-id>-session-store-changelog` (compacted) and, if you re-key, `<app-id>-...-repartition`.
+
+**Sizing sanity check:** 50M users with active windows means tens of millions of keys. That's fine spread over, say, 64 partitions (each task's RocksDB holds about 1/64). Disk and restore time per task are what you size for.
+
+**State store recovery:**
 
 ```
-Instance A (active, partition 0-4):
-  session-store/ (RocksDB)
-     └── Checkpoint: offset 14235 in input topic
+Each task keeps a local .checkpoint file: the changelog offset its RocksDB store
+reflects (written on commit/flush). This is a CHANGELOG offset, not an input offset.
 
-Instance A crashes:
-
-Instance B takes over partition 0-4:
-  1. Restore starting from checkpoint offset 14235
-  2. Reads changelog topic "session-store-changelog" from offset 14235
-  3. Replays ALL state changes into local RocksDB
-  4. Once caught up with changelog end → resume processing from input
-
-Optimization:
-  standby.replicas=1
-  - A warm standby replica maintains state in parallel
-  - Failover: standby has state current to within milliseconds
-  - No RocksDB replay needed → sub-second failover
+Instance A (owns task 0_3) crashes.
+Instance B is assigned task 0_3:
+  1. If B has a local store for 0_3 (it's a standby, or owned it earlier), read its checkpoint.
+     Otherwise start from an empty store at changelog offset 0.
+  2. Restore: consume changelog partition 3 from the checkpoint to the end → write into RocksDB.
+  3. Resume processing input partition 3 from the group's committed input offset.
+With exactly_once_v2, input offsets, output and changelog writes commit atomically,
+so state and position always agree.
 ```
 
-**Interactive Queries:**
+**Making failover fast:**
 
-```python
-# Query state stores directly from external services
-// Get the store for a specific partition
-ReadOnlyWindowStore<String, Duration> store = streams
-    .store(StoreQueryParameters.fromNameAndType(
-        "session-store", QueryableStoreTypes.windowStore()));
+- `num.standby.replicas=1`: another instance tails the changelog continuously. On failover it replays only the last few seconds.
+- **Warmup replicas (KIP-441, 2.6+):** on scale-out, Streams keeps the task on its caught-up owner and warms a copy on the new instance first, moving it only once it's within `acceptable.recovery.lag`.
+- Keep RocksDB on persistent volumes (StatefulSets) so a restart reuses local state instead of rebuilding.
+- Size changelog compaction so restore isn't replaying stale history.
 
-// Query by key
-WindowStoreIterator<Duration> result = store.fetch(
-    "user-12345",
-    Instant.now().minus(1, ChronoUnit.HOURS),
-    Instant.now());
+**Interactive queries:**
 
-// Access across partition: route by key → find hosting instance
-HostInfo host = streams.metadataForKey(
+```java
+ReadOnlySessionStore<String, SessionStats> store = streams.store(
+    StoreQueryParameters.fromNameAndType("session-store", QueryableStoreTypes.sessionStore()));
+
+// Which instance owns this key? (metadataForKey was replaced by queryMetadataForKey)
+KeyQueryMetadata meta = streams.queryMetadataForKey(
     "session-store", "user-12345", Serdes.String().serializer());
 
-if (host.equals(thisHost)) {
-    // Local query
+if (meta.activeHost().equals(thisHost)) {
+    try (KeyValueIterator<Windowed<String>, SessionStats> it = store.fetch("user-12345")) { /* ... */ }
 } else {
-    // Remote query via RPC (gRPC/REST)
+    // forward to meta.activeHost() over your own RPC (REST/gRPC), or to a standby
+    // in meta.standbyHosts() if stale reads are acceptable
 }
 ```
 
-**Threading Model:**
+**Threading model:**
 
 ```properties
-# Task parallelism (NOT data parallelism)
-num.stream.threads=4   # Default: 1
-
-# Each thread runs a subset of tasks (max 1 thread per partition)
-# Task: one partition of input topic → one state store (if stateful)
-# Threads share JVM heap but have SEPARATE RocksDB instances
-
-# If topic has 20 partitions, num.stream.threads=4:
-#   Task assignment: 5 partitions per thread
-#   Each thread has 5 RocksDB instances (one per partition)
+num.stream.threads=4   # default 1
+# Unit of parallelism = task = one partition of each co-partitioned input topic.
+# 20 input partitions → 20 tasks → spread over all threads of all instances.
+# More threads/instances than tasks = idle threads.
+# Each task has its own store instances (a window/session store is several RocksDB segments).
 ```
+
+Kafka 4.1 introduced the **streams rebalance protocol (KIP-1071)** as early access. It moves Streams task assignment to the broker, in the same spirit as KIP-848.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **State store model** | Understands RocksDB local + changelog topic for fault tolerance |
-| **Changelog replay** | Can explain how offset checkpointing + changelog replay enables recovery |
-| **Standby replicas** | Knows standby.replicas eliminates replay cost on failover |
-| **Interactive queries** | Understands how to query state stores externally across instances |
+| **Window choice** | Session vs tumbling vs hopping, grace periods and late data |
+| **State store model** | RocksDB + compacted changelog. Task = partition. |
+| **Recovery** | Checkpoint = changelog offset. Standby and warmup replicas. Persistent volumes. |
+| **Interactive queries** | `queryMetadataForKey`, routing to the active host, standby reads for availability |
+
+**What they probe next:** "How do you handle out-of-order events?" Grace period plus `suppress(untilWindowCloses)` for final-only output. "Repartition cost?" Changing the key writes everything through a repartition topic, so avoid unnecessary `selectKey`.
 
 ---
 
 ## 8. Disk I/O & Page Cache Optimization
 
-**Q:** "Your Kafka cluster's page cache drops from 40GB to 2GB during a BGSAVE-like operation. Write throughput drops 80%. Diagnose the root cause. How do you isolate Kafka from other processes sharing the same OS?"
+**Q:** "Your Kafka brokers' page cache drops from 40GB to 2GB when another process on the host does a large file operation (think a backup or a Redis BGSAVE). Throughput drops 80%. Diagnose the root cause. How do you isolate Kafka from other processes sharing the same OS?"
 
-**What They're Really Testing:** Whether you understand Kafka's OS-level performance model — page cache as the primary performance layer, and how to isolate it from other processes.
+**What They're Really Testing:** Whether you know that Kafka's performance depends on the page cache, how Linux writeback works, and the real isolation tools (dedicated hosts/disks, cgroup v2 memory protection).
+
+!!! tip "30-second answer"
+    Kafka keeps a small JVM heap (around 6 GB) and relies on the OS page cache for the hot tail of every partition. When another process streams a large file through the cache, it evicts Kafka's pages. Consumer and follower reads that were memory hits become disk reads, which compete with appends, and latency spikes. Fixes in order of strength: **don't co-locate** (dedicated hosts or disks), then cgroup v2 `memory.low`/`memory.min` to protect Kafka's cache and `memory.max` on the noisy neighbour, then tune writeback. Tiered storage also keeps cold replays off local disk.
 
 ### Answer
 
-**Root Cause:** Another process (or Kafka's own compaction) triggered massive page cache eviction. Kafka's write path relies on the OS page cache for its speed:
+**What actually breaks:**
 
 ```
-Normal path: Producer → send() → RecordAccumulator → Sender thread → Socket send
-  → Kernel allocates page cache pages → writes reach disk asynchronously via pdflush
+Normal:  appends → page cache (dirty) → kernel flusher threads write back asynchronously
+         follower + consumer fetches for recent offsets → page cache hits → sendfile()
 
-When page cache is evicted:
-  - Every write must allocate NEW pages (expensive)
-  - Every read goes to disk (no cache hit)
-  - mmap-based reads (index files) cause page cache churn
-  - Dirty page ratio hits vm.dirty_ratio → writes throttle
+After eviction:
+  - Fetches for recent data miss the cache → synchronous disk reads on the fetch path
+  - Followers slow down → ISR shrink → acks=all produce latency rises (RemoteTimeMs)
+  - Random reads interleave with sequential appends → appends slow too
+  - If dirty pages exceed vm.dirty_ratio, writers block in the kernel (LocalTimeMs spikes)
 ```
 
-**Linux Tuning for Kafka Isolation:**
+Confirm it with `free -g` or `/proc/meminfo` (Cached), `vmtouch` on segment files, `iostat -x` (read IOPS on the Kafka disks), and `sar -B` (page reclaim activity).
+
+**Linux tuning (starting points, validate under load):**
 
 ```bash
 # /etc/sysctl.d/99-kafka.conf
-
-# Dirty page thresholds (critical for Kafka)
-vm.dirty_ratio = 40           # % of memory that can be dirty before writes block
-vm.dirty_background_ratio = 5 # % that triggers background writeback
-
-# Page cache pressure
-vm.vfs_cache_pressure = 50    # Less aggressive cache eviction
-vm.swappiness = 1             # Never swap (except emergency)
-
-# Network tuning
+vm.swappiness = 1                 # avoid swapping the JVM. Prefer dropping cache.
+vm.dirty_background_ratio = 5     # start background writeback early
+vm.dirty_ratio = 60               # allow a large dirty buffer before writers block
+                                  # (higher = smoother throughput, longer flush bursts)
+vm.max_map_count = 262144         # each segment's index files are mmapped; many partitions need more
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 ```
 
-**OS Isolation (cgroups v2):**
+**OS isolation with cgroup v2 memory controls** (systemd: `MemoryLow=`, `MemoryMax=`):
 
 ```bash
-# Use cgroups v2 to reserve page cache for Kafka
-# /etc/cgconfig.d/kafka.conf
+# Kafka's cgroup: protect its working set (anon + page cache it has charged)
+echo 48G > /sys/fs/cgroup/kafka.slice/memory.low   # best-effort protection from reclaim
+#   memory.min = hard protection (never reclaimed). Use sparingly, it can trigger OOM elsewhere.
 
-# Memory controller: limit but also protect
-sudo mkdir -p /sys/fs/cgroup/kafka
-echo 50G > /sys/fs/cgroup/kafka/memory.max          # Hard limit
-echo 40G > /sys/fs/cgroup/kafka/memory.high         # Throttle above this
-echo 350G > /sys/fs/cgroup/kafka/memory.soft_protection  # Page cache reservation
-
-# Move Kafka JVM to this cgroup
-echo $(pidof java) > /sys/fs/cgroup/kafka/cgroup.procs
+# Noisy neighbour's cgroup: cap it, so its file I/O reclaims its own cache, not Kafka's
+echo 8G > /sys/fs/cgroup/backup.slice/memory.max
+echo 6G > /sys/fs/cgroup/backup.slice/memory.high  # throttle + reclaim above this
 ```
 
-**Dedicated Disks:**
+Caveat: page cache is charged to the cgroup that **first touched** the page. Protection only works if the readers and writers of Kafka's files are in Kafka's cgroup. For a backup job, `fadvise(DONTNEED)` / `O_DIRECT` (or tools like `nocache`) stop it from polluting the cache at all.
 
-```yaml
-# Recommendation: JBOD (Just a Bunch of Disks), NOT RAID
+**Disks:**
 
-# Good:
-  /data/kafka-0 (NVMe disk 0) → topics partition 0-9
-  /data/kafka-1 (NVMe disk 1) → topics partition 10-19
-  /data/kafka-2 (NVMe disk 2) → topics partition 20-29
-
-# Bad:
-  RAID5 → Write amplification factor 4 (read-modify-write on parity)
-  RAID6 → WAF 6 → Kafka's sequential patterns become random
-
-# /etc/kafka/server.properties
+```properties
+# JBOD: one log dir per physical disk (supported in KRaft since 3.7, KIP-858)
 log.dirs=/data/kafka-0,/data/kafka-1,/data/kafka-2
-num.recovery.threads.per.data.dir=1  # Parallel recovery across disks
+num.recovery.threads.per.data.dir=4   # threads per dir for log recovery after unclean shutdown
 ```
 
-**File System: XFS vs ext4:**
+| Layout | Pros | Cons |
+|---|---|---|
+| **JBOD** | Full disk bandwidth. One disk failure takes only its partitions offline, and Kafka replication re-protects them. | Uneven disk usage. Rebalance across dirs with `kafka-reassign-partitions` (log dir moves). |
+| **RAID10** | Survives disk loss without broker-level recovery, and balances load | Halves usable capacity, on top of Kafka's own RF=3 |
+| **RAID5/6** | Capacity-efficient | Small writes cost read-modify-write on parity (RAID5: 4 I/Os per small write). Rebuilds are slow and hurt latency. Generally avoided. |
 
-```yaml
-XFS (recommended):
-  - Allocation groups → parallel allocation
-  - No fsck after crash (journal replay, instant mount)
-  - Delayed allocation → fewer, larger extents
-  - Best for large file workloads
-
-ext4:
-  - Good for smaller deployments
-  - Needs periodic fsck (unmount for hours on large volumes)
-  - Block groups can cause allocation contention
-```
+**File system:** XFS is the usual recommendation (good parallel allocation for many large append-only files, mature at large sizes). ext4 works fine too. Both are journaling, so neither needs a long fsck after a crash. Mount with `noatime`.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Page cache primacy** | Understands Kafka performance IS page cache performance |
-| **Isolation techniques** | Can describe cgroup v2 memory protection, dedicated disks, NUMA pinning |
-| **File system choice** | Can defend XFS > ext4 for Kafka workloads |
-| **Dirty page tradeoff** | Explains high dirty_ratio for throughput vs low for write latency |
+| **Page cache primacy** | Small heap, large cache, and the chain from cache misses to ISR shrink to produce latency |
+| **Isolation techniques** | Dedicated hosts first. cgroup v2 `memory.low`/`memory.max` and its charging caveat. |
+| **Disk layout** | JBOD vs RAID10 trade-off, why RAID5/6 are avoided |
+| **Dirty page trade-off** | Higher `dirty_ratio` gives smoother throughput but bigger flush stalls |
+
+**What they probe next:** "Should Kafka call fsync?" `log.flush.interval.*` is off by default. Replication across AZs is the durability mechanism, and forcing fsync costs a lot of throughput. "How does tiered storage change this?" Historical reads come from object storage, not local disk, so replays don't evict the hot tail.
 
 ---
 
@@ -703,115 +699,93 @@ ext4:
 
 **Q:** "You add 3 brokers to a 6-broker Kafka cluster. Partition distribution is now heavily skewed (old brokers at 80% load). Walk through the partition reassignment process without downtime. How do you control the impact on production traffic?"
 
-**What They're Really Testing:** Whether you understand Kafka's partition reassignment tool, throttling, and the preferred replica election process.
+**What They're Really Testing:** Whether you know that Kafka never moves data on its own, how reassignment and throttles work, and how to keep the operation safe.
+
+!!! tip "30-second answer"
+    New brokers get **no** existing partitions. Kafka doesn't rebalance automatically. Generate a plan (or let Cruise Control compute one), execute it **with a replication throttle**, move a batch of partitions at a time, watch under-replicated partitions and produce latency, then run `--verify`. That step also **removes the throttle**. Finally, run preferred leader election so leadership (and request load) spreads to the new brokers. Tiered storage makes this far cheaper, because only the local hot tail has to be copied.
 
 ### Answer
 
-**Partition Reassignment Process:**
+**Reassignment with the stock tool:**
 
 ```bash
-# Step 1: Generate reassignment plan
-kafka-reassign-partitions \
-  --bootstrap-server kafka:9092 \
-  --generate \
-  --topics-to-move-json-file topics.json > plan.json
+# 1. Generate a candidate plan (simple: doesn't consider load, only counts)
+cat > topics.json <<'EOF'
+{"version": 1, "topics": [{"topic": "orders"}, {"topic": "payments"}]}
+EOF
+kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+  --topics-to-move-json-file topics.json --broker-list "1,2,3,4,5,6,7,8,9" --generate
+# Prints "Current" (save it as rollback.json) and "Proposed" (save it as plan.json)
 
-# topics.json:
-#   {"topics": [{"topic": "orders"}, {"topic": "payments"}],
-#    "version": 1}
+# 2. Execute with a throttle (bytes/sec, applied to the brokers involved)
+kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+  --reassignment-json-file plan.json --execute --throttle 100000000   # 100 MB/s
 
-# plan.json contains:
-#   Current partition → broker mapping
-#   Proposed partition → broker mapping (evenly distributed)
+# 3. Poll until complete. --verify also REMOVES the throttle configs once done.
+kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+  --reassignment-json-file plan.json --verify
 
-# Step 2: Execute reassignment with throttle
-kafka-reassign-partitions \
-  --bootstrap-server kafka:9092 \
-  --execute \
-  --reassignment-json-file plan.json \
-  --throttle 500000000  # 500 MB/s throttle (critical!)
+# Abort an in-flight reassignment if things go wrong
+kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+  --reassignment-json-file plan.json --cancel
 ```
 
-**Throttling Mechanics:**
+**How the move works:** the controller sets replicas to old ∪ new. The new replicas fetch from the leader like any follower, catch up and join the ISR. Then the controller drops the old replicas and, if needed, moves leadership. At no point are there fewer in-sync copies than before.
+
+**Throttling:**
 
 ```
-Replication throttle limits:
-  leader.throttled.rate = 500 MB/s  (per broker, outbound)
-  follower.throttled.rate = 500 MB/s (per broker, inbound)
+--throttle sets per-broker dynamic configs:
+  leader.replication.throttled.rate / follower.replication.throttled.rate
+and per-topic lists of which replicas are throttled:
+  leader.replication.throttled.replicas / follower.replication.throttled.replicas
+Normal ISR replication is NOT throttled, only the moving replicas.
 
-What happens without throttle:
-  - New broker pulls 10GB/s from old brokers
-  - Old brokers' page cache evicted by outbound replication
-  - Production write throughput drops 50%+
-
-Throttle sizing:
-  Rule: throttle ≤ (replica.fetch.max.bytes × num.followers) / tolerable_impact
-  Example: if 10% throughput drop is acceptable on 500MB/s producers:
-    throttle = 500MB/s × 10% = 50 MB/s per broker
-
-Monitoring during reassignment:
-  kafka.server:type=ReplicaManager,name=LeaderAndIsrExpiredPerSec
-  kafka.network:type=RequestMetrics,name=LocalTimeMs,request=LeaderAndIsr
+Sizing: throttle ≈ (disk or NIC headroom at peak) − (normal produce + replication + consumer traffic).
+Example: 25 Gb/s NIC (~3 GB/s), peak usage 2 GB/s → leave a safety margin, start at 200–500 MB/s.
+Too low: a reassignment that never catches up on a busy partition (data arrives faster than the throttle).
+Forgotten throttle: if you never run --verify, the throttle stays and later slows real recovery.
 ```
 
-**Automated Rebalancing with Cruise Control:**
+**What to watch:** `UnderReplicatedPartitions` (expected for moving partitions only), `kafka.server:type=ReplicaManager,name=ReassigningPartitions`, `ReplicationBytesInPerSec`/`ReplicationBytesOutPerSec`, produce p99 (`RequestMetrics` `TotalTimeMs` for `Produce`), consumer lag, and disk usage on the **source** brokers (they hold both copies until the move finishes).
 
-```json
-# LinkedIn Cruise Control (open source)
-# Goals:
-#   - RackAwareDistributionGoal
-#   - ReplicaDistributionGoal
-#   - DiskUsageDistributionGoal (uniform disk usage ±10%)
-#   - LeaderBytesInDistributionGoal
-
-POST /kafkacruisecontrol/rebalance
-{
-  "goals": [
-    "com.linkedin.kafka.cruisecontrol.analyzer.goals.RackAwareGoal",
-    "com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskCapacityGoal",
-    "com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaDistributionGoal"
-  ],
-  "dryRun": false,
-  "throttle": 500000000
-}
-```
-
-**Preferred Replica Election:**
+**Cruise Control** (LinkedIn, open source) models CPU, disk, network and replica counts per broker, and proposes a minimal set of moves that satisfies a prioritized list of goals (rack awareness, capacity, replica and leader distribution). It also runs them in batches with throttles:
 
 ```bash
-# After reassignment, the leader may still be on the old broker
-# Run preferred replica election to balance leader load
-
-kafka-leader-election \
-  --bootstrap-server kafka:9092 \
-  --election-type preferred \
-  --all-topic-partitions
-
-# Now each partition's preferred leader (first replica in list) is the leader
-# Combined with Cruise Control: balanced leaders = balanced request load
+# Dry run first (the default), then execute
+curl -X POST "http://cruise-control:9090/kafkacruisecontrol/add_broker?brokerid=7,8,9&dryrun=true"
+curl -X POST "http://cruise-control:9090/kafkacruisecontrol/rebalance?dryrun=false&replication_throttle=200000000&concurrent_partition_movements_per_broker=5"
 ```
 
-**Rolling Restart During Scaling:**
+On Kubernetes, Strimzi wraps this as `KafkaRebalance` resources (including `add-brokers` / `remove-brokers` modes).
 
-```yaml
-# After adding brokers:
-1. Add new brokers: start with empty data dirs
-2. New brokers join cluster, see metadata from ZooKeeper
-3. No partitions moved yet → new brokers are idle
-4. Run reassignment: move partitions to new brokers
-5. After reassignment completes → run preferred leader election
-6. Verify: kafka-topics --describe --under-replicated-partitions (should be 0)
-7. Update monitoring thresholds (new brokers need alerting)
+**Preferred leader election:**
+
+```bash
+kafka-leader-election.sh --bootstrap-server kafka:9092 --election-type PREFERRED --all-topic-partitions
+# The preferred leader is the first replica in the list. auto.leader.rebalance.enable=true (default)
+# also does this periodically when imbalance > leader.imbalance.per.broker.percentage (10%).
 ```
+
+**Adding brokers in KRaft:**
+
+1. Format storage with the cluster ID (`kafka-storage.sh format`).
+2. Start the brokers. They register with the controller quorum and get metadata from the `__cluster_metadata` log, not from ZooKeeper.
+3. They're idle until you reassign.
+4. Reassign in batches, then run preferred leader election.
+5. Confirm 0 under-replicated partitions and balanced disk/network usage, and add the new brokers to monitoring.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Throttling** | Knows how to limit reassignment impact with throttles |
-| **Plan verification** | Understands --verify to check reassignment completion |
-| **Cruise Control** | Mentions LinkedIn's Cruise Control for automated rebalancing |
-| **Preferred leaders** | Knows to run leader election after reassignment |
+| **No auto-rebalance** | Knows new brokers stay empty until you act |
+| **Throttling** | How to size it, what it applies to, and that `--verify` clears it |
+| **Batching / rollback** | Moves in batches, keeps the "current" assignment for rollback, knows `--cancel` |
+| **Cruise Control** | Goal-based, load-aware planning. Strimzi integration. |
+| **Preferred leaders** | Leadership balance after the move |
+
+**What they probe next:** "How do you remove a broker?" Reassign everything off it (Cruise Control `remove_broker`), then unregister it in KRaft (`kafka-cluster.sh unregister`). "Why not just add partitions?" It changes key→partition mapping for keyed topics and doesn't move existing data.
 
 ---
 
@@ -819,128 +793,77 @@ kafka-leader-election \
 
 **Q:** "Design a monitoring dashboard for a Kafka cluster handling 1M messages/second. What metrics do you track? What are the alert thresholds? How do you detect consumer lag before it causes problems?"
 
-**What They're Really Testing:** Whether you understand Kafka's JMX metrics in detail — which ones signal real problems vs normal variance.
+**What They're Really Testing:** Whether you know the handful of metrics that indicate real trouble, and whether you treat consumer lag as **time**, not message counts.
+
+!!! tip "30-second answer"
+    Page on things that mean data is at risk or unavailable: **offline partitions > 0**, **under-min-ISR partitions > 0**, no active controller or a lost KRaft quorum, and sustained under-replicated partitions. Warn on saturation: request handler and network thread idle % falling, request queue growth, produce/fetch p99 latency. Measure consumer lag as **time behind** (seconds), with alerts on lag that keeps growing, not on a fixed message count. Burrow-style evaluation or `kafka-lag-exporter` does this.
 
 ### Answer
 
-**Critical Metrics (JVM + Kafka):**
+**Core broker metrics (JMX):**
+
+| Metric | Why | Alert |
+|---|---|---|
+| `kafka.controller:type=KafkaController,name=OfflinePartitionsCount` | No leader → unavailable | > 0 → **page** |
+| `kafka.server:type=ReplicaManager,name=UnderMinIsrPartitionCount` | `acks=all` writes failing | > 0 → **page** |
+| `kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions` | Reduced redundancy | > 0 for 5+ min (outside planned reassignment) |
+| `kafka.controller:type=KafkaController,name=ActiveControllerCount` | Exactly one active controller in the KRaft quorum | Sum across controllers ≠ 1 → **page** |
+| `kafka.server:type=raft-metrics` (`current-leader`, `high-watermark`, commit latency) | KRaft metadata quorum health | No leader / quorum lag growing |
+| `kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent` | I/O thread saturation | < 0.3 sustained |
+| `kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent` | Network thread saturation | < 0.3 sustained |
+| `kafka.network:type=RequestChannel,name=RequestQueueSize` | Requests waiting for a handler thread | Growing trend |
+| `kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce` (and `Fetch`), with the `LocalTimeMs` / `RemoteTimeMs` / `RequestQueueTimeMs` breakdown | Where latency comes from: disk vs replication vs queueing | p99 above SLO |
+| `kafka.server:type=ReplicaManager,name=IsrShrinksPerSec` / `IsrExpandsPerSec` | Flapping followers | Sustained non-zero |
+| `kafka.log:type=LogCleaner,name=DeadThreadCount` | Compaction stopped (compacted topics, `__consumer_offsets` grow forever) | > 0 |
+| `BytesInPerSec` / `BytesOutPerSec` (BrokerTopicMetrics) | Capacity | > ~70% of NIC or disk throughput |
+| OS: disk util/await, page cache hit ratio, network, open file descriptors, JVM GC pause | Root-cause context | Per host baseline |
+
+**Consumer lag:** offset lag = log end offset − committed offset. The number by itself is meaningless: 1M messages is 1 s on one topic and a week on another. Alert on:
+
+- **Time lag**: how old is the record at the committed offset, or lag ÷ consumption rate.
+- **Lag trend**: lag growing over a window while the consumer's committed offset isn't advancing means it's stalled. Lag stable or shrinking is fine.
+
+Burrow (LinkedIn) evaluates each partition over a sliding window with these rules. `kafka-lag-exporter` and most managed platforms export time lag directly. With KIP-848, the broker also exposes group state and assignment, which helps spot stuck members.
 
 ```python
-# Essential JMX metrics to track
+# Offset lag per partition for one group (kafka-python). Feed this into a time-lag calculation
+# by sampling it periodically along with the consume rate.
+from kafka import KafkaAdminClient, KafkaConsumer
 
-# ── Broker Health ──
-# kafka.server:type=BrokerTopicMetrics,name=MessagesInPerSec
-#   Rate: total messages/sec
-#   Alert: > 80% of cluster capacity (scale up)
-
-# kafka.server:type=BrokerTopicMetrics,name=TotalFetchRequestPerSec
-#   Fan-out ratio: TotalFetchRequests / TotalProduceRequests
-#   Alert: > 100:1 → too many consumer groups, enable compression
-
-# kafka.server:type=KafkaServer,name=BrokerState
-#   Value (RunningAsController=1, SyncingBroker=2, RunningBroker=3)
-#   Alert: NOT RunningAsController (for controllers)
-
-# kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions
-#   Alert: > 0 for > 5 minutes → replication lagging
-
-# ── Request Handling ──
-# kafka.server:type=RequestMetrics,name=RemoteTimeMs,request=Produce
-#   p99: time the leader waits for follower ACKs
-#   Alert: p99 > 100ms → slow followers (disk I/O or network)
-
-# kafka.server:type=RequestMetrics,name=LocalTimeMs,request=Produce
-#   Time to append to local log
-#   Alert: p99 > 10ms → page cache pressure or disk I/O bottleneck
-
-# kafka.network:type=RequestMetrics,name=RequestQueueSize
-#   Alert: > 1000 → broker can't keep up with requests
-
-# ── Network ──
-# kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent
-#   Alert: < 0.3 → network threads saturated, increase network.threads
-
-# ── OS ──
-# kafka.log:type=LogCleanerManager,name=TimeSinceLastCompaction
-#   Alert: > 24h → compaction stuck or deadlocking
+def group_lag(bootstrap: str, group_id: str) -> dict:
+    admin = KafkaAdminClient(bootstrap_servers=bootstrap)
+    committed = admin.list_consumer_group_offsets(group_id)   # {TopicPartition: OffsetAndMetadata}
+    probe = KafkaConsumer(bootstrap_servers=bootstrap)        # no group_id: doesn't join the group
+    try:
+        end = probe.end_offsets(list(committed))
+        return {tp: end[tp] - meta.offset for tp, meta in committed.items()}
+    finally:
+        probe.close()
+        admin.close()
 ```
 
-**Consumer Lag Monitoring (Burrow Pattern):**
+From the CLI: `kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group payments` shows CURRENT-OFFSET, LOG-END-OFFSET and LAG per partition. Share groups have their own lag metrics, which are part of 4.2's production-ready release.
 
-```python
-# Burrow's approach (LinkedIn): lag evaluation without fixed thresholds
-# Uses consumer's committed offset vs. Kafka's latest offset
-
-# Evaluate lag relative to consumer's OWN behavior:
-#   - Track consumer's offset over a sliding window
-#   - Calculate expected progress rate
-#   - If consumer stops processing but lag is stable → OK (no new messages)
-#   - If consumer stops AND lag grows → PROBLEM
-
-# Python consumer lag checker:
-def check_lag(bootstrap_servers, group_id, topic):
-    admin = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
-    consumer = KafkaConsumer(
-        bootstrap_servers=bootstrap_servers,
-        group_id=group_id,
-        enable_auto_commit=False
-    )
-
-    # Get partition assignments
-    partitions = consumer.partitions_for_topic(topic)
-
-    for tp in consumer.assignment():
-        # Latest offset (end of log)
-        end_offset = consumer.end_offsets([tp])[tp]
-
-        # Consumer committed offset
-        committed = consumer.committed(tp)
-        if committed is None:
-            committed = 0
-
-        lag = end_offset - committed
-
-        # Alert thresholds (dynamic):
-        # 1. Lag > 1M messages → PagerDuty alert
-        # 2. Lag growth rate > 1000/sec → warning
-        # 3. Lag > replica.fetch.max.bytes × 1000 → likely slow consumer
-
-        duration_seconds = lag / (messages_per_second_per_partition or 1)
-        if duration_seconds > 300:  # 5 minutes of backlog
-            raise Alert(f"Consumer {group_id} lagging by {duration_seconds:.0f}s on {tp}")
-
-    consumer.close()
-```
-
-**Alert Thresholds Summary:**
+**Alert tiers:**
 
 ```yaml
-# P0 (Immediate):
-  UnderReplicatedPartitions > 0 for 5+ minutes
-  OfflinePartitions > 0
-  ActiveControllerCount != 1 (for controller broker, not data broker)
-  KafkaRestExceptionCount (REST proxy)
-
-# P1 (High):
-  RequestQueueSize > 1000 (produce or fetch)
-  LocalTimeMs p99 > 50ms
-  LogSegmentCount growth > 1000/day (retention not keeping up)
-  NetworkProcessorAvgIdlePercent < 0.1
-
-# P2 (Warning):
-  ConsumerLag > 1M messages
-  MessagesInPerSec drop > 50% (producer side issue)
-  BytesOutPerSec > 80% of network bandwidth
+P0 (page):   OfflinePartitions > 0, UnderMinIsr > 0, controller quorum has no leader,
+             consumer time-lag on a critical pipeline > SLO and growing
+P1 (urgent): UnderReplicated > 0 for 5+ min (not during reassignment),
+             handler/network idle < 0.2, produce p99 > SLO for 10 min, disk > 80%
+P2 (ticket): IsrShrinks sustained, disk > 70%, BytesIn > 70% capacity, LogCleaner dead thread
 ```
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **JMX metrics depth** | Knows specific MBean names and alert thresholds, not just concepts |
-| **Lag semantics** | Understands committed offset, log end offset, and lag growth rate |
-| **Burrow approach** | Evaluates lag relative to consumer behavior, not static thresholds |
-| **OS-level metrics** | Includes page cache hit rate, dirty page ratio, disk I/O |
+| **Signal vs noise** | Pages only on data loss/unavailability. Saturation metrics are warnings. |
+| **Latency decomposition** | Uses Local / Remote / Queue time to localize the bottleneck |
+| **Lag semantics** | Time lag and trend, not static message counts |
+| **KRaft awareness** | Monitors the controller quorum, not ZooKeeper |
+
+**What they probe next:** "Consumer is lagging, what now?" Check whether processing time per record went up, whether there are more partitions than consumers can handle, rebalance storms, or a hot partition. "How do you capacity-plan?" Bytes in × RF for disk and network, plus fan-out of consumers for bytes out.
 
 ---
 
@@ -948,126 +871,99 @@ def check_lag(bootstrap_servers, group_id, topic):
 
 **Q:** "Design a multi-tenant Kafka cluster serving 5 teams. Each team must only read/write their own topics. All traffic must be encrypted in transit. How do you configure Kafka security? How do you rotate certificates without downtime?"
 
-**What They're Really Testing:** Whether you understand Kafka's security model — SSL/TLS, SASL authentication, and ACL-based authorization at the cluster, topic, and group level.
+**What They're Really Testing:** Whether you understand listeners and security protocols, the authentication options (mTLS, SCRAM, OAUTHBEARER), ACLs with prefixed resource patterns, quotas for noisy tenants, and certificate rotation in practice.
+
+!!! tip "30-second answer"
+    Use **SASL_SSL** listeners: TLS for encryption, plus SCRAM or OAUTHBEARER (OIDC) for identity, or mTLS where you control client certs. Turn on `StandardAuthorizer` (KRaft) with `allow.everyone.if.no.acl.found=false`. Give each team **prefixed ACLs** (`team-a.*` topics, `team-a.*` consumer groups, transactional IDs) and enforce naming at topic creation. Add **client quotas** per team so one tenant can't starve the others. Rotate certificates by reloading keystores and truststores dynamically (no restart). Rotate a CA by trusting old + new first, then reissuing, then removing the old CA.
 
 ### Answer
 
-**Multi-Layer Security Architecture:**
+**Layers:**
 
-```yaml
-Layer 1: Encryption in transit (TLS)
-  - Mutual TLS (mTLS) for both authentication AND encryption
-  - Each broker has server certificate (signed by internal CA)
-  - Each client has client certificate (signed by internal CA)
-  - All inter-broker communication over TLS
+| Layer | Options | Notes |
+|---|---|---|
+| Encryption | TLS (`SSL` or `SASL_SSL` listeners) | Disables zero-copy (`sendfile`), so budget extra broker CPU |
+| Authentication | mTLS (cert DN → principal), SASL/SCRAM-SHA-512, SASL/OAUTHBEARER, SASL/GSSAPI (Kerberos) | SCRAM credentials are stored in the **KRaft metadata log** (`kafka-configs.sh --alter --add-config 'SCRAM-SHA-512=[password=...]'`, or `kafka-storage.sh format --add-scram` to bootstrap) |
+| Authorization | ACLs via `org.apache.kafka.metadata.authorizer.StandardAuthorizer` | `AclAuthorizer` was ZooKeeper-only and is gone in 4.0 |
+| Isolation | Client quotas (produce/fetch bytes/s, request %) per user or client ID | Without these, multi-tenancy is only an access-control feature |
 
-Layer 2: Authentication (SASL)
-  - SASL/SCRAM-SHA-512: username + password over TLS
-    - Stored in ZooKeeper (zookeeper.set.acl=true) or custom DB
-    - Users: admin, team-a-producer, team-b-consumer, etc.
-  - SASL/OAUTHBEARER: OAuth2 tokens (best for SSO)
-    - Kafka can authenticate against your IdP (Okta, Keycloak)
-    - Token introspection (optional) for revocation
-
-Layer 3: Authorization (ACLs)
-  - kafka-acls.sh --authorizer-properties ...
-  - ACLs evaluated for EVERY produce/fetch/describe operation
-```
-
-**Server Configuration:**
+**Broker configuration (KRaft, abbreviated):**
 
 ```properties
-# /etc/kafka/server.properties
+listeners=SASL_SSL://:9094,CONTROLLER://:9093
+advertised.listeners=SASL_SSL://kafka-1.example.com:9094
+inter.broker.listener.name=SASL_SSL
+listener.security.protocol.map=SASL_SSL:SASL_SSL,CONTROLLER:SSL
 
-# TLS
-listeners=SSL://kafka:9093,SASL_SSL://kafka:9094
-advertised.listeners=SSL://kafka:9093,SASL_SSL://kafka:9094
-ssl.keystore.location=/etc/kafka/secrets/server.keystore.jks
-ssl.keystore.password=${KEYSTORE_PASSWORD}
-ssl.key.password=${KEY_PASSWORD}
-ssl.truststore.location=/etc/kafka/secrets/server.truststore.jks
-ssl.truststore.password=${TRUSTSTORE_PASSWORD}
-ssl.client.auth=required          # mTLS: require client cert
+ssl.keystore.type=PEM                      # PEM supported since 2.7 (KIP-651), easier with cert-manager
+ssl.keystore.location=/etc/kafka/tls/broker.pem
+ssl.truststore.type=PEM
+ssl.truststore.location=/etc/kafka/tls/ca-bundle.pem
 ssl.enabled.protocols=TLSv1.3,TLSv1.2
-ssl.cipher.suites=TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256
 
-# SASL
 sasl.enabled.mechanisms=SCRAM-SHA-512,OAUTHBEARER
-listener.name.sasl_ssl.scram-sha-512.sasl.jaas.config= \
-  org.apache.kafka.common.security.scram.ScramLoginModule required;
-listener.name.sasl_ssl.oauthbearer.sasl.jaas.config= \
+sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
+# OAUTHBEARER: validate real JWTs against the IdP's JWKS (KIP-768). The default
+# OAUTHBEARER handlers accept UNSECURED tokens and are for development only.
+listener.name.sasl_ssl.oauthbearer.sasl.server.callback.handler.class=\
+  org.apache.kafka.common.security.oauthbearer.OAuthBearerValidatorCallbackHandler
+listener.name.sasl_ssl.oauthbearer.sasl.jaas.config=\
   org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;
+sasl.oauthbearer.jwks.endpoint.url=https://idp.example.com/.well-known/jwks.json
+sasl.oauthbearer.expected.audience=kafka
 
-# Authorization
-authorizer.class.name=kafka.security.authorizer.AclAuthorizer
-super.users=User:admin       # Bypasses ACL checks
-allow.everyone.if.no.acl.found=false  # DENY by default!
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+super.users=User:admin;User:broker          # bypass ALL ACLs: keep this list tiny
+allow.everyone.if.no.acl.found=false        # deny by default
 ```
 
-**ACL Management (Multi-Tenant Example):**
+**ACLs for one tenant** (the admin client authenticates with `--command-config`):
 
 ```bash
-# Team A: can read/write team-a-* topics
-kafka-acls --authorizer-properties zookeeper.connect=zk:2181 \
+# Producer: write + describe on team-a.* topics, and its transactional IDs if it uses EOS
+kafka-acls.sh --bootstrap-server kafka:9094 --command-config admin.properties \
   --add --allow-principal User:team-a-producer \
   --operation Write --operation Describe \
-  --topic 'team-a-' --resource-pattern-type prefixed
+  --topic team-a. --resource-pattern-type prefixed
+kafka-acls.sh --bootstrap-server kafka:9094 --command-config admin.properties \
+  --add --allow-principal User:team-a-producer \
+  --operation Write --operation Describe \
+  --transactional-id team-a. --resource-pattern-type prefixed
 
-kafka-acls --authorizer-properties zookeeper.connect=zk:2181 \
+# Consumer: read on team-a.* topics AND team-a.* groups (both prefixed)
+kafka-acls.sh --bootstrap-server kafka:9094 --command-config admin.properties \
   --add --allow-principal User:team-a-consumer \
   --operation Read --operation Describe \
-  --topic 'team-a-' --resource-pattern-type prefixed \
-  --group team-a- --resource-pattern-type prefixed
+  --topic team-a. --group team-a. --resource-pattern-type prefixed
 
-# Admin: full access
-kafka-acls --authorizer-properties zookeeper.connect=zk:2181 \
-  --add --allow-principal User:admin \
-  --operation All --topic '*' --group '*' \
-  --cluster
+# Revoke = remove the ALLOW binding (a DENY binding is a separate, explicit rule that overrides allows)
+kafka-acls.sh --bootstrap-server kafka:9094 --command-config admin.properties \
+  --remove --allow-principal User:team-a-producer \
+  --operation Write --topic team-a. --resource-pattern-type prefixed
 
-# Revoke: remove access
-kafka-acls --authorizer-properties zookeeper.connect=zk:2181 \
-  --remove --deny-principal User:team-b-producer \
-  --operation Write --topic 'team-a-' --resource-pattern-type prefixed
+# Quota per tenant
+kafka-configs.sh --bootstrap-server kafka:9094 --command-config admin.properties --alter \
+  --entity-type users --entity-name team-a-producer \
+  --add-config 'producer_byte_rate=52428800,consumer_byte_rate=104857600,request_percentage=50'
 ```
 
-**Certificate Rotation Without Downtime:**
+**Certificate rotation without downtime:**
 
-```bash
-# Strategy: use two keystores + alias-based rotation
-
-# Phase 1: Prepare new certificate (while old is still valid)
-# Generate new CSR with same DN
-keytool -certreq -alias kafka-server-current \
-  -keystore server.keystore.jks -file server.csr
-
-# Sign with internal CA → get new certificate
-# Import CA chain + new cert with new alias
-keytool -import -alias kafka-server-new \
-  -keystore server.keystore.jks -file server-signed.crt
-
-# Phase 2: Rolling restart of brokers (one at a time)
-# Each broker restarts with BOTH old and new cert in keystore
-# Clients still connect with old cert → no disruption
-
-# Phase 3: Update client truststores
-# Distribute new CA certificate to all clients
-# Clients trust both old and new certs during transition
-
-# Phase 4: Remove old certificate
-keytool -delete -alias kafka-server-current \
-  -keystore server.keystore.jks
-# Rolling restart again to remove old alias
-```
+- **Leaf certificate renewal (same CA):** Kafka reloads SSL configs dynamically (KIP-226). Write the new keystore and run `kafka-configs.sh --alter --entity-type brokers --entity-name <id> --add-config listener.name.sasl_ssl.ssl.keystore.location=<path>`. Re-pointing to the same path triggers a reload. New connections use the new certificate, existing ones carry on. No restart, so short-lived certificates from cert-manager or Vault are practical.
+- **CA rotation:** (1) add the new CA to **every** truststore, brokers and clients, keeping the old one. (2) Reissue broker and client certificates from the new CA. (3) Once nothing presents an old-CA certificate, remove the old CA from the truststores. Getting the order wrong breaks the handshake for whoever got ahead.
+- For SCRAM/OAuth, the credentials rotate independently of TLS. Plan both.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Defense in depth** | Explains TLS + SASL + ACLs as layered controls |
-| **Deny by default** | Knows allow.everyone.if.no.acl.found=false (SECURITY!) |
-| **Certificate rotation** | Can describe alias-based rotation without downtime |
-| **Super users** | Understands super.users bypass ALL ACLs — must restrict |
+| **Defense in depth** | TLS + authentication + ACLs + quotas, and knows the TLS CPU cost |
+| **KRaft-era config** | `StandardAuthorizer`, SCRAM in the metadata log, `kafka-acls --bootstrap-server` |
+| **Deny by default** | `allow.everyone.if.no.acl.found=false`, a minimal `super.users` |
+| **Tenant model** | Prefixed ACLs on topics, groups and transactional IDs, plus naming enforcement |
+| **Certificate rotation** | Dynamic reload, and the CA rotation ordering |
+
+**What they probe next:** "How do you stop a team creating topics outside its prefix?" A Create ACL on the prefixed topic pattern only, or create topics via GitOps/an operator rather than through clients. "Encryption at rest?" Disk or volume encryption. Kafka doesn't encrypt segments itself.
 
 ---
 
@@ -1075,117 +971,54 @@ keytool -delete -alias kafka-server-current \
 
 **Q:** "Your team is choosing between Kafka, Pulsar, and Redpanda for a new real-time data platform. Walk through the architectural differences. What workloads would make you choose each one?"
 
-**What They're Really Testing:** Whether you understand the fundamental architectural differences — storage/compute separation, tiered storage, and the impact of JVM vs C++ on operations.
+**What They're Really Testing:** Whether you can compare architectures accurately (coupled vs disaggregated storage, thread-per-core C++ vs JVM) and tie the choice to workload, team and cost rather than benchmarks.
+
+!!! tip "30-second answer"
+    **Kafka** is the default: the biggest ecosystem (Connect, Streams, Flink integrations, every managed cloud). In 4.x it's simpler to run (KRaft only) and has open-source tiered storage and queues. **Pulsar** separates stateless brokers from BookKeeper storage. It's strong for multi-tenancy, geo-replication and very many topics, but has more moving parts. **Redpanda** speaks the Kafka API from a single C++ binary (thread-per-core, Raft per partition, no JVM or page cache). Choose it for tail latency and simpler ops, but check the license and the smaller ecosystem. Also consider **object-storage-native** Kafka-compatible systems (WarpStream, AutoMQ, Bufstream) when cross-AZ network cost dominates and higher latency is acceptable.
 
 ### Answer
 
-**Architectural Comparison:**
+| | **Apache Kafka 4.x** | **Apache Pulsar** | **Redpanda** |
+|---|---|---|---|
+| Language/runtime | Java/Scala, JVM | Java, JVM | C++ (Seastar) |
+| Storage | Broker-local log + optional tiered storage (KIP-405, open source since 3.9) | Stateless brokers. Apache BookKeeper "bookies" store segmented ledgers. Offload to object storage. | Broker-local log + tiered storage to S3/GCS/Azure |
+| Metadata/consensus | KRaft controller quorum (ZooKeeper removed in 4.0) | ZooKeeper (or etcd / Oxia) for metadata | Raft per partition + internal controller Raft group |
+| Replication | ISR, leader-follower pull | Quorum writes to bookies (write quorum / ack quorum) | Raft per partition |
+| I/O model | OS page cache + `sendfile()` | Bookies: journal + ledger storage | Thread-per-core, own cache, direct I/O (bypasses page cache) |
+| Consumption | Consumer groups, plus share groups (queues) since 4.2 | Exclusive, failover, shared and key-shared subscriptions natively | Kafka API (consumer groups) |
+| Scaling a broker in/out | Must move partition data (cheap with tiered storage) | Brokers are stateless. Bundles move quickly with no data copy. | Must move partition data (helped by tiered storage) |
+| License | Apache 2.0 | Apache 2.0 | Source-available (BSL for core, enterprise license for some features). Check current terms. |
+
+**When to choose each:**
+
+- **Kafka:** the ecosystem matters (Debezium/Connect, Streams, Flink, Schema Registry, managed offerings such as MSK, Confluent, Aiven). The team already knows it. You need mature transactions/EOS. Kafka 4.x removed the "ZooKeeper tax" and covers queue use cases with share groups.
+- **Pulsar:** native multi-tenancy (tenants/namespaces with quotas and policies), built-in geo-replication, millions of topics, or fast elastic scaling of the serving layer. The cost is more components to operate (brokers + bookies + metadata store) and a smaller talent pool.
+- **Redpanda:** tight p99 latency targets, small ops teams that want one binary with no JVM tuning, and edge or resource-constrained deployments. Kafka API compatibility means most clients work, but check the features you depend on (transactions, specific Connect or Streams behaviour) and the licensing terms.
+- **Diskless / object-storage-native** (WarpStream, now part of Confluent; AutoMQ; Bufstream; Kafka's own KIP-1150 "diskless topics" proposal): writes go straight to S3-class storage, with no inter-AZ replication traffic. This can be dramatically cheaper for high-volume logs and telemetry, with end-to-end latency in the hundreds of milliseconds.
+
+**Migration strategy (Kafka → another Kafka-API system, e.g. Redpanda or a managed Kafka):**
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ Kafka (Java, Apache)   │ Pulsar (Java, Apache)    │ Redpanda (C++)   │
-├─────────────────────────┼─────────────────────────┼───────────────────┤
-│ Monolithic broker       │ Separation: serving +    │ Monolithic (like  │
-│ (storage + serving)     │ storage (BookKeeper)     │ Kafka) but in C++ │
-│                         │ Tier 1: Broker          │ No ZooKeeper:     │
-│ ZooKeeper required      │ Tier 2: BookKeeper       │ uses Raft via     │
-│ (or KRaft)              │ Tier 3: Offload (S3)     │ Pandora protocol  │
-├─────────────────────────┼─────────────────────────┼───────────────────┤
-│ Storage: local disk     │ Storage: BookKeeper      │ Storage: local    │
-│ Page cache based        │ separates from serving   │ disk + tiered to  │
-│ No tiered storage (not  │ Native tiered storage    │ S3 (Tiered via    │
-│ built-in, Confluent has │ (offload to S3/GCS)      │ RAFC v2)          │
-│ it as a paid feature)   │                          │                   │
-├─────────────────────────┼─────────────────────────┼───────────────────┤
-│ Consumer: pull-based    │ Consumer: pull-based     │ Consumer:         │
-│ via FETCH requests      │ via long-poll            │ pull-based,       │
-│ No segment read        │ No segment read          │ segment read via  │
-│ (must read whole batch) │ (must read whole batch)   │ io_uring          │
-├─────────────────────────┼─────────────────────────┼───────────────────┤
-│ JVM: GC pauses          │ JVM: GC pauses           │ No JVM: no GC     │
-│ Heap: 8-32GB typical   │ Same                    │ Direct memory     │
-│ Large heap → GC tuning  │                          │ allocation        │
-│ Kafka avoids GC by      │                          │ Predictable       │
-│ minimizing heap usage   │                          │ latency (no GC)   │
-└─────────────────────────┴─────────────────────────┴───────────────────┘
+1. Replicate with MirrorMaker 2 (Connect-based; MirrorMaker 1 was removed in Kafka 4.0)
+   or the vendor's tool. MM2 also translates consumer group offsets (checkpoints).
+2. Move consumers first, starting from translated offsets (they must tolerate some duplicates).
+3. Move producers. Stop replication once the old cluster is drained.
+4. Keep the old cluster read-only for a rollback window.
 ```
 
-**When to Choose Each:**
-
-```yaml
-Choose Kafka when:
-  - Largest ecosystem: connectors, Schema Registry, ksqlDB, Streams
-  - Team already knows Kafka operations
-  - Need mature Exactly-Once Semantics
-  - Primarily throughput-oriented, latency-tolerant (>10ms)
-  - Many integrations: Debezium, Kafka Connect ecosystem
-
-Choose Pulsar when:
-  - Need native multi-tenancy (within single cluster)
-  - Geo-replication is a primary requirement
-  - Need tiered storage (hot/warm/cold)
-  - Serverless workloads with Pulsar Functions
-  - Storage and compute must scale independently
-  - Read:Write ratio is highly skewed (Pulsar's BookKeeper handles read scaling better)
-
-Choose Redpanda when:
-  - Sub-5ms end-to-end latency required
-  - Want to eliminate ZooKeeper dependency
-  - Operations team prefers a single binary (no JVM tuning)
-  - Predictable p99 latency more important than ecosystem
-  - Need tiered storage without Confluent licensing
-  - Running Kubernetes native (simpler operator than Strimzi)
-```
-
-**Redpanda's Key Technical Differentiators:**
-
-```yaml
-# No ZooKeeper: Raft consensus via Pandora protocol
-# Each partition is a Raft group (3 or 5 replicas)
-
-# io_uring for async I/O (instead of epoll + page cache)
-# Kernel 5.1+ feature: submission/completion queues
-# The application manages its own I/O scheduling
-# Redpanda bypasses the page cache entirely!
-
-# Single binary, no JVM:
-# - No GC pauses → p99 latency < 5ms sustained
-# - No heap tuning → -Xms/-Xmx doesn't exist
-# - Memory is managed via seastar (shared-nothing per core)
-
-# The trade-off:
-# Redpanda is faster AND simpler to operate
-# BUT: smaller ecosystem, fewer connectors
-# AND: Schema Registry is immature relative to Confluent's
-```
-
-**Migration Strategy (Kafka → Pulsar or Redpanda):**
-
-```python
-# MirrorMaker 2.0 for bidirectional replication during migration
-# Run both clusters in parallel
-
-# Phase 1: MirrorMaker copies from Kafka to target
-# Phase 2: Applications read from Kafka, write to both
-# Phase 3: Cutover applications to new cluster
-# Phase 4: Shut down Kafka
-
-# Example MirrorMaker config:
-kafka-mirror-maker --consumer.config consumer-kafka.properties \
-                   --producer.config producer-pulsar.properties \
-                   --num.streams 4 \
-                   --topics '.*'
-```
+Pulsar isn't Kafka-wire-compatible out of the box. You'd use the Kafka-on-Pulsar protocol handler or Pulsar IO connectors, or dual-write at the application layer, which makes the migration a much larger project.
 
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
 |-----------|----------------------|
-| **Architecture depth** | Understands BookKeeper layer in Pulsar, io_uring in Redpanda |
-| **Trade-off articulation** | Can give specific workload-appropriate recommendations |
-| **Ecosystem awareness** | Knows Kafka's ecosystem strength vs others' operational simplicity |
-| **Migration** | Can describe MirrorMaker-based migration strategy |
+| **Architecture accuracy** | BookKeeper separation in Pulsar, thread-per-core + Raft in Redpanda, KRaft + tiered storage in Kafka 4.x |
+| **Trade-off articulation** | Ties the choice to workload, team skills, cost (cross-AZ traffic) and license |
+| **Currency** | Doesn't claim Kafka needs ZooKeeper or lacks tiered storage or queues |
+| **Migration** | MM2 with offset translation, consumers-first cutover, rollback plan |
+
+**What they probe next:** "Where does the cost go in a cloud Kafka deployment?" Often cross-AZ replication and consumer traffic, more than compute. Mitigations: fetch-from-follower, tiered storage, diskless designs. "Would you build on Kafka Streams or Flink?" Streams is a library embedded in your service. Flink is a separate cluster with richer windowing, SQL and state, at the cost of more operations.
 
 ---
 
-> *All 12 questions cover the full breadth of Kafka internals, operations, and ecosystem — from storage internals to production operations and competitive analysis.*
+> *These 12 questions cover Kafka from storage internals to production operations and platform choice. Re-check the version baseline at the top when Kafka 5.0 ships.*
