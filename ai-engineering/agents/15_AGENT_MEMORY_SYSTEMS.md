@@ -2,7 +2,11 @@
 
 > **Category:** AI Engineering — Memory Architectures  
 > **Target Level:** Staff/Principal Engineer  
-> **Why this matters:** Memory is the #1 differentiator between a toy agent and a production-grade agent. Without proper memory architecture, agents lose context, repeat mistakes, and can't learn from experience.
+> **Why this matters:** Without a deliberate memory design, agents lose track of long tasks, make users repeat themselves, and repeat their own mistakes. With a careless one, they leak data between users and faithfully remember injected instructions.  
+> **Reviewed:** October 2026
+
+!!! tip "30-second answer"
+    LLMs are stateless; "memory" is whatever you choose to put back into the context window. Split it by lifetime: **in-context** (recent turns, compacted or summarized as the window fills), **working/task state** (structured, checkpointed per run, e.g. a LangGraph checkpointer per `thread_id`), and **long-term** (cross-session facts, preferences and past episodes in a store, retrieved on demand). The hard parts are not storage but **policy**: what to write (and who decides: the app, or the model via a memory tool), how to update or expire conflicting facts, how to retrieve only what's relevant within a token budget, and how to keep it scoped per user/tenant and safe from memory poisoning.
 
 ---
 
@@ -93,6 +97,18 @@ Failure 3: No Error Learning
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### 2.1 Where Memory Lives in 2026: Build vs Use What's There
+
+| Need | Off-the-shelf options | Notes |
+|------|----------------------|-------|
+| Keep a long agent run inside the window | Server-side **compaction** and **context editing** (clearing old tool results) on the Anthropic API; summarization middleware in LangChain v1 | Cheaper and simpler than hand-rolled summarizers; keep raw history in your own store |
+| Resume a conversation or run | **Checkpointers** (LangGraph Postgres/Redis savers), OpenAI **Conversations API** / `previous_response_id` | Thread-scoped state, not cross-session memory |
+| Cross-session facts per user | LangGraph **Store** (namespaced key-value + semantic search), your own Postgres/pgvector table | Namespace by tenant and user |
+| Model-managed notes | Anthropic **memory tool** (the model reads and writes files in a `/memories` directory your code backs), "notes file" patterns in coding agents | The model decides what is worth remembering; you control storage and access |
+| Dedicated memory layers | Letta (MemGPT lineage: self-editing memory blocks), Mem0 (fact extraction and update), Zep/Graphiti (temporal knowledge graph) | Useful when memory is the product; another dependency otherwise |
+
+The patterns in the rest of this page are what these tools implement; know them so you can choose and debug, not necessarily to rebuild them.
+
 ---
 
 ## 3. Short-Term (Working) Memory
@@ -118,17 +134,17 @@ class SlidingWindowMemory:
         total_tokens = count_tokens(self.turns)
         budget = self.max_tokens - self.reserve_tokens
         
+        evicted = []
         while total_tokens > budget and len(self.turns) > 2:
-            # Remove oldest turns
-            oldest = self.turns.pop(0)
-            
-            # Summarize removed turns
-            if self.summary is None:
-                self.summary = self._summarize(oldest)
-            else:
-                self.summary = self._summarize(self.summary + oldest)
-            
+            # Remove oldest turns (collect them; one summarization call per
+            # trim, not one LLM call per evicted turn)
+            evicted.append(self.turns.pop(0))
             total_tokens = count_tokens(self.turns)
+        
+        if evicted:
+            text = "\n".join(str(t) for t in evicted)
+            prior = f"Summary so far:\n{self.summary}\n\n" if self.summary else ""
+            self.summary = self._summarize(prior + "New turns:\n" + text)
     
     def _summarize(self, content: str) -> str:
         """Use LLM to summarize old conversation turns."""
@@ -143,10 +159,14 @@ class SlidingWindowMemory:
         return "\n\n".join(parts)
 ```
 
+Trim on **turn boundaries** and never split a tool call from its result (providers reject a tool call without its matching result). Keep the full raw transcript in storage; only the *prompt* is summarized.
+
 ### Token Budget Allocation
 
+Current frontier models have context windows from ~200K to ~1M tokens, but a budget still matters: you pay for every input token on every turn, latency grows with input size, and models get worse at using facts buried in very long contexts. An illustrative budget for a deliberately small working set:
+
 ```python
-# For a 32K context window:
+# Illustrative working-set budget of 32K tokens (even on a larger window):
 CONTEXT_BUDGET = {
     "system_instructions": 1000,    # 3%
     "tools_and_schemas": 4000,     # 12.5%
@@ -202,11 +222,13 @@ class WorkingMemory:
 
 ### Storage Backend Comparison
 
+Latencies are typical orders of magnitude within one region, not benchmarks.
+
 | Backend | Best For | Read Speed | Write Speed | Query Type | Persistence |
 |---------|----------|------------|-------------|------------|-------------|
 | **Redis** | KV facts, session state | <1ms | <1ms | Exact key lookup | Optional (RDB/AOF) |
 | **PostgreSQL** | Structured user data, preferences | 1-5ms | 1-5ms | SQL queries | Durable |
-| **Vector DB (Pinecone, Weaviate, Qdrant)** | Semantic search over memories | 5-20ms | 10-50ms | Similarity search | Durable |
+| **Vector DB (Pinecone, Weaviate, Qdrant) or pgvector** | Semantic search over memories | 5-20ms | 10-50ms | Similarity search (+ metadata filters) | Durable |
 | **SQLite** | Local/embedded, on-premise | <1ms | <1ms | SQL | File-based |
 | **S3/GCS** | Large blobs, conversation archives | 50-200ms | 50-200ms | Metadata + content | Durable |
 
@@ -214,37 +236,39 @@ class WorkingMemory:
 
 ```python
 class RedisMemory:
-    """Fast key-value memory for user preferences and session state."""
+    """Fast key-value memory for user preferences and session state.
+
+    One HASH per user: recall_all is a single HGETALL instead of a KEYS scan
+    (KEYS is O(N) over the whole keyspace and blocks Redis).
+    """
     
     def __init__(self, redis_url: str = "redis://localhost:6379"):
-        self.redis = redis.from_url(redis_url)
+        self.redis = redis.from_url(redis_url, decode_responses=True)
         self.default_ttl = 86400 * 30  # 30 days
+    
+    def _key(self, user_id: str) -> str:
+        return f"memory:{user_id}"
     
     async def remember(self, user_id: str, key: str, value: Any, ttl: int = None):
         """Store a fact about a user."""
-        await self.redis.setex(
-            f"memory:{user_id}:{key}",
-            ttl or self.default_ttl,
-            json.dumps(value)
-        )
+        await self.redis.hset(self._key(user_id), key, json.dumps(value))
+        # Per-field TTL needs Redis 7.4+ (HEXPIRE); otherwise the TTL applies
+        # to the user's whole hash.
+        await self.redis.hexpire(self._key(user_id), ttl or self.default_ttl, key)
     
     async def recall(self, user_id: str, key: str) -> Optional[Any]:
         """Retrieve a stored fact."""
-        data = await self.redis.get(f"memory:{user_id}:{key}")
+        data = await self.redis.hget(self._key(user_id), key)
         return json.loads(data) if data else None
     
     async def recall_all(self, user_id: str) -> Dict[str, Any]:
         """Get all memories for a user."""
-        keys = await self.redis.keys(f"memory:{user_id}:*")
-        memories = {}
-        for key in keys:
-            field = key.decode().split(":")[-1]
-            memories[field] = json.loads(await self.redis.get(key))
-        return memories
+        raw = await self.redis.hgetall(self._key(user_id))
+        return {k: json.loads(v) for k, v in raw.items()}
     
     async def forget(self, user_id: str, key: str):
         """Explicitly remove a memory."""
-        await self.redis.delete(f"memory:{user_id}:{key}")
+        await self.redis.hdel(self._key(user_id), key)
 ```
 
 ### Vector Store — Semantic Memory
@@ -283,7 +307,7 @@ class VectorMemory:
     async def search(
         self,
         query: str,
-        user_id: str = None,
+        user_id: str,                 # required: never search across users by default
         memory_type: str = None,
         top_k: int = 5,
         score_threshold: float = 0.7
@@ -291,10 +315,9 @@ class VectorMemory:
         """Search memories by semantic similarity."""
         query_embedding = await self.embedder.embed(query)
         
-        # Build filter
-        filters = {}
-        if user_id:
-            filters["user_id"] = user_id
+        # Build filter (tenant/user scoping is a security control, not an
+        # optimization: an unfiltered search can return another user's memories)
+        filters = {"user_id": user_id}
         if memory_type:
             filters["type"] = memory_type
         
@@ -319,26 +342,33 @@ class VectorMemory:
 ### PostgreSQL — Structured Memory
 
 ```sql
--- Schema for structured long-term memory
+-- Schema for structured long-term memory (PostgreSQL + pgvector)
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE agent_memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id VARCHAR(64) NOT NULL,
     user_id VARCHAR(255) NOT NULL,
     memory_type VARCHAR(50) NOT NULL,  -- 'preference', 'fact', 'resolution', 'conversation'
     key VARCHAR(255),
     value JSONB NOT NULL,
-    embedding VECTOR(1536),  -- pgvector extension
-    created_at TIMESTAMP DEFAULT NOW(),
-    expires_at TIMESTAMP,
-    importance_score FLOAT DEFAULT 0.5,
-    
-    -- Indexes
-    CONSTRAINT unique_user_key UNIQUE (user_id, key) WHERE key IS NOT NULL
+    embedding VECTOR(1536),            -- dimension is fixed by your embedding model
+    source VARCHAR(64),                -- who wrote it: 'user_stated', 'extracted', 'agent'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    importance_score REAL DEFAULT 0.5
 );
 
-CREATE INDEX idx_memories_user ON agent_memories(user_id);
-CREATE INDEX idx_memories_type ON agent_memories(memory_type);
-CREATE INDEX idx_memories_expires ON agent_memories(expires_at) WHERE expires_at IS NOT NULL;
-CREATE INDEX idx_memories_embedding ON agent_memories USING ivfflat (embedding vector_cosine_ops);
+-- A partial unique constraint must be a unique INDEX (a table constraint
+-- can't have a WHERE clause)
+CREATE UNIQUE INDEX uq_memories_user_key
+    ON agent_memories (tenant_id, user_id, key) WHERE key IS NOT NULL;
+CREATE INDEX idx_memories_user ON agent_memories (tenant_id, user_id, memory_type);
+CREATE INDEX idx_memories_expires ON agent_memories (expires_at) WHERE expires_at IS NOT NULL;
+-- HNSW (pgvector 0.5+) is the usual default: better recall/latency than
+-- IVFFlat and no need to build after loading data. Filter by user first.
+CREATE INDEX idx_memories_embedding ON agent_memories USING hnsw (embedding vector_cosine_ops);
 ```
 
 ---
@@ -399,10 +429,13 @@ class EpisodicMemory:
         episodes = await self._find_by_tag(tag)
         lessons = []
         for ep in episodes:
-            if ep.outcome == "failed":
-                lessons.append(f"Avoid: {ep.problem_summary}")
-            elif ep.outcome == "success" and ep.user_feedback and ep.user_feedback > 4:
-                lessons.append(f"Repeat: {ep.problem_summary}")
+            # A lesson is about the APPROACH, in the context of the problem;
+            # "avoid <problem>" teaches nothing.
+            approach = " → ".join(s.tool_name for s in ep.steps_taken)
+            if ep.outcome == "failed" and ep.failure_reason != "transient":
+                lessons.append(f"For '{ep.problem_summary}', {approach} failed: {ep.failure_reason}")
+            elif ep.outcome == "success" and ep.user_feedback and ep.user_feedback >= 4:
+                lessons.append(f"For '{ep.problem_summary}', {approach} worked")
         return lessons
     
     def _extract_tags(self, task: Task, result: Result) -> List[str]:
@@ -455,6 +488,8 @@ class MemoryAwareAgent:
         
         return result
 ```
+
+Caveats: a past *failure* may have been a transient outage, not a bad approach, so record the failure reason and don't steer away on timeouts. Past episodes can be stale (the API changed) or poisoned, so present them as hints, not instructions. And measure: episodic memory helps only if eval runs show higher task success with it than without.
 
 ---
 
@@ -712,20 +747,26 @@ class ImportanceWeightedMemory:
             "access_count": 0
         })
     
-    async def get_top_k(self, k: int = 10) -> List[str]:
-        """Get the K most important memories."""
+    async def get_top_k(self, user_id: str, k: int = 10) -> List[str]:
+        """Get the K most important memories FOR THIS USER."""
         return await self.db.query(
-            "SELECT content FROM memories ORDER BY importance DESC, access_count DESC LIMIT $1",
-            [k]
+            """SELECT content FROM memories
+               WHERE user_id = $1
+               ORDER BY importance DESC, access_count DESC LIMIT $2""",
+            [user_id, k]
         )
     
     async def _estimate_importance(self, content: str) -> float:
-        """Use LLM to estimate how important this memory is."""
-        response = await llm.call(
-            f"Rate the importance of this information for future conversations "
-            f"(0.0 = trivial, 1.0 = critical):\n{content}\n\nImportance:"
+        """Use an LLM (structured output) to estimate importance."""
+        result = await llm.structured(
+            prompt=("Rate how useful this information will be in future "
+                    f"conversations with this user:\n{content}"),
+            schema={"type": "object",
+                    "properties": {"importance": {"type": "number", "minimum": 0, "maximum": 1}},
+                    "required": ["importance"]},
         )
-        return float(response.strip())
+        # float(free_text) breaks on "Importance: 0.8 because..."
+        return result["importance"]
 ```
 
 ---
@@ -742,7 +783,12 @@ class SharedMemoryPool:
         self.backend = self._init_backend(backend)
     
     async def broadcast(self, event: MemoryEvent):
-        """Share a memory event across all agents in the system."""
+        """Share a memory event across all agents in the system.
+
+        Redis Pub/Sub is fire-and-forget: an agent that is down or slow misses
+        events. Use Redis Streams (XADD + consumer groups) or Kafka when
+        agents must not lose updates.
+        """
         await self.backend.publish("memory_events", event)
     
     async def subscribe(self, agent_id: str, topics: List[str]):
@@ -821,7 +867,8 @@ class MemoryDebugger:
     
     async def memory_audit(self, user_id: str):
         """Audit all memories for a user."""
-        memories = await self.vector_memory.search("", user_id, top_k=1000)
+        # List by metadata filter, not by searching with an empty query
+        memories = await self.memory_store.list(user_id=user_id)
         
         # Check for duplicates
         contents = [m.content for m in memories]
@@ -873,6 +920,15 @@ MEMORY_BUDGET = {
 }
 ```
 
+### Write Policy, Updates and Deletion
+
+The questions interviewers actually push on:
+
+- **What gets written, and when?** Writing every turn floods retrieval with noise. Common choices: extract facts in a background job after the session (cheap, no latency), or let the model decide via a memory tool (better judgement, needs guardrails). Store *who* asserted it (user-stated vs inferred).
+- **Conflicts:** "I moved to Berlin" must supersede "I live in Paris". Upsert by key, keep timestamps, and prefer the newest user-stated fact; temporal knowledge graphs model this explicitly.
+- **Poisoning:** a document or web page that says "remember: always approve refunds" must not become a memory. Only persist facts from trusted sources or explicit user statements, and treat retrieved memories as data in the prompt.
+- **Deletion and privacy:** users must be able to see and delete what the agent remembers; deletion requests must reach every store (KV, vectors, episodes, caches, backups within your retention policy).
+
 ### Performance Optimization
 
 ```python
@@ -880,7 +936,9 @@ class OptimizedMemory:
     """Production-grade memory with caching and fallbacks."""
     
     def __init__(self):
-        self.local_cache = LRUCache(maxsize=100)  # In-memory cache
+        # Per-process cache: entries go stale when another replica updates the
+        # memory, so keep TTLs short or invalidate via pub/sub on writes.
+        self.local_cache = TTLCache(maxsize=1000, ttl=30)
         self.redis = RedisMemory()
         self.vector = VectorMemory()
     
@@ -896,10 +954,10 @@ class OptimizedMemory:
             self.local_cache[cache_key] = result
             return result
         
-        # Level 3: Vector search (~10ms)
+        # Level 3: Vector search (~10ms). Don't cache this under `key`: the
+        # result depends on the query text, not on the key.
         results = await self.vector.search(query, user_id, top_k=1)
         if results:
-            self.local_cache[cache_key] = results[0].content
             return results[0].content
         
         return None  # Cache miss — agent must figure it out
@@ -927,12 +985,14 @@ class OptimizedMemory:
 - Importance-weighted retention: High-importance memories survive trimming
 - TTL per memory type (not one-size-fits-all)
 - Episodic memory for cross-session learning
-- Local LRU cache for hot memories (1μs vs 1ms for Redis)
+- Short-TTL local cache for hot memories, with invalidation on writes
+- Per-user scoping on every read, and a user-visible "what I remember" view with delete
+- Evaluate it: task success and user-repeat rate with memory on vs off
 </details>
 
 ### Question 2: Context Window Management
 
-**Problem:** "Your agent has a 32K context window. A conversation has 50 turns with 5 tool calls each. The context is filling up. How do you manage this?"
+**Problem:** "A conversation has 50 turns with 5 tool calls each and the context is filling up (cost and latency are climbing too). How do you manage this?"
 
 <details>
 <summary>🎯 Answer</summary>
@@ -940,24 +1000,25 @@ class OptimizedMemory:
 **Strategy:** Structured context management with token budgeting.
 
 ```python
-# Budget allocation for 32K window
+# Illustrative budget for a 32K working set
 CONTEXT_BUDGET = {
-    system + tools: 5000,       # 16%
-    working_memory: 2000,       # 6%
-    recent_conversation: 12000, # 37%
-    summarized_history: 6000,   # 19%
-    long_term_memory: 3000,     # 9%
-    agent_scratchpad: 4000      # 13%
+    "system_and_tools": 5000,      # 16%
+    "working_memory": 2000,        # 6%
+    "recent_conversation": 12000,  # 37%
+    "summarized_history": 6000,    # 19%
+    "long_term_memory": 3000,      # 9%
+    "agent_scratchpad": 4000,      # 13%
 }
 ```
 
 **When budget is exceeded:**
-1. First: Trim oldest conversation turns → summarize in batches
-2. Then: Compress summaries (recursive summarization)
-3. Then: Drop lowest-importance long-term memories
-4. Never: Drop system instructions or tools
+1. First: Clear or truncate old **tool results** (usually the bulk of an agent transcript and the least needed later)
+2. Then: Trim oldest conversation turns → summarize in batches (or use server-side compaction)
+3. Then: Compress summaries (recursive summarization)
+4. Then: Drop lowest-importance long-term memories
+5. Never: Drop system instructions or tool definitions, and never split a tool call from its result
 
-**Key insight:** The agent should know its own context usage and adapt accordingly. Include a "context remaining" note in the system prompt.
+**Key insights:** Keep the stable prefix (system + tools) byte-identical so **prompt caching** keeps working; editing the system prompt every turn (e.g. to insert a "context remaining" counter) invalidates the cache, so put such notes in a message at the end instead. Some newer models are trained to track their remaining context themselves.
 </details>
 
 ### Question 3: Memory Retrieval Optimization
@@ -972,7 +1033,7 @@ CONTEXT_BUDGET = {
 1. **Pre-filtering:** Apply metadata filters before vector search (user_id, memory_type, recency)
 2. **Hybrid search:** Combine semantic + keyword (BM25) for better relevance
 3. **Re-ranking:** After initial search, use a cross-encoder or LLM to re-rank results
-4. **Threshold filtering:** Don't include results below 0.7 similarity score
+4. **Threshold filtering:** Drop results below a similarity score tuned for your embedding model (0.7 below is illustrative; score scales differ between models)
 5. **Deduplication:** Remove near-duplicate memories before adding to context
 6. **Importance gating:** Only include high-importance memories by default, low-importance only if there's budget
 

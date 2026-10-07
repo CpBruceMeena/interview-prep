@@ -1,6 +1,6 @@
-# 🤖 LLM Internals — Claude, Model Interaction, Tokenization & the Complete Request/Response Cycle
+# 🤖 LLM Internals — Claude, Claude Code, Tokens & the Request/Response Cycle
 
-> **A deep-dive into how LLMs like Claude work under the hood — from prompt assembly to token calculation, model inference, and response generation.**
+> **How LLMs like Claude work under the hood, from prompt assembly to tokenization, inference, sampling, tool-use loops and cost. Claude- and Claude Code–specific claims are checked against Anthropic's official docs (October 2026); general transformer mechanics are labelled as such, because Anthropic doesn't publish Claude's architecture.**
 
 ---
 
@@ -8,28 +8,26 @@
 
 | # | Document | Description |
 |---|----------|-------------|
-| 1 | [How Claude Works](01_HOW_CLAUDE_WORKS.md) | Model architecture, training, context window, safety |
-| 2 | [Claude Code/Editor — Interaction Flow](02_CLAUDE_CODE_INTERACTION.md) | How Claude Code/Edition interacts with models, tools, and the file system |
-| 3 | [The Request/Response Cycle](03_REQUEST_RESPONSE_CYCLE.md) | Complete end-to-end flow: what data is sent, how the LLM processes it, how responses come back |
-| 4 | [Tokenization & Token Calculation](04_TOKENIZATION_AND_COST.md) | How tokens work — input, output, pricing, and optimization |
-| 5 | [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) | Crafting effective system prompts, role design, constraints |
-| 6 | [How Claude Makes Code Changes](06_HOW_CLAUDE_MAKES_CODE_CHANGES.md) | Step-by-step flow of code changes, debugging, and user input decisions |
-| 7 | [Cost Optimization Best Practices](07_COST_OPTIMIZATION_BEST_PRACTICES.md) | Practical strategies to use LLMs effectively while minimizing costs |
+| 1 | [How Claude Works](01_HOW_CLAUDE_WORKS.md) | What's public vs not, transformer background, training (pre-training, RLHF, Constitutional AI), context window, prefill/decode, sampling, safety |
+| 2 | [Claude Code — Interaction Flow](02_CLAUDE_CODE_INTERACTION.md) | The agentic harness: what's loaded into context, real tool names, the request/stream/tool loop, context management, permissions |
+| 3 | [The Request/Response Cycle](03_REQUEST_RESPONSE_CYCLE.md) | Messages API request anatomy, what happens server-side, streaming events, stop reasons, token growth across tool calls |
+| 4 | [Tokenization & Token Calculation](04_TOKENIZATION_AND_COST.md) | BPE, counting tokens with the API, input/output/cache/batch pricing, prompt caching mechanics |
+| 5 | [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) | Anthropic's current prompting guidance, patterns, antipatterns, and evaluating prompts |
+| 6 | [How Claude Makes Code Changes](06_HOW_CLAUDE_MAKES_CODE_CHANGES.md) | Traced code-change and debugging loops: Read/Edit/Write/Bash, permissions, hooks, checkpoints |
+| 7 | [Cost Optimization Best Practices](07_COST_OPTIMIZATION_BEST_PRACTICES.md) | The cost levers in order of payoff, measurement, and Claude Code habits |
 
 ---
 
 ## 🎯 Why This Matters
 
-Understanding LLM internals is critical for:
-
 | Reason | Impact |
 |--------|--------|
-| **Cost optimization** | Token-aware design reduces API costs by 30-70% |
-| **Latency reduction** | Understanding inference helps design for faster responses |
-| **Prompt engineering** | Knowing how models process input improves output quality |
-| **Debugging** | Understanding tokenization helps diagnose weird model behavior |
-| **Production deployment** | Capacity planning, caching, and batching strategies |
-| **Agent design** | Tool-use loops depend on understanding the request/response cycle |
+| **Cost** | Token-aware design (caching, batching, context hygiene) is usually the biggest lever on an LLM bill |
+| **Latency** | Prefill drives time-to-first-token; decode drives tokens per second |
+| **Prompt quality** | Knowing what the model actually sees explains most "weird" behaviour |
+| **Debugging** | Tokenization explains character-level failures and surprising token counts |
+| **Production** | Capacity planning, rate limits, caching and batching strategies |
+| **Agent design** | Tool-use loops are just repeated requests with growing context |
 
 ---
 
@@ -37,49 +35,30 @@ Understanding LLM internals is critical for:
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                        COMPLETE LLM INTERACTION FLOW                      │
+│                        ONE LLM REQUEST, END TO END                       │
 │                                                                          │
-│  USER                                                                     │
-│  ┌──────────────────────────────────────────────────────────────────┐    │
-│  │ "Write a function to calculate Fibonacci numbers in Python"      │    │
-│  └──────────────────────────────────────────────────────────────────┘    │
-│                                   │                                       │
-│                                   ▼                                       │
-│  ┌──────────────────────────────────────────────────────────────────┐    │
-│  │                    PROMPT ASSEMBLY                                │    │
-│  │                                                                   │    │
-│  │  System Prompt + Messages + Tools → Tokenized → LLM              │    │
-│  │                                                                   │    │
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌──────────┐  │    │
-│  │  │ System     │  │ User Msgs  │  │ Tool Defs  │  │ Context  │  │    │
-│  │  │ "You are   │  │ "Write     │  │ [execute,  │  │ [files,  │  │    │
-│  │  │ a Python   │+ │ Fibonacci" │+ │ read_file] │+ │ errors]  │  │    │
-│  │  │ expert..." │  │            │  │            │  │          │  │    │
-│  │  └────────────┘  └────────────┘  └────────────┘  └──────────┘  │    │
-│  └──────────────────────────┬───────────────────────────────────────┘    │
-│                             │                                           │
-│                             ▼                                           │
-│  ┌──────────────────────────────────────────────────────────────────┐    │
-│  │                    TOKENIZATION                                   │    │
-│  │                                                                   │    │
-│  │  "Write a function..." → [1456] [892] [331] [1203] ... [789]    │    │
-│  │                                                                   │    │
-│  │  Input tokens: ~1,200  │  Context window used: 23%               │    │
-│  └──────────────────────────┬───────────────────────────────────────┘    │
-│                             │                                           │
-│                             ▼                                           │
-│  ┌──────────────────────────────────────────────────────────────────┐    │
-│  │                    LLM INFERENCE (Claude)                         │    │
-│  │                                                                   │    │
-│  │  1. Token embeddings → Transformer layers → Attention → FFN     │    │
-│  │  2. Next-token prediction (auto-regressive)                       │    │
-│  │  3. Sampling: temperature=0.7, top_p=0.9, top_k=50              │    │
-│  │  4. Response generated token by token                             │    │
-│  │                                                                   │    │
-│  │  Output: "def fibonacci(n):\n    if n <= 1:\n        return n..." │    │
-│  │  Output tokens: ~350                                              │    │
-│  └──────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
+│  USER: "Write a function to calculate Fibonacci numbers in Python"       │
+│                                   │                                      │
+│                                   ▼                                      │
+│  PROMPT ASSEMBLY (client)   tools → system → messages                    │
+│    tool defs   system prompt   history + tool results   new message      │
+│                                   │                                      │
+│                                   ▼                                      │
+│  TOKENIZATION (server)      text → token IDs (model-specific tokenizer)  │
+│    e.g. ~1,200 input tokens; count exactly with count_tokens             │
+│                                   │                                      │
+│                                   ▼                                      │
+│  INFERENCE                                                               │
+│    1. Prefill: all input tokens in parallel → KV cache                   │
+│       (cached prefix reused if prompt caching hits)                      │
+│    2. Decode: one token per step, sampled from the next-token            │
+│       distribution (shaped by effort/thinking on current models)         │
+│    3. Stop: end_turn | tool_use | max_tokens | stop_sequence | refusal   │
+│                                   │                                      │
+│                                   ▼                                      │
+│  RESPONSE  content blocks (thinking, text, tool_use) + stop_reason       │
+│            + usage (input, cache read/write, output tokens)              │
+│    "def fibonacci(n):\n    if n <= 1:\n        return n ..."             │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,7 +69,7 @@ Understanding LLM internals is critical for:
 | Topic | Read This First |
 |-------|-----------------|
 | **New to LLMs?** | [How Claude Works](01_HOW_CLAUDE_WORKS.md) |
-| **Using Claude Code?** | [Claude Code/Editor Interaction](02_CLAUDE_CODE_INTERACTION.md) |
+| **Using Claude Code?** | [Claude Code Interaction](02_CLAUDE_CODE_INTERACTION.md) |
 | **Building agents?** | [Request/Response Cycle](03_REQUEST_RESPONSE_CYCLE.md) |
 | **Optimizing costs?** | [Cost Optimization Best Practices](07_COST_OPTIMIZATION_BEST_PRACTICES.md) (start here) or [Tokenization & Cost](04_TOKENIZATION_AND_COST.md) (deep dive) |
 | **Writing prompts?** | [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) |
@@ -101,4 +80,5 @@ Understanding LLM internals is critical for:
 
 - **[AI Agents](../agents/README.md)** — How agents use LLMs in loops with tool calls
 - **[MCP Protocol](../mcp/README.md)** — How MCP connects AI applications to tools
-- **[RAG Pipeline](../rag/README.md)** — How retrieval augment LLM knowledge
+- **[RAG Pipeline](../rag/README.md)** — How retrieval augments LLM knowledge
+- **[Harness & Loop Engineering](../harness-engineering/README.md)** — Building the scaffolding around the model

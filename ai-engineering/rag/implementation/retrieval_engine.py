@@ -4,11 +4,15 @@ from typing import List, Optional
 
 from config import settings
 from embedding_service import EmbeddingService
-from vector_store import VectorStore, SearchResult, Chunk
+from vector_store import VectorStore, SearchResult
 
 
 class RetrievalEngine:
-    """Orchestrates retrieval: embed query → search → filter → rerank."""
+    """Orchestrates retrieval: embed query → search → filter by threshold.
+
+    Dense-only. Hybrid search (BM25 + dense with RRF) and reranking are the
+    usual next steps; see data/04_retrieval_strategies.md.
+    """
 
     def __init__(self, embedder: EmbeddingService, store: VectorStore):
         self._embedder = embedder
@@ -17,30 +21,24 @@ class RetrievalEngine:
     def retrieve(self, query: str, top_k: Optional[int] = None,
                  threshold: Optional[float] = None) -> List[SearchResult]:
         """Full retrieval pipeline for a query string."""
-        k = top_k or settings.top_k
-        thresh = threshold or settings.similarity_threshold
+        # `is None` checks, not `or`: top_k=0 / threshold=0.0 are legitimate.
+        k = settings.top_k if top_k is None else top_k
+        thresh = settings.similarity_threshold if threshold is None else threshold
 
-        # 1. Embed the query
-        query_vector = self._embedder.embed_text(query)
-
-        # 2. Search the vector store
+        query_vector = self._embedder.embed_query(query)
         results = self._store.search(query_vector, top_k=k)
+        return [r for r in results if r.score >= thresh]
 
-        # 3. Filter by similarity threshold
-        results = [r for r in results if r.score >= thresh]
-
-        return results
-
-    def retrieve_context(self, query: str, top_k: Optional[int] = None
-                         ) -> str:
-        """Retrieve chunks and format as a single context string."""
-        results = self.retrieve(query, top_k=top_k)
-        if not results:
-            return ""
-
+    @staticmethod
+    def format_context(results: List[SearchResult]) -> str:
+        """Format retrieved chunks as one context string with source labels."""
         parts = []
         for i, result in enumerate(results, 1):
             source = result.chunk.metadata.get("source", "unknown")
             parts.append(f"[Source {i}: {source}]\n{result.chunk.text}")
-
         return "\n\n".join(parts)
+
+    def retrieve_context(self, query: str, top_k: Optional[int] = None
+                         ) -> str:
+        """Retrieve chunks and format as a single context string."""
+        return self.format_context(self.retrieve(query, top_k=top_k))

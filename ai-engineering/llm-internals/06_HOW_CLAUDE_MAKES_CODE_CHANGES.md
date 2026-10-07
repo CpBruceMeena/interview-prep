@@ -1,833 +1,315 @@
-# 🔧 How Claude Makes Code Changes — The Complete Step-by-Step Flow
+# 🔧 How Claude Makes Code Changes — The Step-by-Step Flow
 
-> **A deep-dive into what happens when you ask Claude to write code, fix bugs, or refactor — tracing every API call, tool execution, and decision point.**
+> **What happens when you ask Claude Code to add a feature, fix a bug or refactor: every model call, tool execution, permission check and decision point. Tool names and behaviours follow the official [tools reference](https://code.claude.com/docs/en/tools-reference) (checked October 2026).**
+
+!!! warning "Mechanism vs. model judgement"
+    Two kinds of statements appear on this page. **Harness mechanics** (which tools exist, how `Edit` matches text, when permission is asked, how checkpoints work) are documented and deterministic. **Model behaviour** (which file to read next, when to ask you a question, what order to edit files in) is the model's judgement, shaped by its training, Claude Code's system prompt and your CLAUDE.md. Those parts are described as typical behaviour and good practice, not as a fixed algorithm.
+
+**30-second answer:** Claude Code runs a loop: the model looks for the relevant code (search via `Grep`/`Glob` or shell `grep`/`find`, then `Read`), proposes edits as `Edit` calls (exact-string replacement that must match the file uniquely) or `Write` calls (whole file), runs tests or a build through `Bash`, reads the results, and repeats until it's satisfied, then summarises. Each tool call is one model round-trip with the whole conversation resent. Every action passes a permission layer (mode, allow/ask/deny rules, hooks), and file edits are checkpointed so you can rewind.
 
 ---
 
 ## 1. THE BIG PICTURE
 
-When you ask Claude to make a code change, here's the **high-level loop** that runs:
-
 ```ascii
-                    THE CLAUDE CODE CHANGE LOOP
-                    ────────────────────────────
-
-  User says: "Add a health check endpoint"
+                    THE CODE-CHANGE LOOP
+                    ────────────────────
+  You: "Add a health check endpoint"
          │
          ▼
   ┌─────────────────────────────────────────────────────────────┐
-  │  1. READ CONTEXT — Understand the current state              │
-  │     ├── Read project files                                   │
-  │     ├── Search for relevant code                             │
-  │     └── Check git status                                     │
-  │                                                              │
-  │  2. PLAN — Decide what needs to change                       │
-  │     ├── Parse requirements                                   │
-  │     ├── Identify files to modify                             │
-  │     └── Determine change order (dependencies)                 │
-  │                                                              │
-  │  3. EXECUTE — Make the changes                               │
-  │     ├── Apply edits (str_replace / write_file)               │
-  │     ├── Handle dependencies (update imports, etc.)           │
-  │     └── Verify syntax (optional check)                       │
-  │                                                              │
-  │  4. VERIFY — Check correctness                               │
-  │     ├── Run tests                                            │
-  │     ├── Fix any failures                                     │
-  │     └── Confirm the change is complete                       │
-  │                                                              │
-  │  5. REPORT — Tell the user what happened                     │
-  │     ├── Summarize changes made                               │
-  │     ├── Highlight any issues or decisions                    │
-  │     └── Ask for confirmation if needed                       │
-  │                                                              │
+  │ GATHER CONTEXT   search for the app entry point, read files │
+  │                  (CLAUDE.md conventions already in context) │
+  │       ▼                                                     │
+  │ TAKE ACTION      Edit / Write files; maybe add a test       │
+  │       ▼                                                     │
+  │ VERIFY           run tests, linters, type checks via Bash   │
+  │       ▼                                                     │
+  │ failures? ──yes──► diagnose and fix (back to GATHER/ACTION) │
+  │       │ no                                                  │
+  │       ▼                                                     │
+  │ REPORT           summarise what changed and how it was      │
+  │                  verified; flag open questions              │
   └─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  Done — or — More changes needed (loop back)
 ```
+
+Those three phases (gather context, take action, verify) are how Anthropic describes the loop. They blend: a question about the code may only need the first; a bug fix cycles through all three many times.
 
 ---
 
-## 2. THE COMPLETE STEP-BY-STEP FLOW (WITH REAL API CALLS)
+## 2. A TRACED EXAMPLE
 
-Let's trace a real example: **"Add a health check endpoint to the FastAPI app"**
+**Task:** "Add a health check endpoint to the FastAPI app." Token counts are illustrative.
 
-### Step 0: User Sends the Request
+### Step 0: What's Already in Context
 
-```ascii
-User types: "Add a health check endpoint to the FastAPI app"
-                               │
-                               ▼
-                    Claude Code receives the text
-                    Displays it in the terminal
-                    Starts processing...
-```
+Nothing is scanned up front beyond a small, documented set: Claude Code's system prompt and tool definitions, your CLAUDE.md files, auto memory, skill descriptions, MCP tool names, and environment info (working directory, git status). The model has *not* read `main.py` yet.
 
-### Step 1: Context Gathering (Pre-API)
-
-Before anything hits the Claude API, Claude Code gathers **local context**:
-
-```ascii
-Claude Code scans the environment:
-  ├── Reads current directory listing
-  ├── Checks git status (any uncommitted changes?)
-  ├── Reads .gitignore (what to exclude?)
-  ├── Detects project language/framework (pyproject.toml, etc.)
-  └── Reads relevant config files
-
-This context is PREPENDED to the user message:
-  "Current project: FastAPI app in /Users/me/project
-   Files: main.py, requirements.txt, Dockerfile
-   Git: clean, no uncommitted changes"
-```
-
-### Step 2: Prompt Assembly (Claude Code CLI)
-
-Claude Code builds the complete request payload:
+### Step 1: First Model Call
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 8192,
-  "temperature": 0.0,
-  "system": [
-    {
-      "type": "text",
-      "text": "You are Claude, an AI assistant created by Anthropic...
-              You have access to tools: read_files, write_file,
-              str_replace, run_terminal_command, code_search...
-              Rules:
-              1. Always read files before making changes
-              2. Make minimal, targeted edits
-              3. Run tests after changes
-              4. Ask for clarification when requirements are ambiguous
-              5. Follow project conventions..." ,
-      "cache_control": {"type": "ephemeral"}
-    }
-  ],
-  "tools": [
-    {
-      "name": "read_files",
-      "description": "Read the contents of one or more files...",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "paths": {
-            "type": "array",
-            "items": {"type": "string"}
-          }
-        },
-        "required": ["paths"]
-      }
-    },
-    {
-      "name": "str_replace",
-      "description": "Make targeted edits to a file by finding and
-                      replacing a specific string...",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "path": {"type": "string"},
-          "old_string": {"type": "string", "description": "Exact text to find"},
-          "new_string": {"type": "string", "description": "Replacement text"}
-        },
-        "required": ["path", "old_string", "new_string"]
-      }
-    },
-    {
-      "name": "write_file",
-      "description": "Create a new file or overwrite an existing one...",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "path": {"type": "string"},
-          "content": {"type": "string", "description": "Complete file content"},
-          "instructions": {"type": "string", "description": "Brief description"}
-        },
-        "required": ["path", "content"]
-      }
-    },
-    {
-      "name": "run_terminal_command",
-      "description": "Execute a shell command in the project directory...",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "command": {"type": "string"},
-          "timeout_seconds": {"type": "number", "default": 30}
-        },
-        "required": ["command"]
-      }
-    }
-    // ... more tools (list_directory, code_search, glob, etc.)
-  ],
+  "model": "claude-opus-5-5",
+  "max_tokens": 32000,
+  "stream": true,
+  "system": "<Claude Code system prompt + CLAUDE.md + environment>",
+  "tools": ["Read", "Edit", "Write", "Bash", "WebFetch", "Agent", "..."],
   "messages": [
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "Add a health check endpoint to the FastAPI app\n
-                   [Context: Current directory contains:
-                   - main.py (FastAPI app)
-                   - requirements.txt
-                   - Dockerfile]"
-        }
-      ]
-    }
+    {"role": "user", "content": "Add a health check endpoint to the FastAPI app"}
   ]
 }
 ```
 
-**Total tokens sent in this first request:** ~4,500 tokens
+(Tools abbreviated to names; real definitions carry descriptions and JSON schemas. The system prompt's exact text isn't published.)
 
-### Step 3: API Request Sent
+### Step 2: The Model Searches
 
-```ascii
-Claude Code CLI                               Anthropic API
-     │                                            │
-     │  POST https://api.anthropic.com/v1/messages │
-     │  Headers:                                   │
-     │    Authorization: Bearer sk-ant-***         │
-     │    anthropic-version: 2025-01-01            │
-     │    Content-Type: application/json           │
-     │                                             │
-     │  Body: ~4,500 tokens                        │
-     │────────────────────────────────────────────►│
-     │                                             │
-     │  (Waits ~500ms for first token)             │
-     │                                             │
-```
-
-### Step 4: Streaming Response Received
-
-The response comes back as a stream of **Server-Sent Events (SSE)**:
-
-```ascii
-Event 1: message_start
-  ┌────────────────────────────────────────────┐
-  │ Message ID: msg_01ABC                      │
-  │ Usage: input_tokens=4500, output_tokens=0  │
-  └────────────────────────────────────────────┘
-
-Event 2: content_block_start (type: text)
-  ┌────────────────────────────────────────────┐
-  │ Block 0: text block opened                 │
-  └────────────────────────────────────────────┘
-
-Events 3-20: content_block_delta (streaming text)
-  ┌────────────────────────────────────────────┐
-  │ "I'll" → " add" → " a" → " health" → ...  │
-  │ Claude Code displays this text in real-time│
-  └────────────────────────────────────────────┘
-
-Event 21: content_block_stop
-  ┌────────────────────────────────────────────┐
-  │ Block 0 complete                           │
-  └────────────────────────────────────────────┘
-
-Event 22: content_block_start (type: tool_use)
-  ┌────────────────────────────────────────────┐
-  │ Tool: "read_files"                         │
-  │ Args: {"paths": ["main.py"]}              │
-  │ ID: "toolu_abc123"                         │
-  └────────────────────────────────────────────┘
-
-Event 23: message_delta
-  ┌────────────────────────────────────────────┐
-  │ Stop reason: "tool_use"                    │
-  │ Output tokens so far: 85                   │
-  └────────────────────────────────────────────┘
-
-Event 24: message_stop
-  ┌────────────────────────────────────────────┐
-  │ Stream complete                            │
-  └────────────────────────────────────────────┘
-```
-
-### Step 5: Tool Execution (Local)
-
-Claude Code receives the `tool_use` block and executes it **locally**:
-
-```json
-// Response from API says: Claude wants to read main.py
-{
-  "type": "tool_use",
-  "id": "toolu_abc123",
-  "name": "read_files",
-  "input": {"paths": ["main.py"]}
-}
-```
-
-```ascii
-Claude Code CLI:
-  1. Validates: "read_files" is an allowed tool
-  2. Validates: {"paths": ["main.py"]} matches the tool's JSON schema
-  3. Executes: reads /Users/me/project/main.py
-  4. Gets content: 340 tokens worth of Python code
-  5. Appends result to conversation history:
-     {
-       "role": "user",
-       "content": [{
-         "type": "tool_result",
-         "tool_use_id": "toolu_abc123",
-         "content": "from fastapi import FastAPI\napp = FastAPI()\n\n@app.get('/')\ndef read_root():\n    return {'Hello': 'World'}"
-       }]
-     }
-```
-
-### Step 6: Second API Call (With Tool Result)
-
-Claude Code sends **another API call** with the updated conversation:
-
-```ascii
-Turn 2 API Call:
-  System prompt:   ~2,000 tokens  (cached)
-  Tool schemas:    ~2,500 tokens  (cached)
-  History:         ~4,585 tokens  (previous messages + tool result)
-  New message:         ~8 tokens  (same user message — it's still active)
-  ─────────────────────────────────────────
-  Total input:     ~6,133 tokens
-
-  Wait for response (~300ms this time — less thinking needed)
-```
-
-### Step 7: Claude Decides — Edit the File
+The response streams back with some text and a tool call:
 
 ```json
 {
   "content": [
-    {
-      "type": "text",
-      "text": "I can see the app has a single route. Let me add the health check endpoint."
-    },
-    {
-      "type": "tool_use",
-      "id": "toolu_def456",
-      "name": "str_replace",
-      "input": {
-        "path": "main.py",
-        "old_string": "from fastapi import FastAPI\napp = FastAPI()\n\n@app.get('/')\ndef read_root():\n    return {'Hello': 'World'}",
-        "new_string": "from fastapi import FastAPI\napp = FastAPI()\n\n@app.get('/')\ndef read_root():\n    return {'Hello': 'World'}\n\n\n@app.get('/health')\ndef health_check():\n    \"\"\"Health check endpoint.\"\"\"\n    return {'status': 'healthy'}"
-      }
-    }
+    {"type": "text", "text": "Let me find where the FastAPI app is created."},
+    {"type": "tool_use", "id": "toolu_01", "name": "Bash",
+     "input": {"command": "grep -rn \"FastAPI(\" --include=*.py ."}}
   ],
   "stop_reason": "tool_use"
 }
 ```
 
-### Step 8: Claude Code Applies the Edit Locally
+On macOS/Linux, Claude Code's default tool set omits the dedicated `Glob`/`Grep` tools and Claude searches with `find`/`grep` through `Bash` (embedded fast implementations); on Windows, or when you enable them, it uses `Glob` and `Grep` (ripgrep-based). Read-only commands like this run without a permission prompt.
 
-```python
-# Claude Code takes the str_replace arguments and:
-# 1. Validates the path exists
-# 2. Checks that old_string matches EXACTLY in the file
-# 3. If old_string is found EXACTLY ONCE, replaces it with new_string
-# 4. If old_string is found MULTIPLE times, raises error (needs more context)
-# 5. If old_string is NOT found, raises error (file may have changed)
+### Step 3: Read the File
 
-# In this case:
-# - Found "from fastapi import FastAPI\napp = FastAPI()\n..." exactly once
-# - Replaced with the new version including the /health endpoint
-# - File saved to disk
-```
-
-### Step 9: Verification — Run Tests
-
-Claude usually follows up with one more API call to verify:
+Result: `./app/main.py:3:app = FastAPI()`. Next call, the model reads it:
 
 ```json
-// Claude says: "Let me verify the code works"
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "The endpoint has been added. Let me verify the syntax is correct."
-    },
-    {
-      "type": "tool_use",
-      "id": "toolu_ghi789",
-      "name": "run_terminal_command",
-      "input": {
-        "command": "python -c \"import main; print('Syntax OK')\""
-      }
-    }
-  ]
-}
+{"type": "tool_use", "id": "toolu_02", "name": "Read",
+ "input": {"file_path": "/Users/me/project/app/main.py"}}
 ```
 
-### Step 10: Final Response to User
+`Read` returns the file with line numbers. Large files come back as a first page with a "PARTIAL view" notice and the model pages with `offset`/`limit`. Images, PDFs and notebooks are supported too.
+
+### Step 4: Edit
+
+```json
+{"type": "tool_use", "id": "toolu_03", "name": "Edit",
+ "input": {
+   "file_path": "/Users/me/project/app/main.py",
+   "old_string": "@app.get(\"/\")\ndef read_root():\n    return {\"Hello\": \"World\"}",
+   "new_string": "@app.get(\"/\")\ndef read_root():\n    return {\"Hello\": \"World\"}\n\n\n@app.get(\"/health\")\ndef health_check() -> dict[str, str]:\n    return {\"status\": \"ok\"}"
+ }}
+```
+
+Before applying it, Claude Code:
+
+1. **Checks permissions.** In Manual mode you're asked "allow edit to main.py?"; in Accept-edits or Auto mode it proceeds (Auto runs a classifier on riskier actions).
+2. **Snapshots the file** (checkpoint) so you can rewind.
+3. **Validates the edit** (documented behaviour of the `Edit` tool):
+   - *Read-before-edit*: the file must have been read in this conversation (newer models may skip this when reading wouldn't need a permission prompt).
+   - *Exact match*: `old_string` must appear exactly, whitespace included. No regex, no fuzzy matching.
+   - *Uniqueness*: it must appear exactly once, unless `replace_all: true`. Otherwise the model retries with more surrounding context.
+4. **Applies it** and returns a short result (with a snippet of the edited region) as the `tool_result`.
+
+### Step 5: Verify
+
+```json
+{"type": "tool_use", "id": "toolu_04", "name": "Bash",
+ "input": {"command": "pytest -q"}}
+```
+
+Bash commands run in a fresh process each time (the working directory carries over within the project, exported env vars don't), under a default 2-minute timeout the model can raise (10-minute ceiling by default). Long outputs are truncated inline (around 30,000 characters for a successful command, with the full output saved to a file the model can read).
+
+### Step 6: Final Answer
+
+Tests pass, so the model replies with text only (`stop_reason: "end_turn"`):
 
 ```ascii
-Claude Code CLI sends one more API call with the verification result.
-
-Claude responds with text only (stop_reason: "end_turn"):
-
-  "Done! I've added a health check endpoint to your FastAPI app:
-
-   ✅ Added GET /health endpoint that returns {'status': 'healthy'}
-
-   The app structure is:
-   - GET /        → Root endpoint
-   - GET /health  → Health check endpoint (new)
-
-   You can verify by running: curl http://localhost:8000/health"
-
-This text is streamed to the user in real-time.
+Added GET /health to app/main.py returning {"status": "ok"}.
+Ran the test suite: 14 passed. Consider adding it to your load-balancer
+health-check config.
 ```
 
 ---
 
-## 3. THE COMPLETE API CALL SEQUENCE (DIAGRAM)
+## 3. THE COMPLETE CALL SEQUENCE
 
 ```ascii
-USER                    CLAUDE CODE CLI              CLAUDE API
- │                            │                         │
- │  "Add health check"        │                         │
- │───────────────────────────►│                         │
- │                            │                         │
- │                            │ 1. Gather local context │
- │                            │    (files, git, config) │
- │                            │                         │
- │                            │ 2. POST /v1/messages    │
- │                            │────────────────────────►│
- │                            │   Input: ~4,500 tokens  │
- │                            │                         │
- │                            │ 3. SSE stream ◄────────│
- │                            │   Text: "I'll add..."   │
- │                            │   Tool: read_files()    │
- │                            │   Stop: tool_use        │
- │                            │   Output: 85 tokens     │
- │                            │                         │
- │  "Reading main.py..."      │                         │
- │◄───────────────────────────│                         │
- │                            │                         │
- │                            │ 4. Execute read_files   │
- │                            │    (local file system)  │
- │                            │                         │
- │                            │ 5. POST /v1/messages    │
- │                            │    (with tool result)   │
- │                            │────────────────────────►│
- │                            │   Input: ~6,133 tokens  │
- │                            │                         │
- │                            │ 6. SSE stream ◄────────│
- │                            │   Text: "Adding..."     │
- │                            │   Tool: str_replace()   │
- │                            │   Stop: tool_use        │
- │                            │   Output: 62 tokens     │
- │                            │                         │
- │                            │ 7. Execute str_replace  │
- │                            │    (edit main.py)       │
- │                            │                         │
- │                            │ 8. POST /v1/messages    │
- │                            │    (with tool result)   │
- │                            │────────────────────────►│
- │                            │   Input: ~6,257 tokens  │
- │                            │                         │
- │                            │ 9. SSE stream ◄────────│
- │                            │   Text: "Verifying..."  │
- │                            │   Tool: run_terminal()  │
- │                            │   Stop: tool_use        │
- │                            │   Output: 90 tokens     │
- │                            │                         │
- │                            │ 10. Execute bash cmd    │
- │                            │     (python -c import)  │
- │                            │                         │
- │                            │ 11. POST /v1/messages   │
- │                            │────────────────────────►│
- │                            │                         │
- │                            │ 12. SSE stream ◄───────│
- │                            │   Text: "Done! Added"   │
- │                            │   Stop: end_turn        │
- │                            │   Output: 150 tokens    │
- │                            │                         │
- │  "Done! Added /health..."  │                         │
- │◄───────────────────────────│                         │
- │                            │                         │
+YOU                      CLAUDE CODE                          CLAUDE API
+ │ "Add health check"         │                                     │
+ │───────────────────────────►│ call 1: system+tools+prompt ───────►│ ~20K in
+ │                            │◄──── Bash(grep "FastAPI(")          │
+ │                            │ run grep (read-only, no prompt)     │
+ │                            │ call 2: + tool_result ─────────────►│
+ │                            │◄──── Read(app/main.py)              │
+ │                            │ read file                           │
+ │                            │ call 3: + file contents ───────────►│
+ │                            │◄──── Edit(main.py, old→new)         │
+ │  "Allow edit?" (Manual)    │                                     │
+ │◄───────────────────────────│                                     │
+ │  yes ─────────────────────►│ checkpoint, validate, apply         │
+ │                            │ call 4: + "edit applied" ──────────►│
+ │                            │◄──── Bash(pytest -q)                │
+ │  "Allow pytest?" (unless   │                                     │
+ │   allow-listed)            │ run tests                           │
+ │                            │ call 5: + test output ─────────────►│
+ │  "Added GET /health..."    │◄──── text, stop_reason: end_turn    │
+ │◄───────────────────────────│                                     │
 ```
+
+Five model calls for a two-line change. With prompt caching, calls 2–5 mostly pay cache-read rates for the shared prefix. The model can also issue **several tool calls in one turn** (e.g. read three files at once), which cuts round-trips.
 
 ---
 
-## 4. HOW DEBUGGING WORKS (THE BUG-FIX FLOW)
+## 4. HOW DEBUGGING WORKS
 
-Debugging uses a **different flow pattern** from feature addition:
-
-```ascii
-                     THE DEBUG FLOW
-                     ──────────────
-
-  User: "This code is throwing a KeyError, can you fix it?"
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  PHASE 1: REPRODUCE                                          │
-  │  ├── Read the file where the error occurs                    │
-  │  ├── Read the error message / stack trace                    │
-  │  └── Run the code to reproduce the error (optional)          │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  PHASE 2: DIAGNOSE                                           │
-  │  ├── Trace the code path leading to the error                │
-  │  ├── Identify the root cause (not just the symptom)          │
-  │  ├── Check for similar issues in the same file               │
-  │  └── Formulate a hypothesis: \"The error occurs because...\"   │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  PHASE 3: FIX                                                │
-  │  ├── Apply the fix (str_replace / write_file)                │
-  │  ├── Consider edge cases                                     │
-  │  └── Check for the same bug pattern elsewhere               │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  PHASE 4: VERIFY                                             │
-  │  ├── Run the code again to confirm the fix                   │
-  │  ├── Run related tests                                       │
-  │  └── If still broken, loop back to Phase 2                   │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  PHASE 5: EXPLAIN                                            │
-  │  ├── Tell the user what was wrong                            │
-  │  ├── Explain what was changed                                │
-  │  └── Suggest how to prevent similar issues                   │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-### Real Debugging Trace
+Bug fixing leans harder on the gather and verify phases:
 
 ```ascii
-User: "I'm getting 'KeyError: 'username'' when I call /users endpoint"
-
-─── API Call 1 ──────────────────────────────────────────────────
-  Claude reads main.py to see the /users endpoint
-  Claude reads the error traceback (user provided it)
-
-─── API Call 2 ──────────────────────────────────────────────────
-  Claude identifies: The /users endpoint expects a 'username' key
-  in the request body but doesn't validate it first.
-  
-  Root cause: No input validation before accessing dict keys.
-  
-  Claude applies the fix:
-    old: username = data["username"]
-    new: username = data.get("username")
-         if not username:
-             raise HTTPException(status_code=400, ...)
-
-─── API Call 3 ──────────────────────────────────────────────────
-  Claude runs the endpoint to verify: curl -X POST /users -d '{}'
-  Confirms it now returns a proper 400 error instead of 500.
-
-─── API Call 4 ──────────────────────────────────────────────────
-  Claude checks for similar patterns in the codebase:
-  Searches for other `data["` patterns that might have the same bug.
-  
-─── Final Response ──────────────────────────────────────────────
-  "Found and fixed the KeyError. Root cause: missing input validation.
-   Also checked for similar issues in the codebase — no other instances found."
+  "The /users endpoint returns 500 with KeyError: 'username'"
+         │
+  REPRODUCE   run the failing request or test; read the traceback
+         │
+  LOCATE      search for the handler; read it and its callers
+         │
+  DIAGNOSE    form a hypothesis about the root cause, not the symptom
+         │    (here: request body accessed without validation)
+         │
+  FIX         Edit: validate input (e.g. a Pydantic model → 422 on
+         │    missing fields) instead of data["username"]
+         │
+  VERIFY      re-run the reproduction and the related tests;
+         │    if still failing, loop back to DIAGNOSE
+         │
+  GENERALISE  search for the same pattern elsewhere (data["...] on
+              raw request bodies), report what was found
 ```
+
+Habits that make Claude Code better at this, all things you control: give the exact error and how to reproduce it, point to the test that should pass, and ask it to write a failing test first.
 
 ---
 
-## 5. HOW CLAUDE DECIDES WHEN TO ASK FOR USER INPUT
+## 5. WHEN DOES CLAUDE ASK YOU?
 
-This is one of the most important and nuanced behaviors. Claude follows a **confidence-based escalation system**:
+Two different mechanisms decide this.
 
-### The Decision Tree
+### 5.1 The Harness Asks: Permissions (deterministic)
 
-```ascii
-  User request received
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Does Claude understand the request clearly?                  │
-  ├──────────────────────────────────────────────────────────────┤
-  │  YES → Proceed with changes                                  │
-  │  NO  → Ask user for clarification                            │
-  │         Example: "Should this endpoint return JSON or plain   │
-  │                  text? Also, should it be authenticated?"     │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Are there ambiguous design choices?                          │
-  ├──────────────────────────────────────────────────────────────┤
-  │  NO  → Make reasonable defaults and proceed                  │
-  │  YES → Flag to user and ask OR make a best-guess decision    │
-  │         (depends on the impact of being wrong)               │
-  │                                                              │
-  │  Low impact (variable name, formatting):                     │
-  │    → Make a choice and proceed                                │
-  │                                                              │
-  │  Medium impact (library choice, architecture):               │
-  │    → Make a choice but mention it in the response            │
-  │                                                              │
-  │  High impact (database, auth, security):                     │
-  │    → STOP and ask the user                                   │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Did the tool execution succeed?                              │
-  ├──────────────────────────────────────────────────────────────┤
-  │  YES → Continue to next step                                 │
-  │  NO  → Can Claude fix it without new info?                   │
-  │    YES → Fix and retry                                       │
-  │    NO  → Report error and ask user                           │
-  │         Example: "I tried to edit the file but the exact text│
-  │                  wasn't found. Has the file changed?"         │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Did something unexpected happen?                             │
-  ├──────────────────────────────────────────────────────────────┤
-  │  NO  → Complete and report success                           │
-  │  YES → Does Claude understand the unexpected behavior?       │
-  │    YES → Explain and adjust                                  │
-  │    NO  → Ask user for guidance                               │
-  └──────────────────────────────────────────────────────────────┘
-```
+| Mode / rule | What triggers a prompt |
+|-------------|------------------------|
+| **Manual** | File edits and shell commands (read-only commands and reads inside the project don't prompt) |
+| **Accept edits** | Shell commands beyond common filesystem ones; edits proceed |
+| **Plan** | No source edits at all; Claude explores and presents a plan for approval (`ExitPlanMode`) |
+| **Auto** | A classifier approves routine actions and blocks risky ones instead of asking |
+| **Rules** (`settings.json`) | `deny` blocks, `ask` always prompts, `allow` skips the prompt; e.g. `Bash(npm test)`, `Edit(/src/**)`, `Read(./.env)` |
+| **Hooks** | A `PreToolUse` hook can allow, deny, ask, or rewrite the input of any tool call |
 
-### Concrete Examples of When Claude Asks vs When It Doesn't
+### 5.2 The Model Asks: Clarifying Questions (judgement)
 
-| Scenario | Claude's Behavior | Why |
-|----------|------------------|-----|
-| **Vague request**: "Make this better" | ❓ **Asks**: "What specifically would you like improved? Performance? Readability? Features?" | Too ambiguous |
-| **Missing detail**: "Add error handling" | ❓ **Asks**: "What kind of errors should I handle? Network errors? Validation? Database?" | Multiple valid interpretations |
-| **Security-sensitive**: "Add user auth" | ❓ **Asks**: "What auth method? JWT? OAuth? Session-based? Any existing auth provider?" | High impact choice |
-| **Uncommon dependency**: "Use library X" | ✅ **Proceeds** (or asks about version) | If it's a known library, proceeds |
-| **File-rename impact**: "Rename this function" | ✅ **Proceeds** with searching for all callers | Routine refactoring |
-| **Test failure after change** | ✅ **Fixes** and retries automatically | Part of the normal loop |
-| **Tool execution error** (str_replace failed) | ❓ **Asks**: "The exact string wasn't found, has the file changed?" | Unexpected error |
-| **Ambiguous formatting choice**: "Use tabs vs spaces" | ✅ **Proceeds** with project conventions | Low impact |
-| **Adding new dependency**: "Add FastAPI" | ❓ **Asks**: "Which version? Any specific plugins?" | Version choice matters |
+The model can stop and ask in text, or with the `AskUserQuestion` tool (multiple-choice). Whether it does is judgement guided by its instructions. A sensible heuristic, and one you can make explicit in CLAUDE.md:
+
+| Situation | Reasonable behaviour |
+|-----------|---------------------|
+| Request is clear | Proceed |
+| Low-impact ambiguity (naming, formatting) | Follow project conventions, proceed |
+| Medium-impact choice (which library, where code lives) | Make a choice, state it in the summary |
+| High-impact or hard-to-reverse (auth design, schema migrations, deleting data, pushing, deploying) | Ask first, or present options in plan mode |
+| Tool failure it can explain (test failure, stale `old_string`) | Fix and retry; an `Edit` mismatch usually just means "re-read the file" |
+| Unexplained state (unexpected files, failing setup) | Report it and ask |
+
+If you want more or fewer questions, say so in CLAUDE.md or the prompt ("ask before adding dependencies"; "don't ask, make reasonable assumptions and list them"). Plan mode is the structural way to force a checkpoint before edits.
 
 ---
 
-## 6. HOW MULTI-FILE CHANGES WORK
+## 6. MULTI-FILE CHANGES
 
-When a change spans multiple files, Claude follows a **dependency-ordered execution**:
+There's no built-in dependency solver; ordering is the model's judgement. What works well, and what Claude typically does on a task like "add a `/users` endpoint with database support":
 
 ```ascii
-                    MULTI-FILE CHANGE FLOW
-                    ─────────────────────
-
-  Example: "Add a new /users endpoint with database support"
-
-  ┌──────────────────────────────────────────────────────────────┐
-  │  1. IDENTIFY FILES TOUCHED                                    │
-  │     ├── app/main.py          — New route                      │
-  │     ├── app/models.py        — New User model                 │
-  │     ├── app/schemas.py       — New Pydantic schemas           │
-  │     ├── app/database.py      — May need new DB function       │
-  │     └── tests/test_users.py  — New test file                  │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  2. DETERMINE BUILD ORDER (dependency analysis)               │
-  │                                                               │
-  │   Files with no dependencies FIRST:                           │
-  │     ├── app/models.py       (no internal dependencies)        │
-  │     └── app/schemas.py      (no internal dependencies)        │
-  │                                                               │
-  │   Files that depend on others SECOND:                         │
-  │     ├── app/database.py     (uses models)                     │
-  │     └── app/main.py         (uses schemas, database)          │
-  │                                                               │
-  │   Tests LAST:                                                  │
-  │     └── tests/test_users.py (uses everything)                 │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  3. APPLY CHANGES IN ORDER                                    │
-  │                                                               │
-  │  ── API Call: Create models.py (write_file)                   │
-  │  ── API Call: Create schemas.py (write_file)                  │
-  │  ── API Call: Update database.py (str_replace)                │
-  │  ── API Call: Update main.py (str_replace × 2)                │
-  │  ── API Call: Create test_users.py (write_file)               │
-  │                                                               │
-  │  → 5 API calls × ~6,000 tokens = ~30,000 tokens total        │
-  └──────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  4. VERIFY                                                    │
-  │     ├── Run import check: python -c "import app"              │
-  │     ├── Run tests: pytest tests/test_users.py                 │
-  │     └── If failures: diagnose, fix, retry                     │
-  └──────────────────────────────────────────────────────────────┘
+1. EXPLORE         read the existing route, model, schema and test files
+                   to learn the project's patterns
+2. PLAN            list files to touch (plan mode makes this explicit
+                   and reviewable)
+3. EDIT            usually leaf-first: models.py → schemas.py →
+                   crud/database → main.py routes → tests, so each
+                   step's imports exist when the next one is written
+4. VERIFY          import check, type check, the new tests, then the
+                   whole suite
+5. FIX             iterate on failures
 ```
 
-### How Claude Handles Dependencies
+Ordering matters less than you'd think, because nothing runs between edits; what matters is that the final verification passes. For large changes, Claude may delegate exploration or independent pieces to **sub-agents** (`Agent` tool), each with its own context window, so the main conversation only receives summaries. Separate sessions in **git worktrees** let several Claude Code instances work on different branches in parallel.
 
-```python
-# Claude understands dependency ordering implicitly:
-# 1. It reads all relevant files first (context gathering)
-# 2. It mentally maps which files depend on which
-# 3. It creates/modifies files in dependency order
-# 4. It verifies that imports work end-to-end
-
-# Example: If main.py imports from models.py and schemas.py,
-# Claude creates/modifies models.py and schemas.py FIRST,
-# then updates main.py — so imports never break.
-```
+Cost: each edit is a round-trip carrying the whole history. Five edits at ~30K input tokens each is ~150K input tokens before caching, which is why caching and batching edits into fewer turns matter.
 
 ---
 
-## 7. HOW CLAUDE HANDLES EDITS (str_replace vs write_file)
+## 7. EDIT vs WRITE
 
-Claude has two main tools for making changes, and it chooses between them based on the situation:
+| | `Edit` | `Write` |
+|---|--------|---------|
+| **What it does** | Replaces an exact `old_string` with `new_string` | Creates a file, or overwrites it with the full content |
+| **Preconditions** | File read in this conversation (relaxed on newer models when no permission prompt would be needed); `old_string` matches exactly and uniquely (or `replace_all`) | For an existing file, the same read-before-overwrite rule applies; new files need nothing |
+| **Output tokens** | Only the changed region (both old and new text) | The whole file |
+| **Failure mode** | Fails loudly on mismatch, protecting against stale views of the file | Silently replaces everything, including changes you made meanwhile (but checkpoints allow rewind) |
+| **Typical use** | Most changes to existing files | New files; complete rewrites of small files |
 
-### str_replace (Targeted Edits)
-
-```python
-# Claude uses this when: Making a small change to an existing file
-# Advantage: Preserves file history, minimal diff, fewer tokens
-
-# Example: Adding one import
-old_string = "from fastapi import FastAPI"
-new_string = "from fastapi import FastAPI, HTTPException"
-
-# Claude Code validates:
-# 1. The file exists
-# 2. old_string is found EXACTLY ONCE
-# 3. If found multiple times → error (ambiguity)
-# 4. If not found → error (file may have changed since reading)
-```
-
-### write_file (Full File Write)
-
-```python
-# Claude uses this when:
-# - Creating a brand new file
-# - The edit is >50% of the file content
-# - Multiple scattered changes across the file
-
-# Claude Code validates:
-# 1. The parent directory exists
-# 2. If overwriting: warns the user first
-# 3. Writes the complete file content
-```
-
-### How Claude Chooses
-
-```ascii
-  ┌──────────────────────────────────────────────────────────┐
-  │  Does the file exist?                                     │
-  │  NO  → write_file (create new file)                      │
-  │  YES → Is the change >50% of the file?                    │
-  │    YES → write_file (rewrite entire file)                 │
-  │    NO  → Are changes scattered across the file?           │
-  │      → Multiple str_replace calls                         │
-  │      → OR write_file if >3 scattered edits               │
-  └──────────────────────────────────────────────────────────┘
-```
+The model chooses between them. Output tokens are the expensive ones, so `Edit` is usually cheaper for small changes to big files, while `Write` can be simpler when most of a small file changes. There's no fixed "> 50% of the file" rule.
 
 ---
 
 ## 8. THE TOOL EXECUTION PIPELINE
 
-Every tool call goes through this pipeline:
+What Claude Code does with each `tool_use` block (documented behaviour; details evolve between versions):
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────────┐
-│                    TOOL EXECUTION PIPELINE                        │
-│                                                                  │
-│  Claude API responds with tool_use                               │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  1. PARSE & VALIDATE                                      │   │
-│  │     ├── Extract tool name, id, input                      │   │
-│  │     ├── Validate tool name is in the allowed list         │   │
-│  │     ├── Validate input against tool's JSON schema         │   │
-│  │     └── Reject hallucinated tools (e.g., "delete_all")   │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  2. SANITIZE                                               │   │
-│  │     ├── Sanitize file paths (prevent path traversal)      │   │
-│  │     ├── Sanitize command arguments (shell injection)      │   │
-│  │     └── Validate within project boundaries                │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  3. EXECUTE                                                │   │
-│  │     ├── Run the tool locally                              │   │
-│  │     ├── Respect timeouts                                  │   │
-│  │     ├── Respect rate limits (per-second, per-tool)        │   │
-│  │     └── Capture stdout, stderr, exit code                 │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  4. FORMAT RESULT                                          │   │
-│  │     ├── Truncate large outputs (token budget)             │   │
-│  │     ├── Mask sensitive data (API keys, secrets)           │   │
-│  │     └── Format as tool_result message                     │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  5. APPEND TO HISTORY & SEND NEXT API CALL                │   │
-│  │     ├── Add tool_result to messages array                 │   │
-│  │     ├── Send complete history back to Claude API          │   │
-│  │     └── Claude decides: more tools or end_turn            │   │
-│  └──────────────────────────────────────────────────────────┘   │
+│ 1. PARSE         tool name, id, JSON input; unknown tool or bad  │
+│                  input → error tool_result, model corrects itself│
+├──────────────────────────────────────────────────────────────────┤
+│ 2. PERMISSION    deny rules → ask rules → allow rules; then the  │
+│                  permission mode (Manual / Accept edits / Plan / │
+│                  Auto classifier); paths outside the working and │
+│                  added directories need approval                 │
+├──────────────────────────────────────────────────────────────────┤
+│ 3. PreToolUse    your hooks may block, approve, or rewrite input │
+│    HOOKS         (e.g. filter test output to failures only)      │
+├──────────────────────────────────────────────────────────────────┤
+│ 4. EXECUTE       checkpoint files first for edits; Bash in a new │
+│                  process with a timeout; optional sandboxing     │
+│                  isolates filesystem and network for Bash        │
+├──────────────────────────────────────────────────────────────────┤
+│ 5. PostToolUse   your hooks see the result (e.g. run a formatter │
+│    HOOKS         after every edit, feed lint errors back)        │
+├──────────────────────────────────────────────────────────────────┤
+│ 6. FORMAT        cap large outputs (inline limit, rest saved to  │
+│                  a file the model can read); build tool_result   │
+│                  (is_error on failure)                           │
+├──────────────────────────────────────────────────────────────────┤
+│ 7. CONTINUE      append to history; next model call; compaction  │
+│                  kicks in automatically near the context limit   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+Things Claude Code does **not** claim to do: automatically mask secrets in tool output, or rate-limit individual tools. Protect secrets with `deny` rules (e.g. `Read(./.env)`), sandboxing, and hooks.
+
 ---
 
-## 9. SUMMARY: THE COMPLETE CODE CHANGE LOOP
+## 9. SUMMARY
 
 ```ascii
 ┌─────────────────────────────────────────────────────────────────────┐
-│                THE COMPLETE CLAUDE CODE CHANGE LOOP                   │
-│                                                                      │
-│  1. USER SENDS REQUEST                                                │
-│     └── Claude Code gathers local context (files, git, config)        │
-│                                                                      │
-│  2. API CALL #1: Understand + Plan                                    │
-│     ├── Send: System + Tools + User message                           │
-│     ├── Receive: Streaming text + tool_use (read_files)               │
-│     └── Execute: Read file(s) from disk                              │
-│                                                                      │
-│  3. API CALL #2: Plan + First Edit                                    │
-│     ├── Send: Previous + Tool result                                  │
-│     ├── Receive: Streaming text + tool_use (str_replace/write_file)   │
-│     └── Execute: Edit file(s) on disk                                │
-│                                                                      │
-│  4. API CALL #3-N: Continue Editing + Handle Dependencies             │
-│     ├── Each call adds more context and results                       │
-│     ├── Each call costs ~5,000-8,000 input tokens                     │
-│     └── Continues until Claude finishes all edits                     │
-│                                                                      │
-│  5. API CALL (Final): Verify + Report                                 │
-│     ├── Run tests to verify correctness                               │
-│     ├── If failures: fix and retry (loop back to step 3)              │
-│     └── If success: Final response to user (end_turn)                 │
-│                                                                      │
-│  DECISION POINTS along the way:                                       │
-│  ├── Need more context? → Read more files                             │
-│  ├── Need clarification? → Ask user                                   │
-│  ├── Tool failed? → Retry or report error                             │
-│  ├── Tests failed? → Diagnose and fix                                 │
-│  └── Unexpected state? → Ask user for guidance                       │
+│ 1. You send a request; context = system prompt, tools, CLAUDE.md,  │
+│    memory, git/env info (no repo pre-scan)                          │
+│ 2. Model searches and reads (Bash grep/find or Grep/Glob, Read)     │
+│ 3. Model edits (Edit exact-match, or Write) → permission check →   │
+│    checkpoint → apply                                               │
+│ 4. Model verifies (Bash: tests, build, lint) and iterates           │
+│ 5. Model reports (stop_reason: end_turn)                            │
+│                                                                     │
+│ Each tool call = one model round-trip with the full history         │
+│ Decision points: more context? ask the user? retry? → model         │
+│ Safety points: permissions, hooks, checkpoints → harness            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -837,16 +319,20 @@ Every tool call goes through this pipeline:
 
 | Concept | Why It Matters |
 |---------|---------------|
-| **Each tool call = one API round-trip** | 5 edits = 5 API calls × growing context = expensive |
-| **Claude reads before writing** | Always: read file → understand → edit. Never blind writes |
-| **str_replace is preferred over write_file** | Targetted edits preserve history and show exact changes |
-| **Context grows with every turn** | Each tool result is appended, making subsequent calls more expensive |
-| **Claude asks only when necessary** | Uses confidence-based escalation: low-impact → proceed, high-impact → ask |
-| **Debugging follows a different pattern** | Reproduce → Diagnose → Fix → Verify — more analysis, fewer edits |
-| **Multi-file changes are dependency-ordered** | Files with no deps first, dependent files second, tests last |
-| **Temperature=0 for coding** | Deterministic — same input always produces same output |
-| **Streaming is critical for UX** | First token in ~500ms, full response streamed in real-time |
+| **Each tool call is a round-trip** | Cost and latency scale with calls × context size; parallel calls and caching help |
+| **Search, read, then edit** | `Edit` requires a prior read (on most models) and an exact, unique match, so stale or ambiguous edits fail loudly instead of corrupting files |
+| **`Edit` for most changes, `Write` for new files** | Output tokens cost 5× input; full rewrites are expensive and riskier |
+| **Verification is the model's job, enabled by you** | Give it a test command and a definition of done |
+| **Asking is judgement; permissions are mechanism** | Shape the first with CLAUDE.md and plan mode, the second with modes, rules and hooks |
+| **Checkpoints cover files only** | Database writes, deploys and pushes can't be rewound, so gate them with permissions |
+| **No temperature tricks** | Consistency comes from clear instructions and verification, not `temperature: 0` |
+
+### What Interviewers Probe Next
+
+- *"Why exact string replacement instead of line numbers or diffs?"* Line numbers go stale after the first edit; exact-match with a uniqueness check is robust to concurrent changes and fails safely.
+- *"How would you stop an agent from running `rm -rf` or leaking `.env`?"* Deny rules, sandboxing, PreToolUse hooks, least-privilege credentials, human approval for irreversible actions.
+- *"How do you keep a long refactor within the context window?"* Sub-agents for exploration, compaction with focus instructions, CLAUDE.md for durable rules, and splitting work into sessions.
 
 ---
 
-> **Next:** See the [Request/Response Cycle](03_REQUEST_RESPONSE_CYCLE.md) for full token breakdowns, or [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) for how Claude's behavior is defined.
+> **Next:** See the [Request/Response Cycle](03_REQUEST_RESPONSE_CYCLE.md) for token accounting, or [System Prompt Engineering](05_SYSTEM_PROMPT_ENGINEERING.md) for how to shape the model's behaviour.

@@ -1,28 +1,45 @@
 """
 PostgreSQL database MCP server with security, rate limiting, and auth.
-Run: python -m servers.database_server
+Run (from ai-engineering/mcp): python -m servers.database_server
 
-Requires: pip install psycopg2-binary mcp
+Requires: pip install psycopg2-binary "mcp>=2"
 
 Environment variables:
 - DATABASE_URL: PostgreSQL connection string (default: postgresql://localhost:5432/analytics)
 - MAX_ROWS: Maximum rows per query (default: 1000)
-- QUERY_TIMEOUT: Query timeout in seconds (default: 10)
+- QUERY_TIMEOUT: Per-statement timeout in seconds (default: 10)
+- MCP_STDIO_PERMISSIONS: permissions for the local stdio user, e.g. "database:read"
+  (without it the protected tools fail closed; see common/auth.py)
+
+Defence in depth for "let an LLM run SQL":
+1. A read-only role in Postgres (the real guarantee; grant SELECT on an allow-list
+   of tables/views only). This file can't create it for you.
+2. A read-only transaction + statement_timeout on every connection.
+3. The SELECT/WITH prefix check below, which only gives a friendlier error:
+   it is NOT a security boundary (`WITH x AS (DELETE ...)`, side-effecting
+   functions, `SELECT pg_sleep(...)` all pass a prefix check).
 """
 
 import json
 import os
 import time
 import logging
-from typing import Optional, List
+from functools import wraps
+from typing import Callable, List, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from common.rate_limiter import MCPRateLimiter, MCPRateLimitError
 from common.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
-from common.auth import get_current_context, get_current_client_id, require_permission
+from common.auth import (
+    AuthorizationError,
+    get_current_client_id,
+    get_current_context,
+    require_permission,
+)
 
-# Configure logging
+# Configure logging (to stderr: stdout is the stdio transport's JSON-RPC channel)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -35,7 +52,7 @@ MAX_ROWS = int(os.environ.get("MAX_ROWS", "1000"))
 QUERY_TIMEOUT_SECONDS = int(os.environ.get("QUERY_TIMEOUT", "10"))
 
 # ── Initialize MCP Server ──
-mcp = FastMCP("DatabaseConnector")
+mcp = MCPServer("DatabaseConnector")
 
 # ── Resilience: Rate Limiter + Circuit Breaker ──
 rate_limiter = MCPRateLimiter(rate=10, burst=20)
@@ -49,11 +66,19 @@ db_circuit_breaker = CircuitBreaker(
 # ── Database Helpers ──
 
 def get_connection():
-    """Create a read-only database connection."""
+    """Create a read-only database connection with a statement timeout.
+
+    A new connection per call keeps the demo simple; a real server would use a
+    pool (psycopg_pool / pgbouncer) sized below the database's connection limit.
+    """
     import psycopg2
     from psycopg2.extras import RealDictCursor
 
-    conn = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+    conn = psycopg2.connect(
+        DB_URL,
+        cursor_factory=RealDictCursor,
+        options=f"-c statement_timeout={QUERY_TIMEOUT_SECONDS * 1000}",
+    )
     conn.set_session(readonly=True, autocommit=True)
     return conn
 
@@ -76,7 +101,7 @@ def execute_query(
     Returns:
         dict with columns, rows, total_returned, and truncated flag
     """
-    # Safety check: only allow SELECT and WITH (CTE) queries
+    # Friendly early rejection only; the read-only session/role is the real guard.
     sql_stripped = sql.strip().upper()
     if not sql_stripped.startswith("SELECT") and not sql_stripped.startswith("WITH"):
         raise ValueError(
@@ -88,12 +113,16 @@ def execute_query(
         with conn.cursor() as cur:
             cur.execute(sql, params)
             columns = [desc[0] for desc in cur.description] if cur.description else []
-            rows = cur.fetchmany(min(max_rows, MAX_ROWS))
+            limit = min(max_rows, MAX_ROWS)
+            # Fetch one extra row so "truncated" is exact, not a guess.
+            rows = cur.fetchmany(limit + 1) if cur.description else []
+            truncated = len(rows) > limit
+            rows = rows[:limit]
             return {
                 "columns": columns,
                 "rows": [dict(row) for row in rows],
                 "total_returned": len(rows),
-                "truncated": len(rows) >= min(max_rows, MAX_ROWS),
+                "truncated": truncated,
             }
     finally:
         conn.close()
@@ -125,10 +154,26 @@ def _format_results(sql: str, max_rows: int) -> str:
     return output
 
 
+def as_tool_errors(func: Callable) -> Callable:
+    """Turn anticipated failures into ToolErrors so the model sees the message.
+
+    In SDK v2, any other exception is reported to the client only as a generic
+    "Error executing tool X" (details stay in the server log).
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (ValueError, AuthorizationError, MCPRateLimitError) as e:
+            raise ToolError(str(e)) from e
+    return wrapper
+
+
 # ── Tools ──
 
 
 @mcp.tool()
+@as_tool_errors
 @require_permission("database:read")
 def query(sql: str, max_rows: int = 100) -> str:
     """Execute a read-only SQL query against the analytics database.
@@ -178,18 +223,16 @@ def query(sql: str, max_rows: int = 100) -> str:
 def list_tables() -> str:
     """List all tables in the public schema with their sizes."""
     start = time.time()
+    # Sizes and row estimates come from the catalog: an exact COUNT(*) per
+    # table would scan every table just to render a schema listing.
     result = execute_query(
-        "SELECT table_name, "
-        "       pg_size_pretty(pg_total_relation_size("
-        "           quote_ident(table_name)"
-        "       )) as size, "
-        "       (SELECT COUNT(*) FROM "
-        "           quote_ident(table_name)) as row_count "
-        "FROM information_schema.tables "
-        "WHERE table_schema = 'public' "
-        "ORDER BY pg_total_relation_size("
-        "    quote_ident(table_name)"
-        ") DESC"
+        "SELECT c.relname AS table_name, "
+        "       pg_size_pretty(pg_total_relation_size(c.oid)) AS size, "
+        "       c.reltuples::bigint AS approx_rows "
+        "FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') "
+        "ORDER BY pg_total_relation_size(c.oid) DESC"
     )
     elapsed = (time.time() - start) * 1000
     output = f"*Schema loaded in {elapsed:.0f}ms*\n\n"
@@ -234,18 +277,17 @@ def health_check() -> str:
             "timestamp": time.time(),
         }, indent=2)
     except Exception as e:
-        return json.dumps({
-            "status": "unhealthy",
-            "error": str(e),
-        }, indent=2)
+        logger.warning("Health check failed: %s", e)
+        # Don't return raw driver errors: they can contain hostnames or credentials.
+        return json.dumps({"status": "unhealthy", "error": type(e).__name__}, indent=2)
 
 
 # ── Main ──
 
 if __name__ == "__main__":
-    print("🗄️  Starting Database MCP Server...")
-    print(f"   Database: {DB_URL.split('@')[-1] if '@' in DB_URL else DB_URL}")
-    print(f"   Max rows: {MAX_ROWS}")
-    print(f"   Rate limit: {rate_limiter.rate} req/s (burst: {rate_limiter.burst})")
-    print("   Transport: stdio")
+    # stdio transport: anything printed to stdout would corrupt the JSON-RPC stream.
+    logger.info(
+        "Starting Database MCP Server (stdio): db=%s max_rows=%d rate=%s/s burst=%s",
+        DB_URL.split("@")[-1], MAX_ROWS, rate_limiter.rate, rate_limiter.burst,
+    )
     mcp.run(transport="stdio")

@@ -42,8 +42,13 @@ class ShortTermMemory:
         )
 
     def get_token_count(self) -> int:
-        """Estimate token count of all entries."""
-        return sum(len(e.content.split()) for e in self.entries)
+        """Rough token estimate (~0.75 English words per token).
+
+        Use the provider's tokenizer / token-counting endpoint when the number
+        matters (budgets, truncation decisions).
+        """
+        words = sum(len(e.content.split()) for e in self.entries)
+        return int(words / 0.75)
 
     def clear(self):
         self.entries.clear()
@@ -125,6 +130,7 @@ class AgentMemory:
     """Combined memory system for an agent."""
 
     def __init__(self, user_id: str = "default"):
+        self.user_id = user_id  # long-term memory must be scoped per user/tenant
         self.short_term = ShortTermMemory()
         self.working = WorkingMemory()
         self.long_term = LongTermMemory()

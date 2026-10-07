@@ -12,7 +12,8 @@
 | 🔌 **[MCP](mcp/README.md)** | Model Context Protocol | Protocol mechanics, server implementation, RAG integration, production deployment |
 | 🤖 **[Agents](agents/README.md)** | AI Agent Engineering | Agent architecture, orchestration, tool-use loops, multi-agent systems, production guardrails |
 | 🏭 **[Production AI](production-ai/INTERVIEW_QUESTIONS.md)** | Production AI Engineering & Interview Prep | RAG debugging, hallucination detection, cost optimization, latency debugging, enterprise agents, MCP security, multi-agent workflows |
-| 🔧 **[Harness & Loop Engineering](harness-engineering/README.md)** | Production Scaffolding & Agentic Loops | Evaluation/agent harnesses, guardrails, sandboxing, verification loops, ReAct patterns, loop safety, termination logic |
+| 🔧 **[Harness & Loop Engineering](harness-engineering/README.md)** | Production Scaffolding & Agentic Loops | Evaluation/agent harnesses, guardrails, sandboxing, prompt-injection containment, verification loops, ReAct patterns, loop safety, termination logic |
+| 🧬 **[LLM Internals](llm-internals/README.md)** | How Claude and Claude Code Work | Prefill/decode and KV cache, sampling, tokenization, Messages API request/response cycle, prompt caching, prompting, cost optimization |
 
 ---
 
@@ -44,7 +45,7 @@
 # RAG — Index documents and query
 cd rag/
 pip install -r implementation/requirements.txt
-python implementation/main.py --index --docs ./data/documents/
+python implementation/main.py --index --docs ./data/
 python implementation/main.py --query "What is RAG?"
 
 # MCP — Start servers

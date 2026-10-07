@@ -1,8 +1,14 @@
 """
-Python client for connecting to MCP servers.
-Supports both calculator and RAG MCP servers.
+Python client for connecting to MCP servers (Python SDK v2, `mcp>=2`).
+Supports the calculator, database and RAG servers in this folder.
 
-Usage:
+`mcp.Client` replaces v1's `stdio_client` + `ClientSession` + `initialize()`
+layering. Against a 2026-07-28 server there is no handshake at all: each
+request carries its protocol version and capabilities in `_meta`, and the
+client probes `server/discover` first; against older servers it falls back to
+the `initialize` handshake automatically.
+
+Usage (from ai-engineering/mcp):
     # Test calculator server
     python -m clients.python_client --server calculator --add 5 3
 
@@ -16,12 +22,15 @@ Usage:
     python -m clients.python_client --server calculator --interactive
 """
 
-import asyncio
 import argparse
+import asyncio
 import json
+import os
 import sys
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+
+from mcp import Client, StdioServerParameters
+
+MCP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 SERVER_COMMANDS = {
@@ -40,93 +49,71 @@ SERVER_COMMANDS = {
 }
 
 
-async def list_tools(server_name: str) -> None:
-    """Connect to an MCP server and list its available tools."""
+def server_params(server_name: str) -> StdioServerParameters:
     config = SERVER_COMMANDS[server_name]
-    params = StdioServerParameters(
-        command=config["command"],
-        args=config["args"],
-    )
+    return StdioServerParameters(command=config["command"], args=config["args"], cwd=MCP_ROOT)
 
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
 
-            # List tools
-            tools_result = await session.list_tools()
-            print(f"\n🔧 Tools available on '{server_name}' server:\n")
-            for tool in tools_result.tools:
-                print(f"  📌 {tool.name}")
-                print(f"     {tool.description}")
-                if tool.inputSchema and tool.inputSchema.get("properties"):
-                    print(f"     Parameters:")
-                    for p_name, p_info in tool.inputSchema["properties"].items():
-                        p_type = p_info.get("type", "any")
-                        p_desc = p_info.get("description", "")
-                        req = (
-                            "required"
-                            if p_name in tool.inputSchema.get("required", [])
-                            else "optional"
-                        )
-                        print(f"       - {p_name} ({p_type}, {req}): {p_desc}")
-                print()
+async def list_tools(server_name: str) -> None:
+    """Connect to an MCP server and list its tools, resources and prompts."""
+    async with Client(server_params(server_name)) as client:
+        print(f"\nConnected to '{server_name}' (protocol {client.protocol_version})")
 
-            # List resources
-            resources_result = await session.list_resources()
-            if resources_result.resources:
-                print(f"📦 Resources available on '{server_name}' server:\n")
-                for resource in resources_result.resources:
-                    print(f"  📄 {resource.uri}")
-                    if resource.description:
-                        print(f"     {resource.description}")
-                    print()
+        tools_result = await client.list_tools()
+        print(f"\nTools on '{server_name}':\n")
+        for tool in tools_result.tools:
+            print(f"  {tool.name}: {tool.description}")
+            schema = tool.input_schema or {}
+            for p_name, p_info in schema.get("properties", {}).items():
+                p_type = p_info.get("type", "any")
+                req = "required" if p_name in schema.get("required", []) else "optional"
+                print(f"    - {p_name} ({p_type}, {req})")
+            print()
 
-            # List prompts
-            prompts_result = await session.list_prompts()
-            if prompts_result.prompts:
-                print(f"💡 Prompts available on '{server_name}' server:\n")
-                for prompt in prompts_result.prompts:
-                    print(f"  📝 {prompt.name}")
-                    if prompt.description:
-                        print(f"     {prompt.description}")
-                    print()
+        resources_result = await client.list_resources()
+        if resources_result.resources:
+            print(f"Resources on '{server_name}':\n")
+            for resource in resources_result.resources:
+                print(f"  {resource.uri}: {resource.description or ''}")
+            print()
+
+        prompts_result = await client.list_prompts()
+        if prompts_result.prompts:
+            print(f"Prompts on '{server_name}':\n")
+            for prompt in prompts_result.prompts:
+                print(f"  {prompt.name}: {prompt.description or ''}")
+            print()
 
 
 async def call_tool(server_name: str, tool_name: str, arguments: dict) -> str:
-    """Call a tool on an MCP server and return the result."""
-    config = SERVER_COMMANDS[server_name]
-    params = StdioServerParameters(
-        command=config["command"],
-        args=config["args"],
-    )
-
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments)
-            return result.content[0].text if result.content else "No content returned"
+    """Call a tool and return its text (or structured) result."""
+    async with Client(server_params(server_name)) as client:
+        result = await client.call_tool(tool_name, arguments)
+        if result.is_error:
+            return "ERROR: " + (result.content[0].text if result.content else "unknown error")
+        # `content` is what a model sees; `structured_content` (present when the
+        # tool declares an outputSchema) is what program code should parse.
+        if result.content:
+            return result.content[0].text
+        if result.structured_content is not None:
+            return json.dumps(result.structured_content)
+        return "No content returned"
 
 
 async def read_resource(server_name: str, uri: str) -> str:
     """Read a resource from an MCP server."""
-    config = SERVER_COMMANDS[server_name]
-    params = StdioServerParameters(
-        command=config["command"],
-        args=config["args"],
-    )
-
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.read_resource(uri)
-            if result and result.contents:
-                return result.contents[0].text
-            return "No content returned"
+    async with Client(server_params(server_name)) as client:
+        result = await client.read_resource(uri)
+        if result and result.contents:
+            return getattr(result.contents[0], "text", "<binary resource>")
+        return "No content returned"
 
 
 async def interactive_mode(server_name: str) -> None:
     """Interactive REPL for exploring an MCP server."""
-    print(f"\n🔮 Interactive mode — '{server_name}' MCP Server\n")
+    # Each command opens a fresh connection: simple, and cheap for a local stdio
+    # server. A long-lived client would keep one `Client` open instead.
+    print(f"\nInteractive mode: '{server_name}' MCP server\n")
     print("Available commands:")
     print("  /tools          — List all tools")
     print("  /resources      — List all resources")
@@ -153,20 +140,13 @@ async def interactive_mode(server_name: str) -> None:
         elif line == "/tools":
             await list_tools(server_name)
         elif line == "/resources":
-            config = SERVER_COMMANDS[server_name]
-            params = StdioServerParameters(
-                command=config["command"],
-                args=config["args"],
-            )
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    resources = await session.list_resources()
-                    if resources.resources:
-                        for r in resources.resources:
-                            print(f"  📄 {r.uri} — {r.description or 'No description'}")
-                    else:
-                        print("  No resources available.")
+            async with Client(server_params(server_name)) as client:
+                resources = await client.list_resources()
+                if resources.resources:
+                    for r in resources.resources:
+                        print(f"  {r.uri}: {r.description or 'No description'}")
+                else:
+                    print("  No resources available.")
         elif line.startswith("/call "):
             parts = line[6:].strip().split(" ", 1)
             if len(parts) < 2:

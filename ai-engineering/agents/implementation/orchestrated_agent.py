@@ -166,6 +166,14 @@ class OrchestratorAgent:
             # Execute ready tasks in parallel
             tasks_to_run = []
             for task in ready:
+                failed_deps = [d for d in task.dependencies
+                               if completed[d].status != "completed"]
+                if failed_deps:
+                    # Don't run work whose inputs are missing: fail fast.
+                    task.status = "failed"
+                    task.error = f"Skipped: dependencies failed {failed_deps}"
+                    completed[task.id] = task
+                    continue
                 worker = self.workers.get(task.assigned_to)
                 if not worker:
                     task.status = "failed"
@@ -174,6 +182,9 @@ class OrchestratorAgent:
                     continue
                 tasks_to_run.append(worker.execute(task))
 
+            # WorkerAgent.execute catches its own exceptions; in real code use
+            # gather(..., return_exceptions=True) or a TaskGroup plus per-task
+            # timeouts so one hung worker can't stall the plan.
             results = await asyncio.gather(*tasks_to_run)
             for result in results:
                 completed[result.id] = result

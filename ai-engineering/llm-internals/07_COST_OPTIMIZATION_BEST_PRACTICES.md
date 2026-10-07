@@ -1,653 +1,396 @@
-# 💸 LLM Cost Optimization — Practical Guide for Daily Usage
+# 💸 LLM Cost Optimization — Practical Guide
 
-> **Actionable strategies to get the most out of LLMs while keeping costs under control — from prompt design to model selection, conversation management, and production monitoring.**
+> **How to cut LLM spend without cutting quality: the levers in order of payoff (caching, batching, context hygiene, output control, model and effort choice), how to measure, and Claude Code–specific habits.**
 
----
+**30-second answer:** Measure first (`usage` per request, cost per *completed task*). Then take the free wins: prompt caching for any repeated prefix, the Batch API (50% off) for anything that can wait, and keeping context small (trim tool output, compact or reset long sessions). Then trade-offs: lower `effort` or a cheaper model where evals show quality holds, and shorter outputs (output is 5× the input price on Claude). Optimise per route, verify with evals, and remember a cheaper request that needs more retries isn't cheaper.
 
-## 1. THE COST LANDSCAPE (Updated July 2026)
-
-Understanding current pricing is the first step to controlling costs:
-
-### Model Pricing (per million tokens)
-
-| Model | Input | Output | Best For |
-|-------|-------|--------|----------|
-| **Claude 4 Sonnet** | $3.00 | $15.00 | Daily coding, analysis, reasoning |
-| **Claude 4 Haiku** | $0.80 | $4.00 | Quick Q&A, simple edits, classification |
-| **Claude 4 Opus** | $15.00 | $75.00 | Complex research, deep reasoning |
-| **GPT-4o** | $2.50 | $10.00 | General purpose, creative work |
-| **GPT-4o-mini** | $0.15 | $0.60 | Simple tasks, high volume, cheap |
-| **DeepSeek Coder V3** | $0.90 | $3.60 | Code generation, technical tasks |
-| **DeepSeek V4 Flash** | $0.40 | $1.60 | Fast inference, prototyping |
-
-> **Key insight:** Output tokens cost **3-5x more** than input tokens for most models. Every word the model generates has a disproportionate cost impact.
+!!! info "Prices on this page"
+    Claude API rates were checked on the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing) on **7 Oct 2026**. Prices and model names change every few months. Re-check before quoting, and compare other providers using their own pricing pages. Worked examples use round example rates ($3 input / $15 output per million tokens) so the arithmetic is easy to follow.
 
 ---
 
-## 2. MODEL SELECTION STRATEGY
+## 1. THE COST LANDSCAPE
 
-The single biggest cost lever is **choosing the right model for the right task**.
+### Claude API Pricing (per million tokens, 7 Oct 2026)
 
-### The Tiered Model Strategy
+| Model | Input | Output | Cache read | Batch (in / out) | Typical use |
+|-------|-------|--------|-----------|------------------|-------------|
+| **Claude Fable 5.1** | $10 | $50 | $0.25 | $5 / $25 | Hardest reasoning, long-horizon agents |
+| **Claude Opus 5.5** | $4 | $20 | $0.20 | $2 / $10 | Anthropic's default recommendation; agentic coding |
+| **Claude Sonnet 5.5** | $2 | $10 | $0.20 | $1 / $5 | High-volume production, everyday coding |
+| **Claude Haiku 4.5** | $1 | $5 | $0.10 | $0.50 / $2.50 | Classification, extraction, cheap sub-agents |
+
+The structure is what lasts:
+
+- **Output is 5× input** on every current Claude model, and **thinking tokens bill as output**.
+- **Cache writes** cost 1.25× input (5-minute TTL) or 2× (1-hour); **cache reads** 0.1× on most models (less on Opus 5.5 and Fable 5.1).
+- **Batch API**: 50% off input and output; stacks with caching.
+- **Long context**: no premium on Claude 4.6+ models (1M window at the standard rate).
+- **Newer tokenizer** (Opus 4.7 and later): roughly 1.0–1.35× the tokens for the same text, so compare *cost per task*, not price per token.
+- Other providers (OpenAI, Google, DeepSeek, open-weight hosts) price differently and change often; benchmark them on your own eval set.
+
+---
+
+## 2. MODEL AND EFFORT SELECTION
+
+Choosing the model is a big lever, but on current Claude models **effort** is often the first one to try: `output_config.effort` (`low` → `max`) trades thoroughness against tokens *within* a model.
+
+### The Tiered Strategy
 
 ```
-                    TIERED MODEL SELECTION
-                    ─────────────────────
-
-  Task Complexity          Model Choice          Cost/Task
-  ──────────────────────────────────────────────────────────
-  Simple Q&A               GPT-4o-mini /         $0.001-0.005
-  (What is X?)             Claude 4 Haiku
-  
-  Simple edit              Claude 4 Haiku        $0.005-0.02
-  (Fix one typo)
-  
-  Daily coding             Claude 4 Sonnet       $0.02-0.10
-  (Feature implementation)
-  
-  Complex refactoring      Claude 4 Sonnet       $0.10-0.50
-  (Multi-file changes)
-  
-  Deep research            Claude 4 Opus         $0.50-5.00
-  (Architecture design)
-
-  Percentage of tasks:
-  ┌────────────────────────────────────────────────────────────┐
-  │  60% Simple (cheap model)                                  │
-  │  30% Moderate (balanced model)                             │
-  │  10% Complex (best model when needed)                      │
-  └────────────────────────────────────────────────────────────┘
+  Task                                   Start with
+  ─────────────────────────────────────────────────────────────────────
+  Classification, extraction, routing    Haiku, or Sonnet at low effort
+  Chat, summarisation, simple edits      Sonnet at low/medium effort
+  Everyday coding, tool-using agents     Sonnet or Opus at medium/high
+  Hard debugging, architecture, research Opus at high, or Fable
 ```
-
-### Rule of Thumb
-
-| If your task is... | Use... | Savings vs Opus |
-|-------------------|--------|-----------------|
-| A simple question you'd Google | GPT-4o-mini or Claude 4 Haiku | **97%** |
-| Writing a short email or message | GPT-4o-mini | **99%** |
-| Reviewing a small PR | Claude 4 Sonnet | **80%** |
-| Brainstorming ideas | GPT-4o | **83%** |
-| Complex debugging | Claude 4 Sonnet | **80%** |
-| Only the hardest problems | Claude 4 Opus | — |
 
 ### How to Choose in Practice
 
+1. Build an eval set from real traffic for the route.
+2. Run the most capable model you'd consider at a lower effort, and a cheaper model at its default. Often the newest large model at low effort matches an older one at high effort.
+3. Pick the cheapest configuration that clears your quality bar, measured as **cost per successfully completed task**.
+4. Route per task type, not globally. A multi-model cascade adds complexity and splits prompt caches (caches are per model); measure the single-model option first.
+
 ```python
-# Decision framework for model selection
-def pick_model(task: str, context: dict) -> str:
-    """Pick the most cost-effective model for a task."""
-    
-    # 1. High-volume, repetitive tasks → cheapest
-    if context.get("volume", 0) > 1000:
-        return "gpt-4o-mini"  # $0.15/M input
-    
-    # 2. Real-time, user-facing → fast + cheap
-    if context.get("latency_sensitive"):
-        return "claude-4-haiku"  # Fastest Claude model
-    
-    # 3. Code generation → coding-specialized
-    if task in ("code_gen", "code_review", "debug"):
-        return "deepseek-coder-v3"  # $0.90/M input
-    
-    # 4. Complex reasoning → best model
-    if context.get("complexity", "low") == "high":
-        return "claude-4-sonnet"  # Best reasoning/price ratio
-    
-    # 5. Everything else → balanced
-    return "claude-4-sonnet"  # Default for daily use
+# Per-route configuration, chosen from eval results rather than intuition.
+ROUTES = {
+    "classify_ticket": {"model": "claude-haiku-4-5", "effort": None},   # Haiku doesn't support effort
+    "summarise_doc":   {"model": "claude-sonnet-5-5", "effort": "low"},
+    "code_review":     {"model": "claude-opus-5-5", "effort": "medium"},
+    "incident_rca":    {"model": "claude-opus-5-5", "effort": "high"},
+}
+
+def request_params(route: str) -> dict:
+    cfg = ROUTES[route]
+    params = {"model": cfg["model"]}
+    if cfg["effort"]:
+        params["output_config"] = {"effort": cfg["effort"]}
+    return params
 ```
 
 ---
 
-## 3. PROMPT CACHING — YOUR BIGGEST COST SAVER
+## 3. PROMPT CACHING — USUALLY THE BIGGEST SAVER
 
-Prompt caching can reduce input costs by **90%** for repeated prompt components.
+Any request that repeats a prefix (system prompt, tool definitions, a shared document, an agent's growing history) should cache it.
 
-### How Caching Works
+### How the Math Works (example rates: input $3, write $3.75, read $0.30 per M)
 
 ```
-Without Caching (every request pays full price):
-  Request 1: System(2K) + Tools(2.5K) + User(0.5K) = 5.0K charged
-  Request 2: System(2K) + Tools(2.5K) + User(0.5K) = 5.0K charged
-  Request 3: System(2K) + Tools(2.5K) + User(0.5K) = 5.0K charged
-  ──────────────────────────────────────────────────────────
-  Total: 15.0K tokens charged at full price
+Prefix (system + tools) = 4,500 tokens, question = 500 tokens, 3 requests within 5 minutes
 
-With Caching:
-  Request 1: System(2K, write) + Tools(2.5K, write) + User(0.5K) = 5.0K (cache write)
-  Request 2: System(2K, hit)  + Tools(2.5K, hit)  + User(0.5K) = 0.5K (cache hit!)
-  Request 3: System(2K, hit)  + Tools(2.5K, hit)  + User(0.5K) = 0.5K (cache hit!)
-  ──────────────────────────────────────────────────────────
-  Total: 6.0K tokens charged (60% savings!)
+Without caching:
+  3 × 5,000 × $3/M                                    = $0.0450
+
+With caching:
+  Request 1: 4,500 × $3.75/M (write) + 500 × $3/M     = $0.0184
+  Request 2: 4,500 × $0.30/M (read)  + 500 × $3/M     = $0.0029
+  Request 3: same as request 2                        = $0.0029
+                                                        ───────
+                                                        $0.0241  (-46%)
+
+At 100 requests: $1.50 uncached vs ~$0.30 cached (-80%)
 ```
 
-### Cache Pricing
+The first request costs more; each hit is far cheaper. With the 5-minute TTL a single hit pays back the write.
 
-| Component | Normal Price | Cached Price | Savings |
-|-----------|-------------|--------------|---------|
-| **System prompt** | $3.00/M | $0.30/M | **90%** |
-| **Tool schemas** | $3.00/M | $0.30/M | **90%** |
-| **Large context prefix** | $3.00/M | $0.30/M | **90%** |
-
-### Best Practices for Prompt Caching
+### Doing It Right
 
 ```python
-# ✅ GOOD: Cache-friendly prompt structure
-SYSTEM_PROMPT = [
-    {
-        "type": "text",
-        "text": "You are a senior software engineer...",
-        "cache_control": {"type": "ephemeral"}  # ← Mark for caching
-    }
-]
+import anthropic
 
-# ✅ GOOD: Group static content together
-messages = [
-    # Put ALL cached content at the beginning
-    {
-        "role": "system",
-        "content": LONG_SYSTEM_PROMPT,  # Marked with cache_control
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "text",
-                "text": STATIC_CONTEXT,  # Project info, conventions
-                "cache_control": {"type": "ephemeral"}
-            },
-            {
-                "type": "text",
-                "text": DYNAMIC_QUERY  # The actual question
-            }
-        ]
-    }
-]
+client = anthropic.Anthropic()
+
+response = client.messages.create(
+    model="claude-sonnet-5-5",
+    max_tokens=4000,
+    cache_control={"type": "ephemeral"},     # automatic: caches up to the last cacheable block
+    tools=TOOLS,                             # rendered first: keep the list and order stable
+    system=[
+        {
+            "type": "text",
+            "text": LONG_SYSTEM_PROMPT + PROJECT_CONVENTIONS,   # stable content only
+            "cache_control": {"type": "ephemeral"},            # explicit breakpoint on the static prefix
+        }
+    ],
+    messages=history + [{"role": "user", "content": question}],  # dynamic content last
+)
+u = response.usage
+print(u.cache_creation_input_tokens, u.cache_read_input_tokens, u.input_tokens)
 ```
 
-### What to Cache vs What Not to Cache
+Note that `system` is a top-level parameter, not a message with `role: "system"` at the start of `messages`.
 
-| ✅ Cache This | ❌ Don't Cache This |
-|--------------|-------------------|
-| System prompt (persona, rules) | User messages (change every turn) |
-| Tool definitions and schemas | Tool results (different every time) |
-| Project conventions and context | File contents (variable per request) |
-| Static knowledge base snippets | Error messages |
-| Template explanations | Session-specific data |
+| ✅ Cache | ❌ Keep after the last breakpoint |
+|----------|----------------------------------|
+| Tool definitions, system prompt | The newest user message |
+| Project conventions, reference docs | Per-request IDs, timestamps |
+| Conversation history and earlier tool results (agent loops) | Anything that differs between otherwise-identical requests |
 
-### Cache Invalidation Strategy
+### Cache Rules That Trip People Up
 
-The cache is **ephemeral** — it lasts ~5 minutes of inactivity. Design for this:
-
-```python
-# Strategy: Organize prompts to maximize cache hits
-
-# 1. Place static content FIRST (most likely to be cached)
-# 2. Place dynamic content LAST (always new)
-# 3. Keep cacheable content contiguous (no interleaving)
-
-BAD:  [System] [UserMsg1] [Tools] [UserMsg2]  ← Cache broken
-GOOD: [System] [Tools] [StaticContext] [Dynamic]  ← Max cache hits
-```
+- **Prefix-exact, in order tools → system → messages.** Change one byte early and everything after it misses.
+- **TTL:** 5 minutes (refreshed by every hit) or 1 hour (2× write cost). Pick by the gap between requests.
+- **Minimum length:** 512–4,096 tokens depending on the model; shorter prefixes silently don't cache.
+- **Up to 4 explicit breakpoints** per request.
+- **Verify:** if `cache_read_input_tokens` stays 0, look for timestamps, unsorted JSON, changing tool lists, or a model switch.
 
 ---
 
-## 4. CONVERSATION MANAGEMENT
+## 4. CONTEXT MANAGEMENT
 
-The #1 cost killer in agent tools: **conversation history that grows unbounded**.
+In agents, the biggest cost driver is a conversation that grows without bound: every call resends it.
 
-### The Cost of Conversation Growth
+### The Cost of Conversation Growth (example rate $3/M input, uncached)
 
 ```
-Turn 1:   5,000 tokens  →  $0.015
-Turn 5:  15,000 tokens  →  $0.045
-Turn 10: 30,000 tokens  →  $0.090
-Turn 20: 60,000 tokens  →  $0.180
-Turn 50: 150,000 tokens →  $0.450
+Call 1:    5,000 tokens  →  $0.015
+Call 10:  30,000 tokens  →  $0.090
+Call 50: 150,000 tokens  →  $0.450  per call, 30× the first
 
-After 50 turns: You're spending $0.45 per message — 30x the first message!
+With caching, most of each call is billed at the cache-read rate,
+so call 50 costs about $0.06 (145K cached reads + 5K new tokens written). Still: smaller context is
+cheaper, faster, and more accurate (context rot).
 ```
 
-### Strategies to Control History Growth
+### Strategies
 
-#### Strategy 1: Summarize, Don't Accumulate
+**Compact, don't just accumulate.** Summarise old turns when the context passes a threshold. The Claude API offers server-side compaction (beta) and context editing that clears old tool results; Claude Code auto-compacts and supports `/compact <focus>`.
 
 ```python
-# ❌ BAD: Keep everything
-messages.append(user_message)
-messages.append(assistant_response)  # Grows forever
-
-# ✅ GOOD: Summarize periodically
-if len(messages) > MAX_HISTORY_TURNS:
-    summary = summarize_conversation(messages[:-2])  # Condense history
-    messages = [summary_message(summary)] + messages[-2:]  # Keep only last turn
+# Client-side version of the idea (server-side compaction does this for you).
+if count_tokens(messages) > COMPACT_AT:
+    summary = summarise(messages[:-KEEP_RECENT])          # one cheap model call
+    messages = [{"role": "user", "content": f"<summary>{summary}</summary>"}] + messages[-KEEP_RECENT:]
+    # Keep tool_use/tool_result pairs together when choosing the cut point.
 ```
 
-#### Strategy 2: Know When to Fork
+**Reset for unrelated work.** Starting a new conversation (Claude Code: `/clear`) costs nothing; carrying 100K tokens of irrelevant history into every call does.
 
-```python
-# When to start a NEW conversation (fork) vs. continue:
-#
-# CONTINUE if: Same task, incremental progress
-#   "Fix this bug" → "Now fix the related bug in utils.py"
-#
-# FORK if: New task, unrelated topic
-#   "Fix this bug" → "Now design a new API from scratch"
-#
-# FORK if: Conversation > 20 turns
-#   Starting fresh saves costs even if you lose some context
-```
+**Trim tool results at the source.** Return the matching lines, not the file; paginate; cap command output; summarise logs in a sub-agent.
 
-#### Strategy 3: Trim Tool Results
-
-```python
-# Tool results (file contents, search results) are the biggest cost driver.
-# Trim them before sending back to the LLM.
-
-# ❌ BAD: Send full file contents every time
-tool_result = read_entire_file("large_file.py")  # 2000+ tokens
-
-# ✅ GOOD: Send only what's relevant
-tool_result = extract_relevant_section("large_file.py", line_range=(10, 50))
-```
-
-### The Fresh Start Rule
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          FRESH START RULE                             │
-│                                                                       │
-│  If your task is COMPLETELY DIFFERENT from the current conversation:  │
-│                                                                       │
-│  ❌ Don't: "Now let's also redesign the database schema"              │
-│     (After 30 turns of frontend work — $0.30/msg)                    │
-│                                                                       │
-│  ✅ Do: Start a new conversation with a concise summary:              │
-│     "We have a FastAPI app with user auth. Design a DB schema."      │
-│     (Fresh start: $0.02/msg — 15x cheaper!)                         │
-└──────────────────────────────────────────────────────────────────────┘
-```
+**Offload noisy work.** A sub-agent with its own context reads the 10,000-line log and returns ten lines.
 
 ---
 
 ## 5. OUTPUT LENGTH CONTROL
 
-Output tokens cost **3-5x more** than input tokens. Every unnecessary word burns budget.
+Output costs 5× input, and long outputs are slow (decode is sequential).
 
-### The Cost of Verbosity
+### The Cost of Verbosity (example rate $15/M output)
 
 ```
-Concise response (50 tokens):   $0.00075  (75/100 of a cent)
-Verbose response (500 tokens):  $0.00750  (7.5 cents)
-Very verbose (2000 tokens):     $0.03000  (3 cents — 40x more!)
+Concise (50 tokens):      $0.00075   (0.075 cents)
+Verbose (500 tokens):     $0.0075    (0.75 cents)
+Very verbose (2,000):     $0.030     (3 cents, 40× concise)
 
-Over 1000 conversations/day:
-  Concise:   $0.75/day
-  Verbose:   $7.50/day
-  Very verbose: $30.00/day
+× 1,000 requests/day:     $0.75   vs   $7.50   vs   $30.00 per day
 ```
 
-### Controlling Output Length
+### Levers
 
-```python
-# Method 1: Set max_tokens aggressively
-response = client.messages.create(
-    model="claude-sonnet-4-20250514",
-    max_tokens=500,  # ← Be specific about how much you need
-)
-
-# Method 2: Instruct conciseness in system prompt
-"You are a concise assistant. Keep responses under 3 sentences.
- Never add unnecessary commentary. Answer directly."
-
-# Method 3: Use structured output format
-"Respond with ONLY the code. No explanations. No markdown.
- Just the raw code block."
-
-# Method 4: Set response format explicitly
-"Format your response as:
- - One-line summary
- - Bullet points only (max 5)
- - No prose, no greetings, no sign-offs"
-```
-
-### When Verbosity Is Actually Wasteful
-
-| ❌ Unnecessary | ✅ Better |
-|--------------|----------|
-| "Certainly! I'd be happy to help you with that. Here's my analysis..." | Direct answer, no preamble |
-| "Let me first understand your requirements..." (and then asks a question you already answered) | Read the existing context before responding |
-| "In conclusion, to summarize the key points we've discussed..." (at the end of every turn) | Only summarize when starting a new task |
-| "I hope this helps! Let me know if you have any questions." (on every response) | Skip sign-offs in a conversation |
+| Lever | Notes |
+|-------|-------|
+| **Lower `effort`** | Fewer thinking tokens, fewer and more consolidated tool calls, terser answers |
+| **Instructions** | "Answer in at most three sentences", "Return only the code block" |
+| **Structured outputs** | `output_config.format` with a JSON schema returns exactly the fields you need |
+| **`max_tokens`** | A safety cap, not a style control: hitting it truncates mid-answer (`stop_reason: "max_tokens"`) and you pay for a retry |
+| **Show, don't tell** | An example of the desired terse format beats "be concise" |
 
 ---
 
 ## 6. TOOL CALL OPTIMIZATION
 
-In agent frameworks (Claude Code, Cursor, etc.), each tool call costs an additional API round-trip.
+Each tool call is another round-trip carrying the full context.
 
-### The Hidden Cost of Tool Calls
-
-```
-Example: Implementing a feature
-    
-    Step                     Tokens (Input)  Cost
-    ─────────────────────────────────────────────────
-    1. Initial request         5,000         $0.015
-    2. Read main.py            6,000         $0.018
-    3. Read models.py          7,000         $0.021
-    4. Read schemas.py         8,000         $0.024
-    5. Edit main.py            9,000         $0.027
-    6. Edit models.py         10,000         $0.030
-    7. Run tests              11,000         $0.033
-    8. Final response         12,000         $0.036
-    ─────────────────────────────────────────────────
-    Total                     —             $0.204
-
-WITH optimization:
-    Step                     Tokens (Input)  Cost
-    ─────────────────────────────────────────────────
-    1. Initial request         5,000         $0.015
-    2. Read ALL files at once  7,000         $0.021
-    3. Edit main.py + models   9,000         $0.027
-    4. Run tests + respond    11,000         $0.033
-    ─────────────────────────────────────────────────
-    Total                      —            $0.096  (53% savings!)
-```
-
-### Tool Call Best Practices
-
-```python
-# ✅ GOOD: Batch reads together
-read_files(["main.py", "models.py", "schemas.py"])  # One call
-
-# ❌ BAD: Read one file at a time
-read_files(["main.py"])     # Call 1
-read_files(["models.py"])   # Call 2  
-read_files(["schemas.py"])  # Call 3
-
-# ✅ GOOD: Read only what you need
-read_file("src/main.py")  # Read the file you're editing
-# Don't read irrelevant files just to be thorough
-
-# ✅ GOOD: Use targeted search instead of full file reads
-search_code("class User")  # Find only the relevant section
-# vs. read entire 500-line file
-
-# ✅ GOOD: Combine multiple small edits into one str_replace
-str_replace(
-    old="line1\nline2\nline3",
-    new="new_line1\nnew_line2\nnew_line3"
-)
-# vs. three separate str_replace calls
-```
-
-### The "Read Once" Rule
+### The Hidden Cost (example rate $3/M input, uncached)
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          READ ONCE RULE                              │
-│                                                                      │
-│  Before you ask Claude to read a file, ask yourself:                 │
-│                                                                      │
-│  ❌ "Can I give Claude enough context in my prompt instead?"         │
-│  ✅ Copy the key function/section into your prompt                   │
-│                                                                      │
-│  ❌ "Do I need the entire file or just a function?"                  │
-│  ✅ Target specific functions, classes, or line ranges              │
-│                                                                      │
-│  ❌ "Can I find it with a search instead?"                          │
-│  ✅ Use targeted search for patterns, not full file reads           │
-└──────────────────────────────────────────────────────────────────────┘
+Sequential (8 calls)                     Batched (4 calls)
+  1. Initial request    5,000  $0.015      1. Initial request        5,000  $0.015
+  2. Read main.py       6,000  $0.018      2. Read 3 files at once   7,000  $0.021
+  3. Read models.py     7,000  $0.021      3. Edit main + models     9,000  $0.027
+  4. Read schemas.py    8,000  $0.024      4. Run tests + respond   11,000  $0.033
+  5. Edit main.py       9,000  $0.027                                ──────────────
+  6. Edit models.py    10,000  $0.030                                       $0.096
+  7. Run tests         11,000  $0.033
+  8. Final response    12,000  $0.036
+                              ──────
+                              $0.204                                  (-53%)
 ```
+
+How to get there:
+
+- **Parallel tool calls:** the model can request several tools in one turn; return all results in one user message (splitting them across messages discourages parallel calls).
+- **Tools that return exactly what's needed:** `search_code("class User")` beats reading a 500-line file; a `get_failing_tests` tool beats dumping the full test log.
+- **Fewer, well-described tools:** every tool definition is input tokens on every call; for large tool sets use tool search / deferred loading so only names are sent until needed.
+- **Programmatic tool calling** (Claude API): the model writes code that calls your tools in a loop inside code execution, so intermediate results don't flow through the context.
 
 ---
 
 ## 7. BATCH PROCESSING
 
-When processing multiple independent items, **batch them** instead of making separate requests.
+Two different ideas share the word "batch":
 
-### Batching vs. Individual Requests
+### 7.1 The Message Batches API (asynchronous, 50% off)
+
+For work that doesn't need an answer now (evals, backfills, nightly classification, document processing), submit up to tens of thousands of requests in one batch; results arrive asynchronously (most within an hour, at most 24 hours) at **half price**, and caching discounts still apply.
 
 ```python
-# ❌ BAD: 10 separate requests (10x overhead)
-for item in items:
-    response = llm.generate(f"Translate to French: {item}")
-    # Each call pays the full system prompt + tools cost again
-
-# ✅ GOOD: One batched request
-response = llm.generate(f"""
-Translate each of the following to French.
-Return as a JSON array preserving the order.
-
-Items:
-{json.dumps(items, indent=2)}
-
-Response format: {{"translations": [...], "indices": [...]}}
-""")
-# One call, one system prompt, one set of tools
+batch = client.messages.batches.create(
+    requests=[
+        {
+            "custom_id": f"ticket-{t.id}",
+            "params": {
+                "model": "claude-haiku-4-5",
+                "max_tokens": 256,
+                "system": CLASSIFIER_PROMPT,          # identical across requests → cacheable
+                "messages": [{"role": "user", "content": t.text}],
+            },
+        }
+        for t in tickets
+    ]
+)
+# Poll client.messages.batches.retrieve(batch.id) until processing_status == "ended",
+# then stream client.messages.batches.results(batch.id). Results can arrive in any
+# order: match them by custom_id, never by position.
 ```
 
-### When to Batch vs. Not
+### 7.2 Packing Several Items into One Prompt
 
-| Scenario | Batch? | Why |
-|----------|--------|-----|
-| Translate 100 sentences | ✅ Batch | Same task, same context |
-| Review 10 small files | ✅ Batch | Same reviewer persona |
-| Classify 1000 items | ✅ Batch | Same classification criteria |
-| Debug a specific error | ❌ Don't batch | Needs iteration and context |
-| Brainstorming ideas | ❌ Don't batch | Benefits from back-and-forth |
-| Complex multi-step task | ❌ Don't batch | Needs sequential reasoning |
+Putting 20 short items in one request saves the repeated system prompt and per-request overhead, but:
 
-### Batch Size Guidelines
+| Pack items together? | When |
+|---------------------|------|
+| ✅ Yes | Many tiny, independent, same-instruction items (translate phrases, tag short texts) |
+| ❌ No | Items that need careful individual attention, long items, anything where one bad item shouldn't spoil the rest |
 
-```
-Optimal batch size depends on context window:
-
-  Small model (8K context):  3-5 items per batch
-  Medium model (32K context): 5-10 items per batch
-  Large model (128K+ context): 10-50 items per batch
-
-Note: Larger batches can reduce quality. Start small and increase.
-```
+Quality tends to drop as packs grow (items get skipped or blended), so measure accuracy per pack size, and prefer the Batch API plus caching when each item deserves its own request.
 
 ---
 
 ## 8. PRACTICAL BUDGET CONTROL
 
-### Setting Up Cost Alerts
+### Measure from `usage`, Not Estimates
 
 ```python
-class CostMonitor:
-    """Simple cost monitoring for daily usage."""
-    
-    def __init__(self, daily_budget: float = 5.0, monthly_budget: float = 100.0):
-        self.daily_budget = daily_budget
-        self.monthly_budget = monthly_budget
-        self.daily_usage = 0.0
-        self.monthly_usage = 0.0
-    
-    def track_call(self, model: str, input_tokens: int, output_tokens: int):
-        cost = calculate_cost(model, input_tokens, output_tokens)
-        self.daily_usage += cost
-        self.monthly_usage += cost
-        
-        if self.daily_usage > self.daily_budget * 0.8:
-            print(f"⚠️ Warning: Daily usage at 80% (${self.daily_usage:.2f}/${self.daily_budget:.2f})")
-        
-        if self.monthly_usage > self.monthly_budget:
-            print(f"🚨 Monthly budget exceeded!")
-    
-    def get_report(self) -> str:
-        return f"""
-Cost Report:
-  Today:  ${self.daily_usage:.2f} / ${self.daily_budget:.2f}
-  Month:  ${self.monthly_usage:.2f} / ${self.monthly_budget:.2f}
-        """
+from dataclasses import dataclass
+
+
+def alert(msg: str) -> None:
+    print(msg)  # wire to your paging/alerting system
+
+
+PRICES = {  # USD per million tokens; load from config and keep in sync with the pricing page
+    "claude-sonnet-5-5": {"in": 2.00, "out": 10.00, "cache_write_5m": 2.50, "cache_read": 0.20},
+}
+
+@dataclass
+class CostTracker:
+    daily_budget_usd: float
+    spent_today: float = 0.0
+
+    def record(self, model: str, usage) -> float:
+        p = PRICES[model]
+        cost = (
+            usage.input_tokens * p["in"]
+            + (usage.cache_creation_input_tokens or 0) * p["cache_write_5m"]
+            + (usage.cache_read_input_tokens or 0) * p["cache_read"]
+            + usage.output_tokens * p["out"]
+        ) / 1_000_000
+        self.spent_today += cost
+        if self.spent_today > 0.8 * self.daily_budget_usd:
+            alert(f"LLM spend at {self.spent_today / self.daily_budget_usd:.0%} of daily budget")
+        return cost
 ```
 
-### Quick Cost Estimation Cheat Sheet
+(`input_tokens` excludes cached tokens; the three input fields add up to the total input.) In production also: tag requests by route/customer, use workspace spend limits in the Claude Console, and track cost per completed task, cache hit rate, and retry rate on a dashboard.
 
-```
-ESTIMATE YOUR COSTS QUICKLY
-────────────────────────────
+### Reference Points
 
-Per API call (average):
-  Simple Q&A:            ~$0.002  (2,000 input + 200 output tokens)
-  Code generation:       ~$0.02   (5,000 input + 500 output tokens)
-  Complex task (10 turns): ~$0.25  (50,000 input + 5,000 output total)
-
-For heavy daily usage (Claude Code, Cursor, etc.):
-  Light day:   ~$1-3/day    (~30-90 simple tasks)
-  Medium day:  ~$3-10/day   (~10-30 coding tasks)
-  Heavy day:   ~$10-30/day  (~5-10 complex tasks)
-  Very heavy:  ~$30-100/day (agent sessions, bulk processing)
-
-Monthly projections:
-  Light usage:   ~$30-90/month
-  Medium usage:  ~$90-300/month
-  Heavy usage:   ~$300-900/month
-  Power usage:   ~$900-3000+/month
-```
+- Anthropic's Claude Code cost docs (checked Oct 2026): across enterprise deployments the average is **about $13 per developer per active day** and **$150–250 per developer per month**, with 90% of users under $30 per active day. Your numbers depend on model, codebase and habits; pilot and measure.
+- Per-request costs scale with context: at example rates, a 2K-token Q&A is under a cent, a 50K-input agent task is tens of cents, a long multi-hour agent session can be dollars.
 
 ---
 
-## 9. FREE/OPEN-SOURCE ALTERNATIVES
+## 9. LOCAL AND OPEN-WEIGHT MODELS
 
-When costs become a concern, consider local/open-source models for certain tasks:
+Open-weight models (Llama, Qwen, Gemma, Mistral, DeepSeek families and others) can run locally or on your own GPUs. They're "free" per token but not free: hardware, ops, and usually lower capability than frontier APIs.
 
-| When to Use Local | Recommended Model | Hardware Needed |
-|-------------------|-------------------|-----------------|
-| Prototype / testing | Gemma 4B, Llama 3.2 3B | 8GB RAM (any Mac) |
-| Simple classification | Phi-3 Mini | 4GB RAM |
-| Code completion | DeepSeek Coder (local) | 16GB RAM, GPU recommended |
-| Batch processing | Mistral 7B | 16GB RAM |
-| Last resort | Llama 3 70B (via API) | Requires API or heavy GPU |
+| Good fit | Poor fit |
+|----------|----------|
+| Prototyping, offline dev, unit tests of plumbing | Hard reasoning and long agentic tasks |
+| High-volume simple classification/extraction after evals prove quality | Workloads needing frontier coding ability |
+| Data that can't leave your network | Teams without capacity to run inference infra |
 
-### Hybrid Strategy for Maximum Savings
-
-```python
-# Hybrid approach: local for simple, API for complex
-def get_response(prompt: str, complexity: str):
-    if complexity == "simple":
-        return local_model.generate(prompt)    # Free!
-    elif complexity == "medium":
-        return cheap_api.generate(prompt)      # $0.001
-    else:
-        return best_api.generate(prompt)       # $0.02-0.10
-```
+Sizing rule of thumb for weights: parameters × bytes per parameter. An 8B model is ~16 GB at FP16 or ~4–5 GB at 4-bit, plus KV-cache memory that grows with context length and concurrency.
 
 ---
 
-## 10. CLAUDE CODE / EDITOR SPECIFIC TIPS
+## 10. CLAUDE CODE SPECIFIC TIPS
 
-If you're using Claude Code (CLI) or Claude Editor:
+All from the official [Claude Code cost guide](https://code.claude.com/docs/en/costs) unless noted.
 
-### Before Starting a Session
+### Before Starting
 
-- [ ] **Define the scope clearly**: Vague requests lead to more back-and-forth
-- [ ] **Include relevant context in your prompt**: Saves file reads
-- [ ] **Check for existing solutions**: Don't ask Claude to write what already exists
-- [ ] **Use a focused task description**: "Add search to the user list" vs "Make the app better"
+- [ ] **Be specific:** "add input validation to `login()` in auth.ts" lets Claude go straight there; "improve this codebase" triggers broad scanning.
+- [ ] **Give a verification target:** a test command, expected output, or screenshot, so it doesn't iterate blindly.
+- [ ] **Use plan mode** (`Shift+Tab`) for complex work, so you approve the approach before tokens go into implementation.
+- [ ] **Keep CLAUDE.md lean** (the docs suggest under ~200 lines); move specialised workflows into skills, which load only when used.
 
 ### During a Session
 
-- [ ] **Monitor the cost indicator** (Claude Code shows token usage)
-- [ ] **Restart for new tasks**: `/clear` or start a new conversation
-- [ ] **Give complete requirements in one message**: Avoid multiple rounds of clarification
-- [ ] **Use precise file paths**: "Read src/main.py:42-60" vs "Read the main file"
-- [ ] **Explicitly say when Claude is done**: Don't let it continue analyzing after task is complete
+- [ ] **Watch usage:** `/usage` shows session tokens and estimated cost (meaningful for API billing), `/context` shows what fills the window; the status line can show it continuously.
+- [ ] **`/clear` between unrelated tasks** (free); `/compact <focus>` when you need continuity.
+- [ ] **Pick the model and effort for the job:** `/model`, `/effort`. Sonnet handles most coding; reserve Opus for harder reasoning; use Haiku for simple sub-agents.
+- [ ] **Course-correct early:** `Esc` to stop, `Esc Esc` or `/rewind` to roll back, rather than letting a wrong approach run.
+- [ ] **Delegate verbose work to sub-agents:** test runs, log reading and doc fetching stay out of your main context.
+- [ ] **Prefer CLIs to MCP servers where both exist** (`gh`, `aws`), and disable unused MCP servers (`/mcp`).
+- [ ] **Filter output with hooks:** e.g. a `PreToolUse` hook that rewrites test commands to show only failures.
+- [ ] **Mind idle-time costs:** after a break longer than the cache TTL, the next message re-processes the full context; scheduled tasks and agent teams keep spending while you're away.
 
-### Cost-Effective Prompt Templates
+### Cost-Effective Prompts
 
 ```
-❌ EXPENSIVE: "Make this better" → Claude reads all files, analyzes everything, suggests many changes
-   Cost: ~$0.30-0.50
+❌ "Make this better"
+   → broad exploration, many reads, many suggestions
 
-✅ CHEAP: "In src/main.py, change the /health endpoint to return {'status': 'ok'} instead of {'health': 'good'}"
-   Cost: ~$0.01-0.02
-
-❌ EXPENSIVE: "Review this code for issues" → Claude might do a deep analysis
-   Cost: ~$0.15-0.30
-
-✅ CHEAP: "Check this function for SQL injection vulnerabilities: [paste function]"
-   Cost: ~$0.01-0.02
+✅ "In src/main.py, change the /health endpoint to return {'status': 'ok'}
+    instead of {'health': 'good'}, and update its test."
+   → one search, one read, two edits, one test run
 ```
-
-### End-of-Session Checklist
-
-- [ ] Did I complete the task within this session?
-- [ ] If not, should I save a summary for next time vs. continuing?
-- [ ] Did I learn anything I should document for future reference?
-- [ ] Is there a way to write shorter prompts next time for similar tasks?
 
 ---
 
-## 11. SUMMARY — THE TOP 10 COST-SAVING RULES
+## 11. SUMMARY — THE LEVERS IN ORDER
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                   TOP 10 COST-SAVING RULES                            │
-│                                                                       │
-│  1.  Pick the cheapest model that can do the job                     │
-│      (Haiku for simple, Sonnet for daily, Opus for emergencies)      │
-│                                                                       │
-│  2.  Enable prompt caching on system prompts and tool schemas        │
-│      (90% savings on cached content)                                 │
-│                                                                       │
-│  3.  Start fresh conversations for new tasks                         │
-│      (Don't let history grow beyond 20 turns)                        │
-│                                                                       │
-│  4.  Be specific in your prompts                                     │
-│      (Vague prompts → more round-trips → more cost)                 │
-│                                                                       │
-│  5.  Ask for concise responses                                       │
-│      (Output costs 5x more than input)                               │
-│                                                                       │
-│  6.  Batch independent tasks into one request                        │
-│      (Avoid paying system prompt overhead N times)                  │
-│                                                                       │
-│  7.  Read files once and target specific sections                    │
-│      (Each tool call multiplies the cost)                            │
-│                                                                       │
-│  8.  Use local models for prototyping and simple tasks               │
-│      (Free inference for development work)                           │
-│                                                                       │
-│  9.  Set budget alerts and monitor usage                             │
-│      (Catch cost spikes before they become problems)                 │
-│                                                                       │
-│  10. Document effective prompts for reuse                            │
-│      (Don't reinvent the wheel — save and iterate)                  │
+│  FREE WINS (no quality trade-off)                                    │
+│  1. Measure: usage per request, cost per completed task, cache hits  │
+│  2. Prompt caching on every repeated prefix                          │
+│  3. Batch API (-50%) for anything that can wait                      │
+│  4. Context hygiene: trim tool output, compact, reset, sub-agents    │
+│  5. Output hygiene: no preamble, structured outputs, sane max_tokens │
+│                                                                      │
+│  TRADE-OFFS (verify with evals)                                      │
+│  6. Lower effort per route                                           │
+│  7. Cheaper model per route                                          │
+│  8. Pack small items / route simple work to open-weight models       │
+│                                                                      │
+│  GUARDRAILS                                                          │
+│  9. Budgets and alerts per route/customer; spend limits              │
+│ 10. Re-check pricing and re-run evals when models change             │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### What Interviewers Probe Next
 
-## 12. QUICK REFERENCE CARD
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                    QUICK COST REFERENCE                              │
-│                                                                      │
-│  MODEL          INPUT      OUTPUT    BEST FOR                       │
-│  ───────────────────────────────────────────────────────────        │
-│  GPT-4o-mini    $0.15/M    $0.60/M   Simple Q&A, classification    │
-│  Claude Haiku   $0.80/M    $4.00/M   Fast tasks, simple edits      │
-│  DeepSeek Coder $0.90/M    $3.60/M   Code gen & review            │
-│  GPT-4o         $2.50/M   $10.00/M   General purpose              │
-│  Claude Sonnet  $3.00/M   $15.00/M   Daily coding & reasoning     │
-│  Claude Opus    $15.00/M  $75.00/M   Complex research only         │
-│                                                                      │
-│  SAVINGS TIPS                                                        │
-│  ────────────────────────────────────                               │
-│  Prompt caching:           Up to 90% on system/tools               │
-│  Concise instructions:     Up to 80% on output                      │
-│  Fresh conversations:      Up to 70% on long sessions              │
-│  Batch processing:         Up to 60% on high-volume tasks          │
-│  Local models:             100% (free) on prototyping              │
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
-```
+- *"Your LLM bill doubled last month. How do you investigate?"* Break down by route/model/customer; look at tokens per request (context growth? tokenizer change?), output and thinking tokens, cache hit rate, retry/loop rates, and traffic volume.
+- *"Would you route to a cheaper model?"* Only per route and with evals; compare cost per completed task, including retries and escalations, and account for losing cache reuse across models.
+- *"How do you stop a runaway agent from burning money?"* Per-task token/turn budgets, loop detection, max tool calls, spend limits, and alerting on per-session cost.
 
 ---
 

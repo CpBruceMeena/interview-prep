@@ -2,7 +2,7 @@
 # Install: pip install -r requirements.txt
 
 # ── MCP SDK ──
-mcp >= 1.0.0
+mcp >= 2.0, < 3     # v2 API: MCPServer (was FastMCP), mcp.Client; spec 2026-07-28
 
 # ── Common Utilities ──
 pyjwt >= 2.0.0           # JWT authentication (optional, for auth.py)
@@ -11,8 +11,8 @@ pyjwt >= 2.0.0           # JWT authentication (optional, for auth.py)
 psycopg2-binary >= 2.9.0  # PostgreSQL connectivity (optional)
 
 # ── RAG Server ──
-# Note: The RAG server relies on ai-engineering/implementation/requirements.txt
-# for sentence-transformers, chromadb, langchain, etc.
+# Note: The RAG server relies on ai-engineering/rag/implementation/requirements.txt
+# for sentence-transformers, chromadb, langchain-text-splitters, etc.
 # Those are NOT duplicated here — install from there or use the shared venv.
 
 # ── Testing ──

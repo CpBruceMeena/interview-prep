@@ -1,7 +1,10 @@
 # 📊 Multi-LLM Production Operations — Monitoring, Rate Limiting, Caching & Reliability
 
-> **Target:** Principal Engineer | **Focus:** Production operational excellence for multi-LLM deployments
+> **Target:** Principal Engineer | **Focus:** Production operational excellence for multi-LLM deployments | **Reviewed:** October 2026
 > *Companion to [08_MULTI_LLM_ARCHITECTURE.md](./08_MULTI_LLM_ARCHITECTURE.md) which covers routing, cost management, and fallback architecture*
+
+!!! tip "30-second answer"
+    Running LLMs in production is ordinary SRE plus four LLM-specific twists. **Usage is multi-dimensional** (input, cached input, cache writes, output, reasoning tokens, each priced differently), so meter what the provider reports, per call. **Limits are token-based** on both sides (your per-tenant quotas and the providers' RPM/TPM), so enforce them atomically in a shared store and back off on 429s. **Caching has two layers:** provider prompt caching of stable prefixes (free and always correct; do it first) and response caching (exact, or semantic with real correctness risk). **Quality is invisible to infra metrics**, so prompts and models are versioned config, changes ship through offline evals and A/B or canary tests on task-level quality, and every call is traced with OpenTelemetry GenAI attributes.
 
 ---
 
@@ -24,402 +27,146 @@
 
 ### Granular Token Tracking
 
+Record what the provider's response actually reports, per call. Modern usage objects have more than two numbers: cached input reads, cache writes and reasoning tokens are billed differently, so a two-field `prompt/completion` record mis-costs most real traffic.
+
 ```python
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, UTC
 from typing import Optional
-import asyncio
-import json
+from prometheus_client import Counter, Histogram
+
+LLM_TOKENS = Counter("llm_tokens_total", "Tokens by type",
+                     ["model", "provider", "type"])  # input|cached_input|cache_write|output|reasoning
+LLM_REQUESTS = Counter("llm_requests_total", "LLM API requests",
+                       ["model", "provider", "status"])
+LLM_LATENCY = Histogram("llm_latency_seconds", "End-to-end LLM call latency",
+                        ["model", "provider"],
+                        buckets=[0.25, 0.5, 1, 2, 5, 10, 30, 60, 120])
+LLM_TTFT = Histogram("llm_time_to_first_token_seconds", "Streaming time to first token",
+                     ["model", "provider"], buckets=[0.1, 0.25, 0.5, 1, 2, 5, 10])
+LLM_COST = Counter("llm_cost_usd_total", "Estimated cost in USD", ["model", "provider"])
 
 @dataclass
 class TokenUsageRecord:
-    """Granular record of a single LLM API call's token usage"""
-    model: str
+    """One LLM API call. Field names are provider-neutral; map from
+    OpenAI usage.input_tokens / output_tokens / *_details.cached_tokens /
+    reasoning_tokens, or Anthropic usage.input_tokens / output_tokens /
+    cache_read_input_tokens / cache_creation_input_tokens."""
+    model: str                      # the exact model id the response reports
     provider: str
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-    cost: float
-    latency_ms: float
-    endpoint: str                          # e.g., /v1/chat/completions
-    user_id: Optional[str] = None
+    input_tokens: int               # uncached input
+    output_tokens: int              # includes reasoning tokens where billed as output
+    cached_input_tokens: int = 0    # prompt-cache reads (cheap)
+    cache_write_tokens: int = 0     # prompt-cache writes (Anthropic bills a premium)
+    reasoning_tokens: int = 0       # informational: already inside output_tokens
+    cost_usd: float = 0.0
+    latency_ms: float = 0.0
+    ttft_ms: Optional[float] = None
     tenant_id: Optional[str] = None
-    request_id: Optional[str] = None
-    prompt_id: Optional[str] = None        # Which prompt template was used
-    cache_hit: bool = False
-    status_code: int = 200
-    error_type: Optional[str] = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    
-    @property
-    def tokens_per_second(self) -> float:
-        if self.latency_ms > 0:
-            return (self.completion_tokens / self.latency_ms) * 1000
-        return 0.0
+    prompt_version: Optional[str] = None
+    status: str = "success"
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
-class PrometheusMetrics:
-    """Wrapper around prometheus_client for LLM-specific metrics.
-    
-    In production, use prometheus_client directly:
-        from prometheus_client import Counter, Histogram, Gauge
-    """
-    def create_counter(self, name, description, labels=None):
-        import prometheus_client
-        return prometheus_client.Counter(name, description, labels or [])
-    
-    def create_histogram(self, name, description, labels=None, buckets=None):
-        import prometheus_client
-        return prometheus_client.Histogram(name, description, labels or [], buckets=buckets)
-    
-    def increment_counter(self, name, value, labels=None):
-        # In production, get the counter by name and call .inc(value)
-        pass
-    
-    def observe_histogram(self, name, value, labels=None):
-        # In production, get the histogram by name and call .observe(value)
-        pass
-
-class TokenUsageTracker:
-    """
-    Real-time token usage tracking with sliding window aggregation.
-    Exposes metrics for Prometheus and dashboards.
-    """
-    
-    def __init__(self):
-        self._records: list[TokenUsageRecord] = []
-        self._lock = asyncio.Lock()
-        self._prometheus = PrometheusMetrics()
-        
-        # Pre-register Prometheus metrics
-        self._prometheus.create_counter(
-            "llm_tokens_total",
-            "Total tokens used across all models",
-            labels=["model", "provider", "type"],  # type: prompt|completion
-        )
-        self._prometheus.create_counter(
-            "llm_requests_total",
-            "Total LLM API requests",
-            labels=["model", "provider", "status"],
-        )
-        self._prometheus.create_histogram(
-            "llm_latency_seconds",
-            "LLM API latency in seconds",
-            labels=["model", "provider"],
-            buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
-        )
-        self._prometheus.create_histogram(
-            "llm_tokens_per_request",
-            "Tokens per LLM request",
-            labels=["model", "provider"],
-            buckets=[100, 500, 1000, 2000, 4000, 8000, 16000, 32000],
-        )
-    
-    async def track(self, record: TokenUsageRecord) -> None:
-        """Track a single LLM API call"""
-        async with self._lock:
-            self._records.append(record)
-            
-            # Update Prometheus metrics
-            self._prometheus.increment_counter(
-                "llm_tokens_total",
-                record.prompt_tokens,
-                labels={"model": record.model, "provider": record.provider, "type": "prompt"},
-            )
-            self._prometheus.increment_counter(
-                "llm_tokens_total",
-                record.completion_tokens,
-                labels={"model": record.model, "provider": record.provider, "type": "completion"},
-            )
-            self._prometheus.increment_counter(
-                "llm_requests_total",
-                1,
-                labels={
-                    "model": record.model,
-                    "provider": record.provider,
-                    "status": "success" if record.status_code < 400 else "error",
-                },
-            )
-            self._prometheus.observe_histogram(
-                "llm_latency_seconds",
-                record.latency_ms / 1000.0,
-                labels={"model": record.model, "provider": record.provider},
-            )
-            self._prometheus.observe_histogram(
-                "llm_tokens_per_request",
-                record.total_tokens,
-                labels={"model": record.model, "provider": record.provider},
-            )
-    
-    def get_current_minute_rate(self, model: Optional[str] = None) -> dict:
-        """Get tokens per minute rate for real-time monitoring"""
-        now = datetime.utcnow()
-        one_minute_ago = now - timedelta(minutes=1)
-        
-        recent = [
-            r for r in self._records
-            if r.timestamp >= one_minute_ago
-            and (model is None or r.model == model)
-        ]
-        
-        return {
-            "tokens_per_minute": sum(r.total_tokens for r in recent),
-            "requests_per_minute": len(recent),
-            "cost_per_minute": sum(r.cost for r in recent),
-            "average_latency_ms": (
-                sum(r.latency_ms for r in recent) / len(recent)
-                if recent else 0
-            ),
-            "p99_latency_ms": self._calculate_percentile(
-                [r.latency_ms for r in recent], 99
-            ),
-            "error_rate": (
-                sum(1 for r in recent if r.error_type) / len(recent)
-                if recent else 0
-            ),
-        }
-    
-    def get_model_comparison(self) -> list[dict]:
-        """Compare performance across models for cost optimization"""
-        from collections import defaultdict
-        
-        model_stats = defaultdict(lambda: {
-            "total_tokens": 0, "total_cost": 0.0,
-            "total_requests": 0, "total_latency": 0.0,
-            "errors": 0, "cache_hits": 0,
-        })
-        
-        for r in self._records:
-            stats = model_stats[r.model]
-            stats["total_tokens"] += r.total_tokens
-            stats["total_cost"] += r.cost
-            stats["total_requests"] += 1
-            stats["total_latency"] += r.latency_ms
-            if r.error_type:
-                stats["errors"] += 1
-            if r.cache_hit:
-                stats["cache_hits"] += 1
-        
-        return [
-            {
-                "model": model,
-                **stats,
-                "avg_latency_ms": stats["total_latency"] / stats["total_requests"],
-                "avg_cost_per_request": stats["total_cost"] / stats["total_requests"],
-                "cost_per_1k_tokens": (
-                    (stats["total_cost"] / stats["total_tokens"]) * 1000
-                    if stats["total_tokens"] > 0 else 0
-                ),
-                "error_rate": stats["errors"] / stats["total_requests"],
-                "cache_hit_rate": stats["cache_hits"] / stats["total_requests"],
-            }
-            for model, stats in model_stats.items()
-        ]
+def record(r: TokenUsageRecord) -> None:
+    labels = {"model": r.model, "provider": r.provider}
+    for kind, n in [("input", r.input_tokens), ("cached_input", r.cached_input_tokens),
+                    ("cache_write", r.cache_write_tokens), ("output", r.output_tokens)]:
+        LLM_TOKENS.labels(**labels, type=kind).inc(n)
+    LLM_REQUESTS.labels(**labels, status=r.status).inc()
+    LLM_LATENCY.labels(**labels).observe(r.latency_ms / 1000)
+    if r.ttft_ms is not None:
+        LLM_TTFT.labels(**labels).observe(r.ttft_ms / 1000)
+    LLM_COST.labels(**labels).inc(r.cost_usd)
+    # Ship the full record (with tenant_id, prompt_version, request id) to the
+    # log/event pipeline for per-tenant analysis. Don't put tenant or user ids
+    # in Prometheus labels: unbounded cardinality.
 ```
+
+Keep raw records in a log/event store (or your warehouse), not in a process-local list: an in-memory list grows without bound and is per replica. Derive per-minute rates, percentiles and per-model comparisons in PromQL or SQL.
 
 ### Streaming Token Counter
 
-```python
-class StreamingTokenCounter:
-    """
-    Counts tokens in streaming responses without buffering.
-    Uses tiktoken for accurate tokenization.
-    """
-    
-    def __init__(self, model: str = "gpt-4"):
-        import tiktoken
-        self.encoding = tiktoken.encoding_for_model(model)
-        self.total_tokens = 0
-        self._buffer = ""
-    
-    async def count_chunk(self, chunk: str) -> int:
-        """
-        Count tokens in a streaming chunk.
-        Returns cumulative token count so far.
-        """
-        self._buffer += chunk
-        # Tokenize in small batches to avoid OOM on long streams
-        if len(self._buffer) >= 1000:
-            tokens = self.encoding.encode(self._buffer)
-            self.total_tokens += len(tokens)
-            self._buffer = ""  # Clear buffer after counting
-        return self.total_tokens
-    
-    def finalize(self) -> int:
-        """Count remaining buffered tokens"""
-        if self._buffer:
-            tokens = self.encoding.encode(self._buffer)
-            self.total_tokens += len(tokens)
-            self._buffer = ""
-        return self.total_tokens
+Don't count streamed tokens yourself with a local tokenizer: `tiktoken` only matches OpenAI tokenizers (Claude, Gemini and open models tokenize differently), and splitting text at arbitrary chunk boundaries miscounts. Use the usage the provider sends with the stream:
 
-# ── Usage in streaming response ────────────────────────────
-@app.post("/chat/stream")
-async def stream_chat(request: ChatRequest):
-    counter = StreamingTokenCounter()
-    
-    async def generate():
-        async for chunk in llm.stream(request.messages):
-            token_count = await counter.count_chunk(chunk)
-            yield f"data: {json.dumps({'content': chunk, 'tokens': token_count})}\n\n"
-        
-        total = counter.finalize()
-        yield f"data: {json.dumps({'done': True, 'total_tokens': total})}\n\n"
-    
-    return StreamingResponse(generate(), media_type="text/event-stream")
+- **OpenAI:** final usage arrives in the last event (Responses API `response.completed`; Chat Completions needs `stream_options={"include_usage": True}`).
+- **Anthropic:** `message_start` carries input usage and `message_delta` carries cumulative output usage; the SDK's `get_final_message()` returns the totals.
+
+A local estimate (characters ÷ ~4 for English) is fine for a live progress indicator, never for billing. For pre-flight estimates on Claude, use the token-counting endpoint.
+
+```python
+async def generate(request):
+    first_token_at = None
+    start = time.perf_counter()
+    async with anthropic_client.messages.stream(model=MODEL, max_tokens=4096,
+                                                messages=request.messages) as stream:
+        async for text in stream.text_stream:
+            first_token_at = first_token_at or time.perf_counter()
+            yield f"data: {json.dumps({'content': text})}\n\n"
+        final = await stream.get_final_message()
+    u = final.usage
+    record(TokenUsageRecord(
+        model=final.model, provider="anthropic",
+        input_tokens=u.input_tokens, output_tokens=u.output_tokens,
+        cached_input_tokens=u.cache_read_input_tokens or 0,
+        cache_write_tokens=u.cache_creation_input_tokens or 0,
+        latency_ms=(time.perf_counter() - start) * 1000,
+        ttft_ms=((first_token_at or time.perf_counter()) - start) * 1000,
+    ))
+    yield f"data: {json.dumps({'done': True, 'output_tokens': u.output_tokens})}\n\n"
 ```
 
 ### Token Budget Enforcement
 
+Budgets must be **atomic** across replicas and must account for **output** as well as input. Pattern: *reserve* the worst case (estimated input + `max_tokens`) before the call, then *reconcile* to the actual usage afterwards.
+
 ```python
+RESERVE = """
+-- KEYS: budget counters; ARGV[1]: tokens to reserve; ARGV[i+1]: limit for KEYS[i]
+for i, key in ipairs(KEYS) do
+    local used = tonumber(redis.call('GET', key) or '0')
+    if used + tonumber(ARGV[1]) > tonumber(ARGV[i + 1]) then
+        return i            -- index of the budget that would be exceeded
+    end
+end
+for i, key in ipairs(KEYS) do
+    redis.call('INCRBY', key, ARGV[1])
+    if redis.call('TTL', key) < 0 then redis.call('EXPIRE', key, 40 * 86400) end
+end
+return 0
+"""
+
 class TokenBudgetEnforcer:
-    """
-    Enforces token budgets at multiple levels:
-    - Per request
-    - Per user/session
-    - Per tenant
-    - Global (monthly)
-    """
-    
+    """Per-user daily, per-tenant monthly and global monthly token budgets."""
+
     def __init__(self, redis_client):
         self.redis = redis_client
-    
-    async def check_request_budget(
-        self,
-        user_id: str,
-        estimated_tokens: int,
-        max_tokens_per_request: int = 32000,
-    ) -> bool:
-        """Check if a single request exceeds per-request limits"""
-        if estimated_tokens > max_tokens_per_request:
-            raise TokenBudgetExceeded(
-                f"Request exceeds max tokens per request "
-                f"({estimated_tokens} > {max_tokens_per_request})"
-            )
-        return True
-    
-    async def check_session_budget(
-        self,
-        user_id: str,
-        estimated_tokens: int,
-        max_tokens_per_session: int = 100_000,
-        session_window: int = 3600,
-    ) -> bool:
-        """
-        Check if adding this request would exceed session budget.
-        Uses sliding window to track recent token usage.
-        """
-        key = f"token_budget:session:{user_id}"
-        now = int(datetime.utcnow().timestamp())
-        
-        async with self.redis.pipeline(transaction=True) as pipe:
-            # Remove expired entries
-            await pipe.zremrangebyscore(key, 0, now - session_window)
-            # Get current usage
-            await pipe.zcard(key)
-            result = await pipe.execute()
-            
-            current_count = result[1]
-            if current_count and int(current_count) + estimated_tokens > max_tokens_per_session:
-                return False
-            
-            # Add current estimated tokens
-            await pipe.zadd(key, {str(now): now + estimated_tokens})
-            await pipe.expire(key, session_window)
-            await pipe.execute()
-        
-        return True
-    
-    async def check_daily_budget(
-        self,
-        user_id: str,
-        estimated_tokens: int,
-        daily_limit: int = 1_000_000,
-    ) -> bool:
-        """Check daily token budget per user"""
-        key = f"token_budget:daily:{user_id}:{datetime.utcnow().strftime('%Y%m%d')}"
-        
-        current = await self.redis.get(key)
-        current = int(current) if current else 0
-        
-        if current + estimated_tokens > daily_limit:
-            return False
-        
-        await self.redis.incrby(key, estimated_tokens)
-        await self.redis.expire(key, 86400)  # 24 hours
-        return True
-    
-    async def check_global_budget(
-        self,
-        estimated_tokens: int,
-        monthly_budget_tokens: int = 50_000_000,
-    ) -> bool:
-        """Check global monthly token budget"""
-        key = f"token_budget:monthly:{datetime.utcnow().strftime('%Y%m')}"
-        
-        current = await self.redis.get(key)
-        current = int(current) if current else 0
-        
-        if current + estimated_tokens > monthly_budget_tokens:
-            return False
-        
-        await self.redis.incrby(key, estimated_tokens)
-        await self.redis.expire(key, 31 * 86400)  # ~1 month
-        return True
+        self.reserve_script = redis_client.register_script(RESERVE)
 
-# ── Usage in orchestration ─────────────────────────────────
-class TokenAwareOrchestrator:
-    """Orchestrator that respects token budgets at all levels"""
-    
-    def __init__(
-        self,
-        budget_enforcer: TokenBudgetEnforcer,
-        usage_tracker: TokenUsageTracker,
-    ):
-        self.budget = budget_enforcer
-        self.tracker = usage_tracker
-    
-    async def process(
-        self,
-        request: MultiLLMRequest,
-        user_id: str,
-        tenant_id: str,
-    ) -> LLMResponse:
-        # Estimate tokens from prompt length
-        estimated_tokens = estimate_tokens(request.prompt)
-        
-        # Check all budget levels
-        await self.budget.check_request_budget(user_id, estimated_tokens)
-        
-        if not await self.budget.check_session_budget(user_id, estimated_tokens):
-            return self._budget_exceeded_response("Session token limit reached")
-        
-        if not await self.budget.check_daily_budget(user_id, estimated_tokens):
-            return self._budget_exceeded_response("Daily token limit reached")
-        
-        if not await self.budget.check_global_budget(estimated_tokens):
-            return self._budget_exceeded_response("Global token limit reached")
-        
-        # Proceed with LLM call
-        start = time.perf_counter()
-        response = await self._call_llm(request)
-        latency = (time.perf_counter() - start) * 1000
-        
-        # Track actual usage
-        await self.tracker.track(TokenUsageRecord(
-            model=request.model,
-            provider=request.provider,
-            prompt_tokens=response.usage.prompt_tokens,
-            completion_tokens=response.usage.completion_tokens,
-            total_tokens=response.usage.total_tokens,
-            cost=calculate_cost(response.usage),
-            latency_ms=latency,
-            endpoint=request.endpoint,
-            user_id=user_id,
-            tenant_id=tenant_id,
-        ))
-        
-        return response
+    def _keys(self, user_id: str, tenant_id: str) -> list[str]:
+        now = datetime.now(UTC)
+        return [f"budget:user:{user_id}:{now:%Y%m%d}",
+                f"budget:tenant:{tenant_id}:{now:%Y%m}",
+                f"budget:global:{now:%Y%m}"]
+
+    async def reserve(self, user_id, tenant_id, est_input, max_output, limits) -> list[str]:
+        keys = self._keys(user_id, tenant_id)
+        reserved = est_input + max_output                # worst case
+        exceeded = await self.reserve_script(keys=keys, args=[reserved, *limits])
+        if exceeded:
+            raise TokenBudgetExceeded(keys[exceeded - 1])
+        return keys
+
+    async def reconcile(self, keys: list[str], reserved: int, actual: int) -> None:
+        # Give back the unused part of the reservation (or add any overrun)
+        delta = actual - reserved
+        if delta:
+            pipe = self.redis.pipeline()
+            for k in keys:
+                pipe.incrby(k, delta)
+            await pipe.execute()
 ```
+
+For agents, enforce a per-*run* budget too (sum over every model call in the loop), and stop the loop cleanly when it is exhausted. Token budgets are a proxy; for money, budget in dollars using the price table, because cached input, output and reasoning tokens cost very different amounts.
 
 ---
 
@@ -427,10 +174,11 @@ class TokenAwareOrchestrator:
 
 ### Multi-Layer Rate Limiting
 
+Two different limits are in play: the limits **you impose** on your users (fairness, abuse, cost) and the limits **providers impose** on you (requests per minute, input and output tokens per minute, per model and organization). Enforce yours at the edge; stay under theirs with shared accounting and backoff.
+
 ```python
 import time
 from enum import Enum
-from typing import Optional
 
 class RateLimitTier(Enum):
     FREE = "free"
@@ -438,648 +186,230 @@ class RateLimitTier(Enum):
     ENTERPRISE = "enterprise"
     INTERNAL = "internal"
 
-class RateLimitConfig:
-    """Tiered rate limit configuration"""
-    
-    # Tokens per minute, requests per minute, concurrent requests
-    TIERS = {
-        RateLimitTier.FREE:       {"tpm": 10_000,   "rpm": 20,    "concurrent": 1},
-        RateLimitTier.PRO:        {"tpm": 100_000,  "rpm": 200,   "concurrent": 5},
-        RateLimitTier.ENTERPRISE: {"tpm": 1_000_000,"rpm": 2000,  "concurrent": 50},
-        RateLimitTier.INTERNAL:   {"tpm": 10_000_000,"rpm": 10000,"concurrent": 200},
-    }
+# Per-user limits: tokens per minute, requests per minute, concurrent requests
+TIERS = {
+    RateLimitTier.FREE:       {"tpm": 10_000,     "rpm": 20,     "concurrent": 1},
+    RateLimitTier.PRO:        {"tpm": 100_000,    "rpm": 200,    "concurrent": 5},
+    RateLimitTier.ENTERPRISE: {"tpm": 1_000_000,  "rpm": 2_000,  "concurrent": 50},
+    RateLimitTier.INTERNAL:   {"tpm": 10_000_000, "rpm": 10_000, "concurrent": 200},
+}
+
+# Check-and-increment in ONE atomic script. A GET-then-INCR from the client
+# races: two replicas both see "under limit" and both proceed.
+CHECK_AND_INCR = """
+-- KEYS[i] counter key; ARGV[2i-1] amount to add; ARGV[2i] limit
+for i, key in ipairs(KEYS) do
+    local used = tonumber(redis.call('GET', key) or '0')
+    if used + tonumber(ARGV[2*i-1]) > tonumber(ARGV[2*i]) then
+        return i
+    end
+end
+for i, key in ipairs(KEYS) do
+    redis.call('INCRBY', key, ARGV[2*i-1])
+    redis.call('EXPIRE', key, 120)
+end
+return 0
+"""
 
 class MultiLayerRateLimiter:
-    """
-    Rate limits at multiple levels:
-    1. Global (across all users)
-    2. Per model (e.g., GPT-4, Claude)
-    3. Per user/API key
-    4. Per IP address
-    
-    Uses token bucket + sliding window for accuracy.
-    """
-    
-    def __init__(self, redis_client):
-        self.redis = redis_client
-    
-    async def check_rate_limit(
-        self,
-        user_id: str,
-        model: str,
-        estimated_tokens: int,
-        tier: RateLimitTier = RateLimitTier.FREE,
-        ip_address: Optional[str] = None,
-    ) -> RateLimitResult:
-        """Check all rate limit layers"""
-        
-        config = RateLimitConfig.TIERS[tier]
-        now = int(time.time())
-        
-        # Build all rate limit keys
-        keys = {
-            "global:rpm": f"ratelimit:global:rpm:{now // 60}",
-            "global:tpm": f"ratelimit:global:tpm:{now // 60}",
-            f"model:{model}:rpm": f"ratelimit:model:{model}:rpm:{now // 60}",
-            f"model:{model}:tpm": f"ratelimit:model:{model}:tpm:{now // 60}",
-            f"user:{user_id}:rpm": f"ratelimit:user:{user_id}:rpm:{now // 60}",
-            f"user:{user_id}:tpm": f"ratelimit:user:{user_id}:tpm:{now // 60}",
-        }
-        
-        if ip_address:
-            keys[f"ip:{ip_address}:rpm"] = f"ratelimit:ip:{ip_address}:rpm:{now // 60}"
-        
-        # Check all limits in a single pipeline
-        async with self.redis.pipeline(transaction=True) as pipe:
-            for key in keys.values():
-                await pipe.get(key)
-            results = await pipe.execute()
-        
-        # Parse results
-        limits = {
-            "global:rpm": {"current": int(results[0] or 0), "max": 100000},
-            "global:tpm": {"current": int(results[1] or 0), "max": 50_000_000},
-            f"model:{model}:rpm": {"current": int(results[2] or 0), "max": config["rpm"]},
-            f"model:{model}:tpm": {"current": int(results[3] or 0), "max": config["tpm"]},
-            f"user:{user_id}:rpm": {"current": int(results[4] or 0), "max": config["rpm"]},
-            f"user:{user_id}:tpm": {"current": int(results[5] or 0), "max": config["tpm"]},
-        }
-        
-        if ip_address:
-            limits[f"ip:{ip_address}:rpm"] = {
-                "current": int(results[6] or 0), "max": 1000,
-            }
-        
-        # Check for exceeded limits
-        exceeded = []
-        for name, info in limits.items():
-            if info["current"] >= info["max"]:
-                exceeded.append(name)
-        
-        if exceeded:
-            return RateLimitResult(
-                allowed=False,
-                exceeded_limits=exceeded,
-                retry_after=60 - (now % 60),
-                limits=limits,
-            )
-        
-        # Increment counters
-        async with self.redis.pipeline(transaction=True) as pipe:
-            for key in keys.values():
-                await pipe.incr(key)
-                await pipe.expire(key, 120)
-            await pipe.execute()
-        
-        return RateLimitResult(allowed=True, limits=limits)
-    
-    async def check_concurrency_limit(
-        self,
-        user_id: str,
-        model: str,
-        tier: RateLimitTier,
-    ) -> bool:
-        """Check concurrent request limits using Redis semaphore"""
-        max_concurrent = RateLimitConfig.TIERS[tier]["concurrent"]
-        key = f"concurrent:{user_id}:{model}"
-        
-        current = await self.redis.incr(key)
-        await self.redis.expire(key, 30)  # Auto-cleanup after 30s
-        
-        if current > max_concurrent:
-            await self.redis.decr(key)
-            return False
-        
-        return True
-    
-    async def release_concurrency(self, user_id: str, model: str):
-        """Release concurrency slot"""
-        key = f"concurrent:{user_id}:{model}"
-        await self.redis.decr(key)
+    """Fixed one-minute windows for user, model (provider quota) and global
+    limits. Fixed windows allow up to 2x bursts at a boundary; use a sliding
+    window or token bucket (GCRA) if that matters."""
 
-# ── Rate limit middleware for FastAPI ──────────────────────
-class LLMRateLimitMiddleware:
-    """Middleware that enforces LLM rate limits"""
-    
-    def __init__(self, limiter: MultiLayerRateLimiter):
-        self.limiter = limiter
-    
-    async def __call__(self, request: Request, call_next):
-        # Skip rate limiting for non-LLM endpoints
-        if not request.url.path.startswith("/api/v1/llm/"):
-            return await call_next(request)
-        
-        user_id = request.state.user.id
-        model = request.headers.get("X-Model", "gpt-4o-mini")
-        tier = request.state.user.tier
-        
-        result = await self.limiter.check_rate_limit(
-            user_id=user_id,
-            model=model,
-            estimated_tokens=estimate_tokens_from_request(request),
-            tier=tier,
-            ip_address=request.client.host,
-        )
-        
-        if not result.allowed:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": "rate_limit_exceeded",
-                    "message": f"Rate limit exceeded: {', '.join(result.exceeded_limits)}",
-                    "retry_after_seconds": result.retry_after,
-                },
-                headers={
-                    "Retry-After": str(result.retry_after),
-                    "X-RateLimit-Limit": str(max(
-                        info["max"] for info in result.limits.values()
-                    )),
-                    "X-RateLimit-Remaining": "0",
-                },
-            )
-        
-        # Set rate limit headers
-        response = await call_next(request)
-        response.headers["X-RateLimit-Limit"] = str(max(
-            info["max"] for info in result.limits.values()
-        ))
-        
-        return response
+    def __init__(self, redis_client, provider_limits: dict):
+        self.redis = redis_client
+        self.script = redis_client.register_script(CHECK_AND_INCR)
+        self.provider_limits = provider_limits   # {model: {"rpm":..., "tpm":...}} from your provider quota
+
+    async def check(self, user_id: str, model: str, est_tokens: int,
+                    tier: RateLimitTier) -> tuple[bool, int]:
+        minute = int(time.time()) // 60
+        user, prov = TIERS[tier], self.provider_limits[model]
+        checks = [
+            (f"rl:user:{user_id}:rpm:{minute}", 1, user["rpm"]),
+            (f"rl:user:{user_id}:tpm:{minute}", est_tokens, user["tpm"]),   # TOKENS, not +1
+            (f"rl:model:{model}:rpm:{minute}", 1, prov["rpm"]),
+            (f"rl:model:{model}:tpm:{minute}", est_tokens, prov["tpm"]),
+        ]
+        args = [x for _, amount, limit in checks for x in (amount, limit)]
+        failed = await self.script(keys=[k for k, _, _ in checks], args=args)
+        retry_after = 60 - int(time.time()) % 60
+        return failed == 0, retry_after
 ```
+
+Return `429` with a `Retry-After` header when a user limit is hit. Providers also report their own remaining quota in response headers (OpenAI `x-ratelimit-remaining-requests` / `-tokens`; Anthropic `anthropic-ratelimit-requests-remaining`, `-input-tokens-remaining`, `-output-tokens-remaining`, plus `retry-after` on 429s); feed those back into your model-level limits instead of hard-coding them.
 
 ### Concurrency Pool Management
 
 ```python
 import asyncio
-from typing import Optional, Callable, Awaitable
+from prometheus_client import Histogram, Counter
+
+QUEUE_WAIT = Histogram("llm_queue_wait_seconds", "Wait for a concurrency slot", ["model"])
+TIMEOUTS = Counter("llm_timeouts_total", "LLM call timeouts", ["model"])
 
 class LLMConnectionPool:
-    """
-    Manages concurrent LLM API connections per model/provider.
-    Prevents overwhelming any single provider while maximizing throughput.
-    """
-    
-    def __init__(self):
-        self._pools: dict[str, asyncio.Semaphore] = {}
-        self._max_concurrent = {
-            "gpt-4o": 50,
-            "gpt-4o-mini": 200,
-            "claude-4-sonnet": 30,
-            "claude-4-opus": 10,
-            "deepseek-coder-v3": 100,
-        }
-        self._queue_sizes: dict[str, asyncio.Queue] = {}
-        self._metrics = PrometheusMetrics()
-    
-    def get_semaphore(self, model: str) -> asyncio.Semaphore:
-        """Get or create a semaphore for a model"""
-        if model not in self._pools:
-            max_conn = self._max_concurrent.get(model, 20)
-            self._pools[model] = asyncio.Semaphore(max_conn)
-        return self._pools[model]
-    
-    async def execute(
-        self,
-        model: str,
-        call_fn: Callable[..., Awaitable],
-        *args,
-        timeout: float = 30.0,
-        **kwargs,
-    ) -> Any:
-        """
-        Execute an LLM call with concurrency control.
-        Waits for a slot if the model is at capacity.
-        """
-        semaphore = self.get_semaphore(model)
-        
-        start = time.perf_counter()
-        
-        try:
-            async with semaphore:
-                wait_time = time.perf_counter() - start
-                
-                # Track queue wait time
-                self._metrics.observe_histogram(
-                    "llm_queue_wait_seconds",
-                    wait_time,
-                    labels={"model": model},
-                )
-                
-                # Execute with timeout
-                result = await asyncio.wait_for(
-                    call_fn(*args, **kwargs),
-                    timeout=timeout,
-                )
-                
-                return result
-                
-        except asyncio.TimeoutError:
-            self._metrics.increment_counter(
-                "llm_timeouts_total",
-                1,
-                labels={"model": model},
-            )
-            raise LLMTimeoutError(f"LLM call to {model} timed out after {timeout}s")
-    
-    async def get_pool_stats(self) -> dict:
-        """Get current pool utilization statistics"""
-        stats = {}
-        for model, semaphore in self._pools.items():
-            max_conn = self._max_concurrent.get(model, 20)
-            available = semaphore._value
-            stats[model] = {
-                "max_concurrent": max_conn,
-                "current_used": max_conn - available,
-                "available": available,
-                "utilization_pct": ((max_conn - available) / max_conn) * 100,
-            }
-        return stats
-    
-    def update_max_concurrent(self, model: str, new_max: int):
-        """Dynamically adjust concurrency limits based on provider health"""
-        # Create new semaphore with updated max
-        old = self._pools.get(model)
-        self._max_concurrent[model] = new_max
-        self._pools[model] = asyncio.Semaphore(new_max)
-        
-        if old:
-            # Release any acquired permits to the new semaphore
-            # (This is a simplification; production needs careful migration)
-            pass
+    """Per-model concurrency cap within one process. Limits come from config
+    (load-tested against provider quotas), not from hard-coded model names."""
 
-# ── Rate-limited HTTPX client for LLM calls ────────────────
-class RateLimitedLLMClient:
-    """
-    HTTPX client with automatic retry and rate limit handling.
-    Respects Retry-After headers from LLM providers.
-    """
-    
-    def __init__(self, pool: LLMConnectionPool):
-        self.pool = pool
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=5.0),
-            limits=httpx.Limits(
-                max_keepalive_connections=50,
-                max_connections=200,
-            ),
-        )
-        self._rate_limit_state: dict[str, datetime] = {}  # model → until
-    
-    async def call(
-        self,
-        model: str,
-        provider_url: str,
-        headers: dict,
-        payload: dict,
-    ) -> httpx.Response:
-        """Make a rate-limited LLM API call"""
-        
-        # Check if we're in a rate limit cool-down for this model
-        if model in self._rate_limit_state:
-            until = self._rate_limit_state[model]
-            if datetime.utcnow() < until:
-                wait = (until - datetime.utcnow()).total_seconds()
-                await asyncio.sleep(wait)
-        
-        # Execute via connection pool
-        return await self.pool.execute(
-            model,
-            self._do_call,
-            provider_url,
-            headers,
-            payload,
-        )
-    
-    async def _do_call(
-        self,
-        url: str,
-        headers: dict,
-        payload: dict,
-    ) -> httpx.Response:
-        response = await self.client.post(url, headers=headers, json=payload)
-        
-        # Handle rate limit response
-        if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After", "5")
-            self._rate_limit_state[payload.get("model", "unknown")] = (
-                datetime.utcnow() + timedelta(seconds=int(retry_after))
-            )
-            raise RateLimitHit(retry_after=int(retry_after))
-        
-        response.raise_for_status()
-        return response
+    def __init__(self, max_concurrent: dict[str, int], default: int = 20):
+        self._max = max_concurrent
+        self._default = default
+        self._pools: dict[str, asyncio.Semaphore] = {}
+
+    def _sem(self, model: str) -> asyncio.Semaphore:
+        if model not in self._pools:
+            self._pools[model] = asyncio.Semaphore(self._max.get(model, self._default))
+        return self._pools[model]
+
+    async def execute(self, model: str, call_fn, *args, timeout: float = 120.0, **kwargs):
+        start = time.perf_counter()
+        async with self._sem(model):
+            QUEUE_WAIT.labels(model=model).observe(time.perf_counter() - start)
+            try:
+                async with asyncio.timeout(timeout):
+                    return await call_fn(*args, **kwargs)
+            except TimeoutError:
+                TIMEOUTS.labels(model=model).inc()
+                raise
 ```
+
+A semaphore only bounds one replica: with N replicas the effective limit is N × cap, so size caps as `provider_quota / replicas` or use the Redis limits above as the global guard. Set timeouts from observed latency: long reasoning or agentic calls can legitimately take minutes, so stream them rather than lowering the timeout until healthy calls fail. Changing a cap at runtime by swapping the semaphore loses track of in-flight permits; restart-free tuning needs a resizable limiter (or just a config reload with drain).
+
+The provider SDKs already retry 408/409/429/5xx with exponential backoff (OpenAI and Anthropic both default to 2 retries and honour `retry-after`). Configure `max_retries` and timeouts on the client rather than wrapping raw HTTP calls, and keep your own retry layer for cross-provider fallback (section 4).
 
 ---
 
 ## 3. Response Caching Strategies
 
+### Provider-Side Prompt Caching (Do This First)
+
+Before building any response cache, use the providers' **prompt (prefix) caching**. It caches the model's processing of a repeated prompt *prefix*, not the answer, so it is always correct, and agent loops resend the same system prompt, tool definitions and growing history on every turn.
+
+| | Anthropic | OpenAI |
+|---|---|---|
+| How to enable | `cache_control: {"type": "ephemeral"}` on content blocks (up to 4 breakpoints) or once at the top level | Automatic for prompts above a minimum length |
+| Lifetime | 5 minutes by default (refreshed on use), optional 1 hour | Minutes by default; longer retention options on some models |
+| Billing | Cache reads much cheaper than input; cache writes cost more than plain input | Cached input billed at a discount |
+| Check it worked | `usage.cache_read_input_tokens` | `usage.input_tokens_details.cached_tokens` (Responses) |
+
+Rules that make or break the hit rate:
+
+- **Stable content first, volatile content last.** Order is tools → system → messages. A timestamp, request id or user name in the system prompt invalidates everything after it.
+- **Deterministic serialization:** same tool order, `sort_keys=True` for JSON you embed.
+- **Caches are per model** (and per provider), so switching models mid-conversation or failing over starts cold.
+- Check the minimum cacheable prefix length for each model; shorter prompts silently don't cache.
+
+Track `cached_input_tokens / (input + cached_input)` as a first-class metric; a drop usually means someone added a dynamic value to the prompt prefix.
+
 ### Semantic Caching with Embeddings
 
+A semantic cache returns a *previous answer* when a new query is similar enough. It can cut cost for FAQ-style traffic, but it is the riskiest cache: similarity is not equivalence.
+
+- "How do I **cancel** my order?" and "How do I **not cancel** my order?" embed very close together.
+- Answers that depend on the user, their account, the date or retrieved documents must not be shared: key the cache by everything the answer depends on (tenant, user or role, prompt version, model, data version).
+- Thresholds are embedding-model specific; tune on labelled pairs and measure the false-hit rate, not just the hit rate.
+
 ```python
-import hashlib
+import hashlib, json
 import numpy as np
-from typing import Optional
 
 class SemanticLLMCache:
-    """
-    Caches LLM responses based on semantic similarity.
-    Instead of exact match, uses embeddings to find similar queries.
-    Critical for production: avoids redundant LLM calls for similar prompts.
-    """
-    
-    def __init__(
-        self,
-        redis_client,
-        embedding_model: str = "text-embedding-3-small",
-        similarity_threshold: float = 0.95,
-        ttl_seconds: int = 3600,
-    ):
-        self.redis = redis_client
-        self.embedding_model = embedding_model
-        self.similarity_threshold = similarity_threshold
-        self.ttl = ttl_seconds
-    
-    async def get(
-        self,
-        messages: list[dict],
-        model: str,
-        temperature: float,
-    ) -> Optional[dict]:
-        """Check cache for semantically similar query"""
-        
-        # Only cache deterministic responses
-        if temperature > 0.1:
-            return None
-        
-        # Compute embedding for the query
-        query_embedding = await self._get_embedding(
-            self._serialize_messages(messages)
-        )
-        
-        # Search for similar cached queries
-        similar = await self._search_similar(
-            query_embedding, model, top_k=1
-        )
-        
-        if similar:
-            cached_result, similarity = similar[0]
-            if similarity >= self.similarity_threshold:
-                return cached_result
-        
-        return None
-    
-    async def set(
-        self,
-        messages: list[dict],
-        response: dict,
-        model: str,
-        temperature: float,
-    ) -> None:
-        """Cache a response for future use"""
-        if temperature > 0.1:
-            return  # Don't cache non-deterministic responses
-        
-        key = self._make_key(messages, model)
-        embedding = await self._get_embedding(
-            self._serialize_messages(messages)
-        )
-        
-        # Store response
-        await self.redis.setex(
-            f"llm_cache:response:{key}",
-            self.ttl,
-            json.dumps(response),
-        )
-        
-        # Store embedding for similarity search
-        await self.redis.setex(
-            f"llm_cache:embedding:{key}",
-            self.ttl,
-            json.dumps(embedding.tolist()),
-        )
-        
-        # Add to search index
-        await self.redis.sadd(
-            f"llm_cache:model:{model}:keys",
-            key,
-        )
-        await self.redis.expire(
-            f"llm_cache:model:{model}:keys",
-            self.ttl,
-        )
-    
-    async def _search_similar(
-        self,
-        query_embedding: np.ndarray,
-        model: str,
-        top_k: int = 5,
-    ) -> list[tuple[dict, float]]:
-        """Search for similar cached responses"""
-        keys = await self.redis.smembers(
-            f"llm_cache:model:{model}:keys"
-        )
-        
-        if not keys:
-            return []
-        
-        results = []
-        for key in keys:
-            # Get stored embedding
-            embedding_data = await self.redis.get(
-                f"llm_cache:embedding:{key}"
-            )
-            if not embedding_data:
-                continue
-            
-            stored_embedding = np.array(json.loads(embedding_data))
-            
-            # Compute cosine similarity
-            similarity = np.dot(query_embedding, stored_embedding) / (
-                np.linalg.norm(query_embedding) * np.linalg.norm(stored_embedding)
-            )
-            
-            if similarity >= self.similarity_threshold:
-                response_data = await self.redis.get(
-                    f"llm_cache:response:{key}"
-                )
-                if response_data:
-                    results.append((json.loads(response_data), float(similarity)))
-        
-        # Return top-k sorted by similarity
-        results.sort(key=lambda x: -x[1])
-        return results[:top_k]
-    
-    def _make_key(self, messages: list[dict], model: str) -> str:
-        """Create a deterministic key from messages"""
-        serialized = self._serialize_messages(messages)
-        return hashlib.sha256(
-            f"{model}:{serialized}".encode()
-        ).hexdigest()[:16]
-    
-    def _serialize_messages(self, messages: list[dict]) -> str:
-        """Serialize messages deterministically"""
-        return json.dumps(messages, sort_keys=True)
-    
-    async def _get_embedding(self, text: str) -> np.ndarray:
-        """Get embedding for text using configured model"""
-        response = await openai_client.embeddings.create(
-            model=self.embedding_model,
-            input=text,
-        )
-        return np.array(response.data[0].embedding)
-    
-    async def invalidate_by_prefix(self, prefix: str):
-        """Invalidate cache entries matching a prefix (e.g., user_id)"""
-        pattern = f"llm_cache:*:{prefix}*"
-        cursor = 0
-        while True:
-            cursor, keys = await self.redis.scan(cursor, match=pattern)
-            if keys:
-                await self.redis.delete(*keys)
-            if cursor == 0:
-                break
+    """Semantic cache backed by a vector index (Redis Query Engine / RediSearch,
+    pgvector, OpenSearch kNN...). A linear scan over every cached key per
+    lookup does not scale past a few thousand entries."""
+
+    def __init__(self, vector_index, embed, threshold: float = 0.95, ttl_s: int = 3600):
+        self.index = vector_index      # supports upsert(id, vector, payload, ttl) and knn(vector, k, filter)
+        self.embed = embed             # async text -> np.ndarray (normalized)
+        self.threshold = threshold
+        self.ttl = ttl_s
+
+    @staticmethod
+    def scope(model: str, prompt_version: str, tenant_id: str) -> dict:
+        # Everything the answer depends on, besides the query text
+        return {"model": model, "prompt_version": prompt_version, "tenant": tenant_id}
+
+    async def get(self, query: str, scope: dict) -> tuple[dict | None, float]:
+        vec = await self.embed(query)
+        hits = await self.index.knn(vec, k=1, filter=scope)
+        if hits and hits[0].score >= self.threshold:
+            return hits[0].payload["response"], hits[0].score
+        return None, (hits[0].score if hits else 0.0)
+
+    async def set(self, query: str, scope: dict, response: dict) -> None:
+        vec = await self.embed(query)
+        key = hashlib.sha256(json.dumps([query, scope], sort_keys=True).encode()).hexdigest()
+        await self.index.upsert(key, vec, {"response": response, **scope}, ttl=self.ttl)
 ```
+
+Only cache responses that are safe to reuse: no personal data, no time-sensitive facts, and not the output of tool calls with side effects.
 
 ### Exact-Match Cache with TTL
 
 ```python
 class ExactMatchLLMCache:
     """
-    Simple exact-match cache for LLM responses.
-    Useful for deterministic queries (temperature=0) with repeated prompts.
-    10-50x latency reduction for cached queries.
+    Exact-match cache for identical requests (same model, prompt version,
+    messages and parameters). Hits return in milliseconds instead of seconds.
     """
     
     def __init__(self, redis_client, default_ttl: int = 3600):
         self.redis = redis_client
         self.default_ttl = default_ttl
-        self.hit_counter = 0
-        self.miss_counter = 0
     
-    def _build_key(
-        self,
-        model: str,
-        messages: list | str,
-        temperature: float,
-        max_tokens: int,
-    ) -> str:
-        """Build a deterministic cache key"""
-        if isinstance(messages, str):
-            content = messages
-        else:
-            content = json.dumps(messages, sort_keys=True)
-        
-        raw = f"{model}|{temperature}|{max_tokens}|{content}"
-        return f"llm:exact:{hashlib.sha256(raw.encode()).hexdigest()}"
+    def _build_key(self, model: str, params: dict, messages: list) -> str:
+        # Model in the readable prefix so it can be invalidated per model;
+        # everything that changes the answer goes into the hash.
+        raw = json.dumps({"params": params, "messages": messages}, sort_keys=True)
+        return f"llm:exact:{model}:{hashlib.sha256(raw.encode()).hexdigest()}"
     
-    async def get(
-        self,
-        model: str,
-        messages: list | str,
-        temperature: float = 0.0,
-        max_tokens: int = 1024,
-    ) -> Optional[str]:
-        """Get cached response if available"""
-        key = self._build_key(model, messages, temperature, max_tokens)
-        cached = await self.redis.get(key)
-        
-        if cached:
-            self.hit_counter += 1
-            return cached
-        
-        self.miss_counter += 1
-        return None
+    async def get(self, model: str, params: dict, messages: list) -> str | None:
+        return await self.redis.get(self._build_key(model, params, messages))
     
-    async def set(
-        self,
-        model: str,
-        messages: list | str,
-        response: str,
-        temperature: float = 0.0,
-        max_tokens: int = 1024,
-        ttl: Optional[int] = None,
-    ) -> None:
-        """Cache a response"""
-        key = self._build_key(model, messages, temperature, max_tokens)
-        await self.redis.setex(key, ttl or self.default_ttl, response)
+    async def set(self, model: str, params: dict, messages: list,
+                  response: str, ttl: int | None = None) -> None:
+        await self.redis.setex(self._build_key(model, params, messages),
+                               ttl or self.default_ttl, response)
     
-    async def invalidate_model(self, model: str):
-        """Invalidate all cache entries for a model"""
-        cursor = 0
-        while True:
-            cursor, keys = await self.redis.scan(
-                cursor, match=f"llm:exact:*", count=1000
-            )
-            if keys:
-                await self.redis.delete(*keys)
-            if cursor == 0:
-                break
-    
-    def get_hit_rate(self) -> float:
-        total = self.hit_counter + self.miss_counter
-        return self.hit_counter / total if total > 0 else 0.0
+    async def invalidate_model(self, model: str) -> None:
+        """Delete only this model's entries (SCAN, never KEYS, in production)."""
+        async for key in self.redis.scan_iter(match=f"llm:exact:{model}:*", count=1000):
+            await self.redis.unlink(key)
 ```
+
+Count hits and misses with Prometheus counters (`llm_cache_hits_total{cache="exact"}`), not instance attributes, so the rate is correct across replicas.
 
 ### Cache-Aware Orchestrator
 
 ```python
 class CacheAwareRouter:
-    """
-    Router that checks cache before making LLM calls.
-    Routes to cache-first, then falls back to LLM.
-    """
+    """Exact cache → semantic cache → model call. Provider prompt caching
+    applies underneath the model call regardless."""
     
-    def __init__(
-        self,
-        exact_cache: ExactMatchLLMCache,
-        semantic_cache: SemanticLLMCache,
-    ):
+    def __init__(self, exact_cache: ExactMatchLLMCache, semantic_cache: SemanticLLMCache):
         self.exact_cache = exact_cache
         self.semantic_cache = semantic_cache
     
-    async def route(
-        self,
-        request: LLMRequest,
-        user_id: str,
-    ) -> RouterResult:
+    async def route(self, request, scope: dict) -> dict:
+        params = {"prompt_version": request.prompt_version, "max_tokens": request.max_tokens}
+
+        # Level 1: exact match
+        if (hit := await self.exact_cache.get(request.model, params, request.messages)):
+            return {"response": hit, "source": "exact_cache"}
         
-        # Level 1: Exact match cache (microseconds)
-        exact = await self.exact_cache.get(
-            model=request.model,
-            messages=request.messages,
-            temperature=request.temperature,
-        )
-        if exact:
-            return RouterResult(
-                response=exact,
-                source="exact_cache",
-                latency_us=await self._measure_cache_latency(),
-            )
+        # Level 2: semantic (only for routes where reuse is safe)
+        if request.semantic_cache_ok:
+            hit, similarity = await self.semantic_cache.get(request.query_text, scope)
+            if hit:
+                return {"response": hit, "source": "semantic_cache", "similarity": similarity}
         
-        # Level 2: Semantic cache (milliseconds)
-        semantic = await self.semantic_cache.get(
-            messages=request.messages,
-            model=request.model,
-            temperature=request.temperature,
-        )
-        if semantic:
-            return RouterResult(
-                response=semantic,
-                source="semantic_cache",
-                similarity=self.semantic_cache.last_similarity,
-            )
-        
-        # Level 3: Make LLM call
+        # Level 3: call the model
         response = await self._call_llm(request)
-        
-        # Cache the response asynchronously
-        asyncio.create_task(self._cache_response(request, response))
-        
-        return RouterResult(
-            response=response,
-            source="llm",
-        )
+        # Write-back in the background; keep a reference or use a TaskGroup
+        # so the task isn't garbage-collected and failures get logged.
+        self._spawn(self._cache_response(request, scope, response))
+        return {"response": response, "source": "llm"}
 ```
 
 ---
@@ -1087,6 +417,8 @@ class CacheAwareRouter:
 ## 4. Retry Policies & Exponential Backoff
 
 ### Production Retry Strategy
+
+Start with the SDK's built-in retries (both the OpenAI and Anthropic SDKs retry connection errors, 408, 409, 429 and 5xx with exponential backoff and respect `retry-after`). Add your own layer only for what the SDK can't know: per-model circuit breakers, retry budgets across a whole agent run, and failover to another provider. Retry **only transient** errors: 429, 5xx (including Anthropic's `529 overloaded`), timeouts and connection errors. A 400 (bad request, context too long) or a content-policy refusal will fail identically on every retry.
 
 ```python
 from tenacity import (
@@ -1108,7 +440,7 @@ RETRY_CONFIGS = {
         "max_attempts": 5,
         "min_wait": 1,      # seconds
         "max_wait": 60,     # seconds
-        "exceptions": [RateLimitHit, httpx.HTTPStatusError],
+        "exceptions": [RateLimitHit],
     },
     # Network errors — retry quickly
     "network": {
@@ -1117,12 +449,12 @@ RETRY_CONFIGS = {
         "max_wait": 10,
         "exceptions": [httpx.TimeoutException, httpx.ConnectError],
     },
-    # Server errors — retry with longer backoff
+    # Server errors (5xx, incl. 529 overloaded) — retry with longer backoff
     "server": {
         "max_attempts": 3,
         "min_wait": 5,
         "max_wait": 30,
-        "exceptions": [httpx.HTTPStatusError],  # 500s
+        "exceptions": [ServerError],
     },
     # Non-retryable errors
     "no_retry": {
@@ -1143,7 +475,7 @@ class LLMRetryHandler:
     def __init__(self):
         self.consecutive_failures: dict[str, int] = {}  # model → count
         self.circuit_breakers: dict[str, CircuitBreakerState] = {}
-        self.metrics = PrometheusMetrics()
+        self.metrics = metrics   # thin wrapper over prometheus_client counters/histograms
     
     async def call_with_retry(
         self,
@@ -1183,7 +515,10 @@ class LLMRetryHandler:
                 if isinstance(e, RateLimitHit):
                     wait = e.retry_after
                 elif e.response.status_code == 429:
-                    wait = int(e.response.headers.get("Retry-After", base_delay * 2))
+                    # Retry-After may be seconds or an HTTP date; add jitter so
+                    # many clients don't retry in lockstep
+                    wait = parse_retry_after(e.response.headers.get("retry-after"),
+                                             default=base_delay * 2) + random.uniform(0, 1)
                 elif e.response.status_code >= 500:
                     wait = min(base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1), max_delay)
                 else:
@@ -1237,7 +572,7 @@ class LLMRetryHandler:
         
         state = self.circuit_breakers[model]
         if state.status == "open":
-            if datetime.utcnow() >= state.next_retry_at:
+            if datetime.now(UTC) >= state.next_retry_at:
                 # Move to half-open
                 state.status = "half-open"
                 return False
@@ -1261,8 +596,8 @@ class LLMRetryHandler:
             self.circuit_breakers[model] = CircuitBreakerState(
                 status="open",
                 failure_count=self.consecutive_failures[model],
-                next_retry_at=datetime.utcnow() + timedelta(seconds=60),
-                opened_at=datetime.utcnow(),
+                next_retry_at=datetime.now(UTC) + timedelta(seconds=60),
+                opened_at=datetime.now(UTC),
             )
             logger.error(
                 f"Circuit breaker OPEN for {model} after "
@@ -1276,9 +611,11 @@ async def call_llm_with_retry(model: str, messages: list) -> str:
     """Production LLM call with full retry logic"""
     
     async def make_call():
-        return await llm_client.chat.completions.create(
+        # SDK retries disabled here so the two layers don't multiply
+        # (2 SDK retries x 5 handler attempts = up to 15 calls).
+        return await llm_client.with_options(max_retries=0).responses.create(
             model=model,
-            messages=messages,
+            input=messages,
         )
     
     response = await retry_handler.call_with_retry(
@@ -1288,8 +625,10 @@ async def call_llm_with_retry(model: str, messages: list) -> str:
         base_delay=1.0,
     )
     
-    return response.choices[0].message.content
+    return response.output_text
 ```
+
+Two production details: cap retries with a **retry budget** (e.g. retries may add at most 10% extra load) so a provider brown-out isn't amplified by your own traffic, and remember that a timed-out request may still have been processed and billed, so a retry can double-charge tokens.
 
 ---
 
@@ -1313,7 +652,7 @@ class LLMMetricsCollector:
             ),
             "llm_tokens_total": prometheus_client.Counter(
                 "llm_tokens_total", "Total tokens processed",
-                ["model", "type"],  # type: prompt, completion, total
+                ["model", "type"],  # type: input, cached_input, cache_write, output
             ),
             
             # ── Performance metrics ────
@@ -1391,11 +730,11 @@ class LLMMetricsCollector:
         ).inc()
         
         self.metrics["llm_tokens_total"].labels(
-            model=model, type="prompt"
+            model=model, type="input"
         ).inc(prompt_tokens)
         
         self.metrics["llm_tokens_total"].labels(
-            model=model, type="completion"
+            model=model, type="output"
         ).inc(completion_tokens)
         
         self.metrics["llm_latency_seconds"].labels(
@@ -1403,6 +742,8 @@ class LLMMetricsCollector:
         ).observe(duration_ms / 1000.0)
         
         if completion_tokens > 0 and duration_ms > 0:
+            # Approximation: includes time-to-first-token. For true decode
+            # speed use (duration - ttft). Track TTFT separately for streaming UX.
             tps = (completion_tokens / duration_ms) * 1000
             self.metrics["llm_tokens_per_second"].labels(
                 model=model
@@ -1421,16 +762,21 @@ class LLMMetricsCollector:
                 model=model, error_type=error
             ).inc()
 
-# ── Alert rules (Prometheus) ──────────────────────────────
-"""
+```
+
+**Alert rules (Prometheus):**
+
+```yaml
 # prometheus-alerts.yml
 groups:
   - name: llm_alerts
     rules:
-      # High error rate
+      # High error rate (sum by model: the two metrics have different
+      # label sets, so dividing them without aggregation matches nothing)
       - alert: LLMHighErrorRate
         expr: |
-          rate(llm_errors_total[5m]) / rate(llm_requests_total[5m]) > 0.05
+          sum by (model) (rate(llm_errors_total[5m]))
+            / sum by (model) (rate(llm_requests_total[5m])) > 0.05
         for: 5m
         labels:
           severity: critical
@@ -1440,7 +786,7 @@ groups:
       # High latency
       - alert: LLMHighLatency
         expr: |
-          histogram_quantile(0.99, rate(llm_latency_seconds_bucket[5m])) > 10
+          histogram_quantile(0.99, sum by (le, model) (rate(llm_latency_seconds_bucket[5m]))) > 10
         for: 2m
         labels:
           severity: warning
@@ -1450,7 +796,7 @@ groups:
       # Budget alert
       - alert: LLMBudgetThreshold
         expr: |
-          rate(llm_cost_total[1h]) * 730 > 8000  # ~$8k/month projected
+          sum(increase(llm_cost_total[1h])) * 730 > 8000  # last hour's spend x ~730 h/month
         for: 1h
         labels:
           severity: warning
@@ -1469,7 +815,8 @@ groups:
       # Cache hit rate drop
       - alert: LLMCacheHitRateDrop
         expr: |
-          rate(llm_cache_hits_total[1h]) / (rate(llm_cache_hits_total[1h]) + rate(llm_cache_misses_total[1h])) < 0.1
+          sum(rate(llm_cache_hits_total[1h]))
+            / (sum(rate(llm_cache_hits_total[1h])) + sum(rate(llm_cache_misses_total[1h]))) < 0.1
         for: 15m
         labels:
           severity: warning
@@ -1478,7 +825,7 @@ groups:
       
       # Rate limiting spike
       - alert: LLMRateLimitSpike
-        expr: rate(llm_rate_limited_requests_total[5m]) > 100
+        expr: sum by (model) (rate(llm_rate_limited_requests_total[5m])) > 100
         for: 5m
         labels:
           severity: warning
@@ -1486,30 +833,37 @@ groups:
           summary: "High rate limiting: {{ $value }}/s for {{ $labels.model }}"
 ```
 
+Also alert on **prompt-cache hit rate** (`cached_input` share of input tokens) dropping, and on **quality** signals from online evals (groundedness, task success on a sampled stream), since a silent model or prompt regression shows up in none of the infra metrics above.
+
 ---
 
 ## 6. Prompt Versioning & Management
 
+Treat prompts like code: immutable versions, review, an eval run before promotion, and a pointer per environment that can be rolled back instantly. Store the **prompt version and exact model id on every trace** so you can attribute a regression. Many teams use a prompt-management tool (Langfuse, LangSmith, PromptLayer, Braintrust) or simply keep prompts in the repo and ship them with the code; a database registry like the one below matters when non-engineers edit prompts.
+
 ### Prompt Registry
 
 ```python
-from pydantic import BaseModel, Field
-from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, UTC
+from typing import Optional
 import hashlib
+import json
+import string
 
 @dataclass
 class PromptTemplate:
     """A versioned prompt template with metadata"""
     id: str
     name: str
-    version: str
+    version: int                            # integer: "v10" < "v9" as strings
     template: str
     variables: list[str]
-    model: str                              # Target model
-    temperature: float = 0.3
+    model: str                              # Exact model id the prompt was evaluated on
+    temperature: Optional[float] = None     # some models reject sampling params
     max_tokens: int = 1024
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     author: str = "system"
     description: str = ""
     tags: list[str] = field(default_factory=list)
@@ -1606,9 +960,10 @@ class PromptRegistry:
             )
         else:
             result = await self.db.fetchrow(
-                """SELECT * FROM prompt_templates 
-                   WHERE name = $1 AND environment = $2
-                   ORDER BY created_at DESC LIMIT 1""",
+                """SELECT t.* FROM prompt_templates t
+                   JOIN prompt_deployments d
+                     ON d.name = t.name AND d.version = t.version
+                   WHERE t.name = $1 AND d.environment = $2""",
                 name, environment,
             )
         
@@ -1636,21 +991,28 @@ class PromptRegistry:
         if missing:
             raise ValueError(f"Missing variables: {missing}")
         
-        # Render template
-        return prompt.template.format(**variables)
+        # Render with string.Template ($var), not str.format: prompts often
+        # contain literal JSON braces, which str.format treats as fields.
+        return string.Template(prompt.template).substitute(variables)
     
     async def promote_version(
         self,
         name: str,
-        version: str,
+        version: int,
         environment: str = "production",
     ) -> None:
-        """Promote a specific version to an environment"""
+        """Point an environment at a version (rollback = promote the old one).
+
+        A separate pointer table (name, environment) -> version avoids the bug
+        of tagging rows: after a rollback, "latest row tagged production"
+        would still return the newer, bad version.
+        """
         await self.db.execute(
-            """UPDATE prompt_templates 
-               SET environment = $1, updated_at = NOW()
-               WHERE name = $2 AND version = $3""",
-            environment, name, version,
+            """INSERT INTO prompt_deployments (name, environment, version, updated_at)
+               VALUES ($1, $2, $3, NOW())
+               ON CONFLICT (name, environment)
+               DO UPDATE SET version = EXCLUDED.version, updated_at = NOW()""",
+            name, environment, version,
         )
         # Invalidate cache
         await self.redis.delete(f"prompt:{name}:latest:{environment}")
@@ -1665,14 +1027,14 @@ class PromptRegistry:
         )
         return [PromptTemplate(**row) for row in results]
     
-    async def _next_version(self, name: str) -> str:
-        """Generate next version number"""
+    async def _next_version(self, name: str) -> int:
+        """Next integer version (enforce UNIQUE (name, version) in the DB to
+        make concurrent registrations safe)."""
         last = await self.db.fetchval(
             "SELECT MAX(version) FROM prompt_templates WHERE name = $1",
             name,
         )
-        next_num = int(last) + 1 if last else 1
-        return f"v{next_num}.0.0"
+        return (last or 0) + 1
 
 # ── Usage in orchestration ─────────────────────────────────
 async def process_with_prompt(
@@ -1692,14 +1054,13 @@ async def process_with_prompt(
     prompt = await registry.get_prompt(prompt_name)
     
     # Make LLM call
-    response = await llm_client.chat.completions.create(
+    response = await llm_client.responses.create(
         model=prompt.model,
-        messages=[{"role": "user", "content": rendered}],
-        temperature=prompt.temperature,
-        max_tokens=prompt.max_tokens,
+        input=rendered,
+        max_output_tokens=prompt.max_tokens,
     )
     
-    return response.choices[0].message.content
+    return response.output_text
 ```
 
 ---
@@ -1707,6 +1068,8 @@ async def process_with_prompt(
 ## 7. A/B Testing Different Models
 
 ### Experiment Framework
+
+Online experiments compare models or prompts on **real traffic**, but only after the candidate passes the offline eval suite. The metric that decides the winner must include **quality** (task success, user rating, escalation or retry rate, an LLM-judge score on a sample), not only latency, cost and error rate: a cheaper model with fewer errors can still give worse answers. Decide the primary metric, minimum detectable effect and sample size up front, and assign by user (not by request) so one user gets a consistent experience.
 
 ```python
 from enum import Enum
@@ -1742,6 +1105,8 @@ class ABTestManager:
     def __init__(self, redis_client, tracker: TokenUsageTracker):
         self.redis = redis_client
         self.tracker = tracker
+        # In-process dict for brevity; with several replicas, load experiment
+        # config from a shared store (or a feature-flag service) instead.
         self.experiments: dict[str, ModelExperiment] = {}
     
     async def create_experiment(
@@ -1761,7 +1126,7 @@ class ABTestManager:
             treatment_model=treatment_model,
             traffic_percentage=traffic_percentage,
             min_sample_size=min_sample_size,
-            start_time=datetime.utcnow(),
+            start_time=datetime.now(UTC),
             filters=filters,
         )
         
@@ -1786,7 +1151,7 @@ class ABTestManager:
         if not experiment or experiment.status != ExperimentStatus.RUNNING:
             return False
         
-        # Consistent hashing on user_id for stable assignment
+        # Deterministic hash bucketing on user_id for stable assignment
         hash_val = int(hashlib.md5(
             f"{experiment_id}:{user_id}".encode()
         ).hexdigest(), 16) % 1000
@@ -1810,6 +1175,7 @@ class ABTestManager:
             await pipe.hincrbyfloat(key, "total_cost", metrics.get("cost", 0))
             await pipe.hincrby(key, "total_tokens", metrics.get("total_tokens", 0))
             await pipe.hincrby(key, "errors", 1 if metrics.get("error") else 0)
+            await pipe.hincrby(key, "successes", 1 if metrics.get("task_success") else 0)
             await pipe.expire(key, 86400 * 30)
             await pipe.execute()
     
@@ -1847,6 +1213,7 @@ class ABTestManager:
                         int(data.get(b"errors", 0)) / count
                         if count > 0 else 0
                     ),
+                    "successes": int(data.get(b"successes", 0)),
                 }
         
         return {
@@ -1871,15 +1238,21 @@ class ABTestManager:
         experiment = self.experiments[experiment_id]
         
         if not winner:
-            # Auto-select winner based on metrics
+            # Pick a winner only on a QUALITY metric with a significance test,
+            # then apply cost/latency as tie-breakers or guardrails. Comparing
+            # raw averages ("lower error rate wins") declares winners from noise.
             control = results.get(experiment.control_model, {})
             treatment = results.get(experiment.treatment_model, {})
-            
-            if control.get("error_rate", 1) > treatment.get("error_rate", 0):
-                winner = experiment.treatment_model
-            elif treatment.get("avg_cost", float("inf")) < control.get("avg_cost", 0) * 0.8:
-                # Treatment is at least 20% cheaper with similar quality
-                winner = experiment.treatment_model
+            if min(control.get("count", 0), treatment.get("count", 0)) < experiment.min_sample_size:
+                return {"winner": None, "reason": "insufficient sample", "results": results}
+            quality = compare_proportions(              # e.g. two-proportion z-test
+                control["successes"], control["count"],
+                treatment["successes"], treatment["count"],
+            )
+            if quality.significant and quality.treatment_worse:
+                winner = experiment.control_model
+            elif not quality.treatment_worse and treatment["avg_cost"] < 0.8 * control["avg_cost"]:
+                winner = experiment.treatment_model   # non-inferior quality, 20%+ cheaper
             else:
                 winner = experiment.control_model
         
@@ -1893,14 +1266,14 @@ class ABTestManager:
             ),
         }
 
-# ── Example: Compare GPT-4o-mini vs DeepSeek for simple Q&A ──
+# ── Example: compare the current small model with a cheaper candidate ──
 async def run_ab_test():
     manager = ABTestManager(redis_client, token_tracker)
     
     experiment = await manager.create_experiment(
         name="simple-qa-model-comparison",
-        control_model="gpt-4o-mini",
-        treatment_model="deepseek-coder-v3",
+        control_model=CONFIG["small"],            # exact model ids from config
+        treatment_model=CONFIG["small_candidate"],
         traffic_percentage=0.5,
         min_sample_size=5000,
         filters={"complexity": "simple"},
@@ -1919,7 +1292,9 @@ async def run_ab_test():
             experiment.id,
             user_id,
             model,
-            {"latency_ms": response.latency, "cost": response.cost, "total_tokens": response.total_tokens},
+            {"latency_ms": response.latency, "cost": response.cost,
+             "total_tokens": response.total_tokens,
+             "task_success": response.judged_success},   # from evaluator / user signal
         ))
         
         return response
@@ -1930,6 +1305,8 @@ async def run_ab_test():
 ## 8. Tenant-Level Cost Allocation
 
 ### Usage-Based Billing
+
+Use Redis counters for **real-time dashboards and quota checks**, but bill from a **durable, append-only usage ledger** (a database table or event stream such as Kafka → warehouse) with one row per call and an idempotency key. Redis is not a system of record: evictions, failovers and missed writes would silently change invoices. Reconcile the ledger against the providers' own usage and cost reports.
 
 ```python
 @dataclass
@@ -1963,7 +1340,7 @@ class TenantCostAllocator:
     ) -> None:
         """Record LLM usage for a tenant"""
         
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         date_key = now.strftime("%Y-%m-%d")
         
         # Redis: real-time counters for dashboards
@@ -1983,26 +1360,21 @@ class TenantCostAllocator:
             "total_requests", 1,
         )
         
-        # Model breakdown
-        pipe.hincrbyfloat(
-            f"tenant:{tenant_id}:cost:model:{model}",
-            "total_cost", cost,
-        )
-        pipe.hincrby(
-            f"tenant:{tenant_id}:tokens:model:{model}",
-            "total_tokens", prompt_tokens + completion_tokens,
-        )
-        
-        # Monthly totals for billing
+        # Monthly totals, with a per-model field in the SAME hash, so the
+        # breakdown is for the billing month (not lifetime) and needs no SCAN
         month_key = now.strftime("%Y-%m")
         pipe.hincrbyfloat(
             f"tenant:{tenant_id}:cost:monthly:{month_key}",
             "total_cost", cost,
         )
+        pipe.hincrbyfloat(
+            f"tenant:{tenant_id}:cost:monthly:{month_key}",
+            f"model:{model}", cost,
+        )
         
         await pipe.execute()
         
-        # Async write to permanent storage
+        # Durable ledger write (the billing source of truth)
         await self._write_usage_record(
             tenant_id, user_id, model,
             prompt_tokens, completion_tokens, cost,
@@ -2041,27 +1413,8 @@ class TenantCostAllocator:
             if daily_requests:
                 usage.total_requests += int(daily_requests.get(b"total_requests", 0))
         
-        # Model breakdown
-        cursor = 0
-        while True:
-            cursor, keys = await self.redis.scan(
-                cursor, match=f"tenant:{tenant_id}:cost:model:*"
-            )
-            for key in keys:
-                model = key.split(":")[-1]
-                data = await self.redis.hgetall(key)
-                if data:
-                    usage.model_breakdown[model] = ModelUsage(
-                        model=model,
-                        total_cost=float(data.get(b"total_cost", 0)),
-                        total_tokens=int(
-                            (await self.redis.hgetall(
-                                f"tenant:{tenant_id}:tokens:model:{model}"
-                            )).get(b"total_tokens", 0)
-                        ),
-                    )
-            if cursor == 0:
-                break
+        # Model breakdown comes from the monthly hash's "model:*" fields
+        # (or, better, from the ledger in the warehouse)
         
         return usage
     
@@ -2077,15 +1430,12 @@ class TenantCostAllocator:
         
         total_cost = float(monthly_data.get(b"total_cost", 0))
         
-        # Get per-model breakdown
-        model_costs = {}
-        async for key in self.redis.scan_iter(
-            match=f"tenant:{tenant_id}:cost:model:*"
-        ):
-            model = key.split(":")[-1]
-            data = await self.redis.hgetall(key)
-            if data:
-                model_costs[model] = float(data.get(b"total_cost", 0))
+        # Per-model breakdown for THIS month
+        model_costs = {
+            k.decode().removeprefix("model:"): float(v)
+            for k, v in monthly_data.items()
+            if k.startswith(b"model:")
+        }
         
         return {
             "tenant_id": tenant_id,
@@ -2150,25 +1500,34 @@ class LLMTracer:
     def trace_llm_call(
         self,
         request_id: str,
+        provider: str,
         model: str,
-        user_id: str,
         tenant_id: Optional[str] = None,
     ):
-        """Create a span for an LLM call"""
+        """Create a span for an LLM call using the OpenTelemetry GenAI
+        semantic conventions (still "Development" status)."""
         with self.tracer.start_as_current_span(
-            f"llm_call_{model}",
+            f"chat {model}",                       # "{operation} {model}"
+            kind=trace.SpanKind.CLIENT,
             attributes={
-                "request_id": request_id,
-                "model": model,
-                "user_id": user_id,
-                "tenant_id": tenant_id or "",
-                "service": "multi-llm-orchestrator",
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": provider,  # e.g. "openai", "anthropic"
+                "gen_ai.request.model": model,
+                "app.request_id": request_id,
+                "app.tenant_id": tenant_id or "",  # app-specific attrs: own namespace
             },
         ) as span:
+            # start_as_current_span records exceptions and sets ERROR status
+            # automatically when one propagates out of the block.
             yield span
-            # Set status
-            if span.get_attributes().get("error"):
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
+
+    @staticmethod
+    def record_response(span, response_model: str, input_tokens: int,
+                        output_tokens: int, finish_reason: str):
+        span.set_attribute("gen_ai.response.model", response_model)
+        span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+        span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
     
     def log_llm_call(
         self,
@@ -2227,11 +1586,11 @@ class ObservableLLMOrchestrator:
     ) -> dict:
         request_id = str(uuid.uuid4())
         
+        start = time.perf_counter()
         with self.tracer.trace_llm_call(
-            request_id, request.model, user_id, tenant_id
+            request_id, request.provider, request.model, tenant_id
         ) as span:
             try:
-                start = time.perf_counter()
                 
                 # Route and execute
                 response = await self._execute(request)
@@ -2266,7 +1625,7 @@ class ObservableLLMOrchestrator:
                     cost=0.0,
                     error=str(e),
                 )
-                span.set_attribute("error", True)
+                span.set_attribute("error.type", type(e).__name__)
                 raise
 ```
 
@@ -2294,9 +1653,9 @@ DASHBOARD_QUERIES = {
         sum(rate(llm_tokens_total[1m]))
     """,
     
-    # 4. Cost Rate
+    # 4. Cost Rate (rate() is per second; increase() gives $ per hour)
     "cost_per_hour": """
-        sum(rate(llm_cost_total[1h]))
+        sum(increase(llm_cost_total[1h]))
     """,
     
     # 5. Latency P99 by Model
@@ -2310,6 +1669,12 @@ DASHBOARD_QUERIES = {
     # 6. Error Rate
     "error_rate": """
         sum(rate(llm_errors_total[5m])) / sum(rate(llm_requests_total[5m]))
+    """,
+
+    # 6b. Prompt-cache share of input tokens
+    "prompt_cache_hit_ratio": """
+        sum(rate(llm_tokens_total{type="cached_input"}[15m]))
+          / sum(rate(llm_tokens_total{type=~"input|cached_input"}[15m]))
     """,
     
     # 7. Cache Hit Rate
@@ -2325,9 +1690,10 @@ DASHBOARD_QUERIES = {
         llm_circuit_breaker_status
     """,
     
-    # 9. Top Costs by Model
+    # 9. Top Costs by Model over the dashboard range (raw counters reset
+    #    on restart and count since process start, so use increase())
     "top_costs": """
-        topk(5, sum by (model) (llm_cost_total))
+        topk(5, sum by (model) (increase(llm_cost_total[$__range])))
     """,
     
     # 10. Concurrency by Model
@@ -2341,19 +1707,21 @@ DASHBOARD_QUERIES = {
 
 ## Production Checklist
 
-- [ ] **Token monitoring**: Per-request, per-user, per-tenant, global tracking with Prometheus
-- [ ] **Rate limiting**: Multi-layer (global, model, user, IP) with tiered configs
+- [ ] **Token monitoring**: Input, cached input, cache writes, output and reasoning tokens per call, from provider-reported usage
+- [ ] **Prompt caching**: Stable prefixes cached at the provider; cache-hit ratio monitored
+- [ ] **Rate limiting**: Atomic, shared (Redis) per-user and per-model RPM/TPM limits; provider rate-limit headers honoured
 - [ ] **Concurrency control**: Per-model semaphores with queue wait monitoring
-- [ ] **Caching**: Exact match + semantic caching with configurable TTL
+- [ ] **Response caching**: Exact match by default; semantic only on routes where reuse is safe, scoped by tenant and prompt version
 - [ ] **Retry policy**: Exponential backoff with jitter, per-error-type configs
 - [ ] **Circuit breaker**: Open after N consecutive failures, half-open retry
 - [ ] **Budget enforcement**: Per-request, session, daily, monthly token budgets
 - [ ] **Alerting**: Error rate, latency, cost, cache hit rate, circuit breaker alerts
-- [ ] **Prompt versioning**: Registry with version history, environment promotion
-- [ ] **A/B testing**: Infrastructure for comparing models in production
-- [ ] **Cost allocation**: Tenant-level usage tracking for billing
+- [ ] **Prompt versioning**: Immutable versions, environment pointers, instant rollback, version on every trace
+- [ ] **Evals as a release gate**: Offline suite on every prompt/model change; online quality sampling after release
+- [ ] **A/B testing**: Quality-based success metric, pre-registered sample size, per-user assignment
+- [ ] **Cost allocation**: Durable usage ledger for billing; Redis only for real-time counters
 - [ ] **Logging**: Structured JSON logs with correlation IDs
-- [ ] **Tracing**: OpenTelemetry distributed tracing through the entire pipeline
+- [ ] **Tracing**: OpenTelemetry with GenAI semantic conventions through the entire pipeline
 - [ ] **Dashboard**: Real-time Grafana dashboard with key metrics
 
 ---

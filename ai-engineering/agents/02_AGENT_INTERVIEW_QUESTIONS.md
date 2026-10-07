@@ -1,6 +1,8 @@
 # 🎯 AI Agents — Interview Questions & Answers
 
-> **Principal/Staff Software Engineer level | Production-grade agent systems**
+> **Principal/Staff Software Engineer level | Production-grade agent systems | Reviewed October 2026**
+
+Each answer opens with a 30-second version. Say that first, then go deep where the interviewer pulls.
 
 ---
 
@@ -9,6 +11,9 @@
 **Interviewer:** *"Design an AI agent system that handles customer support tickets for a SaaS platform with 10K daily tickets. The agent needs to classify tickets, search the knowledge base, escalate to humans when needed, and learn from resolutions."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Make it a **workflow with an agentic core**, not a free-roaming agent: classify (cheap model) → resolve with retrieval and read-only account tools (agent loop, bounded) → gate on groundedness and policy checks → auto-reply, or escalate with a summary of the work done. Writes such as refunds go through approval or a deterministic policy engine. Measure resolution rate, escalation precision, CSAT and cost per resolved ticket on a labelled eval set before widening autonomy. 10K tickets/day is only ~0.1/s on average, so the hard parts are quality, safety and cost, not throughput.
 
 **Architecture:**
 
@@ -46,9 +51,11 @@ class CustomerSupportAgent:
 **Key Design Decisions:**
 
 - **ReAct for resolution:** Each sub-agent uses ReAct to search KB, check account, and compose answers
-- **Confidence threshold at 0.85:** Below this → escalate. Prevents wrong answers
+- **Escalation gate, not raw "confidence":** an LLM's self-reported confidence is poorly calibrated. Base the gate on signals you can check: did retrieval return a supporting article above a tuned relevance score, does the answer cite it (groundedness check), is the intent on the allow-list for automation, did a policy check pass. Tune the threshold (0.85 above is illustrative) on labelled data for the precision you need
 - **Async architecture:** Handle multiple tickets concurrently with connection pooling
-- **Feedback loop:** User ratings + accepted/edited answers → improve retrieval + fine-tune classifier
+- **Feedback loop:** User ratings + agent-edited answers → new eval cases, KB gap reports, retrieval tuning. Fine-tuning is the last lever, not the first
+- **Failure modes to name:** confident wrong answers on policy questions, prompt injection inside ticket text, PII leaking into logs, escalation summaries that drop key facts
+- **What they probe next:** how you roll out (shadow mode → agent-drafted, human-sent → auto-send for low-risk intents), how you prevent the agent promising refunds, and the cost per ticket
 
 ---
 
@@ -57,6 +64,9 @@ class CustomerSupportAgent:
 **Interviewer:** *"Your agent calls an internal API tool with hallucinated parameters — for example, it calls 'delete_user(user_id=999)' when it should have called 'get_user(user_id=123)'. How do you prevent this?"*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    You can't make the model never pick the wrong tool, so make wrong picks **harmless**: granular tools with clear descriptions, strict schemas, authorization based on the *end user's* permissions (not the model's intent), and human approval or a deterministic policy check on irreversible actions. The model proposes; your code disposes.
 
 **Multi-layer defense:**
 
@@ -93,33 +103,38 @@ get_user_schema = {
 # Reject any call that doesn't match schema exactly
 ```
 
-**Layer 3 — Pre-Execution Verification:**
+**Layer 3 — Deterministic checks, then (optionally) a verifier model:**
 ```python
-def verify_tool_call(tool_name: str, params: dict) -> bool:
-    """Use a verifier LLM to double-check the tool call."""
+def verify_tool_call(tool_name: str, params: dict, ctx: RequestContext) -> bool:
+    # 1. Deterministic: the END USER must be allowed to do this to this object.
+    if not authz.can(ctx.user, tool_name, resource_id=params.get("user_id")):
+        return False
+    # 2. Deterministic: the target must appear in this conversation
+    #    (blocks "delete_user(999)" when only user 123 was discussed).
+    if tool_name in DESTRUCTIVE_TOOLS and params.get("user_id") not in ctx.mentioned_ids:
+        return False
+    # 3. Optional verifier model with a STRUCTURED verdict. Never substring-match
+    #    free text: "NO" in "I KNOW this is fine" is True.
     if tool_name in DESTRUCTIVE_TOOLS:
-        verification = llm.call(f"""
-        Tool: {tool_name}
-        Params: {json.dumps(params)}
-        
-        Is this tool call appropriate given the conversation context?
-        Explain your reasoning, then answer YES or NO.
-        """)
-        if "NO" in verification:
+        verdict = verifier.check(tool_name, params, ctx.transcript)  # -> {"approve": bool, "reason": str}
+        if not verdict["approve"]:
             return False
     return True
 ```
 
-**Layer 4 — Read-Only by Default:**
+**Layer 4 — Read-only by default, least privilege in the credentials:**
 ```python
-# All tools are read-only unless explicitly marked as "write"
-DEFAULT_TOOL_PERMISSION = "read"  
-write_tools = {"delete_user", "update_record", "send_email"}
-
+# The agent's DB/API credentials for read tools physically cannot write.
+# Write tools use a separate, narrowly scoped credential and require approval.
 for tool in registry:
-    if tool.name not in write_tools:
-        tool.check_permission("read")  # Deny write access
+    tool.credentials = READ_ONLY_CREDS if tool.category == "read" else scoped_creds(tool)
+    if tool.category in ("write", "destructive"):
+        tool.requires_approval = True
 ```
+
+**Layer 5 — Make mistakes reversible:** soft-delete with a retention window, idempotency keys, and an audit log of who (user + agent + trace id) did what.
+
+**What they probe next:** "What if the hallucinated call came from text injected via a tool result?" Same defences: authorization is tied to the user, not to the prompt.
 
 ---
 
@@ -128,6 +143,9 @@ for tool in registry:
 **Interviewer:** *"Your agent needs to maintain context across 50+ conversation turns, remember user preferences from previous sessions, and recall how it resolved similar issues. Design the memory system."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Separate memory by **lifetime and access pattern**: the in-context conversation (sliding window + summaries), task-scoped working state (structured, checkpointed), and cross-session long-term memory (user preferences as structured records, past resolutions as embeddings) retrieved on demand. Long-term memory is scoped per user, written selectively (not every turn) and treated as untrusted when read back.
 
 **Three-tier memory:**
 
@@ -189,10 +207,12 @@ class EpisodicMemory:
             query_vector=problem_embedding,
             top_k=3
         )
-        if similar and similar[0].score > 0.85:
+        if similar and similar[0].score > 0.85:   # threshold is embedding-model specific; tune it
             return similar[0].metadata["resolution"]
         return None
 ```
+
+**Trade-offs and failure modes:** summaries lose detail (keep raw history in storage, only the *prompt* is summarized); stale preferences (store timestamps, let newer facts override); memory poisoning (an injected "always approve refunds" saved as a fact); cross-tenant leakage (filter by `user_id` in every query). See [Agent Memory Systems](15_AGENT_MEMORY_SYSTEMS.md) for the deep dive.
 
 ---
 
@@ -201,6 +221,9 @@ class EpisodicMemory:
 **Interviewer:** *"You have three specialized agents: a Research agent, an Analysis agent, and a Writing agent. An orchestrator delegates a complex research task. Walk me through the coordination — state management, conflict resolution, and output merging."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    The orchestrator owns the plan and the shared state; workers get **self-contained briefs** (objective, inputs, output schema, limits) and return **structured outputs**, not prose. Independent steps run in parallel, dependent ones in sequence. Conflicts are resolved by explicit rules (evidence wins, conservative estimate wins) or an LLM synthesizer that must cite sources. State lives in a durable store keyed by task id so a crashed run can resume.
 
 **Coordination Protocol:**
 
@@ -274,6 +297,8 @@ class AgentState:
         }))
 ```
 
+**What they probe next:** cost (multi-agent runs can use many times the tokens of a single agent), what a worker does when its brief is ambiguous (ask the orchestrator vs guess), how to stop two workers duplicating work, and how you'd debug a bad final report (one trace spanning all workers).
+
 ---
 
 ## Question 5: Production Guardrails
@@ -281,6 +306,9 @@ class AgentState:
 **Interviewer:** *"Your agent is in production and has access to a database tool, an email tool, and a file system tool. Walk me through every guardrail you put in place before it handles real user requests."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Defence in depth, with the strongest controls **outside the model**: network egress allow-lists and sandboxing, per-tool least-privilege credentials, authorization on the end user's identity, schema validation, rate and spend limits, human approval for irreversible actions (sending email, deleting files), and output filtering for PII. Prompt-level instructions help but are never the security boundary, because prompt injection via emails, files and DB rows is the main threat.
 
 **Guardrail Stack (bottom-up):**
 
@@ -310,13 +338,14 @@ class AuthGuard:
         required_role = TOOL_REGISTRY[tool].required_role
         return required_role in agent_roles
 
-# Layer 4: Rate Limiting
+# Layer 4: Rate and spend limiting (per agent/user, not one global bucket)
 class RateGuard:
     def __init__(self):
-        self.limiter = TokenBucket(rate=10, burst=20)  # 10 req/s
+        self.buckets: dict[str, TokenBucket] = defaultdict(
+            lambda: TokenBucket(rate=10, burst=20))  # 10 req/s each
     
     def check(self, agent_id: str) -> bool:
-        return self.limiter.consume(agent_id)
+        return self.buckets[agent_id].consume(1)
 
 # Layer 5: Content Safety (Output)
 class OutputGuard:
@@ -341,6 +370,16 @@ class ApprovalGuard:
         return False
 ```
 
+**Tool-specific controls for this question:**
+
+| Tool | Main risk | Control |
+|------|-----------|---------|
+| Database | Data exfiltration, destructive SQL | Read-only replica user, parameterized query tools instead of raw SQL, row-level security by tenant, row limits |
+| Email | Exfiltration via outbound mail, spam, phishing | Recipient allow-list or approval, rate limit, no attachments from arbitrary paths |
+| File system | Path traversal, reading secrets | Sandbox/container with a mounted working dir only, path canonicalization, no access to credentials |
+
+The dangerous combination is **private data + untrusted content + an outbound channel** in one agent: an injected instruction in a file can read the DB and email it out. Break at least one leg.
+
 ---
 
 ## Question 6: Observability & Debugging
@@ -348,6 +387,9 @@ class ApprovalGuard:
 **Interviewer:** *"Your agent gave a wrong answer and the user is complaining. How do you debug what happened? Walk me through the observability stack."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Pull the **trace** for that conversation: every model call (full prompt as sent, response, tokens, model version) and every tool call (args, result, latency) as spans under one trace id. Find the first step that went wrong and classify it: bad retrieval/tool data, model reasoning error, missing context (truncated or never fetched), or a guardrail gap. Turn it into a regression eval case, fix, and re-run the eval set.
 
 **Debugging workflow:**
 
@@ -378,7 +420,7 @@ print(f"Observation: {moment.tool_result}")
 # Step 4: Check context window
 context = trace.get_context_at_step(failure.step_number)
 print(f"Context used: {count_tokens(context)}")
-print(f"Context max: {model.max_tokens}")
+print(f"Context window: {model.context_window}")  # not max_tokens: that is the OUTPUT cap
 print(f"Was truncated: {context_was_truncated(context)}")
 ```
 
@@ -396,6 +438,8 @@ AGENT_METRICS = {
     "agent_escalation_rate": "fraction requiring human intervention",
 }
 ```
+
+Instrument with the OpenTelemetry GenAI semantic conventions (`invoke_agent`, `chat`, `execute_tool` spans with `gen_ai.*` attributes) so any backend (Langfuse, Phoenix, Datadog, Honeycomb, etc.) can show the trace. See [Agent Observability](07_AGENT_OBSERVABILITY.md).
 
 **Debugging checklist:**
 
@@ -415,6 +459,9 @@ AGENT_METRICS = {
 **Interviewer:** *"How do you evaluate whether your agent is ready for production? What metrics matter, and how do you build a test suite for non-deterministic outputs?"*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Build a **versioned eval set** of realistic tasks (seeded from production traces and past failures), grade both the **outcome** (task success via code checks where possible, LLM-as-judge with a rubric where not, judge calibrated against human labels) and the **trajectory** (right tools, sane arguments, no forbidden actions, step count). Run each case several times and report pass rates (pass@k for "can it", pass^k for "does it reliably"). Gate prompt, model and tool changes on this suite in CI, then watch online metrics after release.
 
 **Evaluation framework:**
 
@@ -470,6 +517,8 @@ escalation_rate = escalated / total_tasks
 user_satisfaction = positive_ratings / total_ratings
 ```
 
+**Pitfalls:** judging with the same model you are testing (self-preference bias), judges that favour longer answers, eval sets that leak into prompts, and averaging away rare-but-catastrophic failures (track them separately, e.g. "any forbidden tool call" must be 0).
+
 ---
 
 ## Question 8: Error Recovery & Resilience
@@ -477,6 +526,9 @@ user_satisfaction = positive_ratings / total_ratings
 **Interviewer:** *"Your agent is running a multi-step task. At step 4 of 8, a database tool times out. The agent retries and gets an error. How does it recover? Design the resilience strategy."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Classify the failure, then pick the strategy: **transient** (timeout, 429, 5xx) → bounded retries with exponential backoff and jitter, honouring `Retry-After`; **auth** → refresh once; **permanent** (bad input, tool gone) → feed the error back to the model to re-plan; **critical or exhausted** → checkpointed partial result plus human escalation. Only retry writes that are idempotent (or carry an idempotency key), and checkpoint after every completed step so a crash resumes at step 4, not step 1.
 
 **Resilience strategy:**
 
@@ -494,9 +546,11 @@ class ResilientAgent:
             try:
                 return await self.execute(task)
             except ToolTimeoutError:
-                # Strategy 1: Retry with backoff
-                await asyncio.sleep(backoff)
-                backoff *= 2  # Exponential backoff
+                # Strategy 1: Retry with exponential backoff + jitter.
+                # A timeout does NOT mean the write didn't happen: only retry
+                # idempotent calls (or ones carrying an idempotency key).
+                await asyncio.sleep(backoff * random.uniform(0.5, 1.5))
+                backoff *= 2
                 continue
             except ToolRateLimitError as e:
                 # Strategy 2: Wait and retry
@@ -534,21 +588,24 @@ class CheckpointManager:
     """Save and restore agent state for long-running tasks."""
     
     async def save_checkpoint(self, agent_state: AgentState):
-        key = f"checkpoint:{agent_state.task_id}:{agent_state.step}"
-        await redis.set(
-            key,
-            pickle.dumps(agent_state),
-            ex=86400  # Expire after 24 hours
-        )
+        # One hash per task: field = step number, value = JSON state.
+        # JSON, not pickle: unpickling data from a shared store is remote
+        # code execution if that store is ever compromised.
+        key = f"checkpoint:{agent_state.task_id}"
+        await redis.hset(key, str(agent_state.step), agent_state.to_json())
+        await redis.hset(key, "latest", str(agent_state.step))
+        await redis.expire(key, 86400)  # 24h retention
     
     async def restore_checkpoint(self, task_id: str) -> Optional[AgentState]:
-        """Find latest checkpoint and restore."""
-        keys = await redis.keys(f"checkpoint:{task_id}:*")
-        if not keys:
+        """Restore the latest checkpoint (no KEYS scan, no string-sorting bugs)."""
+        key = f"checkpoint:{task_id}"
+        latest = await redis.hget(key, "latest")
+        if latest is None:
             return None
-        latest = sorted(keys)[-1]
-        return pickle.loads(await redis.get(latest))
+        return AgentState.from_json(await redis.hget(key, latest))
 ```
+
+Two bugs the naive version had: `KEYS` is O(N) over the whole keyspace and blocks Redis, and `sorted()` on string keys puts step 10 before step 9. Frameworks such as LangGraph give you this for free (a checkpointer persists state after every node, keyed by `thread_id`).
 
 ---
 
@@ -557,6 +614,9 @@ class CheckpointManager:
 **Interviewer:** *"Explain how you would build an agent that uses MCP servers for its tools. How does the agent discover, authenticate, and orchestrate across multiple MCP servers?"*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    The agent host runs one **MCP client per server** (stdio for local servers, Streamable HTTP for remote ones), calls `tools/list` to discover tools and their JSON Schemas, merges them into one namespaced registry, and routes each tool call back to the owning server via `tools/call`. Remote servers authenticate with OAuth 2.1 (the MCP authorization spec), with tokens scoped per server. The host, not the server, owns policy: which servers are trusted, which tools need approval, and how tool output is sanitized.
 
 **Agent-to-MCP architecture:**
 
@@ -583,7 +643,7 @@ class MCPAgent:
             self.tool_registry[tool.name] = ToolSpec(
                 name=tool.name,
                 description=tool.description,
-                input_schema=tool.inputSchema,
+                input_schema=tool.input_schema,   # wire field: inputSchema
                 server=name  # Which server to route to
             )
         
@@ -616,21 +676,22 @@ class MCPAgent:
 **Multi-server orchestration:**
 
 ```python
-# Agent connects to 3 MCP servers
+# Agent connects to 3 MCP servers (stdio; run from ai-engineering/mcp so
+# `servers.*` resolves; don't name your package `mcp`, it shadows the SDK)
 agent = MCPAgent()
 
 # Register all servers
 await agent.register_mcp_server("db", {
     "command": "python", 
-    "args": ["-m", "mcp.servers.database_server"]
+    "args": ["-m", "servers.database_server"]
 })
 await agent.register_mcp_server("rag", {
     "command": "python", 
-    "args": ["-m", "mcp.servers.rag_server"]
+    "args": ["-m", "servers.rag_server"]
 })
 await agent.register_mcp_server("calculator", {
     "command": "python", 
-    "args": ["-m", "mcp.servers.calculator_server"]
+    "args": ["-m", "servers.calculator_server"]
 })
 
 # Now the LLM sees ALL tools from ALL servers in one unified registry
@@ -639,6 +700,14 @@ result = await agent.run(
 )
 # → Might use: db.query_database → calculator.add/multiply
 ```
+
+**What a staff answer adds:**
+
+- **Name collisions:** two servers can both expose `search`; prefix with the server name (`db__search`) and keep the mapping.
+- **Tool count:** dozens of servers means hundreds of schemas in every prompt. Filter tools per task or load them on demand.
+- **Change notifications:** servers can announce tool-list changes (in 2026-07-28, on a `subscriptions/listen` stream the client opts into; list results also carry a `ttlMs` cache hint); refresh the registry rather than caching forever.
+- **Trust:** tool descriptions and results are untrusted input. A malicious server can hide instructions in a description ("tool poisoning") or change it after approval. Pin versions, review servers, and require approval for write tools.
+- **Spec currency:** the MCP spec is versioned by date. The 2026-07-28 revision made the protocol stateless: no `initialize` handshake and no `Mcp-Session-Id`; version and capabilities travel in each request's `_meta`, and servers that need user input mid-call return an `input_required` result the client answers on a retry. It also deprecated Sampling, Roots and Logging (the HTTP+SSE transport has been deprecated since 2025-03-26). In the Python SDK v2 (`mcp>=2`), `mcp.Client` handles this and falls back to `initialize` for older servers. It matters for load-balancing remote servers: any replica can now serve any request.
 
 ---
 
@@ -652,7 +721,7 @@ result = await agent.run(
 
 > **What happened:** An agent was given a search tool. It searched for "latest sales figures," got a summary, thought the summary was incomplete, searched again with a slightly different query, and repeated this 15 times before hitting the step limit.
 
-**Fix:** Implemented **semantic deduplication** — if the agent tried to call a similar tool with similar parameters within N steps, the system short-circuits and returns the cached result:
+**Fix:** First, **exact deduplication** (hash of tool name + canonical JSON args) and a per-tool call cap, which catch most loops for free. Then **semantic deduplication** for near-identical queries: if the agent calls the same tool with similar parameters within N steps, short-circuit, return the cached result and tell the model it already has it:
 
 ```python
 class DuplicateDetector:
@@ -708,7 +777,7 @@ class ContextManager:
 
 > **What happened:** The agent would pass integration tests 7 out of 10 times. The test suite had no way to distinguish between a legitimate improvement and random variance.
 
-**Fix:** Moved to **statistical evaluation** — run each test 5 times, report pass rate + variance:
+**Fix:** Moved to **statistical evaluation**: run each test several times and report the pass rate. For a release gate on reliability, track pass^k (all k runs pass), not just "passed at least once". With n=5, a 4/5 vs 5/5 difference is noise; compare suites of many cases, not single tests.
 
 ```python
 class StatisticalTest:
@@ -717,11 +786,10 @@ class StatisticalTest:
         self.test_fn = test_fn
         self.min_pass_rate = min_pass_rate
     
-    async def run(self, n_runs: int = 5, temperature: float = 0.7) -> TestResult:
-        results = []
-        for i in range(n_runs):
-            result = await self.test_fn(temperature=temperature)
-            results.append(result)
+    async def run(self, n_runs: int = 5) -> TestResult:
+        # Test with production settings. (Several newer models no longer accept
+        # temperature at all, so don't make tests depend on it.)
+        results = [await self.test_fn() for _ in range(n_runs)]
         
         pass_rate = sum(results) / n_runs
         return TestResult(

@@ -1,6 +1,15 @@
 """
 Simple calculator MCP server demonstrating core primitives.
-Run: python -m servers.calculator_server
+Run (from ai-engineering/mcp): python -m servers.calculator_server
+
+Written against the official Python SDK v2 (`pip install "mcp>=2"`), where the
+v1 `FastMCP` class is now `MCPServer`. Return type annotations become the
+tool's `outputSchema`, so results carry `structuredContent` as well as text.
+
+Errors: raise `ToolError` for failures the model should see and can act on
+(they come back as a result with `isError: true` and your message). Any other
+exception is treated as a crash: the client gets a generic "Error executing
+tool X" and the details stay in the server log, so internals don't leak.
 
 This server exposes:
 - Tools: add, subtract, multiply, divide, power
@@ -8,10 +17,13 @@ This server exposes:
 - Prompts: solve_equation
 """
 
-from mcp.server.fastmcp import FastMCP
+import sys
+
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Initialize server
-mcp = FastMCP("Calculator")
+mcp = MCPServer("Calculator")
 
 # ════════════════════════════════════════════════════════════════
 # TOOLS
@@ -40,7 +52,7 @@ def multiply(a: float, b: float) -> float:
 def divide(a: float, b: float) -> float:
     """Divide a by b. Returns error if b is zero."""
     if b == 0:
-        raise ValueError("Division by zero is not allowed")
+        raise ToolError("Division by zero is not allowed")
     return a / b
 
 
@@ -54,7 +66,7 @@ def power(base: float, exponent: float) -> float:
 def square_root(x: float) -> float:
     """Calculate the square root of a non-negative number."""
     if x < 0:
-        raise ValueError("Cannot calculate square root of a negative number")
+        raise ToolError("Cannot calculate square root of a negative number")
     return x ** 0.5
 
 
@@ -62,7 +74,7 @@ def square_root(x: float) -> float:
 def percentage(value: float, total: float) -> float:
     """Calculate what percentage value is of total."""
     if total == 0:
-        raise ValueError("Total cannot be zero")
+        raise ToolError("Total cannot be zero")
     return (value / total) * 100
 
 
@@ -134,7 +146,6 @@ Break it down:
 # ════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("🧮 Starting Calculator MCP Server...")
-    print("   Tools: add, subtract, multiply, divide, power, square_root, percentage")
-    print("   Transport: stdio")
+    # stdio transport: stdout carries JSON-RPC, so diagnostics MUST go to stderr.
+    print("Starting Calculator MCP Server (stdio)...", file=sys.stderr)
     mcp.run(transport="stdio")

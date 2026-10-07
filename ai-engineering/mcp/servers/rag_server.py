@@ -2,25 +2,34 @@
 RAG pipeline exposed as an MCP server.
 Combines document indexing, retrieval, and generation through the MCP protocol.
 
-Run: python -m servers.rag_server
+Run (from ai-engineering/mcp):
+    python -m servers.rag_server                      # stdio (default; what desktop clients launch)
+    MCP_TRANSPORT=streamable-http python -m servers.rag_server   # HTTP at http://127.0.0.1:$RAG_PORT/mcp
 
-This server integrates with the existing RAG implementation in
-ai-engineering/implementation/ to provide AI agents with
-knowledge retrieval capabilities.
+This server wraps the RAG implementation in ai-engineering/rag/implementation/
+to give AI agents knowledge-retrieval tools. Written for the Python SDK v2
+(`mcp>=2`, `MCPServer`).
 
 Environment variables:
-- RAG_MODEL: LLM model name (default: gemma-4b-it)
-- RAG_PORT: HTTP port for SSE transport (default: 8000)
+- MCP_TRANSPORT: "stdio" (default) or "streamable-http". The old HTTP+SSE
+  transport is deprecated in the spec and not offered here.
+- RAG_PORT: HTTP port for Streamable HTTP (default: 8000)
+- USE_MOCK_LLM: "true" to answer without a running LM Studio
+- RAG_ALLOWED_ROOT: the only directory `index_document` may read from
+  (default: ai-engineering/rag/data). Without a root, a prompt-injected model
+  could ask the server to index (and then reveal) ~/.ssh or /etc.
+- LLM settings (model name, LM Studio URL, ...) come from rag/implementation/config.py.
 """
 
+import contextlib
+import logging
 import os
 import sys
 import time
-import json
-import logging
-from typing import Optional, Dict, Any
+from typing import Dict
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 # ── Add implementation to Python path ──
 _IMPL_DIR = os.path.abspath(
@@ -36,7 +45,7 @@ from vector_store import ChromaVectorStore
 from llm_service import LLMService, LMStudioClient, MockLLMService
 from document_loader import TextFileLoader
 
-# Configure logging
+# Configure logging (stderr; stdout is reserved for the stdio transport)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -45,10 +54,15 @@ logger = logging.getLogger("mcp.rag_server")
 
 # ── Configuration ──
 RAG_PORT = int(os.environ.get("RAG_PORT", "8000"))
+MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+RAG_ALLOWED_ROOT = os.path.realpath(os.environ.get(
+    "RAG_ALLOWED_ROOT",
+    os.path.join(os.path.dirname(__file__), "..", "..", "rag", "data"),
+))
 USE_MOCK_LLM = os.environ.get("USE_MOCK_LLM", "false").lower() == "true"
 
 # ── Initialize MCP Server ──
-mcp = FastMCP("RAGPipeline", port=RAG_PORT)
+mcp = MCPServer("RAGPipeline")
 
 # ── Initialize RAG Pipeline ──
 # Use MockLLM by default so the server can start without LM Studio
@@ -64,12 +78,15 @@ if USE_MOCK_LLM:
 else:
     llm = LMStudioClient()
 
-pipeline = RAGPipeline(
-    embedder=SentenceTransformerEmbedding(),
-    store=ChromaVectorStore(),
-    llm=llm,
-    loader=TextFileLoader(),
-)
+# The RAG library prints progress to stdout; on stdio that would corrupt the
+# JSON-RPC stream, so route any such output to stderr.
+with contextlib.redirect_stdout(sys.stderr):
+    pipeline = RAGPipeline(
+        embedder=SentenceTransformerEmbedding(),
+        store=ChromaVectorStore(),
+        llm=llm,
+        loader=TextFileLoader(),
+    )
 
 logger.info("RAG pipeline initialized with %d documents", pipeline.document_count)
 
@@ -88,15 +105,15 @@ def format_sources(sources: list) -> str:
     return output
 
 
-def format_chunks(chunks: list, max_chars: int = 500) -> str:
-    """Format retrieved chunks with metadata."""
-    if not chunks:
+def format_chunks(results: list, max_chars: int = 500) -> str:
+    """Format retrieved chunks (SearchResult: .chunk + .score) with metadata."""
+    if not results:
         return "No relevant documents found."
 
-    output = f"Retrieved {len(chunks)} relevant chunks:\n\n"
-    for i, chunk in enumerate(chunks, 1):
+    output = f"Retrieved {len(results)} relevant chunks:\n\n"
+    for i, result in enumerate(results, 1):
+        chunk, score = result.chunk, result.score
         source = chunk.metadata.get("source", "unknown").split("/")[-1]
-        score = getattr(chunk, "score", 0)
         text = chunk.text[:max_chars]
 
         output += f"--- [{i}] {source} (score: {score:.4f}) ---\n"
@@ -125,7 +142,8 @@ def rag_query(question: str, top_k: int = 5) -> str:
     logger.info("RAG query: %.100s (top_k=%d)", question, top_k)
 
     start = time.time()
-    result = pipeline.query(question, top_k=min(top_k, 10))
+    with contextlib.redirect_stdout(sys.stderr):
+        result = pipeline.query(question, top_k=max(1, min(top_k, 10)))
     elapsed = time.time() - start
 
     answer = result.get("answer", "No answer generated.")
@@ -153,8 +171,8 @@ def retrieve(question: str, top_k: int = 5) -> str:
     logger.info("Retrieval: %.100s (top_k=%d)", question, top_k)
 
     # Access the retriever directly via the pipeline
-    chunks = pipeline._retriever.retrieve(question, top_k=min(top_k, 10))
-    return format_chunks(chunks)
+    results = pipeline._retriever.retrieve(question, top_k=max(1, min(top_k, 10)))
+    return format_chunks(results)
 
 
 @mcp.tool()
@@ -166,20 +184,25 @@ def index_document(file_path: str) -> str:
     and stored in the vector database for future queries.
 
     Args:
-        file_path: Absolute path to the file or directory to index
+        file_path: Path to a file or directory under the server's allowed root
     """
-    if not os.path.exists(file_path):
-        return f"Error: Path '{file_path}' does not exist."
+    # realpath resolves "..", and symlinks, before the containment check.
+    real = os.path.realpath(file_path)
+    if os.path.commonpath([real, RAG_ALLOWED_ROOT]) != RAG_ALLOWED_ROOT:
+        raise ToolError(f"Path '{file_path}' is outside the allowed root '{RAG_ALLOWED_ROOT}'.")
+    if not os.path.exists(real):
+        raise ToolError(f"Path '{file_path}' does not exist.")
 
     start = time.time()
 
     try:
-        if os.path.isdir(file_path):
-            chunk_count = pipeline.index_directory(file_path)
-            source_type = "directory"
-        else:
-            chunk_count = pipeline.index_document(file_path)
-            source_type = "file"
+        with contextlib.redirect_stdout(sys.stderr):
+            if os.path.isdir(real):
+                chunk_count = pipeline.index_directory(real)
+                source_type = "directory"
+            else:
+                chunk_count = pipeline.index_document(real)
+                source_type = "file"
 
         elapsed = time.time() - start
         total_docs = pipeline.document_count
@@ -197,8 +220,8 @@ def index_document(file_path: str) -> str:
         )
 
     except Exception as e:
-        logger.error("Indexing failed: %s", e)
-        return f"❌ Indexing failed: {e}"
+        logger.exception("Indexing failed")
+        raise ToolError(f"Indexing failed: {type(e).__name__}") from e
 
 
 # ── Resources ──
@@ -244,7 +267,7 @@ def list_documents() -> str:
             meta = all_chunks["metadatas"][i] if all_chunks["metadatas"] else {}
             source = meta.get("source", "unknown")
             if source not in doc_map:
-                doc_map[source] = {"chunks": 0, "counted": set()}
+                doc_map[source] = {"chunks": 0}
             doc_map[source]["chunks"] += 1
 
         output = "**Indexed Documents:**\n\n"
@@ -282,10 +305,11 @@ Evaluate:
 # ════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("🧠 Starting RAG MCP Server...")
-    print(f"   Document count: {pipeline.document_count}")
-    print(f"   Embedding model: {settings.embedding_model}")
-    print(f"   Mock LLM: {USE_MOCK_LLM}")
-    print(f"   Transport: sse (port {RAG_PORT})")
-    print(f"   Endpoint: http://localhost:{RAG_PORT}/api/mcp")
-    mcp.run(transport="sse")
+    if MCP_TRANSPORT == "streamable-http":
+        logger.info("Starting RAG MCP Server: Streamable HTTP at http://127.0.0.1:%d/mcp", RAG_PORT)
+        # Binds to localhost by default. Exposing it beyond that needs auth
+        # (OAuth bearer tokens) and Origin checks; see 04_MCP_PRODUCTION_ARCHITECTURE.md.
+        mcp.run(transport="streamable-http", host="127.0.0.1", port=RAG_PORT)
+    else:
+        logger.info("Starting RAG MCP Server (stdio), %d chunks indexed", pipeline.document_count)
+        mcp.run(transport="stdio")

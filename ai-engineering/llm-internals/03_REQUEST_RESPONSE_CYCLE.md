@@ -1,83 +1,51 @@
 # 🔄 The Request/Response Cycle — Complete End-to-End Flow
 
-> **What data goes to the LLM, how it's processed, and how responses come back — with detailed token breakdowns.**
+> **What goes into a Messages API request, what happens to it on the server, how the response streams back, and how tokens (and money) accumulate across an agent loop.**
+
+**30-second answer:** A request is `model` + `max_tokens` + `messages` (plus optional `system`, `tools`, caching markers, thinking/effort settings). The server renders it into the model's prompt format, tokenizes it, runs **prefill** over all input tokens (reusing cached prefix state if there's a cache hit), then **decodes** one token at a time until the model ends its turn, asks for a tool, or hits `max_tokens`. The response is a list of content blocks plus a `stop_reason` and `usage`. In an agent loop every tool call means another full request, so input tokens grow every turn and caching is what keeps that affordable.
 
 ---
 
 ## 1. THE PROMPT ASSEMBLY
 
-Before anything is sent to the API, the prompt must be assembled. This is the most important step because **everything the LLM sees is determined here**.
+Everything the model sees is decided client-side, before the request is sent.
 
 ### 1.1 The Complete Prompt Structure
 
+The API renders a request in a fixed order: **`tools` → `system` → `messages`**. That order matters for prompt caching, which matches on an exact prefix.
+
 ```ascii
 ┌────────────────────────────────────────────────────────────────────┐
-│                    THE COMPLETE PROMPT                              │
-│                                                                    │
-│  ┌────────────────────────────────────────────────────────────┐   │
-│  │  SYSTEM PROMPT (~2,000 tokens)                             │   │
-│  │  ───────────────────────────                               │   │
-│  │  "You are Claude, an AI assistant created by Anthropic...  │   │
-│  │   Your capabilities:                                       │   │
-│  │   - You can read, write, and edit files                    │   │
-│  │   - You can run terminal commands                          │   │
-│  │   - You can search code                                    │   │
-│  │   Rules:                                                   │   │
-│  │   - Always read files before editing                      │   │
-│  │   - Make minimal changes                                   │   │
-│  │   - Follow project conventions..."                         │   │
-│  └────────────────────────────────────────────────────────────┘   │
-│                                                                    │
-│  ┌────────────────────────────────────────────────────────────┐   │
-│  │  TOOL DEFINITIONS (~2,500 tokens)                          │   │
-│  │  ────────────────────────────                              │   │
-│  │  Each tool has: name, description, input_schema (JSON)     │   │
-│  │  [                                                         │   │
-│  │    {name: "read_files", input_schema: {...}},              │   │
-│  │    {name: "write_file", input_schema: {...}},              │   │
-│  │    {name: "str_replace", input_schema: {...}},             │   │
-│  │    {name: "run_terminal_command", input_schema: {...}},    │   │
-│  │    ...                                                     │   │
-│  │  ]                                                         │   │
-│  └────────────────────────────────────────────────────────────┘   │
-│                                                                    │
-│  ┌────────────────────────────────────────────────────────────┐   │
-│  │  CONVERSATION HISTORY (~5,000+ tokens)                     │   │
-│  │  ────────────────────────────────────                      │   │
-│  │  [                                                         │   │
-│  │    {"role": "user", "content": "..."},                    │   │
-│  │    {"role": "assistant", "content": [                      │   │
-│  │      {"type": "text", "text": "..."},                     │   │
-│  │      {"type": "tool_use", ...}                             │   │
-│  │    ]},                                                     │   │
-│  │    {"role": "user", "content": [                           │   │
-│  │      {"type": "tool_result", ...}                          │   │
-│  │    ]},                                                     │   │
-│  │    ... (repeated for each turn)                            │   │
-│  │  ]                                                         │   │
-│  └────────────────────────────────────────────────────────────┘   │
-│                                                                    │
-│  ┌────────────────────────────────────────────────────────────┐   │
-│  │  CURRENT USER MESSAGE (~200-2,000 tokens)                  │   │
-│  │  ──────────────────────────────────────                    │   │
-│  │  {"role": "user", "content": "Create a todo app..."}       │   │
-│  └────────────────────────────────────────────────────────────┘   │
-│                                                                    │
+│  TOOL DEFINITIONS          name, description, input_schema (JSON)  │
+│  (+ a tool-use system prompt the API adds automatically)          │
+├────────────────────────────────────────────────────────────────────┤
+│  SYSTEM PROMPT             role, rules, context, output format     │
+├──────────── cache breakpoint: everything above is stable ──────────┤
+│  MESSAGES                                                          │
+│   user:      "Create a todo API..."                                │
+│   assistant: [text, tool_use{id, name, input}]                     │
+│   user:      [tool_result{tool_use_id, content}]                   │
+│   ... repeated per tool round-trip ...                             │
+│   user:      current message                                       │
 └────────────────────────────────────────────────────────────────────┘
+                  ▼ model generates here (output, ≤ max_tokens)
 ```
 
-### 1.2 Token Count Breakdown
+When you pass `tools`, Anthropic documents that the API also injects a tool-use system prompt (a few hundred tokens, model-dependent), billed as input. Tool *schemas* themselves are input tokens too, which is why large tool sets get expensive and why tool search / deferred loading exists.
 
-| Component | Tokens | Percentage | Notes |
-|-----------|--------|------------|-------|
-| System prompt | ~2,000 | 10% | Fixed per session |
-| Tool definitions | ~2,500 | 12.5% | Fixed per session |
-| Conversation history | ~5,000 | 25% | Grows with each turn |
-| File contents (context) | ~5,000 | 25% | From read_files results |
-| Tool results | ~3,000 | 15% | From tool executions |
-| Current user message | ~500 | 2.5% | The actual prompt |
-| Reserved for output | ~2,000 | 10% | Token budget for response |
-| **Total** | **~20,000** | **100%** | |
+### 1.2 Token Count Breakdown (illustrative agent request)
+
+| Component | Tokens | Share of input | Changes per call? |
+|-----------|--------|---------------|-------------------|
+| Tool definitions (+ tool-use prompt) | ~2,500 | 14% | No (cacheable) |
+| System prompt | ~2,000 | 11% | No (cacheable) |
+| Conversation history (text turns) | ~5,000 | 28% | Grows |
+| Tool results (file contents, command output) | ~8,000 | 44% | Grows, usually the largest part |
+| Current user message | ~500 | 3% | Yes |
+| **Total input** | **~18,000** | **100%** | |
+| Output (`max_tokens` cap, not pre-charged) | up to e.g. 16,000 | n/a | You pay only for tokens actually generated |
+
+`max_tokens` reserves room in the context window (input + output must fit), but you're billed only for generated tokens.
 
 ---
 
@@ -87,357 +55,215 @@ Before anything is sent to the API, the prompt must be assembled. This is the mo
 
 ```http
 POST https://api.anthropic.com/v1/messages
-Authorization: Bearer sk-ant-xxxxxxxxxxxxx
-anthropic-version: 2025-01-01
+x-api-key: sk-ant-...
+anthropic-version: 2023-06-01
 content-type: application/json
 
 {
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 8192,
-  "temperature": 0.0,
-  "top_p": 0.9,
-  "top_k": 50,
+  "model": "claude-opus-5-5",
+  "max_tokens": 16000,
   "stream": true,
-  "stop_sequences": ["\n\nHuman:", "\n\nAssistant:"],
+  "output_config": {"effort": "medium"},
   "system": [
     {
       "type": "text",
-      "text": "You are Claude, an AI assistant...",
+      "text": "You are a coding agent working in a FastAPI repo...",
       "cache_control": {"type": "ephemeral"}
     }
   ],
   "tools": [
     {
-      "name": "read_files",
-      "description": "Read the contents of one or more files...",
+      "name": "read_file",
+      "description": "Read a UTF-8 file from the repository. Use before editing.",
       "input_schema": {
         "type": "object",
-        "properties": {
-          "paths": {
-            "type": "array",
-            "items": {"type": "string"}
-          }
-        },
-        "required": ["paths"]
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
       }
     }
   ],
   "messages": [
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "Create a REST API for a todo app with FastAPI"
-        }
-      ]
-    }
+    {"role": "user", "content": "Create a REST API for a todo app with FastAPI"}
   ]
 }
 ```
+
+Corrections to common mistakes:
+
+- Auth is the **`x-api-key`** header (OAuth bearer tokens are a separate login path). `anthropic-version` is **`2023-06-01`**, the current API version; new features arrive via `anthropic-beta` headers, not new version dates.
+- Don't send `stop_sequences: ["\n\nHuman:"]`. That's a leftover from the retired Text Completions API; the Messages API handles turns structurally.
+- Don't set `temperature`/`top_p`/`top_k` on current models: models released after Opus 4.6 reject non-default values. Use `effort`.
 
 ### 2.2 Request Fields Explained
 
 | Field | Required | Purpose |
 |-------|----------|---------|
-| `model` | ✅ | Which Claude model to use |
-| `max_tokens` | ✅ | Maximum tokens in the response |
-| `messages` | ✅ | The conversation messages |
-| `system` | ❌ | System prompt (optional, recommended) |
-| `tools` | ❌ | Tool definitions for function calling |
-| `temperature` | ❌ | Sampling temperature (default: 0.7) |
-| `top_p` | ❌ | Nucleus sampling parameter |
-| `top_k` | ❌ | Top-K sampling parameter |
-| `stream` | ❌ | Whether to stream the response |
-| `stop_sequences` | ❌ | Custom stop sequences |
-| `metadata` | ❌ | User ID, tags for tracking |
-| `tool_choice` | ❌ | Force a specific tool or allow any |
+| `model` | ✅ | Model ID, e.g. `claude-opus-5-5` (IDs from the 4.6 generation on are dateless pinned snapshots) |
+| `max_tokens` | ✅ | Cap on generated tokens (thinking included) |
+| `messages` | ✅ | Conversation; must start with a `user` turn |
+| `system` | ❌ | System prompt (string or list of text blocks, cacheable) |
+| `tools`, `tool_choice` | ❌ | Tool definitions; `auto` / `none` / force a tool. Forcing (`any`/`tool`) is rejected on the newest models, so use `auto` + `strict: true` tools or structured outputs |
+| `thinking` | ❌ | `{"type": "adaptive"}` on current models (older models: `enabled` + `budget_tokens`) |
+| `output_config` | ❌ | `effort` (low…max) and structured-output `format` (JSON schema) |
+| `cache_control` | ❌ | Top-level automatic caching, or per-block breakpoints (max 4) |
+| `stream` | ❌ | SSE streaming; recommended for long outputs to avoid HTTP timeouts |
+| `stop_sequences` | ❌ | Custom stop strings |
+| `metadata` | ❌ | `user_id` (an opaque ID for abuse detection) |
+| `temperature`, `top_p`, `top_k` | ❌ | Deprecated; only older models accept non-default values |
 
 ---
 
 ## 3. WHAT HAPPENS INSIDE THE LLM
 
-Once the request reaches the API, here's what happens:
+Anthropic doesn't document its serving stack or tokenizer internals. The pipeline below is general LLM background, true of any transformer server.
 
 ```ascii
 ┌──────────────────────────────────────────────────────────────────────┐
-│                    LLM INFERENCE PIPELINE                             │
-│                                                                      │
-│  INPUT: Raw JSON request                                             │
-│         │                                                             │
-│         ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │ 1. TOKENIZATION                                                │   │
-│  │    ┌───────────────────────────────────────────────────────┐  │   │
-│  │    │ "Create a REST API" → [BOS] [1456] [892] [331] ...   │  │   │
-│  │    │                                                        │  │   │
-│  │    │ Claude uses a custom byte-pair encoding (BPE) tokenizer│  │   │
-│  │    │ • 100,000+ vocabulary size                             │  │   │
-│  │    │ • BPE tokens average ~3.5 characters                  │  │   │
-│  │    │ • Special tokens: [BOS], [EOS], [PAD], [SEP]          │  │   │
-│  │    └───────────────────────────────────────────────────────┘  │   │
-│  │                                                               │   │
-│  │         ▼                                                     │   │
-│  │  ┌────────────────────────────────────────────────────────┐   │   │
-│  │  │ 2. EMBEDDING LOOKUP                                     │   │   │
-│  │  │    Each token ID → embedding vector (e.g., 5120 dims)   │   │   │
-│  │  │    • Token embeddings: learned representations          │   │   │
-│  │  │    • Positional embeddings: token position info         │   │   │
-│  │  │    • Combined: embedding + position → transformer input │   │   │
-│  │  └────────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  │         ▼                                                     │   │
-│  │  ┌────────────────────────────────────────────────────────┐   │   │
-│  │  │ 3. TRANSFORMER LAYERS (×N)                              │   │   │
-│  │  │    For each layer (repeated N times):                   │   │   │
-│  │  │                                                          │   │   │
-│  │  │    a. Multi-Head Self-Attention                         │   │   │
-│  │  │       • Each token "attends" to all previous tokens     │   │   │
-│  │  │       • Causal masking: can't see future tokens         │   │   │
-│  │  │       • QKV projections: Query, Key, Value vectors      │   │   │
-│  │  │       • Scaled dot-product: Q·K^T / sqrt(d) → weights  │   │   │
-│  │  │       • Weighted sum of values                          │   │   │
-│  │  │                                                          │   │   │
-│  │  │    b. Feed-Forward Network                              │   │   │
-│  │  │       • Linear → SwiGLU → Linear                        │   │   │
-│  │  │       • Expands hidden dim by ~4x then contracts        │   │   │
-│  │  │                                                          │   │   │
-│  │  │    c. Residual Connection + LayerNorm                   │   │   │
-│  │  │       • output = LayerNorm(input + sublayer(input))      │   │   │
-│  │  │                                                          │   │   │
-│  │  │    d. Next Layer → ... → Final Layer                   │   │   │
-│  │  └────────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  │         ▼                                                     │   │
-│  │  ┌────────────────────────────────────────────────────────┐   │   │
-│  │  │ 4. OUTPUT PROJECTION                                    │   │   │
-│  │  │    • Final hidden state → linear projection             │   │   │
-│  │  │    • Softmax → probability distribution over vocab      │   │   │
-│  │  │    • Returns: logits (raw scores) for each token        │   │   │
-│  │  │    • Token "def" has probability 0.45                   │   │   │
-│  │  └────────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  │         ▼                                                     │   │
-│  │  ┌────────────────────────────────────────────────────────┐   │   │
-│  │  │ 5. SAMPLING                                              │   │   │
-│  │  │    • Apply temperature scaling: logits / temperature    │   │   │
-│  │  │    • Apply top_p filtering: keep tokens with cum prob   │   │   │
-│  │  │    • Apply top_k filtering: keep top K tokens           │   │   │
-│  │  │    • Sample from the filtered distribution              │   │   │
-│  │  │    • Pick one token                                     │   │   │
-│  │  │    • Append to sequence, go back to Step 3 for next tok│   │   │
-│  │  └────────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  │         ▼                                                     │   │
-│  │  ┌────────────────────────────────────────────────────────┐   │   │
-│  │  │ 6. STOP CONDITION                                       │   │   │
-│  │  │    Generation stops when ONE of these is met:           │   │   │
-│  │  │    • max_tokens reached                                 │   │   │
-│  │  │    • Stop sequence encountered                          │   │   │
-│  │  │    • EOS token generated                                │   │   │
-│  │  │    • Model decides tool_use (next response has tool)    │   │   │
-│  │  └────────────────────────────────────────────────────────┘   │   │
-│  │                                                               │   │
-│  └───────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│  OUTPUT: Token IDs → Detokenize → Response text                     │
-│          [1456] [892] [331] → "Create a"                             │
-│                                                                      │
+│ 1. RENDER + TOKENIZE                                                 │
+│    JSON request → model's internal prompt format (role markers,      │
+│    tool schemas, special tokens; not public) → token IDs             │
+│    Subword tokenizer (BPE-style); Claude's vocabulary isn't public   │
+├──────────────────────────────────────────────────────────────────────┤
+│ 2. PREFILL (parallel over all input tokens)                          │
+│    • Cache hit? Reuse stored state for the cached prefix, compute    │
+│      only the rest. That's why cached input is cheaper and faster    │
+│    • Each layer: causal self-attention + feed-forward                │
+│    • Writes K/V for every position into the KV cache                 │
+│    • Produces logits for the first output token                      │
+├──────────────────────────────────────────────────────────────────────┤
+│ 3. DECODE LOOP (one token per step)                                  │
+│    • Sample a token from the logits                                  │
+│    • Run one forward pass for that token, attending over the KV      │
+│      cache; append its K/V                                           │
+│    • Stream the token's text (or tool-input JSON) to the client      │
+├──────────────────────────────────────────────────────────────────────┤
+│ 4. STOP CONDITION → stop_reason                                      │
+│    end_turn            model finished its turn                       │
+│    tool_use            model emitted tool_use block(s), wants results│
+│    max_tokens          hit your cap (output truncated)               │
+│    stop_sequence       hit one of your stop strings                  │
+│    pause_turn          long server-tool turn paused; resend to resume│
+│    refusal             safety classifier stopped the response        │
+│    model_context_window_exceeded  ran out of context window          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+`tool_use` isn't decided "after" generation: the model generates the tool call as tokens like any other output, and the server parses them into a structured `tool_use` block.
 
 ---
 
 ## 4. THE STREAMING RESPONSE
 
-Claude Code uses **streaming** to display responses in real-time.
-
-### Why Streaming?
+### Why Stream?
 
 | Reason | Impact |
 |--------|--------|
-| **User experience** | User sees response immediately, not after full generation |
-| **Perceived latency** | First token in ~500ms vs waiting 5-10s for full response |
-| **Tool calls** | Can execute tools as soon as Claude decides — no wait |
-| **Cancellation** | User can stop mid-generation if Claude goes wrong |
+| **Perceived latency** | Text appears as soon as the first token is decoded (time-to-first-token is dominated by prefill, so it grows with prompt size) |
+| **Long outputs** | Non-streaming requests with very large `max_tokens` can hit HTTP timeouts; the SDKs push you to stream |
+| **Early tool dispatch** | The client sees a complete tool call at `content_block_stop`, before the message ends |
+| **Cancellation** | Close the connection to stop paying for further output |
 
 ### Streaming Event Types
 
-| Event | When | Data |
-|-------|------|------|
-| `message_start` | Stream begins | Message metadata, initial token counts |
-| `content_block_start` | New content block (text or tool_use) | Block index and type |
-| `content_block_delta` | New tokens in a block | Text delta or tool input JSON |
-| `content_block_stop` | Block completed | None |
-| `message_delta` | Message state change | Stop reason, updated token count |
-| `message_stop` | Stream ends | None |
+| Event | Data |
+|-------|------|
+| `message_start` | Message ID, model, input-side `usage` (incl. cache read/write tokens) |
+| `content_block_start` | Block index and type (`text`, `thinking`, `tool_use`, server-tool blocks) |
+| `content_block_delta` | `text_delta`, `input_json_delta` (partial tool JSON), `thinking_delta`, `signature_delta` |
+| `content_block_stop` | Block complete |
+| `message_delta` | `stop_reason`, cumulative output `usage` |
+| `message_stop` | Stream ends |
+| `ping` / `error` | Keep-alive / mid-stream error such as `overloaded_error` |
 
 ---
 
 ## 5. TOOL CALL HANDLING
 
-When Claude decides to use a tool, the flow changes:
-
 ```ascii
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    TOOL CALL FLOW                                    │
+│ Response:                                                           │
+│  content: [ {type: "text", text: "Let me check main.py"},           │
+│             {type: "tool_use", id: "toolu_01A", name: "read_file",  │
+│              input: {"path": "main.py"}} ]                          │
+│  stop_reason: "tool_use"                                            │
 │                                                                     │
-│  Claude's response contains:                                        │
-│  {                                                                 │
-│    "content": [                                                    │
-│      {"type": "text", "text": "Let me check your project..."},    │
-│      {                                                             │
-│        "type": "tool_use",                                         │
-│        "id": "toolu_abc123",                                       │
-│        "name": "read_files",                                       │
-│        "input": {"paths": ["main.py"]}                             │
-│      }                                                             │
-│    ],                                                              │
-│    "stop_reason": "tool_use"                                       │
-│  }                                                                 │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  Claude Code receives the response                          │   │
-│  │                                                             │   │
-│  │  1. Detects stop_reason = "tool_use"                        │   │
-│  │  2. Extracts the tool_use block                             │   │
-│  │  3. Validates tool name and arguments                       │   │
-│  │  4. Executes the tool (e.g., reads main.py)                │   │
-│  │  5. Appends tool result to conversation history             │   │
-│  │                                                             │   │
-│  │  Added to messages:                                         │   │
-│  │  {                                                          │   │
-│  │    "role": "user",                                          │   │
-│  │    "content": [                                             │   │
-│  │      {                                                      │   │
-│  │        "type": "tool_result",                               │   │
-│  │        "tool_use_id": "toolu_abc123",                      │   │
-│  │        "content": "from fastapi import FastAPI\\n..."       │   │
-│  │      }                                                      │   │
-│  │    ]                                                        │   │
-│  │  }                                                          │   │
-│  │                                                             │   │
-│  │  6. Sends the COMPLETE conversation back to Claude          │   │
-│  │     (all previous messages + the new tool result)           │   │
-│  │  7. Claude decides: more tools or final response            │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
+│ Client:                                                             │
+│  1. Append the WHOLE assistant content (text, thinking, tool_use)   │
+│  2. Validate tool name + input (schema, path allow-list)            │
+│  3. Check permissions / ask the user for risky actions              │
+│  4. Execute; truncate huge outputs                                  │
+│  5. Append ONE user message with ALL tool_result blocks:            │
+│     {type: "tool_result", tool_use_id: "toolu_01A",                 │
+│      content: "from fastapi import FastAPI\n...",                   │
+│      is_error: false}                                               │
+│  6. Resend the complete conversation                                │
+│  7. Model either calls more tools or ends its turn                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Credit Consumption for Tool Calls
+Rules that bite in practice:
 
-Each tool call = one additional API call with ALL previous context:
+- Every `tool_use` needs a matching `tool_result` in the very next user message; otherwise you get a 400.
+- Failed tools return `is_error: true` with the error text so the model can recover. Don't drop them.
+- If thinking is on, pass thinking blocks back **unmodified** with the tool results (they're signed).
+- Parse tool `input` as JSON; don't string-match it. Escaping can differ between models.
+
+### Token Consumption Across Tool Calls
+
+Each call re-sends all previous context:
 
 ```
-Turn 1 (user prompt):                5,000 input tokens  +  500 output tokens
-Turn 2 (tool call + result):         6,000 input tokens  +  300 output tokens
-Turn 3 (another tool):               7,000 input tokens  +  400 output tokens
-Turn 4 (final response):             8,000 input tokens  +  800 output tokens
-                                                     ──────────────
-Total:                               26,000 input       +  2,000 output
+Call 1 (user prompt):        5,000 input  +  500 output
+Call 2 (after tool result):  6,000 input  +  300 output
+Call 3 (after tool result):  7,000 input  +  400 output
+Call 4 (final answer):       8,000 input  +  800 output
+                             ──────────────────────────
+Total:                      26,000 input  + 2,000 output
 ```
 
-That's **28,000 tokens** consumed for one interaction with 3 tool calls!
+Three tool calls cost 28,000 tokens, versus ~5,500 if the same answer came in one call. In general, with a fixed prefix P and ~Δ new tokens per turn, cumulative input after N calls is about N·P + Δ·N²/2: **linear per call, quadratic in total.** With prompt caching, most of each call's input is billed as cache reads (~10% of the input rate, less on some models), which flattens that curve dramatically.
 
 ---
 
-## 6. RESPONSE POST-PROCESSING
+## 6. RESPONSE POST-PROCESSING (CLIENT SIDE)
 
-After the LLM response is received, Claude Code post-processes it:
+What a well-built client does with the response:
 
-```ascii
-┌─────────────────────────────────────────────────────────────────────┐
-│                    RESPONSE POST-PROCESSING                          │
-│                                                                     │
-│  RAW RESPONSE                                                       │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ I'll create this file for you:                              │   │
-│  │                                                             │   │
-│  │ Let me also check if there's an existing pyproject.toml     │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ STEP 1: Validate response                                    │   │
-│  │ • Check for valid JSON (if tool_use expected)                │   │
-│  │ • Validate tool call arguments against schema                │   │
-│  │ • Check for hallucinated file paths                          │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ STEP 2: Display to user                                      │   │
-│  │ • Stream text as it arrives (via SSE)                       │   │
-│  │ • Show tool calls as they happen (e.g., "[Reading file...]") │   │
-│  │ • Format code blocks with syntax highlighting                │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ STEP 3: Execute tools (if any)                               │   │
-│  │ • Run the tool locally                                       │   │
-│  │ • Capture tool output                                        │   │
-│  │ • If tool fails, decide whether to retry or report error     │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| Step | Why |
+|------|-----|
+| Branch on `stop_reason` *before* reading content | `max_tokens` means truncated (maybe mid tool-JSON); `refusal` means no usable answer; `pause_turn` means resend to continue |
+| Iterate content blocks by `type` | `content[0]` may be a `thinking` block, not text |
+| Validate tool inputs against your schema | Or set `strict: true` on tools to get schema-valid inputs |
+| Render text, show tool activity | UX; Claude Code shows each tool call as it runs |
+| Record `usage` | Cost tracking, cache hit-rate monitoring (`cache_read_input_tokens`) |
 
 ---
 
 ## 7. COMPLETE END-TO-END EXAMPLE
 
-Here's a real example with token counts:
+"Add a health check endpoint to the FastAPI app", in a loop with no caching (illustrative counts):
 
 ```
-USER: "Add a health check endpoint to the FastAPI app"
-       └── 8 tokens
+CALL 1
+  input:  tools 2,500 + system 2,000 + history 3,200 + message 8   = 5,708
+  output: text + tool_use(read_file main.py)                        =    85
 
-CLAUDE CODE assembles prompt:
-  System prompt:                   2,000 tokens
-  Tool schemas:                    2,500 tokens
-  Conversation history:            3,200 tokens
-  Current message:                    8 tokens
-  ─────────────────────────────────────────
-  Total input:                     5,708 tokens
+  client reads main.py → tool_result                                =   340
 
-CLAUDE API response (Turn 1):
-  Stop reason: "tool_use"
-  Tool: read_files (main.py)
-  Output:                            85 tokens
-  ─────────────────────────────────────────
-  Total output:                        85 tokens
+CALL 2
+  input:  5,708 + 85 (assistant turn) + 340 (tool result)          = 6,133
+  output: tool_use(edit main.py)                                    =    62
 
-CLAUDE CODE executes read_files:
-  Gets main.py content: 340 tokens
-  Appends tool_result to history
+  client applies edit → tool_result "edit applied"                  =    62
 
-CLAUDE API call (Turn 2):
-  Total input:                     6,133 tokens  (5,708 + 85 + 340)
-  
-  Stop reason: "tool_use"
-  Tool: str_replace (edit main.py)
-  Output:                            62 tokens
-  ─────────────────────────────────────────
-  Total output:                        62 tokens
+CALL 3
+  input:  6,133 + 62 + 62                                           = 6,257
+  output: "Added GET /health ..."  stop_reason: end_turn            =   150
 
-CLAUDE CODE executes str_replace:
-  Adds health check endpoint
-  Appends tool_result
-
-CLAUDE API call (Turn 3):
-  Total input:                     6,257 tokens
-  
-  Stop reason: "end_turn"
-  Content: "Done! Added /health endpoint..."
-  Output:                           150 tokens
-  ─────────────────────────────────────────
-  Total output:                       150 tokens
-
-TOTAL for this interaction:
-  Input:   5,708 + 6,133 + 6,257 = 18,098 tokens
-  Output:    85 +    62 +   150 =    297 tokens
-  ─────────────────────────────────────────────
-  Total:                    18,395 tokens
+TOTAL  input 18,098   output 297
 ```
+
+At example rates of $3 / $15 per million input/output tokens: 18,098 × $3/M + 297 × $15/M ≈ $0.054 + $0.004 = **$0.059**. With the 4,500-token tools+system prefix cached (written once at 1.25× in call 1, read at 0.1× in calls 2 and 3), billed input drops by roughly 40% for this short loop; caching the growing history too, and running more turns, pushes the saving much higher.
 
 ---
 
@@ -445,12 +271,12 @@ TOTAL for this interaction:
 
 | Concept | Why It Matters |
 |---------|---------------|
-| **Each turn resends ALL context** | Token costs grow linearly with conversation length |
-| **Tool calls double the cost** | Each tool call = one more API request with full context |
-| **Streaming reduces perceived latency** | First token in ~500ms, even for long responses |
-| **System prompt is per-session** | Same 2,000 tokens every request — use prompt caching |
-| **Output tokens cost more** | Typically 3-4x more expensive than input tokens |
-| **Stop_reason determines next action** | `tool_use` = execute tool and continue; `end_turn` = done |
+| **The API is stateless** | Every call resends everything; the client owns conversation state |
+| **Cost per call grows linearly; per session, quadratically** | Cache the prefix, compact or reset long sessions |
+| **Order is tools → system → messages** | Put stable content first so caching works |
+| **Output is priced at 5× input** (current Claude lineup) | Control verbosity and `effort`; thinking tokens bill as output |
+| **`stop_reason` drives the loop** | `tool_use` → run tools and continue; `end_turn` → done; handle the rest explicitly |
+| **TTFT comes from prefill** | Long prompts start slower; caching cuts TTFT on repeated prefixes |
 
 ---
 

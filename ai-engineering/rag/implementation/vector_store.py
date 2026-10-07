@@ -67,49 +67,63 @@ class ChromaVectorStore(VectorStore):
         self._client = chromadb.PersistentClient(
             path=persist_directory or settings.persist_directory
         )
+        # Distance metric is fixed when the collection is created. "cosine"
+        # makes Chroma return distance = 1 - cosine_similarity. Chroma 1.x
+        # also accepts configuration={"hnsw": {"space": "cosine"}}; the
+        # metadata form is kept so existing persisted collections still match.
         self._collection = self._client.get_or_create_collection(
             name=collection_name,
-            metadata={"hnsw:space": "cosine"}
+            metadata={"hnsw:space": "cosine"},
         )
 
     def add_chunks(self, chunks: List[Chunk]) -> None:
+        """Upsert chunks. With deterministic chunk IDs, re-indexing the same
+        document overwrites instead of duplicating."""
         if not chunks:
             return
-        ids = [c.chunk_id for c in chunks]
-        texts = [c.text for c in chunks]
-        embeddings = [c.embedding for c in chunks]
-        metadatas = [c.metadata for c in chunks]
-
-        self._collection.add(
-            ids=ids,
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
+        # Chroma caps the number of records per call.
+        batch = self._client.get_max_batch_size()
+        for start in range(0, len(chunks), batch):
+            part = chunks[start:start + batch]
+            self._collection.upsert(
+                ids=[c.chunk_id for c in part],
+                documents=[c.text for c in part],
+                embeddings=[c.embedding for c in part],
+                # Chroma metadata values must be str/int/float/bool (no None).
+                metadatas=[{k: v for k, v in c.metadata.items() if v is not None}
+                           or {"source": "unknown"} for c in part],
+            )
 
     def search(self, query_embedding: List[float],
                top_k: int = 5) -> List[SearchResult]:
         results = self._collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
+            include=["documents", "metadatas", "distances"],
         )
-        if not results["ids"]:
+        if not results["ids"] or not results["ids"][0]:
             return []
 
         search_results = []
-        for i in range(len(results["ids"][0])):
+        for i, chunk_id in enumerate(results["ids"][0]):
+            metadata = results["metadatas"][0][i] if results["metadatas"] else None
             chunk = Chunk(
                 text=results["documents"][0][i],
-                chunk_id=results["ids"][0][i],
-                metadata=results["metadatas"][0][i] if results["metadatas"] else {},
+                chunk_id=chunk_id,
+                metadata=dict(metadata or {}),
             )
-            score = 1 - results["distances"][0][i]  # Convert distance to similarity
+            score = 1 - results["distances"][0][i]  # cosine distance -> similarity
             search_results.append(SearchResult(chunk=chunk, score=score))
 
         return search_results
 
     def delete(self, chunk_id: str) -> None:
         self._collection.delete(ids=[chunk_id])
+
+    def delete_source(self, source: str) -> None:
+        """Remove every chunk of one source document (used before re-indexing
+        it, so chunks from a longer old version don't linger)."""
+        self._collection.delete(where={"source": source})
 
     def count(self) -> int:
         return self._collection.count()

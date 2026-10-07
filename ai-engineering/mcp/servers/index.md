@@ -1,78 +1,68 @@
-# 🔌 MCP Server Implementations
+# MCP Server Implementations
 
-This directory contains runnable Python MCP (Model Context Protocol) server implementations that provide tools and resources for AI agents.
-
-## Server Overview
+Three runnable MCP servers, written for the official Python SDK **v2** (`pip install "mcp>=2"`). In v2 the v1 `FastMCP` class is `MCPServer` (`from mcp.server.mcpserver import MCPServer`); the decorator API is the same.
 
 ```
 servers/
-├── calculator_server.py    # Basic arithmetic tools for agents
-├── database_server.py      # Database query tools with SQL support
-├── rag_server.py           # RAG retrieval tools for knowledge-augmented queries
-├── requirements.txt        # Python dependencies
+├── calculator_server.py    # Tutorial: tools, resources, prompts, structured output
+├── database_server.py      # Read-only PostgreSQL with auth, rate limit, circuit breaker
+├── rag_server.py           # Wraps ../../rag/implementation as MCP tools
 └── __init__.py
 ```
 
-## Servers
+## Calculator (`calculator_server.py`)
 
-### Calculator Server (`calculator_server.py`)
+| Primitive | Names |
+|---|---|
+| Tools | `add`, `subtract`, `multiply`, `divide`, `power`, `square_root`, `percentage` |
+| Resources | `calculator://constants`, `calculator://help` |
+| Prompts | `solve_equation`, `explain_formula` |
 
-Provides mathematical operation tools for AI agents:
-- **`add(a, b)`** — Addition of two numbers
-- **`subtract(a, b)`** — Subtraction
-- **`multiply(a, b)`** — Multiplication
-- **`divide(a, b)`** — Division with error handling
-- **`power(base, exp)`** — Exponentiation
+Shows two things worth knowing for interviews:
 
-**Usage:**
-```python
-from mcp.server import Server
+- **Structured output.** The `-> float` annotation becomes the tool's `outputSchema`, so a call returns `structuredContent: {"result": 8.0}` alongside the text block `"8.0"`.
+- **Tool errors vs crashes.** `raise ToolError("Division by zero ...")` comes back as a result with `isError: true` and that message, so the model can correct itself. Any other exception is reported only as `Error executing tool divide`; the details stay in the server log.
 
-server = Server("calculator")
-server.add_tool(add, subtract, multiply, divide, power)
-server.run()
-```
+## Database (`database_server.py`)
 
-### Database Server (`database_server.py`)
+- Tool `query(sql, max_rows=100)`: read-only SQL, returned as a Markdown table.
+- Resources: `database://schema/tables`, `database://schema/table/{table_name}` (a resource template), `database://health`.
+- Guards, in order of strength: a read-only database role (yours to create), a read-only session with `statement_timeout`, then a `SELECT`/`WITH` prefix check that is only a friendly error, not a security boundary.
+- Per-caller token-bucket rate limit and a circuit breaker around the database (from `../common`).
+- Needs `database:read`. Over stdio, grant it locally with `MCP_STDIO_PERMISSIONS=database:read`; over HTTP it would come from the OAuth token's scopes.
 
-Provides database interaction tools:
-- **`query(sql, params)`** — Execute SQL queries
-- **`list_tables()`** — List available database tables
-- **`describe(table)`** — Get schema for a specific table
+## RAG (`rag_server.py`)
 
-Designed to work with SQLite for local development and PostgreSQL/Aurora in production.
+- Tools: `rag_query(question, top_k)` (retrieve and answer, with sources), `retrieve(question, top_k)` (chunks only), `index_document(file_path)`.
+- Resources: `rag://status`, `rag://documents`. Prompt: `rag_debug`.
+- `index_document` only reads under `RAG_ALLOWED_ROOT` (default `ai-engineering/rag/data`), so a prompt-injected model can't index `~/.ssh`.
+- `USE_MOCK_LLM=true` answers without LM Studio.
 
-### RAG Server (`rag_server.py`)
+## Running
 
-Provides retrieval-augmented generation tools for knowledge-augmented agent responses:
-- **`search(query, top_k)`** — Vector search across indexed documents
-- **`get_context(doc_id)`** — Retrieve full document context
-- **`list_collections()`** — List available knowledge collections
-
-Integrates with the vector store and embedding services from the RAG pipeline.
-
-## Running Servers
-
-Each server can be run independently:
+From `ai-engineering/mcp/` (the servers import `common.*`, so run them as modules):
 
 ```bash
-cd ai-engineering/mcp/servers
-python calculator_server.py
-python database_server.py
-python rag_server.py
+pip install -r requirements.txt
+
+python -m servers.calculator_server            # stdio: normally launched BY a client, not by hand
+MCP_TRANSPORT=streamable-http python -m servers.rag_server   # HTTP at http://127.0.0.1:8000/mcp
+
+# Interactive debugging in a browser
+npx @modelcontextprotocol/inspector python -m servers.calculator_server
 ```
 
-## Connecting from an MCP Agent
+On stdio, stdout carries the JSON-RPC messages, so the servers log only to stderr. A stray `print()` to stdout corrupts the stream and is the most common "my server hangs" bug.
+
+## Connecting
 
 ```python
-from implementation.agent_with_mcp import MCPAgent
+from mcp import Client, StdioServerParameters
 
-agent = MCPAgent(mcp_server_command=["python", "ai-engineering/mcp/servers/calculator_server.py"])
-result = await agent.run("Calculate 15 * 27")
+params = StdioServerParameters(command="python", args=["-m", "servers.calculator_server"])
+async with Client(params) as client:
+    result = await client.call_tool("multiply", {"a": 15, "b": 27})
+    print(result.structured_content)   # {'result': 405.0}
 ```
 
-## Dependencies
-
-```bash
-pip install mcp httpx pydantic
-```
+See [clients/](../clients/index.md) for the command-line client and desktop configuration.

@@ -1,5 +1,11 @@
 """
 Guardrails for AI agents — rate limiting, input/output validation, safety checks.
+
+These are deliberately simple teaching examples. Regex deny-lists catch only
+the laziest prompt injections and are trivially bypassed (paraphrase, another
+language, base64, or injection hidden in a tool result). Real defences are
+architectural: least-privilege tools, approval gates on side effects, treating
+tool output as untrusted data, and a classifier model for screening.
 """
 
 import re
@@ -9,17 +15,20 @@ from dataclasses import dataclass
 
 
 class TokenBucket:
-    """Token bucket rate limiter."""
+    """Token bucket rate limiter (single-process, not thread-safe).
+
+    Uses time.monotonic() so wall-clock jumps (NTP steps, manual changes) can't mint tokens.
+    """
 
     def __init__(self, rate: float = 10.0, burst: int = 20):
         self.rate = rate
         self.burst = burst
         self.tokens = burst
-        self.last_refill = time.time()
+        self.last_refill = time.monotonic()
 
     def consume(self, tokens: int = 1) -> bool:
         """Try to consume tokens. Returns True if allowed."""
-        now = time.time()
+        now = time.monotonic()
         elapsed = now - self.last_refill
         self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
         self.last_refill = now
@@ -35,6 +44,9 @@ class TokenBucket:
         if self.tokens >= 1:
             return 0
         return (1 - self.tokens) / self.rate
+
+
+CARD_RE = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
 
 
 @dataclass
@@ -73,8 +85,8 @@ class InputGuard:
                     severity="critical",
                 )
 
-        # PII detection (basic)
-        if re.search(r"\b\d{16}\b", user_input):
+        # PII detection (basic): 13-19 digit card numbers, optional spaces/dashes.
+        if CARD_RE.search(user_input):
             return GuardrailResult(
                 passed=False,
                 message="Input contains credit card numbers",
@@ -90,14 +102,14 @@ class OutputGuard:
     def validate(self, agent_output: str) -> GuardrailResult:
         """Validate agent output before it reaches the user."""
         # Check for PII leakage
-        if re.search(r"\b\d{16}\b", agent_output):
+        if CARD_RE.search(agent_output):
             return GuardrailResult(
                 passed=False,
                 message="Output contains sensitive information",
                 severity="critical",
             )
 
-        # Check for harmful URLs
+        # Check for HTML/script injection into a web UI
         if re.search(r"<script[^>]*>", agent_output, re.IGNORECASE):
             return GuardrailResult(
                 passed=False,
@@ -109,6 +121,6 @@ class OutputGuard:
 
     def sanitize(self, text: str) -> str:
         """Remove or replace sensitive content."""
-        text = re.sub(r"\b\d{16}\b", "[REDACTED]", text)
+        text = CARD_RE.sub("[REDACTED]", text)
         text = re.sub(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", "[EMAIL]", text)
         return text

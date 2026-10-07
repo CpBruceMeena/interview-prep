@@ -37,6 +37,9 @@
 
 ### 🎯 Answer
 
+!!! tip "30-second answer"
+    First prove it really is a **faithfulness** failure: log the exact context the model saw and confirm the answer is in it. Then fix in order of cost: put fewer, better-ranked chunks in the prompt; make the "answer only from the documents, cite them, say 'not found' otherwise" instruction explicit; require citations; add a post-generation groundedness check (NLI or LLM judge) that blocks or regenerates unsupported answers. Measure with a faithfulness eval set, not anecdotes.
+
 This is a **faithfulness failure** — the model has the correct information but isn't using it. This is distinct from a retrieval failure (wrong context) or a factuality gap (context doesn't contain the answer).
 
 **Diagnosis pipeline:**
@@ -54,7 +57,7 @@ def diagnose_hallucination(question, context, answer):
     Extract the EXACT answer from the context above.
     If the answer is not in the context, say 'NOT FOUND'."""
     
-    extraction = llm.generate(prompt_1, temperature=0)
+    extraction = llm.generate(prompt_1)   # lowest-variance settings the model allows
     
     if extraction == "NOT FOUND":
         # The model genuinely can't find it — context might be poorly structured
@@ -68,7 +71,7 @@ def diagnose_hallucination(question, context, answer):
     
     Question: {question}"""
     
-    forced_result = llm.generate(prompt_2, temperature=0)
+    forced_result = llm.generate(prompt_2)
     
     if "hallucination" in evaluate_faithfulness(forced_result, context):
         # Even with explicit instruction, model ignores context
@@ -81,93 +84,75 @@ def diagnose_hallucination(question, context, answer):
 
 | Root Cause | Symptoms | Fix |
 |-----------|----------|-----|
-| **Context position bias** | Model uses first/last chunk, ignores middle | Re-rank chunks by relevance; place most relevant first and last |
-| **Lost-in-the-middle** | Answer is in chunk 5 of 10; model ignores mid-context | Reduce total context chunks (top-3 instead of top-5); use re-ranker; summarize secondary chunks |
+| **Context position bias / lost-in-the-middle** | Answer is in chunk 5 of 10; model uses first/last chunks and ignores the middle (Liu et al., 2023). Newer long-context models suffer less, but it still shows up with many noisy chunks | Fewer chunks (rerank, keep top-3 to top-5); put the most relevant first (and optionally last); summarize secondary chunks |
+| **Distractor chunks** | Near-duplicate or outdated chunks sit next to the right one | Dedupe, filter by freshness/version metadata, drop chunks below a reranker score threshold |
 | **Prior knowledge override** | Model knows a "better" answer from training | Harder system prompt: *"Answer EXCLUSIVELY from context. If context disagrees with your knowledge, the context is authoritative."* |
 | **Instruction drift** | Earlier turns dilute the "answer from context" instruction | Re-inject the instruction every turn; keep system prompt short and reinforced |
 | **Contradictory context** | Two chunks say different things | Add contradiction detection: if chunks conflict, surface both and flag uncertainty |
 
-**Concrete fix — counter-position bias with chunk prioritization:**
+**Concrete fix — rerank, order deliberately, cite, then verify:**
 
 ```python
 class FaithfulRAG:
     """
     RAG pipeline engineered to maximize faithfulness.
+    (self.retrieve, self.llm, self.verifier_llm and extract_supporting_spans are app-specific.)
     """
     def __init__(self):
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    
+
     def build_faithful_context(self, chunks: list[str], question: str) -> str:
-        # Step 1: Rerank — most relevant first
-        scored = self.reranker.rank(question, chunks)
-        
-        # Step 2: Sandwich the best — most RELEVANT at start AND end
-        # (models pay most attention to the first and last items)
-        best = scored[0:1]        # Top-1 at the start
-        rest = scored[1:3]        # Top-2 to top-3 in the middle
-        best_also = scored[0:1]   # Repeat top-1 at the end
-        
-        ordered = best + rest + best_also
-        
-        # Step 3: Structured format with clear boundaries
-        return "\n---\n".join([
-            f"[Document {i+1}]: {chunk}" 
-            for i, chunk in enumerate(ordered)
-        ])
-    
+        # Step 1: Rerank — CrossEncoder.rank returns [{"corpus_id", "score"}, ...] sorted by score
+        ranked = self.reranker.rank(question, chunks, top_k=3)
+        ordered = [chunks[r["corpus_id"]] for r in ranked]
+        # Most relevant first. Some teams also repeat the top chunk at the end
+        # to counter lost-in-the-middle; measure it on your eval set before keeping it.
+
+        # Step 2: Clear boundaries + stable IDs so the model can cite
+        return "\n---\n".join(f"[Document {i+1}]: {c}" for i, c in enumerate(ordered))
+
     async def generate(self, question: str) -> str:
         chunks = self.retrieve(question)
         context = self.build_faithful_context(chunks, question)
-        
+
         system_prompt = """You are a precise answer generator.
-        
-        RULES:
-        1. Answer ONLY using the provided documents.
-        2. If the documents don't contain the answer, say "I don't have enough information."
-        3. Do NOT use any prior knowledge.
-        4. If any document contradicts another, point out the contradiction.
-        5. Cite which document(s) support your answer.
-        
-        Documents:
-        {context}
-        
-        Question: {question}
-        """
-        
-        answer = await self.llm.generate(system_prompt, temperature=0.1)
-        
-        # Step 4: Post-hoc faithfulness check
-        if not self.verify_faithfulness(answer, chunks):
-            return await self.constrained_generate(question, chunks)  # Fallback
-        
+RULES:
+1. Answer ONLY using the provided documents. They override anything you believe.
+2. If the documents don't contain the answer, say "I don't have enough information."
+3. If documents contradict each other, say so and cite both.
+4. Cite the supporting document IDs after each claim, e.g. [Document 2]."""
+        user_prompt = f"Documents:\n{context}\n\nQuestion: {question}"
+
+        answer = await self.llm.generate(system=system_prompt, user=user_prompt)
+
+        # Step 3: Post-hoc groundedness check
+        if not await self.verify_faithfulness(answer, context):
+            return await self.extractive_fallback(question, chunks)
         return answer
-    
-    def verify_faithfulness(self, answer: str, chunks: list[str]) -> bool:
-        """Use a smaller, stricter LLM to verify."""
-        verifier_prompt = f"""Context: {' '.join(chunks)}
-        
-        Answer: {answer}
-        
-        List EVERY claim in the answer. For each claim, say SUPPORTED or UNSUPPORTED.
-        """
-        result = self.verifier_llm.generate(verifier_prompt)
-        return "UNSUPPORTED" not in result
-    
-    async def constrained_generate(self, question: str, chunks: list[str]) -> str:
-        """Constrained generation using LMQL or guidance."""
-        from guidance import select, gen
-        
-        # Extract verbatim spans from chunks and force answer to use them
-        spans = self.extract_answer_spans(chunks, question)
-        
-        prompt = f"""Based on: {spans}
-        Answer: {select(spans)}"""
-        return prompt
+
+    async def verify_faithfulness(self, answer: str, context: str) -> bool:
+        """A separate judge (or NLI model) checks every claim against the context."""
+        verdict = await self.verifier_llm.generate(
+            f"Context:\n{context}\n\nAnswer:\n{answer}\n\n"
+            "List every claim in the answer and label it SUPPORTED or UNSUPPORTED "
+            "by the context. End with one line: VERDICT: PASS or VERDICT: FAIL."
+        )
+        return verdict.strip().endswith("VERDICT: PASS")
+
+    async def extractive_fallback(self, question: str, chunks: list[str]) -> str:
+        """Safer degraded mode: quote verbatim supporting spans instead of free generation,
+        or say 'I don't have enough information' if none exist."""
+        spans = self.extract_supporting_spans(chunks, question)
+        if not spans:
+            return "I don't have enough information."
+        return "From the source documents:\n" + "\n".join(f'> "{s}"' for s in spans)
 ```
+
+**Trade-offs and failure modes:** every verification step adds a model call (latency and cost), so many teams run it synchronously only on high-risk intents and asynchronously (sampled) elsewhere. LLM judges have their own error rate; calibrate them against a few hundred human labels before trusting the gate. Citations help users and evaluation, but a model can cite a document that does not actually support the claim, so check citations too.
 
 **🔴 Follow-up:** *"What if the fix still doesn't work?"*
 
-**✅ Answer:** If faithfulness remains broken after prompt engineering and reranking, the model itself may be unsuitable. Switch to a model with stronger instruction-following (e.g., Claude vs a smaller model). As a last resort, implement **factored verification**: generate an answer, then use a separate BERT-based NLI model to check if the answer is entailed by the context. Reject answers below the entailment threshold.
+**✅ Answer:** If faithfulness remains broken after prompt changes and reranking, run the same faithfulness eval set against other models; instruction-following on grounded tasks varies a lot between model families and sizes, so this is an empirical choice, not a brand choice. Use the provider's citation/grounding features where they exist (several APIs can return citations tied to supplied documents). As a hard gate, add **factored verification**: split the answer into claims and check each with an NLI model or judge; reject or regenerate answers whose claims are not entailed. Finally, consider fine-tuning on grounded QA examples if the volume justifies it.
 
 ---
 
@@ -177,46 +162,45 @@ class FaithfulRAG:
 
 ### 🎯 Answer
 
-Retrieval latency in RAG comes from embedding, vector search, and re-ranking. On a large knowledge base (10M+ documents), each of these must be optimized.
+!!! tip "30-second answer"
+    Measure first: split the retrieval span into query embedding, ANN search, metadata filtering, reranking and network hops. The usual big wins are an **approximate** index (HNSW, IVF, or a disk-based index such as DiskANN) tuned for a recall target, **vector compression** (scalar/product/binary quantization with full-precision re-scoring), a **cheap first stage + reranker on a small candidate set**, and **caching** of query embeddings and hot results. Every speedup trades recall, so track recall@k against an exact-search baseline while you tune.
 
-**Latency budget breakdown:**
+Retrieval latency in RAG comes from embedding, vector search, and re-ranking. On a large knowledge base (10M+ chunks), each of these must be optimized.
 
-| Component | Naive | Optimized | Technique |
-|-----------|-------|-----------|-----------|
-| Query embedding | 100ms | 20ms | Cached embeddings, smaller model |
-| Vector search | 500ms | 50ms | IVF/ANNOY indexing, quantization |
-| Reranking | 300ms | 100ms | Two-stage: fast coarse → small candidate set → slow fine |
-| Total | 900ms+ | <200ms | |
+**Where the time goes (illustrative; measure your own):**
+
+| Component | Typical cause of slowness | Technique |
+|-----------|---------------------------|-----------|
+| Query embedding | Large model on CPU, remote API round trip | Cache embeddings for repeated queries, GPU/batched inference, smaller model **for both queries and documents** |
+| Vector search | Brute-force kNN, index larger than RAM, restrictive filters | ANN index (HNSW/IVF/DiskANN), quantization, pre-filter partitions |
+| Reranking | Cross-encoder over too many candidates | Rerank only the top 50–100 candidates; smaller reranker |
 
 **1. Query embedding optimization:**
 
+!!! warning "Queries and documents must use the same embedding model"
+    Two different models (e.g. MiniLM for queries, mpnet for documents) produce vectors in unrelated spaces, so cosine similarity between them is meaningless. If you want a cheaper query path, switch **both** sides and re-embed the corpus, or use a model family designed for asymmetric search that shares one space (e.g. models that take a "query:" / "passage:" prefix).
+
 ```python
+from cachetools import TTLCache
+from sentence_transformers import SentenceTransformer
+
 class FastEmbedding:
-    """
-    Multiple strategies to reduce embedding latency.
-    """
-    def __init__(self):
-        # Strategy A: Use a smaller embedding model for queries
-        self.query_encoder = SentenceTransformer("all-MiniLM-L6-v2")   # 80MB, 20ms
-        self.doc_encoder = SentenceTransformer("all-mpnet-base-v2")    # 400MB, better quality
-        
-        # Strategy B: Cache frequent queries
-        self.query_cache = LRUCache(maxsize=10000, ttl=300)  # 5 min TTL
-    
-    def embed_query(self, query: str) -> vector:
-        # Check cache first
-        cached = self.query_cache.get(query)
-        if cached:
-            return cached
-        
-        # Use fast model
-        embedding = self.query_encoder.encode(query, normalize=True)
-        self.query_cache.put(query, embedding)
-        return embedding
-    
-    def embed_document(self, doc: str) -> vector:
-        # Documents use the high-quality model (done offline)
-        return self.doc_encoder.encode(doc, normalize=True)
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        # ONE model for queries and documents (same vector space)
+        self.encoder = SentenceTransformer(model_name)
+        self.query_cache = TTLCache(maxsize=10_000, ttl=300)  # 5 min TTL
+
+    def embed_query(self, query: str):
+        key = query.strip().lower()
+        if (hit := self.query_cache.get(key)) is not None:
+            return hit
+        emb = self.encoder.encode(query, normalize_embeddings=True)
+        self.query_cache[key] = emb
+        return emb
+
+    def embed_documents(self, docs: list[str]):
+        # Offline, batched; re-run for the whole corpus whenever the model changes
+        return self.encoder.encode(docs, batch_size=256, normalize_embeddings=True)
 ```
 
 **2. Vector search optimization:**
@@ -230,47 +214,42 @@ class TieredVectorStore:
     Multi-tier vector search for speed.
     """
     def __init__(self, dimension: int = 768):
-        # Tier 1: In-memory IVF index (fast, approximate)
+        # Option A: IVF (approximate; good with quantization, cheap to build)
         self.ivf_index = self._build_ivf(nlist=1000, nprobe=10)
-        
-        # Tier 2: Disk-based HNSW (slower, exact)
+
+        # Option B: HNSW graph (approximate; usually best recall/latency in RAM,
+        # but memory-hungry: full vectors + graph links)
         self.hnsw_index = self._build_hnsw(M=16, ef_construction=200)
-        
-        # Tier 3: Full scan (fallback)
+
+        # Exact brute force: only for small corpora or to measure ground-truth recall
         self.full_store = None
-    
-    def search(self, query_vector: np.ndarray, top_k: int = 10, 
+
+    def search(self, query_vector: np.ndarray, top_k: int = 10,
                latency_budget_ms: int = 50) -> List[str]:
         """
-        Adaptive search based on latency budget.
+        Adaptive search: the knobs (nprobe for IVF, ef_search for HNSW)
+        trade latency for recall at query time.
         """
         if latency_budget_ms < 20:
-            # Ultra-fast: IVF with high nprobe
-            return self.ivf_search(query_vector, top_k, nprobe=5)
-        
+            return self.ivf_search(query_vector, top_k, nprobe=5)    # low nprobe: fastest, lowest recall
         elif latency_budget_ms < 50:
-            # Standard: IVF with more probes
-            return self.ivf_search(query_vector, top_k, nprobe=20)
-        
+            return self.ivf_search(query_vector, top_k, nprobe=20)   # more probes: better recall
         elif latency_budget_ms < 200:
-            # High quality: HNSW
-            return self.hnsw_search(query_vector, top_k, ef=100)
-        
+            return self.hnsw_search(query_vector, top_k, ef=100)     # higher ef: better recall
         else:
-            # Full precision
-            return self.exact_search(query_vector, top_k)
-    
+            return self.exact_search(query_vector, top_k)            # exact, O(N·d)
+
     def _build_ivf(self, nlist: int, nprobe: int):
         """
         IVF (Inverted File Index):
-        - Clusters vectors into nlist groups
-        - Search only nprobe nearest clusters
-        - Speed: O(log(nlist) + nprobe/nlist * N)
+        - k-means clusters vectors into nlist lists
+        - At query time: compare against nlist centroids, then scan only nprobe lists
+        - Cost per query ≈ O(nlist·d + (nprobe/nlist)·N·d)
         - Trade-off: nprobe controls speed vs recall
         
         Example: 10M docs, 1000 clusters, nprobe=20
         → Search 20/1000 * 10M = 200K docs
-        → 50x faster than full scan
+        → ~50x fewer vectors scanned than a full scan (recall depends on clustering)
         
         Implementation with FAISS:
         quantizer = faiss.IndexFlatIP(dimension)
@@ -282,23 +261,26 @@ class TieredVectorStore:
         """
         pass
 
-# ScaNN (Google) achieves <10ms for 1B-scale search
-# Usage:
-# pip install scann
-# searcher = scann.ScannBuilder(embeddings, 10, "dot_product").tree(
-#     num_leaves=2000, num_leaves_to_search=100, training_sample_size=250000
-# ).score_ah(2, anisotropic_quantization_threshold=0.2).build()
+# Other options: ScaNN (Google; partitioning + anisotropic quantization),
+# DiskANN-style graph indexes for corpora larger than RAM (vectors on SSD,
+# compressed copies in RAM), or a managed vector DB exposing the same knobs.
+# ScaNN usage sketch:
+# searcher = scann.scann_ops_pybind.builder(normalized_dataset, 10, "dot_product") \
+#     .tree(num_leaves=2000, num_leaves_to_search=100, training_sample_size=250_000) \
+#     .score_ah(2, anisotropic_quantization_threshold=0.2) \
+#     .reorder(100).build()
 ```
 
-**3. Quantization for speed:**
+**3. Quantization for speed and memory:**
 
-| Quantization | Size | Recall@10 | Speed |
-|-------------|------|-----------|-------|
-| Float32 (baseline) | 100% | 100% | 1x |
-| Float16 | 50% | ~99.9% | 1.5x |
-| Int8 (scalar) | 25% | ~98% | 3x |
-| Binary (1-bit) | 3% | ~85% | 20x |
-| Product Quantization (PQ) | ~10% | ~95% | 10x |
+Size is exact arithmetic; recall and speed depend heavily on the embedding model and data, so treat the right-hand columns as directional and measure on your corpus.
+
+| Quantization | Size vs float32 | Recall impact | Notes |
+|-------------|-----------------|---------------|-------|
+| Float16 / bfloat16 | 50% | Negligible | Easy default |
+| Int8 (scalar) | 25% | Small | Widely supported in vector DBs |
+| Product Quantization (PQ) | Configurable (e.g. 16–64 bytes/vector) | Moderate | Re-score top candidates with full vectors |
+| Binary (1-bit) | ~3% (1/32) | Large unless re-scored | Works best with models trained for it; always oversample + re-score |
 
 ```python
 class QuantizedIndex:
@@ -323,23 +305,22 @@ class QuantizedIndex:
 ```python
 class TwoStageRetriever:
     """
-    Stage 1: Fast, cheap embedding (MiniLM) → top-100
-    Stage 2: Slow, accurate reranker (CrossEncoder) → top-5
-    
-    Latency: 20ms + 100ms = 120ms vs 300ms for direct reranker
+    Stage 1: Fast bi-encoder ANN search (often hybrid with BM25) → top-100
+    Stage 2: Slower, more accurate cross-encoder reranker → top-5
+
+    A cross-encoder scores (query, doc) pairs jointly, so it cannot be
+    pre-computed or indexed: running it over the whole corpus is infeasible.
+    Its cost scales with the candidate count, which is the knob to tune.
     """
     def __init__(self):
-        self.stage1 = FastVectorIndex()          # Bi-encoder, 20ms
-        self.stage2 = CrossEncoder("ms-marco")   # 100ms for 100 pairs
-    
+        self.stage1 = FastVectorIndex()   # bi-encoder ANN (+ BM25)
+        self.stage2 = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
     def retrieve(self, query: str, top_k: int = 5) -> List[Document]:
-        # Stage 1: Coarse retrieval — 20ms
-        candidates = self.stage1.search(query, top_k=100)
-        
-        # Stage 2: Fine reranking — 100ms for 100 pairs
-        scored = self.stage2.rank(query, [c.text for c in candidates])
-        
-        return scored[:top_k]
+        candidates = self.stage1.search(query, top_k=100)               # cheap, high recall
+        ranked = self.stage2.rank(query, [c.text for c in candidates],  # expensive, high precision
+                                  top_k=top_k)
+        return [candidates[r["corpus_id"]] for r in ranked]
 ```
 
 **5. Caching strategy:**
@@ -373,13 +354,17 @@ class FullCacheStrategy:
         return None
 ```
 
+!!! warning "Semantic-cache failure modes"
+    A similarity threshold cannot tell "cancel my order" from "don't cancel my order", or one tenant's question from another's. Scope cache keys by tenant/user/permissions and by the index version, keep thresholds strict, exclude personalised or time-sensitive intents, and invalidate on re-index.
+
 **🔴 Follow-up:** *"What's the one optimization you'd do first?"*
 
-**✅ Answer:** Switch from brute-force kNN to **IVF with Product Quantization**. It's the highest ROI:
-- 10-50x speedup with ~95% recall
-- Reduces memory from ~30GB (1M floats × 768 dims) to ~1GB (PQ compressed)
-- Works with FAISS, ScaNN, or Milvus — no infrastructure change
-- Can be implemented in an afternoon with `faiss.IndexIVFPQ`
+**✅ Answer:** Profile first. If the time is in vector search and you are doing brute-force kNN (or the index does not fit in RAM), move to an **ANN index with compression**: HNSW if it fits in memory, IVF-PQ (`faiss.IndexIVFPQ`) or a disk-based graph index if it doesn't.
+- Memory math: 10M vectors × 768 dims × 4 bytes ≈ **31 GB** as float32; PQ at 16 bytes/vector is ≈ **160 MB** of codes (plus IDs and centroids).
+- Order-of-magnitude speedups are typical, at some recall cost; recover recall by oversampling (e.g. fetch 100) and re-scoring with full-precision vectors.
+- Set a recall@k target against exact search and tune `nprobe`/`ef_search` to the cheapest setting that meets it.
+
+**What they probe next:** filtered search (metadata filters can wreck HNSW recall if applied after the search; prefer pre-filtering or filter-aware indexes), index rebuild/update cost for fresh data, and hybrid lexical + vector retrieval for exact IDs and rare terms.
 
 ---
 
@@ -388,6 +373,9 @@ class FullCacheStrategy:
 **Interviewer:** *"Your model gives confident but wrong answers in high risk situations. How do you find the cause and fix it?"*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    An LLM's tone is not a confidence score. Build an **external** uncertainty signal (sampling-based consistency / semantic entropy, retrieval support, a verifier, token log-probs only where the API exposes them), **calibrate** it on labelled examples from the risky domain, and use it to **abstain or route to a human** above a risk-specific threshold. For the cause, slice the failures: missing knowledge, out-of-distribution queries, ignored context, or reasoning shortcuts each have a different fix.
 
 This is the **most dangerous failure mode** — the model doesn't know it doesn't know. In high-risk domains (healthcare, finance, legal, safety-critical), confident wrong answers can cause real harm.
 
@@ -432,72 +420,43 @@ class HallucinationDiagnosis:
 | **Distribution shift** | Question is out-of-distribution from training data | OOD detection; route to human |
 | **Reasoning shortcut** | Model skips verification steps | Chain-of-thought with mandatory verification step |
 | **Context ignoring** | Model relies on parametric knowledge over context | Reinforced instruction; context-grounded generation |
-| **Calibration collapse** | Softmax probabilities are miscalibrated (all outputs are 0.9+) | Temperature scaling; Platt scaling; separate calibration set |
+| **Calibration collapse** | Scores are miscalibrated (everything comes out 0.9+) | Recalibrate the *external* score (temperature scaling, Platt scaling or isotonic regression) on a held-out labelled set |
 
 **Fix 1 — Uncertainty estimation:**
 
+!!! note "What works with hosted models in 2026"
+    MC Dropout (sampling with dropout on) needs access to the weights and a model trained with dropout, so it applies to your own classifiers, not to hosted LLMs. Token log-probs are exposed by some APIs and by self-hosted servers (e.g. vLLM), but not by every hosted frontier model, and reasoning models often hide the reasoning tokens. **Sampling-based** methods (self-consistency, semantic entropy) work against any API, at N× the cost.
+
 ```python
 import numpy as np
-from scipy.special import softmax
 
 class UncertaintyEstimator:
     """
-    Multiple methods to estimate when the model doesn't know.
+    Methods to estimate when the model doesn't know.
     """
     def __init__(self, model):
         self.model = model
-    
-    def estimate_uncertainty(self, question: str, n_samples: int = 10) -> dict:
+
+    def mean_token_probability(self, answer_logprobs: list[float]) -> float:
         """
-        Method 1: MC Dropout — run inference N times with dropout enabled.
-        High variance = high uncertainty.
+        Method 1 (only if the API/server returns logprobs):
+        exp(mean log-prob) = geometric-mean token probability, in (0, 1].
+        Long answers and stylistic tokens dilute it; score the key span
+        (e.g. the entity or number) rather than the whole answer.
         """
-        predictions = []
-        for _ in range(n_samples):
-            # Enable dropout at inference
-            pred = self.model.generate(question, dropout=True)
-            predictions.append(pred)
-        
-        semantic_variance = self._semantic_similarity(predictions)
-        lexical_variance = self._lexical_diversity(predictions)
-        
-        return {
-            "semantic_variance": semantic_variance,  # Lower is better
-            "lexical_variance": lexical_variance,    # Lower is better
-            "is_uncertain": semantic_variance > 0.3 or lexical_variance > 0.5
-        }
-    
-    def estimate_token_probabilities(self, answer: str) -> float:
+        return float(np.exp(np.mean(answer_logprobs)))
+
+    def semantic_entropy(self, question: str, n: int = 5) -> float:
         """
-        Method 2: Average token probability.
-        Low average probability = model is unsure.
+        Method 2: Semantic entropy (Kuhn, Gal & Farquhar, ICLR 2023;
+        Farquhar et al., Nature 2024). Sample N answers, cluster them by
+        meaning (bidirectional entailment), take entropy over clusters.
+        0 = all answers mean the same thing; max = ln(N) (≈1.61 for N=5).
         """
-        log_probs = self.model.get_token_log_probs(answer)
-        avg_log_prob = np.mean(log_probs)
-        
-        # Calibrated threshold (domain-specific)
-        return softmax([avg_log_prob, -avg_log_prob])[0]
-    
-    def semantic_entropy(self, question: str, temperature: float = 1.0) -> float:
-        """
-        Method 3: Semantic entropy (Kuhn et al., 2023).
-        Generate multiple answers, cluster by meaning, compute entropy.
-        
-        High entropy = model doesn't know.
-        """
-        answers = [
-            self.model.generate(question, temperature=temperature)
-            for _ in range(5)
-        ]
-        clusters = self._cluster_by_semantic_meaning(answers)
-        
-        total = len(answers)
-        entropy = -sum(
-            (len(c) / total) * np.log(len(c) / total)
-            for c in clusters
-        )
-        
-        return entropy  # 0 = confident, >1 = uncertain
+        answers = [self.model.generate(question) for _ in range(n)]  # default sampling settings
+        clusters = self._cluster_by_bidirectional_entailment(answers)
+        p = np.array([len(c) for c in clusters]) / n
+        return float(-(p * np.log(p)).sum())
 ```
 
 **Fix 2 — Calibrated confidence thresholds:**
@@ -509,25 +468,24 @@ class CalibratedGuardrail:
     Threshold is calibrated on a validation set.
     """
     def __init__(self, calibration_data: List[tuple], risk_level: str):
-        # Calibrate threshold based on risk level
+        # Starting points only: pick the threshold from the precision/coverage
+        # curve on labelled data so that accepted answers meet the target accuracy.
         self.risk_levels = {
             "critical": 0.95,   # Healthcare, safety
-            "high": 0.90,        # Financial, legal
-            "medium": 0.80,      # Customer support
-            "low": 0.70,         # Content generation
+            "high": 0.90,       # Financial, legal
+            "medium": 0.80,     # Customer support
+            "low": 0.70,        # Content generation
         }
         self.threshold = self.risk_levels[risk_level]
-        
-        # Temperature scaling (Platt et al.)
-        self.temperature = self._calibrate_temperature(calibration_data)
-    
-    def should_accept(self, answer: str, uncertainty: dict) -> bool:
-        confidence = 1 - uncertainty["semantic_variance"]
-        
-        if confidence < self.threshold:
-            return False  # Route to human
-        
-        return True
+
+        # Map raw scores (e.g. 1 - normalised semantic entropy) to calibrated
+        # probabilities: Platt scaling (Platt, 1999) or isotonic regression;
+        # temperature scaling (Guo et al., 2017) if you own the logits.
+        self.calibrator = self._fit_calibrator(calibration_data)
+
+    def should_accept(self, raw_score: float) -> bool:
+        confidence = self.calibrator.predict(raw_score)
+        return confidence >= self.threshold   # else abstain / route to human
 ```
 
 **Fix 3 — Verification chain for high-risk queries:**
@@ -586,7 +544,7 @@ class VerifiedGeneration:
 ```python
 # Alert when:
 # 1. Confidence > 0.9 AND answer is wrong → calibration drift
-# 2. Semantic entropy of answers drops suddenly → model collapse
+# 2. Share of high-semantic-entropy queries jumps → new, unfamiliar traffic or a model change
 # 3. Human override rate increases → trust degradation
 
 class CalibrationMonitor:
@@ -609,7 +567,7 @@ class CalibrationMonitor:
 
 **🔴 Follow-up:** *"How do you detect hallucinations in real-time without ground truth?"*
 
-**✅ Answer:** Use **self-consistency** — generate 3-5 answers at higher temperature, cluster semantically. If they disagree, the model is uncertain. Also use the **nuclear log-probability**: if the average token probability of the answer is below a calibrated threshold (e.g., -0.5 nats), it's likely hallucinated. Combine both for a robust real-time detector.
+**✅ Answer:** Use **self-consistency / semantic entropy**: sample 3–5 answers and cluster them by meaning; disagreement means the model is uncertain. Where the API exposes log-probs, add the **mean token log-probability** of the key answer span, with a threshold calibrated on labelled data (there is no universal value). For RAG, check **groundedness** against the retrieved context with NLI or a judge. These signals catch different failures, so combine them, and remember the cost: sampling N answers multiplies spend, so apply it to high-risk intents or a sample of traffic.
 
 ---
 
@@ -619,19 +577,23 @@ class CalibrationMonitor:
 
 ### 🎯 Answer
 
+!!! tip "30-second answer"
+    Single-shot top-k retrieval embeds the *whole* question once, so it often fetches only one of the facts needed. Fix retrieval first: **decompose** the question into sub-queries (or iterate with an agentic retrieve-reason loop), retrieve per hop, then compose. For "summarize everything about X" use **map-reduce**; for relationship-heavy corpora consider a **graph index**. Evaluate with a multi-hop test set, because each extra hop adds latency, cost and error compounding.
+
 This is a **compositional reasoning failure** — the model has all the pieces but can't assemble them. Standard RAG retrieves independent chunks, but multi-document reasoning requires synthesized understanding.
 
 **The root problem:**
 
 ```python
 # Standard RAG retrieves:
-chunk_1 = "Amazon revenue in 2023 was $574B"
-chunk_2 = "Microsoft's cloud revenue grew 20% in Q4 2023"
-chunk_3 = "AWS contributes 15% of Amazon's total revenue"
+chunk_1 = "Amazon's total net sales in 2023 were $574.8B"     # 10-K
+chunk_2 = "Microsoft's cloud revenue kept growing in 2023"     # distractor
+chunk_3 = "AWS segment net sales were $90.8B in 2023"          # different document
 
-# Question: "How much did AWS contribute to Amazon's 2023 revenue?"
-# Need to COMBINE chunk_1 and chunk_3 to answer: 15% × $574B = $86.1B
-# But model sees 3 chunks about different topics → misses the connection
+# Question: "What share of Amazon's 2023 revenue came from AWS?"
+# Need to COMBINE chunk_1 and chunk_3: 90.8 / 574.8 ≈ 15.8%
+# Often only one of them is retrieved (the query embedding sits "between" them),
+# or the model doesn't connect facts from different sources.
 ```
 
 **Solution 1 — Query decomposition (Multi-Hop RAG):**
@@ -643,30 +605,28 @@ class MultiHopRAG:
     then compose the final answer.
     """
     def __init__(self):
-        self.decomposer = LLM(temperature=0)   # Breaks down questions
+        self.decomposer = LLM()   # Breaks down questions
         self.retriever = Retriever()
-        self.composer = LLM(temperature=0.1)   # Combines answers
+        self.composer = LLM()     # Answers sub-questions and combines answers
     
     async def answer(self, question: str) -> str:
-        # Phase 1: Decompose into sub-questions
-        sub_questions = await self.decomposer.generate(f"""
-        Decompose this question into independent sub-questions.
+        # Phase 1: Decompose into sub-questions (ask for JSON / structured output)
+        raw = await self.decomposer.generate(f"""
+        Decompose this question into sub-questions.
         Each sub-question must be answerable from a single document.
-        
         Question: {question}
-        
-        Return as a numbered list:
-        1. [first sub-question]
-        2. [second sub-question]
-        ...
+        Return JSON: {{"sub_questions": ["...", "..."]}}
         """)
-        
-        # Phase 2: Answer each sub-question independently
-        sub_answers = []
-        for sq in sub_questions:
+        sub_questions = json.loads(raw)["sub_questions"]
+
+        # Phase 2: Answer independent sub-questions in parallel.
+        # (Dependent hops, e.g. "who is X's CEO" then "where did they study",
+        #  must run sequentially, feeding answer N into query N+1.)
+        async def solve(sq: str) -> str:
             docs = self.retriever.retrieve(sq)
-            answer = await self.answer_sub_question(sq, docs)
-            sub_answers.append(answer)
+            return await self.answer_sub_question(sq, docs)
+
+        sub_answers = await asyncio.gather(*(solve(sq) for sq in sub_questions))
         
         # Phase 3: Compose final answer from sub-answers
         final = await self.composer.generate(f"""
@@ -680,8 +640,8 @@ class MultiHopRAG:
         
         return final
     
-    def answer_sub_question(self, question: str, docs: list[str]) -> str:
-        return self.llm.generate(f"""
+    async def answer_sub_question(self, question: str, docs: list[str]) -> str:
+        return await self.composer.generate(f"""
         Context: {' '.join(docs)}
         Question: {question}
         Answer based ONLY on the context above.
@@ -691,42 +651,38 @@ class MultiHopRAG:
 **Solution 2 — Map-Reduce RAG:**
 
 ```python
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 class MapReduceRAG:
     """
     Map phase: process each document independently.
     Reduce phase: combine all findings.
     """
-    def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=5)
-    
+    def __init__(self, max_concurrency: int = 5):
+        self.sem = asyncio.Semaphore(max_concurrency)   # respect provider rate limits
+
     def retrieve_and_divide(self, question: str) -> List[Document]:
         """
         Retrieve MORE documents than standard RAG (top-15 instead of top-5)
         because we need breadth for multi-document reasoning.
         """
         return self.retriever.retrieve(question, top_k=15)
-    
+
     async def answer(self, question: str) -> str:
         docs = self.retrieve_and_divide(question)
-        
-        # MAP: Process each doc independently
-        map_promises = []
-        for doc in docs:
-            map_promises.append(self.executor.submit(
-                self._extract_relevant_info, doc, question
-            ))
-        
-        extracts = [p.result() for p in map_promises]
-        extracts = [e for e in extracts if e]  # Filter empty
-        
-        # REDUCE: Combine all extracts
-        final = await self._synthesize(extracts, question)
-        
-        return final
-    
-    def _extract_relevant_info(self, doc: str, question: str) -> Optional[str]:
+
+        async def bounded(doc):
+            async with self.sem:
+                return await self._extract_relevant_info(doc, question)
+
+        # MAP: process each doc independently, in parallel
+        extracts = await asyncio.gather(*(bounded(d) for d in docs))
+        extracts = [e for e in extracts if e]  # drop IRRELEVANT
+
+        # REDUCE: combine all extracts (hierarchically if they exceed the context budget)
+        return await self._synthesize(extracts, question)
+
+    async def _extract_relevant_info(self, doc: str, question: str) -> Optional[str]:
         """Extract only the parts of each document relevant to the question."""
         prompt = f"""Document: {doc}
         
@@ -735,10 +691,10 @@ class MapReduceRAG:
         Extract ONLY the specific facts from this document that are relevant 
         to answering the question. If nothing is relevant, say "IRRELEVANT".
         """
-        result = self.llm.generate(prompt)
+        result = await self.llm.generate(prompt)
         return None if result.strip() == "IRRELEVANT" else result
-    
-    def _synthesize(self, extracts: list[str], question: str) -> str:
+
+    async def _synthesize(self, extracts: list[str], question: str) -> str:
         """Combine all extracted facts into a coherent answer."""
         combined = "\n\n".join(extracts)
         prompt = f"""Facts gathered from multiple documents:
@@ -751,7 +707,7 @@ class MapReduceRAG:
         If facts are contradictory, note the contradiction.
         If the facts are insufficient to fully answer, say what's missing.
         """
-        return self.llm.generate(prompt)
+        return await self.llm.generate(prompt)
 ```
 
 **Solution 3 — Graph-based RAG:**
@@ -788,10 +744,11 @@ class GraphRAG:
         entities = self.entity_extractor.extract(question)
         
         # Step 2: For multi-hop, traverse the graph
-        # Question: "What was AWS's contribution to Amazon's 2023 revenue?"
+        # Question: "What share of Amazon's 2023 revenue came from AWS?"
         # Entities: ["AWS", "Amazon"]
-        # Relations: [AWS→(part_of)→Amazon, Amazon→(has_revenue)→2023]
-        # Traversal: AWS → part_of → Amazon → has_revenue → 2023 → $86.1B
+        # Relations: [AWS→(segment_of)→Amazon, Amazon→(net_sales_2023)→$574.8B,
+        #             AWS→(net_sales_2023)→$90.8B]
+        # Traversal collects both figures' source chunks; the LLM does the division.
         
         paths = self.graph.find_paths(
             start_entities=[e.name for e in entities],
@@ -814,6 +771,9 @@ class GraphRAG:
 class ReActMultiDoc:
     """
     Use ReAct pattern to iteratively gather and reason.
+    Sketch only: matching keywords in free text is brittle. In production,
+    expose search/compute as tools via the provider's native tool calling
+    (schema-validated arguments) and let the model loop until it answers.
     """
     def answer(self, question: str) -> str:
         thought_history = []
@@ -854,8 +814,10 @@ class ReActMultiDoc:
 **✅ Answer:** 
 - **Query decomposition:** Best for questions with clear sub-steps (e.g., "Compare Q1 and Q2 revenue"). Simple to implement, works well.
 - **Map-Reduce:** Best when you need breadth (e.g., "Summarize all customer feedback about feature X"). Handles large document sets well.
-- **Graph RAG:** Best for complex relational questions (e.g., "Which suppliers of our top 3 customers were acquired recently?"). Requires more setup but handles arbitrary hops.
-- **ReAct:** Best when the retrieval strategy itself needs to be dynamic (e.g., "Find and compare all products from vendors that meet our compliance standards"). Most flexible but also most variable.
+- **Graph RAG:** Best for complex relational questions (e.g., "Which suppliers of our top 3 customers were acquired recently?") and corpus-wide "themes" questions. Costly to build and keep fresh (LLM-based entity/relation extraction over the whole corpus), and extraction errors become retrieval errors.
+- **ReAct / agentic retrieval:** Best when the retrieval strategy itself needs to be dynamic (e.g., "Find and compare all products from vendors that meet our compliance standards"). Most flexible, but latency, cost and quality are the most variable; cap steps and tokens.
+
+**What they probe next:** how you'd evaluate it (a multi-hop test set with per-hop retrieval recall, not just final-answer accuracy), and when long-context models make this unnecessary (if the whole relevant corpus fits in the context window and prompt caching makes it affordable, stuffing it in can beat a fragile multi-hop pipeline).
 
 ---
 
@@ -905,31 +867,26 @@ class RiskAssessment:
 
 **Negotiation playbook:**
 
-```markdown
-## Step 1: Quantify the actual risk
+**Step 1: Quantify the actual risk.** Ask: "What does '15% of edge cases' mean in absolute numbers, and what does one bad answer cost?"
 
-Ask: "What does '15% of edge cases' mean in absolute numbers?"
+- 15% of 0.1% of traffic = 0.015% of requests affected
+- 15% of 10% of traffic = 1.5% of requests affected
 
-- 15% of 0.1% of traffic = 0.015% of users affected
-- 15% of 10% of traffic = 1.5% of users affected
+If it's 0.015% in a low-harm domain, the answer might be "yes, with guardrails." If it's 1.5% in a regulated domain, it's "not yet." Also check how the 15% was measured: a small or unrepresentative eval set gives a wide confidence interval.
 
-If it's 0.015%, the answer might be "yes, with guardrails."
-If it's 1.5%, the answer might be "no, we need more work."
+**Step 2: Propose guardrails instead of saying "no."** "Here's what I need to ship this safely." Put effort and measured impact next to each item from your own eval set; don't quote generic percentages.
 
-## Step 2: Propose guardrails to reduce risk
+| Guardrail | What it buys |
+|-----------|--------------|
+| Detect the edge-case class (classifier/rules) and route it to a fallback, a human, or a scoped "I can't help with that" | Removes the riskiest traffic from the model entirely |
+| Calibrated abstention threshold (see Q3) | Trades coverage for precision on what remains |
+| Post-generation verifier (groundedness/NLI or judge) | Blocks a share of unsupported answers; adds latency and cost |
+| Shadow mode (log only, not user-facing), then analyse | Measures real-traffic rate instead of eval-set rate |
+| Monitoring, alerting, feature flag, auto-rollback | Limits blast radius when you are wrong |
 
-Instead of saying "no," say: "Here's what I need to ship this safely:"
+Commit to a measured target ("hallucination rate on the edge-case set below X% at Y% coverage"), not a promised number before you've measured.
 
-| Guardrail | Cost | Risk Reduction | 
-|-----------|------|-----------------|
-| Confidence threshold: reject < 0.75 → fallback | 2 days | Catches ~50% of hallucinations |
-| Human-in-loop for high-confidence wrong answers | 1 week | Catches ~20% more |
-| Post-generation verifier LLM | 3 days | Catches ~15% more |
-| Monitoring + alerting + auto-rollback | 2 days | Limits blast radius |
-| Shadow mode (log only, no user-facing) → analyze | 1 week | Understand real impact |
-| **Total** | **~3 weeks** | **Reduces from 15% to <2%** |
-
-## Step 3: Define the rollout plan
+**Step 3: Define the rollout plan.**
 
 ```python
 rollout_plan = {
@@ -941,7 +898,7 @@ rollout_plan = {
 }
 ```
 
-## Step 4: Define the "stop ship" criteria
+**Step 4: Define the "stop ship" criteria** (thresholds are examples; agree them with the PM up front).
 
 ```python
 # Pre-defined conditions that would trigger rollback:
@@ -954,14 +911,13 @@ STOP_SHIP_CONDITIONS = [
 ]
 ```
 
-## Step 5: The conversation template
+**Step 5: The conversation template.**
 
-> "I understand we want to ship fast. Here's my concern: 15% hallucination rate in [domain] means [concrete harm]. Let me propose a path forward: give me [3 weeks] to build guardrails that bring that down to [2%], and we can start with a [5% canary rollout]. If the guardrails work, we ramp to full. If not, we learn and iterate. Here's the specific work I'd need to prioritize..."
-```
+> "I understand we want to ship fast. Here's my concern: 15% hallucination rate in [domain] means [concrete harm]. Let me propose a path forward: give me [N weeks] to build guardrails and measure them, with a target of [X%] on the edge-case set, and we start with a [5% canary rollout]. If the guardrails hit the target, we ramp to full. If not, we learn and iterate. Here's the specific work I'd need to prioritize..."
 
 **What NOT to do:**
 
-```python
+```text
 # ❌ Don't just flat-out refuse
 "Sorry, I can't ship this."
 
@@ -972,7 +928,7 @@ STOP_SHIP_CONDITIONS = [
 "Let's talk about it in the next sprint."
 
 # ✅ Do this instead
-"I can ship this safely with a 3-week investment in guardrails and phased rollout. 
+"I can ship this safely with a few weeks of guardrails and a phased rollout. 
 Here's the plan. If we can't invest that, we should defer the feature to [next quarter] 
 and ship the low-risk parts now."
 ```
@@ -992,6 +948,9 @@ and ship the low-risk parts now."
 **Interviewer:** *"Your RAG system suddenly starts giving wrong answers. What's the first thing you debug?"*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    "Suddenly" means something changed. First ask **what changed and when** (deploys, prompt/config, index rebuild, embedding or model version, provider alias, data source), and correlate it with the start of the regression in your traces. Then split the failing requests: **was the right context retrieved?** If no, it's retrieval (index, embeddings, chunking, filters); if yes, it's generation (prompt, model, context assembly). Mitigate first (roll back the change, pin versions), then root-cause.
 
 **First: isolate whether it's a retrieval failure or a generation failure.**
 
@@ -1041,7 +1000,7 @@ class IncidentResponse:
         return "UNKNOWN", "Further investigation needed"
 ```
 
-**Common root causes (ranked by frequency):**
+**Common root causes (no universal ranking; check the cheapest-to-verify first):**
 
 ```python
 ROOT_CAUSES = {
@@ -1058,8 +1017,8 @@ ROOT_CAUSES = {
         "Fix: Check top_k parameter; increase if needed"),
     
     4: ("LLM provider change",
-        "Model was updated by provider (e.g., GPT-4 → GPT-4-turbo)",
-        "Fix: Pin model version; test output format with new version"),
+        "An unpinned alias (e.g. a '-latest' name) now points to a new snapshot, or the old snapshot was retired",
+        "Fix: Pin dated model snapshots; track provider deprecation schedules; run evals before switching"),
     
     5: ("Prompt regression",
         "Someone changed the system prompt",
@@ -1092,8 +1051,10 @@ curl vector_store:8000/stats      # Returns dimension count, version
 echo "SELECT * FROM retrieval_logs WHERE query_hash = 'abc123'" \
   | psql -h logs-db
 
-# 4. What does the model say with temperature=0?
-# (eliminates stochasticity)
+# 4. Replay the logged request (same prompt, context, model snapshot) several times.
+#    Consistent wrong answer → deterministic cause; varies → sampling/model noise.
+#    (Many current hosted models reject temperature/top_p, and temperature=0 never
+#     guaranteed identical outputs anyway; see Q11.)
 
 # 5. What was the last deployment?
 kubectl rollout history deployment/rag-service
@@ -1107,6 +1068,8 @@ kubectl logs -l app=rag-service --tail=100 --since=1h
 2. **Retrieval freshness**: track the average age (time since last re-index) of retrieved documents.
 3. **Faithfulness score**: use a small NLI model to check answer against context on every response. Track the percentage of unfaithful answers.
 4. **Human override rate**: if users are frequently editing or correcting answers, that's a leading indicator of degradation before explicit error reporting.
+5. **Version tags on every trace**: prompt version, model snapshot, embedding model, index build ID and retriever config attached to each request trace, so "what changed" is a query, not an investigation.
+6. **Canary eval on every change**: run a golden set against any new prompt, model, or index build before it takes traffic.
 
 ---
 
@@ -1115,6 +1078,9 @@ kubectl logs -l app=rag-service --tail=100 --since=1h
 **Interviewer:** *"Design a production AI coding assistant."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Clarify the surfaces first: inline completion (very latency-sensitive, small fast model, tight context), chat, and agentic tasks (multi-step edits that run tools and tests). Core components: a **code context engine** (repo index with lexical + symbol/AST + embedding search, plus open files and recent edits), **model routing** by task, a **sandbox** for executing code and tests, **prompt caching** of repo/system context, and **guardrails** (secret scanning, licence/PII filters, prompt-injection defences for content read from repos and the web). Measure acceptance and retained-code rate, not just latency.
 
 ```python
 class CodingAssistantArchitecture:
@@ -1127,8 +1093,11 @@ class CodingAssistantArchitecture:
     """
     
     def __init__(self):
-        self.fast_model = FastLLM("gpt-4o-mini")       # $0.15/M tokens
-        self.slow_model = SlowLLM("gpt-4o")            # $2.50/M tokens
+        # Model IDs come from config, not code: names and prices change every few months.
+        # Typical 2026 split: a small, fast tier and a frontier tier that costs
+        # roughly an order of magnitude more per token.
+        self.fast_model = LLM(config.FAST_MODEL_ID)
+        self.slow_model = LLM(config.FRONTIER_MODEL_ID)
         self.code_indexer = CodeIndexer()               # AST-based retrieval
         self.sandbox = SecureSandbox()                  # For code execution
         self.conversation_store = PostgresConversations()
@@ -1163,19 +1132,20 @@ class CodingAssistantArchitecture:
         
         return response
     
+    HIGH_COMPLEXITY_KEYWORDS = (
+        "architecture", "refactor", "design pattern", "performance",
+        "security", "distributed", "thread safety", "implement", "design",
+    )
+
     def classify_complexity(self, query: str) -> str:
         """
-        Simple heuristics to route to fast/slow model.
+        Cheap heuristic router. (Bug to avoid: putting bare strings in a list and
+        calling any() on it is always True, because non-empty strings are truthy.)
+        In production, prefer a small trained classifier and measure routing
+        quality against "always use the frontier model" on an eval set.
         """
-        high_complexity_signals = [
-            "architecture", "refactor", "design pattern",
-            "performance optimization", "security vulnerability",
-            "distributed system", "thread safety",
-            len(query.split()) > 100,
-            any(func_call in query for func_call in ["implement", "design"])
-        ]
-        
-        if any(high_complexity_signals):
+        q = query.lower()
+        if len(q.split()) > 100 or any(kw in q for kw in self.HIGH_COMPLEXITY_KEYWORDS):
             return "high"
         return "low"
 ```
@@ -1219,12 +1189,15 @@ class CodeIndexer:
         
         return self._to_context(ordered, max_tokens)
 
-class Sandbox:
+class SecureSandbox:
     """
-    Secure code execution for verification.
+    Code execution for verification.
+    Plain Docker shares the host kernel, so for untrusted, model-generated code
+    use a stronger boundary: gVisor, Firecracker/Kata microVMs, or a managed
+    sandbox service. Ephemeral per task, no credentials, egress denied by default.
     """
     def __init__(self):
-        # Docker-based sandbox
+        # Container-style config (run under gVisor/microVM runtime)
         self.container = DockerContainer(
             image="sandbox:python-3.12",
             memory_limit="256m",
@@ -1323,6 +1296,11 @@ class CodingAssistantObservability:
 
 ### 🎯 Answer
 
+!!! tip "30-second answer"
+    Decompose end-to-end latency into **your own time** (retrieval, tool calls, guardrails, retries) and **model time**, and split model time into **TTFT** (time to first token: network + queueing + prefill) and **decode time** (output tokens × time per output token). Then ask what changed: more input tokens, more output (including hidden **reasoning tokens**), a model/effort setting, retries after 429s, an extra agent step, or provider-side load. A 2s → 15s jump with the same token counts points at queueing/rate limits/provider; with more tokens it points at you.
+
+With a hosted API you can't see the provider's internal queue or prefill directly; you see TTFT, output tokens, total time and response headers. Inside your own serving stack (vLLM, SGLang, TensorRT-LLM) you can measure queue time, prefill and decode separately. The code below models the general case.
+
 ```python
 class LatencyTriage:
     """
@@ -1350,9 +1328,7 @@ class LatencyTriage:
             "decode": self._check_decode,
             "post": self._check_post_processing,
         }
-        
-        method_name = f"_check_{phase}"
-        handler = getattr(self, method_name, None)
+        handler = investigations.get(phase)
         return handler(trace) if handler else "Unknown"
     
     def _check_network(self, trace: Trace) -> str:
@@ -1365,9 +1341,9 @@ class LatencyTriage:
         curl -w "TCP handshake: %{time_connect}s\n\
                  TLS: %{time_appconnect}s\n\
                  Total: %{time_total}s" \
-             -o /dev/null -s https://api.openai.com/v1/models
+             -o /dev/null -s https://<provider-api-host>/
         
-        mtr --report-wide api.openai.com  # Continuous traceroute
+        mtr --report-wide <provider-api-host>  # Continuous traceroute
         """
         if trace.tcp_handshake > 1:
             return "NETWORK: High TCP handshake time — check DNS/proxy/firewall"
@@ -1382,95 +1358,75 @@ class LatencyTriage:
         Queue time = time between request arrival and start of processing.
         """
         if trace.queue_time > 5:
-            return "QUEUE: Provider is overloaded. Check: OpenAI status page, rate limits, tier"
+            return "QUEUE: Provider is overloaded. Check: provider status page, rate limits, tier"
         if trace.queue_time > 2:
             return "QUEUE: Moderate queueing. Consider: higher tier, different model, fallback"
         return "QUEUE: Normal"
     
     def _check_prefill(self, trace: Trace) -> str:
         """
-        Prefill (prompt processing) scales with prompt size.
+        Prefill (prompt processing) grows with uncached prompt tokens
+        (attention makes it super-linear at very long contexts).
+        Compare against YOUR baseline for this model, not a universal constant.
         """
-        expected = trace.prompt_tokens / 1000 * 0.3  # ~300ms per 1K tokens
+        uncached = trace.prompt_tokens - trace.cached_prompt_tokens
+        expected = uncached * self.baseline_prefill_s_per_token[trace.model]
         if trace.prefill_time > expected * 2:
             return (f"PREFILL: Slower than expected. "
                     f"Prompt: {trace.prompt_tokens} tokens, "
                     f"Expected: {expected:.1f}s, "
                     f"Actual: {trace.prefill_time:.1f}s. "
-                    f"Check: prompt grew? System prompt too long?")
+                    f"Check: prompt grew? Prompt-cache hit rate dropped?")
         return "PREFILL: Normal"
-    
+
     def _check_decode(self, trace: Trace) -> str:
         """
-        Decode (token generation) scales with output length.
+        Decode time = output tokens × time per output token.
+        Output tokens include hidden reasoning/thinking tokens on reasoning
+        models, which are billed and add latency even though you don't see them.
         """
         tokens_per_second = trace.completion_tokens / trace.decode_time
-        
-        expected_tps = {
-            "gpt-4": 20,      # t/s
-            "gpt-4-turbo": 40,
-            "gpt-3.5": 80,
-            "claude-3": 30,
-        }
-        
-        expected_tps_val = expected_tps.get(trace.model, 30)
-        
+
+        # Baseline per model snapshot from your own metrics (e.g. p50 over the
+        # last 7 days). Never hard-code: throughput differs by model, provider,
+        # region, time of day, and changes with every release.
+        expected_tps_val = self.baseline_tps[trace.model]
+
         if tokens_per_second < expected_tps_val * 0.5:
             return (f"DECODE: Very slow. {tokens_per_second:.0f} t/s vs "
                     f"expected {expected_tps_val} t/s. "
-                    f"Check: output length increased? Model degraded? "
-                    f"Did max_tokens change?")
+                    f"Check: output length or reasoning tokens increased? "
+                    f"max_tokens / effort / thinking budget changed? Provider degraded?")
         return "DECODE: Normal"
 ```
 
 **Quick triage checklist:**
 
-```markdown
-## 30-second triage
-
-1. Check provider status page: 
-   - OpenAI: status.openai.com
-   - Anthropic: status.anthropic.com
-
-2. Check your rate limits:
-   curl -I https://api.openai.com/v1/models \
-     -H "Authorization: Bearer $KEY"
-   # Look for: x-ratelimit-remaining-requests
-   #           x-ratelimit-remaining-tokens
-
-3. Check if prompt size grew:
-   kubectl logs -l app=llm-service --tail=50
-   # Look for: "prompt_tokens" — did someone increase context?
-
-4. Check if output length increased:
-   # Did max_tokens change from 512 to 2048?
-
-5. Check if model was auto-upgraded:
-   # Did gpt-3.5-turbo route to a newer, slower version?
-
-6. Check network path:
-   traceroute api.openai.com
-   # Is there a new hop? Did a proxy change?
-
-7. Check for regional issues:
-   # Did traffic shift to a different region?
-```
+1. **Provider status page and your error rates.** A provider incident shows up as rising TTFT, 429/5xx/overloaded errors across all your services at once.
+2. **Rate limits.** Look for 429s and client-side retries (each retry with backoff adds seconds). Read the rate-limit headers that come back **on real inference responses** (e.g. OpenAI's `x-ratelimit-remaining-*`, Anthropic's `anthropic-ratelimit-*` and `retry-after`); limits are typically per org/project and per model, in requests and tokens per minute.
+3. **Input tokens.** Did average prompt tokens grow (more history, more RAG chunks, bigger tool definitions)? Did the **prompt-cache hit rate** drop (e.g. someone put a timestamp or user ID at the start of the system prompt, which breaks prefix caching)?
+4. **Output tokens.** Did `max_tokens` rise, did the prompt start asking for longer answers, or did a **reasoning effort / thinking budget** setting change? Reasoning tokens are generated (and billed) before the visible answer.
+5. **Model change.** Did an alias move to a new snapshot, or did a deploy change the model or route more traffic to the larger tier?
+6. **Your own pipeline.** More agent steps or tool calls per request, slower retrieval, a new synchronous guardrail call.
+7. **Network/region.** New proxy hop, cross-region traffic, DNS/TLS issues.
 
 **Common causes and fixes:**
 
 | Cause | Symptoms | Fix |
 |-------|----------|-----|
-| **Prompt bloat** (most common) | Prefill time grew 5x; prompt tokens doubled | Summarize conversation history; trim system prompt; implement token budget |
-| **Output bloat** | Decode time grew 10x; max tokens was increased | Cap max_tokens; implement early stopping |
-| **Provider queueing** | Queue time > 5s; status page shows incidents | Add fallback provider; buffer with queue |
-| **Rate limiting** | HTTP 429 responses; requests being queued client-side | Implement retry with backoff; increase quota |
-| **Model degradation** | Same model, same prompt, slower decode | Switch to different model version; contact provider |
-| **Network issue** | High TCP/TLS handshake time; new proxy hop | Check CDN, proxy, DNS; direct connection |
-| **Shared infrastructure overload** | All your services are slow; not just LLM | Check CPU/memory of serving infrastructure |
+| **Prompt bloat / cache misses** | TTFT up; input tokens up or cache-read tokens down | Token budgets; summarize history; keep static content first so prefix caching hits |
+| **Output or reasoning bloat** | Decode time up; output (incl. reasoning) tokens up | Cap `max_tokens`; lower effort/thinking budget for simple intents; ask for concise output |
+| **Provider queueing / overload** | TTFT up at same token counts; status page incident | Fallback model/provider/region; priority or provisioned-throughput tier; load shedding |
+| **Rate limiting** | 429s; client-side retries | Exponential backoff with jitter honouring `retry-after`; client-side token-bucket per key; raise limits; batch API for offline work |
+| **Agent loop growth** | More LLM calls per request | Cap steps; trace per step; parallelize independent tool calls |
+| **Network issue** | High TCP/TLS handshake time; new proxy hop | Check proxy, DNS; connection pooling/keep-alive |
+| **Shared infrastructure overload** | All your services are slow, not just the LLM | Check CPU/memory/threads of your own services |
+
+**If you self-host the model** (vLLM, SGLang, TensorRT-LLM), the levers are serving-level: **continuous batching** (higher throughput, but long prompts in the batch slow everyone's decode unless you use **chunked prefill**), **PagedAttention**/KV-cache memory (cache exhaustion causes preemption and recompute), **automatic prefix caching**, **speculative decoding** (draft tokens verified by the big model; helps decode latency at low batch sizes), quantization, tensor parallelism, and **prefill/decode disaggregation** at scale. Track TTFT, time per output token (TPOT/ITL), queue depth and KV-cache utilisation.
 
 **🔴 Follow-up:** *"What's the most impactful long-term fix?"*
 
-**✅ Answer:** Implement **prompt caching** and **semantic caching**. Prompt bloat is the #1 cause of gradual latency creep. Cache frequent system prompts, and cache responses to semantically similar queries (with TTL). This brings p50 latency down from 15s to ~200ms for cached queries, and reduces the provider queueing pressure for uncached queries.
+**✅ Answer:** Make latency a managed budget rather than a surprise: (1) per-route **SLOs on TTFT and total latency** with alerts tied to token counts, cache hit rate and retry rate, so a regression points at its cause; (2) **prompt (prefix) caching**: put the static system prompt, tool definitions and shared documents first so repeated prefixes skip prefill, which cuts TTFT and input cost on cache hits (it does not speed up decode); (3) **token budgets** on history, retrieval and output; (4) **streaming** so users see the first tokens quickly; (5) **exact/semantic response caching** only for safe, repeatable intents; and (6) a **fallback path** (smaller model, other region/provider) behind a circuit breaker.
 
 ---
 
@@ -1479,6 +1435,9 @@ class LatencyTriage:
 **Interviewer:** *"Design an enterprise AI agent."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    The model is untrusted; the **harness** enforces security. Authenticate the user and act **on their behalf** with their permissions (never a god-mode service account), expose only the tools their role allows, validate every tool call against a schema and policy *outside* the model, require **human approval** for irreversible actions, treat all tool output and retrieved content as untrusted (prompt injection), isolate tenants at the data layer, and keep an immutable audit trail of every step. Bound the loop with step, token, time and cost budgets, and make tool calls idempotent so retries are safe.
 
 ```python
 class EnterpriseAgent:
@@ -1515,7 +1474,10 @@ class EnterpriseAgent:
         if identity.tenant_id != self.tenant_id:
             raise PermissionError("Cross-tenant access denied")
         
-        # Step 2: Redact PII from input
+        self.identity = identity
+
+        # Step 2: Redact/pseudonymize PII from input. Use reversible tokens
+        # (e.g. <EMAIL_1> mapped in a vault) if tools legitimately need the real value.
         safe_input = self.pii_scanner.redact(request.input)
         
         # Step 3: Check policy
@@ -1536,7 +1498,8 @@ class EnterpriseAgent:
         trace_id = self.audit_logger.start_trace(
             tenant_id=self.tenant_id,
             user=identity.user_id,
-            input_hash=hash(safe_input)
+            # Not Python's hash(): it is salted per process, so it can't be compared later
+            input_hash=hashlib.sha256(safe_input.encode()).hexdigest()
         )
         
         try:
@@ -1578,11 +1541,11 @@ class EnterpriseAgent:
             # Verify tool call against policy
             tool_allowed = self.policy_engine.evaluate(
                 action=f"use_tool:{thought.tool_name}",
-                user=self.user_context,
+                user=self.identity,
                 resource=thought.tool_params
             )
-            
-            if not tool_allowed:
+
+            if not tool_allowed.allowed:
                 steps.append(Step(
                     action=f"BLOCKED: {thought.tool_name}",
                     reason=tool_allowed.reason
@@ -1655,7 +1618,7 @@ class EnterpriseMemory:
         """
         await self.relational_db.execute("""
             INSERT INTO agent_memory (tenant_id, key, value, expires_at)
-            VALUES (:tenant, :key, :value, NOW() + :ttl)
+            VALUES (:tenant, :key, :value, NOW() + CAST(:ttl AS INTERVAL))
         """, {
             "tenant": self.tenant,
             "key": key,
@@ -1727,14 +1690,16 @@ class ScopedToolRegistry:
                 "allowed_roles": ["analyst", "admin"],
                 "read_only": True,
                 "rate_limit": 50,
-                "query_validation": "SELECT ONLY"  # Prevent injection
+                # Enforce read-only with a read-only DB role + row-level security +
+                # statement timeout; string checks like "SELECT only" are bypassable
+                "db_role": "agent_readonly",
             },
             "send_email": {
                 "allowed_roles": ["admin"],
                 "read_only": False,
                 "rate_limit": 10,
                 "requires_approval": True,
-                "recipient_whitelist": ["@company.com"]  # Prevent data exfiltration
+                "recipient_allowlist": ["@company.com"]  # Prevent data exfiltration
             },
         }
     
@@ -1760,21 +1725,32 @@ class ScopedToolRegistry:
         return await self._call_tool(tool_name, params)
     
     def _is_mutating(self, params: dict) -> bool:
-        """Check if the tool call would mutate state."""
+        """Defence-in-depth heuristic only. The real guarantee is that read-only
+        tools run with credentials that cannot write."""
         mutation_keywords = ["create", "update", "delete", "insert", "drop"]
         params_str = json.dumps(params).lower()
         return any(kw in params_str for kw in mutation_keywords)
 ```
 
+**Structured outputs for tool calls and machine-read responses.** As of 2026 the major APIs (OpenAI, Anthropic, Gemini) and self-hosted servers (vLLM, SGLang via grammar backends) support **schema-constrained decoding**: you pass a JSON Schema and the decoder can only emit tokens that keep the output valid, either for the response body or for tool arguments ("strict" tool use). This removes parse failures, but:
+
+- It guarantees **shape, not truth**: values can still be wrong, so keep business validation (IDs exist, amounts within limits, user may act on that resource).
+- Each provider supports a **subset of JSON Schema** (e.g. some reject numeric/string-length constraints, recursion or open `additionalProperties`); enforce the rest yourself.
+- The first request with a new schema can be slower while the grammar compiles (providers cache it).
+- Refusals and `max_tokens` cut-offs can still produce non-conforming output; check the stop reason.
+
 **🔴 Follow-up:** *"How do you prevent prompt injection and data leakage?"*
 
-**✅ Answer:** 
-1. **Input sanitization**: strip special tokens, delimiter injection attempts, and known jailbreak patterns before they reach the LLM.
-2. **Parameterized tool calls**: never interpolate user input directly into tool parameters. Use validated schemas only.
-3. **Output redaction**: run PII detection on every output before it leaves the system.
-4. **Least-privilege tool access**: each user role sees only permitted tools; even the LLM can't call tools it doesn't know about.
-5. **Human-in-loop for all write/destructive operations**: the agent can generate the parameterized call, but a human must approve execution.
-6. **Tenant data isolation**: separate vector stores, separate database schemas, separate encryption keys per tenant.
+**✅ Answer:** Assume injection **will** succeed sometimes (no filter or prompt reliably stops it, especially *indirect* injection hidden in emails, web pages, documents or tool results), and design so a hijacked model can't do much damage:
+1. **Least privilege**: each user role sees only permitted tools, and tools run with the *user's* scoped, short-lived credentials.
+2. **Break the "lethal trifecta"**: avoid giving one agent session private-data access, exposure to untrusted content, *and* an exfiltration channel (outbound email, arbitrary URLs, rendering remote images). Remove at least one.
+3. **Treat tool output as data, not instructions**: delimit it, and for high-risk flows use a privileged/quarantined split (a planner that never sees raw untrusted content; a quarantined model that processes it but can't call tools).
+4. **Validate tool calls outside the model**: schema validation, policy checks, allowlisted destinations, egress controls at the network layer.
+5. **Human approval for writes/destructive or external actions**, showing the exact parameters.
+6. **Input/output filters as a layer, not the defence**: injection classifiers and PII/secret scanning on inputs and outputs catch the obvious cases and give you telemetry.
+7. **Tenant data isolation**: enforced in the data layer (row-level security, per-tenant indexes/namespaces, per-tenant keys), not by the prompt.
+
+**What they probe next:** how you red-team it (an injection test suite in CI), how approvals avoid rubber-stamping (risk-tiered, batched, with clear diffs), and how you'd detect a compromised session (anomalous tool sequences, unusual destinations).
 
 ---
 
@@ -1783,6 +1759,9 @@ class ScopedToolRegistry:
 **Interviewer:** *"Build a multi-agent workflow."*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Start by asking whether you need agents at all: a fixed **workflow** (prompt chain, router, parallel fan-out, evaluator-optimizer loop) is cheaper, faster and easier to debug than autonomous agents. Use multiple agents when the work is **broad and parallelizable** (e.g. research across many sources) or needs isolated contexts. The usual shape is an **orchestrator** that plans and delegates to subagents with clean, focused contexts and returns condensed results. Key design points: explicit task specs per subagent, shared state in a durable store (not just chat history), budgets per agent, idempotent tools, per-step tracing, and an evaluation of the whole system. Expect it to burn many more tokens than a single call.
 
 ```python
 class MultiAgentWorkflow:
@@ -1825,7 +1804,8 @@ class MultiAgentWorkflow:
         # Phase 4: Writing (depends on analysis)
         draft = await self.writer.compose(analysis, task.style)
         
-        # Phase 5: Verification (independent)
+        # Phase 5: Verification by a separate agent (fresh context, ideally
+        # different prompt or model, so it doesn't share the writer's blind spots)
         verification = await self.verifier.verify(draft)
         
         # Phase 6: Quality gate
@@ -1984,12 +1964,14 @@ PATTERNS = {
 **✅ Answer:** A single agent is better when:
 1. **Task is simple and linear**: no benefit to decomposition overhead.
 2. **Context coherence matters**: splitting context across agents can lose nuance.
-3. **Latency critical**: multi-agent adds coordination overhead (20-200ms per handoff).
-4. **Cost sensitive**: N agents = N × cost. Single agent is cheaper.
+3. **Latency critical**: each handoff is usually at least one more LLM call (seconds, not milliseconds), plus the orchestrator's planning and synthesis calls.
+4. **Cost sensitive**: token use multiplies. Anthropic reported (June 2025) that in their research system agents used about 4× the tokens of chat and multi-agent systems about 15×; it paid off only because the task was high-value and parallelizable.
 5. **Debugging simplicity**: multi-agent failure modes (deadlock, conflict, circular reasoning) are harder to debug.
 6. **One model is sufficient**: the task doesn't require different capabilities.
 
 Rule of thumb: start with a single agent, extract to multi-agent only when you hit a specific bottleneck (e.g., context window, specialized knowledge, need for parallel work).
+
+**Failure modes to name:** subagents duplicating work or drifting from vague task specs, errors compounding across steps, infinite delegation or retry loops (cap depth, steps and spend), lost state on crash (checkpoint workflow state durably so you can resume rather than restart), and non-reproducible runs (trace every call with inputs, outputs and versions). Cross-agent and cross-vendor communication standards exist (MCP for tools/context; A2A for agent-to-agent), but most production systems still orchestrate in their own code.
 
 ---
 
@@ -1999,154 +1981,78 @@ Rule of thumb: start with a single agent, extract to multi-agent only when you h
 
 ### 🎯 Answer
 
-```python
-class SamplingParameters:
-    """
-    Understanding LLM output variability through sampling parameters.
-    """
-    def explain_temperature(self, temperature: float) -> str:
-        """
-        Temperature controls the "sharpness" of the probability distribution.
-        
-        Low temperature (0.0 - 0.3):
-        - Model picks the most likely token almost always
-        - Deterministic output (with seed), focused, conservative
-        - Best for: factual QA, code generation, classification
-        
-        Medium temperature (0.5 - 0.8):
-        - Model considers more possibilities
-        - Creative but within reasonable bounds
-        - Best for: general chat, summarization, translation
-        
-        High temperature (0.9 - 2.0):
-        - Model flattens the probability distribution
-        - More creative, unpredictable, sometimes nonsensical
-        - Best for: creative writing, brainstorming
-        
-        Technical explanation:
-        temperature = 0.7:
-        P(token) = softmax(logits / 0.7)
-        → Distribution is smoother, low-probability tokens get a better chance
-        
-        temperature = 0.0:
-        P(token) = argmax(logits)
-        → Always picks the most likely token (greedy decoding)
-        """
-        return {
-            "0.0": "Deterministic (with seed). Picks highest probability token always.",
-            "0.7": "Balanced. Slight deviation from highest probability.",
-            "1.0": "Default. Uses raw model probabilities.",
-            "1.5": "Creative. Significantly flattens distribution.",
-            "2.0": "Maximum randomness. Near-uniform distribution.",
-        }[str(temperature)]
-    
-    def explain_top_p(self, top_p: float) -> str:
-        """
-        Top-P (nucleus sampling) dynamically selects a set of tokens
-        whose cumulative probability reaches P.
-        
-        Example:
-        Next token probabilities:
-        Token A: 0.45
-        Token B: 0.25
-        Token C: 0.15
-        Token D: 0.08
-        Token E: 0.04
-        Token F: 0.03
-        
-        top_p = 0.9:
-        - Select tokens until cumulative probability >= 0.9
-        - Selects: A(0.45) + B(0.25) + C(0.15) + D(0.08) = 0.93
-        - Excludes: E(0.04), F(0.03) — the long tail
-        - Model samples from {A, B, C, D}
-        
-        top_p = 0.9:
-        - Include tokens in order of highest probability until cumulative sum >= 0.9
-        - A(0.45) → cumulative: 0.45 < 0.9 → include ✓
-        - B(0.25) → cumulative: 0.70 < 0.9 → include ✓
-        - C(0.15) → cumulative: 0.85 < 0.9 → include ✓
-        - D(0.08) → cumulative: 0.93 >= 0.9 → include ✓ | STOP
-        - E(0.04), F(0.03) excluded (the long tail)
-        - Model samples from {A, B, C, D}
-        
-        So top_p = 0.9 discards the tail {E, F} and samples from the nucleus.
-        
-        Key insight:
-        - top_p = 0.1: Very narrow selection, almost deterministic
-        - top_p = 0.9: Broad selection, creative
-        - top_p = 1.0: All tokens considered
-        
-        top_p is ADAPTIVE — when the model is confident (one token very probable),
-        it selects fewer tokens. When the model is uncertain, it selects more.
-        This is better than fixed top_k (which always selects K tokens regardless).
-        """
-        pass
-    
-    def explain_seed(self, seed: int) -> str:
-        """
-        Seed makes the random sampling deterministic.
-        
-        Without seed:
-        temperature=0.7 → random sampling → different output each time
-        temperature=0.0 → argmax → same output (seed doesn't matter)
-        
-        With seed=42:
-        temperature=0.7 → deterministic random sampling → same output EVERY time
-        
-        How it works:
-        1. Seed initializes the random number generator
-        2. Same seed → same random sequence → same token selections
-        3. As long as the model weights haven't changed
-        
-        Practical use:
-        - Testing: seed=42 for reproducible test outputs
-        - A/B testing: same seed for apples-to-apples comparison
-        - User preference: user can "lock" a variant they liked
-        - Debugging: reproduce exact outputs for investigation
-        
-        Limitations:
-        - Different model versions → different outputs (different weights → different logits)
-        - Different hardware → potential floating point differences
-        - For EXACT reproducibility: need temperature=0.0 (greedy)
-        """
-        pass
-```
+!!! tip "30-second answer"
+    The model outputs a probability distribution over the next token and the decoder **samples** from it. **Temperature** reshapes that distribution (divide logits by T: lower is sharper, higher is flatter), **top-p** keeps only the smallest set of tokens whose cumulative probability reaches p, and a **seed** fixes the random number generator. Even with temperature 0 and a seed, hosted APIs are **not guaranteed deterministic**: batching, kernel and hardware differences change the logits slightly. And in 2026 many frontier reasoning models no longer accept these knobs at all, so in production you design for variability (evals with pass rates, structured outputs, caching of answers you must repeat) rather than trying to switch it off.
 
-**Practical examples:**
+!!! warning "Version-sensitive (as of October 2026)"
+    - **Anthropic:** current Claude models reject non-default `temperature`, `top_p` and `top_k` with a 400 error (Claude Opus 4.7 and later, per Anthropic's migration guide); several earlier 4.x models accepted temperature *or* top_p but not both. Steering is done with prompting and the effort setting. There has never been a `seed` parameter.
+    - **OpenAI:** reasoning models don't accept `temperature`/`top_p`; `seed` on Chat Completions has only ever been best-effort (compare `system_fingerprint` to spot backend changes).
+    - **Google Gemini:** accepts temperature but recommends leaving Gemini 3-generation models at the default of 1.0.
+    - **Open-weight / self-hosted models** (vLLM, SGLang, llama.cpp): all of these knobs are available and behave as described below.
+
+    Check the current docs for the exact model you use; this changes with every model generation.
+
+**Temperature.** `P(token) = softmax(logits / T)`.
+
+- T → 0 approaches **greedy decoding** (argmax). Many APIs treat 0 as greedy.
+- T = 1 samples from the model's raw distribution.
+- T > 1 flattens it, giving tail tokens more mass (more diverse, more errors).
+- Ranges differ by provider (historically 0–1 for Anthropic, 0–2 for OpenAI and Gemini).
+
+Worked example: the next-token distribution below re-weighted by temperature (computed, rounded):
+
+| Token | T = 0.5 | T = 1.0 (raw) | T = 1.5 |
+|-------|---------|---------------|---------|
+| A | 0.683 | 0.45 | 0.353 |
+| B | 0.211 | 0.25 | 0.238 |
+| C | 0.076 | 0.15 | 0.169 |
+| D | 0.022 | 0.08 | 0.111 |
+| E | 0.005 | 0.04 | 0.070 |
+| F | 0.003 | 0.03 | 0.058 |
+
+**Top-p (nucleus sampling).** Sort tokens by probability and keep the smallest prefix whose cumulative probability is ≥ p, renormalise, then sample. With the raw distribution and p = 0.9:
+
+- A (0.45) → cumulative 0.45
+- B (0.25) → 0.70
+- C (0.15) → 0.85
+- D (0.08) → 0.93 ≥ 0.9, stop
+- Sample from {A, B, C, D}; the tail {E, F} is discarded.
+
+Top-p is **adaptive**: when the model is confident, the nucleus is one or two tokens; when it's uncertain, it widens. Top-k always keeps exactly k tokens regardless of the shape. Providers that support both generally advise tuning temperature *or* top-p, not both.
+
+**Seed.** Fixes the sampler's random sequence, so the same seed, input, model snapshot and settings *should* reproduce the same sample. In practice it's best-effort:
+
+- A different model snapshot means different logits and different outputs.
+- **Batch invariance:** a request's logits can differ slightly depending on what else is in the server's batch, because GPU kernels reduce in different orders for different batch sizes. Thinking Machines Lab (Sept 2025, "Defeating Nondeterminism in LLM Inference") showed this, not random concurrency, is the main reason temperature-0 output varies on inference servers, and that batch-invariant kernels make it bitwise reproducible at a throughput cost. Hosted APIs generally don't offer that mode.
+- Once one token differs, everything after it can diverge.
+
+**Illustration** (the haiku text is made up; the behaviour is the point):
 
 ```python
-# Example: Temperature effect
 prompt = "Write a haiku about AI:"
-
-# temperature=0.0 (with seed=42):
-# "Silicon minds think\nProcessing data all day\nLearning, growing fast"
-# → Always outputs this exact haiku (greedy)
-
-# temperature=0.7 (with seed=42):
-# "Neural pathways gleam\nData flows through endless streams\nWisdom from machine"
-# → Same seed → same output. Change seed → different output.
-
-# temperature=0.7 (no seed):
-# → Different output each time
-
-# temperature=1.5:
-# "Electric dreams dance\nThrough circuits of pure logic\nChaos breeds insight"
-# → More creative, might produce unusual word choices
-
-# Recommened combinations:
-RECOMMENDED = {
-    "factual_qa": {"temperature": 0.0, "top_p": 1.0, "seed": None},
-    "code_generation": {"temperature": 0.1, "top_p": 0.9, "seed": 42},
-    "creative_writing": {"temperature": 0.9, "top_p": 0.95, "seed": None},
-    "summarization": {"temperature": 0.3, "top_p": 0.9, "seed": None},
-    "translation": {"temperature": 0.1, "top_p": 1.0, "seed": None},
-    "brainstorming": {"temperature": 1.2, "top_p": 0.9, "seed": None},
-}
+# Greedy / temperature≈0 (where supported): usually the same haiku, but not guaranteed.
+# temperature=0.7 + fixed seed (where supported): usually repeatable on the same snapshot.
+# temperature=0.7, no seed: a different haiku most of the time.
+# temperature=1.5: more unusual word choices, more risk of incoherence.
 ```
+
+**Starting points where the knobs exist** (tune one of temperature/top-p, then measure on your eval set):
+
+| Use case | Setting |
+|----------|---------|
+| Extraction, classification, code | Low temperature (≈0–0.2) |
+| Summarization, Q&A | Low to moderate (≈0.2–0.5) |
+| Creative writing, brainstorming | Higher (≈0.8–1.0+) |
+| Reasoning models | Leave sampling at provider defaults; use effort/thinking settings and prompting |
 
 **🔴 Follow-up:** *"How do you handle non-determinism in production testing?"*
 
-**✅ Answer:** Use **seed + temperature=0** for regression tests. For integration tests, run each test case 5 times at production temperature and measure the pass rate statistically. Accept only if pass rate > 0.8. This turns non-determinism into a statistical guarantee.
+**✅ Answer:** Don't rely on byte-for-byte equality.
+- **Unit tests of your code:** record/replay or mock the LLM so your logic is tested deterministically.
+- **Behavioural tests:** assert on properties (valid JSON against a schema, contains the required fields, cites a source, judge score above a bar), not on exact strings.
+- **Regression evals:** run each case several times and compare **pass rates** with a confidence interval between the old and new prompt/model; small eval sets can't detect small regressions.
+- **Pin model snapshots** and log the snapshot ID, settings and any `system_fingerprint` with every call, so a change in behaviour can be traced.
+- **When users need the same answer twice** (e.g. a compliance answer), cache and return the stored output rather than regenerating.
 
 ---
 
@@ -2156,175 +2062,67 @@ RECOMMENDED = {
 
 ### 🎯 Answer
 
-```python
-class CostOptimization:
-    """
-    Systematic approach to reducing LLM inference costs.
-    Ordered by ROI (highest first).
-    """
-    
-    @staticmethod
-    def get_optimizations() -> List[Optimization]:
-        return [
-            # 1. Prompt optimization (ROI: 40-60% reduction, effort: low)
-            Optimization(
-                name="Prompt compression",
-                description="Trim system prompts, compress conversation history, use shorter instructions",
-                effort="Low (1-2 days)",
-                savings="40-60% on prompt tokens",
-                implementation="""
-                # Before: 2000 token system prompt
-                system = "You are an expert assistant..."
-                
-                # After: 500 token system prompt
-                system = "You are an expert assistant. Be concise. Answer with only the facts."
-                
-                # Compress conversation history
-                # Before: full conversation (4000 tokens)
-                # After: summarized last N turns (1000 tokens)
-                
-                # Before: verbose output
-                "The answer to your question is that the capital of France is Paris."
-                
-                # After: concise output
-                "Paris"
-                """,
-                # ROI = savings / effort = 50% / 2 days = 25% per day
-            ),
-            
-            # 2. Caching (ROI: 30-50% reduction, effort: low)
-            Optimization(
-                name="Semantic caching",
-                description="Cache responses to similar queries. Use embedding similarity to detect cache hits.",
-                effort="Low (3-5 days)",
-                savings="30-50% of total queries",
-                implementation="""
-                Cache levels:
-                - L1: Exact match cache (identical query → same response)
-                - L2: Semantic cache (similar query → same response)
-                - L3: Prefix cache (common prefixes → reuse KV cache)
-                
-                Tools: Redis + vector similarity search
-                """
-            ),
-            
-            # 3. Model routing (ROI: 40-70% reduction, effort: medium)
-            Optimization(
-                name="Tiered model routing",
-                description="Route simple queries to cheap models, complex to expensive",
-                effort="Medium (1-2 weeks)",
-                savings="40-70% on total cost",
-                implementation="""
-                # Classifier → routes to model
-                if is_simple(query):
-                    model = "gpt-4o-mini"    # $0.15/M tokens
-                elif is_medium(query):
-                    model = "gpt-4o"          # $2.50/M tokens  
-                elif is_complex(query):
-                    model = "claude-3-opus"   # $15.00/M tokens
-                
-                # 60% of traffic → mini model (40% cost savings vs using gpt-4o for everything)
-                # 30% → gpt-4o
-                # 10% → opus
-                """
-            ),
-            
-            # 4. Output length control (ROI: 20-40% reduction, effort: low)
-            Optimization(
-                name="Output length optimization",
-                description="Reduce max_tokens, implement early stopping, prefer shorter responses",
-                effort="Low (1-2 days)",
-                savings="20-40% on completion tokens",
-                implementation="""
-                max_tokens: 2048 → 512
-                
-                prompt: "Answer in 2-3 sentences."
-                
-                Early stopping: stop generation when answer is complete
-                (use stop tokens: ["\n\n", "I hope this helps"])
-                """
-            ),
-            
-            # 5. Batching (ROI: 20-30% reduction, effort: medium)
-            Optimization(
-                name="Request batching",
-                description="Batch multiple requests into one API call (cost per token is ~40% lower)",
-                effort="Medium (1-2 weeks)",
-                savings="20-30% on API costs",
-                implementation="""
-                # Most providers charge less per token for batch API:
-                # OpenAI Batch API: 50% discount
-                # Anthropic Batch API: 50% discount
-                
-                # Collect requests over 1-minute window → send as batch
-                # Non-urgent queries → batch → 50% cheaper
-                # Urgent queries → real-time → full price
-                
-                # Trade-off: 10-60 minute latency for batch results
-                """
-            ),
-        ]
-    
-    @staticmethod
-    def get_highest_roi_optimizations() -> List[str]:
-        """
-        Highest ROI optimizations, ordered:
-        """
-        return [
-            "1. Prompt compression + caching: 2-3 days → 50-70% cost reduction",
-            "2. Model routing: 1-2 weeks → 40-70% cost reduction",
-            "3. Output length control: 1-2 days → 20-40% reduction",
-            "4. Batching: 1-2 weeks → 20-30% reduction",
-            "5. Fine-tuning smaller models: 2-4 weeks → 80-90% reduction",
-        ]
-```
+!!! tip "30-second answer"
+    First **attribute** the 40% before optimizing: cost = Σ (requests × (uncached input tokens × input price + cached tokens × cache price + output tokens incl. reasoning × output price)) per model. Find which term moved: more traffic (maybe fine), longer prompts, a lower prompt-cache hit rate, more output or reasoning tokens, a model-mix shift, retries, or agents taking more steps. Then pull levers in ROI order: fix the regression itself; **prompt caching** (structure prompts so the static prefix is reused); **trim tokens** (history, RAG chunks, tool definitions, verbose output); **route** easy traffic to a smaller model; move non-interactive work to the **batch API**; and only then fine-tuning/distillation or self-hosting.
 
-**Cost analysis framework:**
+**Step 1: Attribute the increase.**
 
 ```python
 class CostAnalysis:
     """
-    Break down the cost to find the biggest levers.
+    Break the bill down per (route/feature, model, tenant) and per token type.
+    Requires that every call logs: model snapshot, input/cached/output/reasoning
+    tokens, route, tenant, agent step, retry count.
     """
-    def analyze(self, cost_data: CostReport) -> Insights:
-        # Where is the money going?
-        by_model = cost_data.group_by("model")
-        by_endpoint = cost_data.group_by("endpoint")
-        by_user = cost_data.group_by("user")
-        
-        # Look for anomalies
+    def analyze(self, now: CostReport, before: CostReport) -> list[str]:
         insights = []
-        
-        # 1. Did prompt size grow?
-        avg_prompt_tokens = cost_data.avg("prompt_tokens")
-        if avg_prompt_tokens > 2000:
-            insights.append(f"High avg prompt size ({avg_prompt_tokens}). Consider compression.")
-        
-        # 2. Is everyone using the most expensive model?
-        expensive_model_usage = by_model["gpt-4o"].percentage
-        if expensive_model_usage > 0.8:
-            insights.append(f"80% of traffic uses expensive model. Route simple queries to cheaper model.")
-        
-        # 3. Are outputs longer than needed?
-        avg_completion = cost_data.avg("completion_tokens")
-        if avg_completion > 500:
-            insights.append(f"Avg output: {avg_completion} tokens. Reduce max_tokens.")
-        
-        # 4. Are there many duplicate queries?
-        duplicate_rate = cost_data.duplicate_query_rate()
-        if duplicate_rate > 0.2:
-            insights.append(f"{duplicate_rate:.0%} duplicate queries. Add caching.")
-        
-        return Insights(insights, total_savings=self.estimate_savings(insights))
+        for key in now.group_keys(["route", "model"]):
+            a, b = now[key], before.get(key)
+            if b is None:
+                insights.append(f"New spend: {key} ({a.cost:.0f})")
+                continue
+            # Which factor moved? requests, tokens/request, cache hit rate, price
+            if a.requests > 1.2 * b.requests:
+                insights.append(f"{key}: traffic up {a.requests / b.requests - 1:.0%}")
+            if a.input_tokens_per_req > 1.2 * b.input_tokens_per_req:
+                insights.append(f"{key}: prompts grew; check history/RAG/tool definitions")
+            if a.cache_hit_rate < b.cache_hit_rate - 0.1:
+                insights.append(f"{key}: prompt-cache hit rate fell; check prefix stability")
+            if a.output_tokens_per_req > 1.2 * b.output_tokens_per_req:
+                insights.append(f"{key}: outputs/reasoning grew; check max_tokens/effort")
+            if a.llm_calls_per_task > 1.2 * b.llm_calls_per_task:
+                insights.append(f"{key}: more calls per task; agent loops or retries")
+        return insights
 ```
+
+**Step 2: Levers, in rough ROI order.** Savings depend entirely on your traffic; the right-hand column says what drives them.
+
+| Lever | Effort | What determines the saving | Risk |
+|-------|--------|----------------------------|------|
+| **Revert the regression** (bloated prompt, broken cache prefix, extra agent step, retry storm) | Low | Whatever caused the 40% | Low |
+| **Prompt (prefix) caching** | Low | Share of input tokens that are a stable, repeated prefix | Low; quality unchanged |
+| **Token hygiene**: trim history, fewer/better RAG chunks, smaller tool definitions, concise output, cap `max_tokens` | Low–medium | Input/output token reduction | Quality regressions; run evals |
+| **Lower reasoning effort / thinking budget** for simple intents | Low | Reasoning tokens are billed as output | Quality on hard cases |
+| **Model routing / cascades** | Medium | Share of traffic a smaller model handles at acceptable quality; price gap between tiers (often ~10×) | Router mistakes; needs evals per route |
+| **Batch API** for offline work (evals, enrichment, backfills) | Low–medium | Batch discount (50% at OpenAI and Anthropic as of 2026), results within 24h (often much sooner) | Not for interactive traffic |
+| **Response caching** (exact, then semantic) | Medium | Repeat rate of safe, non-personalised questions | Stale or wrong-for-context answers |
+| **Fine-tune/distil a smaller model**, or self-host open weights | High | Volume; GPU utilisation if self-hosting | Ops burden, quality drift, retraining |
+
+**Prompt caching, the mechanism.** Providers cache the processed (KV) state of a prompt **prefix**. A later request that starts with exactly the same tokens skips recomputing them, so cached input is billed at a fraction of the normal input price and TTFT drops. Version-sensitive details (as of Oct 2026; check your provider's docs):
+
+| | OpenAI | Anthropic |
+|---|---|---|
+| How | Automatic on supported models; `prompt_cache_key` to improve routing/accounting | Explicit `cache_control` breakpoints (up to 4), or a single top-level automatic mode |
+| Read price | Fraction of input price (commonly 0.1×; lower on some models) | 0.1× base input on most models (lower on some newer ones) |
+| Write price | No surcharge on older models; 1.25× on the newest ones | 1.25× (5-minute TTL) or 2× (1-hour TTL) |
+| Minimum prefix | ~1,024 tokens (model-dependent) | 512–4,096 tokens depending on model |
+| Rate limits | Cached tokens still counted as input | Cache reads don't count toward input-tokens-per-minute limits |
+
+Because writes can cost more than uncached input, caching only pays when a prefix is reused within its TTL; a prefix written once and never read is a net loss. Design rules: put static content first (system prompt, tool definitions, shared documents) and variable content last; never put timestamps, request IDs or user names at the top; keep tool lists deterministic in order; monitor cached-token counts from the usage fields to verify hits.
 
 **🔴 Follow-up:** *"Which optimization gives the biggest ROI first?"*
 
-**✅ Answer:** **Prompt compression + caching**. It's the lowest effort (1-2 days), requires no infrastructure changes, and typically reduces costs by 40-60%. Specifically:
-1. Compress system prompts (remove verbose instructions, use concise language)
-2. Implement semantic caching (catch repeated/similar queries before hitting the LLM)
-3. Reduce max_tokens to match actual output needs
-4. These three together take 3 days and deliver 50-70% cost savings
+**✅ Answer:** Whatever **caused** the 40%, once attributed: usually a prompt that grew, a cache prefix that broke, more output/reasoning tokens, or more calls per task. After that, **prompt caching and token hygiene** are the cheapest wins because they need no quality trade-off or infrastructure; **routing** usually has the largest ceiling but needs per-route evals; the **batch API** is a near-free halving for anything not user-facing. Put a cost-per-successful-task metric and a budget alert on every route so the next 40% is caught in a day, not a billing cycle.
 
 ---
 
@@ -2334,7 +2132,10 @@ class CostAnalysis:
 
 ### 🎯 Answer
 
-This is a **distribution shift** problem — the testing environment doesn't match production. The fix is to systematically compare the two environments.
+!!! tip "30-second answer"
+    Treat it as **test/prod mismatch** and diff the two along three axes: **inputs** (length, language, multi-turn, topics your eval set never covered), **system** (model snapshot, prompt version, config, retrieval index, rate limits, concurrency, timeouts), and **behaviour** (error/timeout rate, refusals, tool-call failures, user corrections) sliced by input type. You can only do this if production requests are traced end to end with versions attached. The lasting fix is to feed sampled, labelled production failures back into the eval set.
+
+This is usually a **distribution shift** problem — the testing environment doesn't match production. The fix is to systematically compare the two environments.
 
 ```python
 class ProductionDebug:
@@ -2342,7 +2143,7 @@ class ProductionDebug:
     Systematic approach to debugging production-only failures.
     """
     
-    # Tier 1: Data distribution (most common cause)
+    # Tier 1: Data distribution (input mismatch)
     DATA_CHECKS = {
         "input_distribution": """
         Compare input distributions:
@@ -2375,7 +2176,7 @@ class ProductionDebug:
         """,
     }
     
-    # Tier 2: Latency and timeout (second most common)
+    # Tier 2: Latency, timeouts and rate limits under real load
     LATENCY_CHECKS = {
         "p95_latency": """
         Testing: consistent < 2s (local/CI environment)
@@ -2492,7 +2293,9 @@ CAUSES = {
 
 **🔴 Follow-up:** *"Which observability metrics do you check first?"*
 
-**✅ Answer:** The **three-cornered view**: (1) input distribution (length, vocabulary, complexity), (2) latency breakdown (network, queue, prefill, decode), and (3) error rate by input type. These three tell you immediately whether it's a data mismatch, a performance issue, or a model behavior issue. Within the first 5 minutes, you should know which of those three it is and where to start digging.
+**✅ Answer:** The **three-cornered view**: (1) input distribution (length, vocabulary, complexity), (2) latency breakdown (your pipeline vs model; TTFT vs decode; retries and 429s), and (3) error/quality rate by input type. These three tell you quickly whether it's a data mismatch, a performance issue, or a model behavior issue.
+
+The enabler is **LLM tracing**: one trace per request with spans for retrieval, each model call (model snapshot, prompt version, input/cached/output tokens, latency, finish reason), each tool call and each guardrail. OpenTelemetry's GenAI semantic conventions define standard attribute names for these spans (they now live in their own repository and are still evolving, so pin the version you emit), and most LLM observability tools ingest them. Mind privacy: prompts and outputs often contain PII, so redact or sample them and set retention.
 
 ---
 
@@ -2501,6 +2304,9 @@ CAUSES = {
 **Interviewer:** *"How do you evaluate an LLM in production?"*
 
 ### 🎯 Answer
+
+!!! tip "30-second answer"
+    Three loops. **Offline**: a versioned golden set built from real (sampled, labelled) traffic plus edge and adversarial cases, scored with code-based checks where possible and **LLM-as-judge** where not, run as a CI gate on every prompt/model/retrieval change. **Online**: trace everything, run cheap automated checks (groundedness, format, safety) on a sample of live traffic, and track user signals (acceptance, edits, regenerations, escalations); A/B or shadow-test changes. **Feedback**: route failures and disagreements to human review, and add them to the golden set. Judges must be calibrated against human labels or they quietly measure the wrong thing.
 
 ```python
 class ProductionEvaluation:
@@ -2620,24 +2426,30 @@ class OfflineMetrics:
     
     def _nli_entailment(self, answer: str, context: str) -> float:
         """
-        Use a Natural Language Inference model to check if the answer
-        is ENTAILED by the context (vs NEUTRAL or CONTRADICTION).
-        
-        Example:
-        Context: "Amazon's revenue in 2023 was $574 billion."
-        Answer: "Amazon's 2023 revenue was $574 billion."
-        → ENTAILMENT (score: 0.95)
-        
-        Answer: "Amazon's 2023 revenue was $500 billion."
-        → CONTRADICTION (score: 0.02)
-        
-        Answer: "Amazon is an e-commerce company."
-        → NEUTRAL (score: 0.50)
+        Use a Natural Language Inference model to get P(ENTAILMENT) of the
+        answer (hypothesis) given the context (premise).
+
+        Example (illustrative):
+        Context: "Amazon's net sales in 2023 were $574.8 billion."
+        "Amazon's 2023 revenue was about $575 billion."  → high P(entailment)
+        "Amazon's 2023 revenue was $500 billion."         → CONTRADICTION
+        "Amazon is an e-commerce company."                → NEUTRAL (not in context)
+
+        Caveats: MNLI models have a ~512-token input limit, so check claim by
+        claim against the most relevant chunk, not the whole context at once.
         """
-        nli_model = pipeline("text-classification", model="roberta-large-mnli")
-        result = nli_model(f"{context} </s> {answer}")
-        return result["score"] if result["label"] == "ENTAILMENT" else 1 - result["score"]
+        # Load once (e.g. in __init__), not per call:
+        # self.nli = pipeline("text-classification", model="roberta-large-mnli", top_k=None)
+        scores = self.nli({"text": context, "text_pair": answer})
+        return next(s["score"] for s in scores if s["label"] == "ENTAILMENT")
 ```
+
+**LLM-as-judge, used carefully.** Most production quality criteria (helpfulness, tone, policy compliance, groundedness of long answers) are scored by another model with a rubric. Make it trustworthy:
+
+- Give the judge a **specific rubric** and ask for a reason before the score; prefer binary or small-scale labels over 1–10.
+- **Calibrate** against a few hundred human labels and report agreement; re-check when you change the judge model.
+- Know the biases: **position bias** in pairwise comparisons (evaluate both orders), **verbosity bias**, and **self-preference** (a judge tends to favour outputs from its own model family).
+- Pin the judge's model snapshot and prompt version; a judge upgrade can shift every metric.
 
 **Hallucination detection without ground truth:**
 
@@ -2647,10 +2459,11 @@ class HallucinationDetector:
     Detect hallucinations when you don't have a ground truth answer.
     """
     
-    def __init__(self):
-        self.nli_model = pipeline("text-classification", 
-                                   model="microsoft/deberta-large-mnli")
-    
+    def __init__(self, model):
+        self.model = model
+        self.nli_model = pipeline("text-classification",
+                                  model="microsoft/deberta-large-mnli")
+
     def check_with_context(self, answer: str, context: str) -> Detection:
         """
         Method 1: Context-grounding check.
@@ -2658,10 +2471,11 @@ class HallucinationDetector:
         """
         claims = self._extract_claims(answer)
         verdicts = []
-        
+
         for claim in claims:
-            # Does context support this claim?
-            entailment = self.nli_model(f"{context} </s> {claim}")
+            # Does context support this claim? (premise=context, hypothesis=claim)
+            scores = self.nli_model({"text": context, "text_pair": claim}, top_k=None)
+            entailment = max(scores, key=lambda s: s["score"])   # top label
             
             if entailment["label"] == "CONTRADICTION":
                 verdicts.append(ClaimVerdict(claim, "CONTRADICTED", entailment["score"]))
@@ -2675,29 +2489,30 @@ class HallucinationDetector:
         unverifiable = [v for v in verdicts if v.status == "UNVERIFIABLE"]
         
         return Detection(
-            hallucination_probability=len(contradictions) / len(claims),
+            # Unverifiable claims also matter in RAG: anything not supported
+            # by the context is ungrounded, even if it happens to be true.
+            hallucination_probability=len(contradictions) / max(len(claims), 1),
             contradictions=contradictions,
             unverifiable_claims=unverifiable,
             verdict="HALLUCINATION" if len(contradictions) > 0 else "LIKELY_GROUNDED"
         )
     
-    def check_without_context(self, answer: str, n_samples: int = 5) -> Detection:
+    def check_without_context(self, question: str, n_samples: int = 5) -> Detection:
         """
-        Method 2: Self-consistency check (no context needed).
-        Generate multiple answers at higher temperature, check for contradictions.
+        Method 2: Self-consistency check (no context needed; SelfCheckGPT-style).
+        Re-ask the ORIGINAL question several times (sampling on) and check
+        whether the answers agree with each other.
         """
-        # Generate N versions
-        versions = [
-            self.model.generate(f"Answer: {answer}", temperature=0.7)
-            for _ in range(n_samples)
-        ]
-        
-        # Check if versions agree
+        versions = [self.model.generate(question) for _ in range(n_samples)]
+
+        # Pairwise agreement = P(entailment) between answers
         pairwise_agreement = []
         for i in range(n_samples):
-            for j in range(i+1, n_samples):
-                entailment = self.nli_model(f"{versions[i]} </s> {versions[j]}")
-                pairwise_agreement.append(entailment["score"])
+            for j in range(i + 1, n_samples):
+                scores = self.nli_model({"text": versions[i], "text_pair": versions[j]},
+                                        top_k=None)
+                pairwise_agreement.append(
+                    next(s["score"] for s in scores if s["label"] == "ENTAILMENT"))
         
         avg_agreement = sum(pairwise_agreement) / len(pairwise_agreement)
         
@@ -2758,9 +2573,9 @@ class EvalDashboard:
 **✅ Answer:** Three complementary methods:
 1. **Context-grounding (NLI)**: extract claims from the answer, check each against the provided context using an NLI model. If claims are contradicted or unsupported by context, flag as hallucination.
 2. **Self-consistency**: generate 3-5 answers at higher temperature, check semantic agreement. If they disagree significantly, the model is uncertain and likely hallucinating.
-3. **Semantic entropy**: compute the entropy of the token probabilities for the key claims in the output. High entropy = uncertain = likely hallucination.
+3. **Semantic entropy**: sample several answers, cluster them by meaning (bidirectional entailment), and compute entropy over the clusters, not over raw token probabilities. High entropy = the model gives semantically different answers = likely confabulation. (Token-level entropy/log-probs are a cheaper, weaker signal, and only available where the API exposes them.)
 
-Combine all three for a robust real-time hallucination detector that works without any ground truth.
+Combine them, but be honest about cost: methods 2 and 3 multiply inference spend, so run them on high-risk intents or a sample of traffic, and validate every detector against human labels before using it as a gate.
 
 ---
 
@@ -2770,15 +2585,21 @@ Combine all three for a robust real-time hallucination detector that works witho
 
 ### 🎯 Answer
 
+!!! tip "30-second answer"
+    MCP standardises how an AI host (the app running the model) discovers and calls **tools**, reads **resources** and uses **prompts** exposed by MCP servers, over stdio locally or **Streamable HTTP** remotely. MCP itself is not a security boundary, so the enterprise design puts an **MCP gateway** in front of an **allowlisted registry** of vetted servers: OAuth 2.1 authentication with audience-bound tokens (no token passthrough), per-user/per-tool authorization and schema validation, human approval for write/destructive tools, DLP on inputs and outputs, rate limits, and an audit trail with OpenTelemetry traces. Treat tool descriptions and tool output as untrusted input to the model (tool poisoning, indirect prompt injection).
+
+!!! note "MCP spec status (as of October 2026)"
+    The current revision is **2026-07-28** (previous: 2025-11-25); MCP is now governed under the Linux Foundation's Agentic AI Foundation. The 2026-07-28 revision makes the protocol **stateless**: no `initialize` handshake and no `Mcp-Session-Id` (each request carries its protocol version and capabilities in `_meta`; servers that need cross-call state mint explicit handles), a new `server/discover` RPC, `subscriptions/listen` for change notifications, server-initiated requests replaced by a multi-round-trip "input required" pattern, tasks moved to an official extension, and Roots, Sampling and Logging deprecated. Authorization keeps the OAuth 2.1 model (MCP servers are resource servers; clients use resource indicators so tokens are audience-bound) and now prefers Client ID Metadata Documents over Dynamic Client Registration. Statelessness makes MCP servers much easier to put behind ordinary load balancers and gateways.
+
 ```python
 class EnterpriseMCPApplication:
     """
-    Enterprise MCP-based AI application with security, 
+    Enterprise MCP-based AI application with security,
     permission management, and memory isolation.
-    
-    MCP (Model Context Protocol): Standard protocol for AI models
-    to interact with tools, data sources, and services through
-    a secure, governed interface.
+
+    MCP (Model Context Protocol): open protocol for connecting AI
+    applications to tools, data sources and services. Governance
+    (auth, policy, audit) is the deployer's job, which is what this design adds.
     """
     
     def __init__(self, config: EnterpriseConfig):
@@ -2810,6 +2631,13 @@ class MCPGateway:
     """
     Central gateway that all MCP requests flow through.
     Provides auth, routing, rate limiting, and audit.
+    (Simplified: on the wire this is a JSON-RPC `tools/call` request.)
+
+    Token rule: validate that the incoming token was issued FOR the gateway
+    (audience check), and never forward it downstream. Obtain a separate,
+    narrowly scoped credential for each upstream server/API (e.g. OAuth token
+    exchange). Forwarding the client's token ("token passthrough") is
+    forbidden by the MCP spec and creates confused-deputy bugs.
     """
     def __init__(self):
         self.servers = {}       # Registered MCP servers
@@ -2844,7 +2672,9 @@ class MCPGateway:
         # 5. Execute with audit trail
         self.audit.log_start(identity, request)
         try:
-            response = await server.call_tool(request.tool_name, request.params)
+            upstream_cred = await self.credentials.for_server(identity, server)  # not request.token
+            response = await server.call_tool(request.tool_name, request.params,
+                                              credential=upstream_cred)
             self.audit.log_success(identity, request, response)
             return response
         except Exception as e:
@@ -2864,50 +2694,71 @@ class ToolPolicyEngine:
             # Read-only tools: anyone with 'read' role
             "search_documents": ToolPolicy(
                 allowed_roles=["viewer", "editor", "admin"],
-                param_validation={
-                    "query": {"type": "string", "max_length": 500},
-                    "max_results": {"type": "integer", "min": 1, "max": 50},
+                param_schema={   # real JSON Schema keywords
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "maxLength": 500},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
                 },
                 rate_limit=100,
                 requires_approval=False,
             ),
-            
+
             # Write tools: restricted + approval required
             "update_document": ToolPolicy(
                 allowed_roles=["editor", "admin"],
-                param_validation={
-                    "document_id": {"type": "string", "pattern": "^doc_[a-z0-9]+$"},
-                    "content": {"type": "string", "max_length": 10000},
+                param_schema={
+                    "type": "object",
+                    "properties": {
+                        "document_id": {"type": "string", "pattern": "^doc_[a-z0-9]+$"},
+                        "content": {"type": "string", "maxLength": 10000},
+                    },
+                    "required": ["document_id", "content"],
+                    "additionalProperties": False,
                 },
                 rate_limit=30,
                 requires_approval=True,  # Human must approve
             ),
-            
+
             # Destructive tools: admin only + always requires approval
             "delete_document": ToolPolicy(
                 allowed_roles=["admin"],
-                param_validation={
-                    "document_id": {"type": "string", "pattern": "^doc_[a-z0-9]+$"},
-                    "reason": {"type": "string", "required": True},
+                param_schema={
+                    "type": "object",
+                    "properties": {
+                        "document_id": {"type": "string", "pattern": "^doc_[a-z0-9]+$"},
+                        "reason": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["document_id", "reason"],
+                    "additionalProperties": False,
                 },
                 rate_limit=5,
                 requires_approval=True,
             ),
-            
+
             # External API calls: restricted with allowlist
             "call_external_api": ToolPolicy(
                 allowed_roles=["admin"],
-                param_validation={
-                    "url": {"type": "string", "pattern": "^https://api\.company\.com/.*$"},
-                    "method": {"type": "string", "enum": ["GET", "POST"]},
+                param_schema={
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "format": "uri"},
+                        "method": {"type": "string", "enum": ["GET", "POST"]},
+                    },
+                    "required": ["url", "method"],
+                    "additionalProperties": False,
                 },
                 rate_limit=20,
                 requires_approval=True,
-                # Only allow calls to company's own APIs
-                url_allowlist=["https://api.company.com/*"],
+                # Only allow calls to the company's own API host (checked on the
+                # PARSED URL, not with a glob/regex over the raw string)
+                allowed_hosts={"api.company.com"},
             ),
         }
-    
+
     async def evaluate(self, user: User, tool_name: str, 
                        params: dict) -> PolicyDecision:
         policy = self.policies.get(tool_name)
@@ -2927,14 +2778,16 @@ class ToolPolicyEngine:
         except jsonschema.ValidationError as e:
             return PolicyDecision(allowed=False, reason=f"Invalid params: {e}")
         
-        # Check URL allowlist (if applicable)
-        if policy.url_allowlist and "url" in params:
-            if not any(fnmatch(params["url"], pattern) 
-                      for pattern in policy.url_allowlist):
+        # Check destination allowlist (if applicable)
+        if policy.allowed_hosts and "url" in params:
+            u = urllib.parse.urlsplit(params["url"])
+            if u.scheme != "https" or u.hostname not in policy.allowed_hosts:
                 return PolicyDecision(
-                    allowed=False, 
-                    reason=f"URL not in allowlist: {params['url']}"
+                    allowed=False,
+                    reason=f"Destination not allowed: {u.hostname}"
                 )
+            # Also enforce egress at the network layer; DNS rebinding and
+            # redirects can defeat app-level checks alone.
         
         return PolicyDecision(
             allowed=True,
@@ -2949,7 +2802,9 @@ class DataLossPrevention:
     """
     Prevents sensitive data from being leaked through MCP responses.
     """
-    def __init__(self):
+    def __init__(self, config, audit: AuditLogger):
+        self.config = config
+        self.audit = audit
         self.pii_detector = PIIDetector()
         self.allowlist = DataAllowlist()
     
@@ -2980,6 +2835,10 @@ class DataLossPrevention:
     def scan_input(self, user_input: str) -> InputVerdict:
         """
         Check user input for prompt injection or sensitive data leaks.
+        A keyword list only catches naive attacks (paraphrases, other languages,
+        encodings and injections hidden in documents get through). Use it for
+        telemetry, add a trained injection classifier, and rely on least
+        privilege + approvals for actual safety.
         """
         # Check for prompt injection patterns
         injection_patterns = [
@@ -3014,11 +2873,16 @@ class DataLossPrevention:
 class EnterpriseMemory:
     """
     Multi-tenant memory with encryption and strict isolation.
+
+    Simplified: one Fernet key (AES-128-CBC + HMAC-SHA256, from the
+    `cryptography` package; key = 32 url-safe base64-encoded bytes).
+    Production: envelope encryption with a per-tenant data key from a KMS
+    (e.g. AES-256-GCM), so one tenant's key can be rotated or revoked
+    (crypto-shredding) without touching others.
     """
-    def __init__(self, backend: str, encryption_key: str):
-        self.backend = backend
-        self.encryption_key = encryption_key
-        self.cipher = Fernet(encryption_key.encode())
+    def __init__(self, backend, encryption_key: bytes):
+        self.backend = backend          # DB client, e.g. Postgres + pgvector
+        self.cipher = Fernet(encryption_key)
     
     async def store(self, tenant_id: str, user_id: str, 
                     key: str, value: dict, ttl_days: int = 30):
@@ -3032,7 +2896,7 @@ class EnterpriseMemory:
         await self.backend.execute("""
             INSERT INTO agent_memory 
             (tenant_id, user_id, key, encrypted_value, expires_at)
-            VALUES (:tenant, :user, :key, :value, NOW() + :ttl_days)
+            VALUES (:tenant, :user, :key, :value, NOW() + CAST(:ttl_days AS INTERVAL))
             ON CONFLICT (tenant_id, user_id, key) 
             DO UPDATE SET encrypted_value = :value, 
                           updated_at = NOW()
@@ -3071,6 +2935,9 @@ class EnterpriseMemory:
                      query: str, top_k: int = 5) -> List[Memory]:
         """
         Semantic search across memory — WITHIN tenant + user scope ONLY.
+        Note: the embeddings themselves can't be encrypted if the DB must
+        search them, and embeddings can be partially inverted back to text,
+        so treat the vector index as sensitive data too.
         """
         query_vector = embed(query)
         
@@ -3134,7 +3001,7 @@ class MCPAgent:
             
             if action.type == "tool_call":
                 # DLP check on input
-                input_verdict = self.dlp.scan_input(action.params)
+                input_verdict = self.dlp.scan_input(json.dumps(action.params))
                 if not input_verdict.safe:
                     return Output(
                         error=f"Input blocked: {input_verdict.reason}"
@@ -3165,19 +3032,22 @@ class MCPAgent:
 **✅ Answer:**
 
 **Tools security:**
-1. **Schema validation**: every tool has a JSON Schema that parameter types and ranges must match. Reject calls that don't match.
-2. **URL allowlisting**: external API tools can only call pre-approved domains/endpoints.
-3. **Read-only by default**: all tools are read-only unless explicitly marked write/destructive.
-4. **Human-in-loop**: write and destructive operations require explicit human approval before execution.
-5. **Rate limiting**: per-tool, per-user, per-tenant rate limits prevent abuse.
+1. **Server allowlist and supply chain**: only vetted, version-pinned MCP servers from an internal registry; review tool descriptions on every update, because a server can change them after approval ("rug pull") or hide instructions in them ("tool poisoning").
+2. **Schema validation**: every tool has a JSON Schema that parameters must match; reject calls that don't.
+3. **Destination allowlisting**: external API tools can only reach pre-approved hosts, enforced on the parsed URL and at the network egress layer.
+4. **Read-only by default**: all tools are read-only unless explicitly marked write/destructive. MCP tool annotations such as `readOnlyHint`/`destructiveHint` are hints from the server, so don't trust them from untrusted servers; your own policy decides.
+5. **Human-in-loop**: write and destructive operations require explicit human approval before execution.
+6. **Rate limiting**: per-tool, per-user, per-tenant rate limits prevent abuse.
+7. **Isolation for local servers**: stdio servers run as local processes with the user's privileges, so sandbox them (container, restricted filesystem and network).
 
 **Permissions (RBAC):**
 1. **Role-based access**: viewer < editor < admin. Each role has a defined set of allowed tools.
-2. **Tenant isolation**: every query includes tenant_id. Databases and vector stores are partitioned by tenant.
-3. **Audit trail**: every tool call is logged with user, timestamp, params, and response. Immutable log.
+2. **Act as the user**: OAuth 2.1 with audience-bound tokens; the gateway exchanges the user's token for narrowly scoped upstream credentials, so the agent can never exceed the user's own permissions and the upstream audit log shows the real user.
+3. **Tenant isolation**: every query includes tenant_id, enforced by the data layer (row-level security, per-tenant indexes), not by the prompt.
+4. **Audit trail**: every tool call is logged with user, timestamp, params, and response in an append-only store, with trace IDs propagated into MCP requests (the 2026-07-28 spec documents W3C trace context in `_meta`).
 
 **Memory security:**
-1. **Encryption at rest**: all persistent memory is encrypted with tenant-specific keys (AES-256-GCM).
+1. **Encryption at rest**: persistent memory is encrypted with per-tenant data keys from a KMS (envelope encryption), so a tenant's data can be crypto-shredded by destroying its key.
 2. **TTL-based expiration**: memory automatically expires after configurable TTL (default 30-90 days).
 3. **Strict scoping**: queries are scoped to tenant_id + user_id. One tenant can never see another tenant's memory.
 4. **PII redaction**: memory content is scanned for PII before storage. PII can be redacted or excluded.
@@ -3192,7 +3062,7 @@ class MCPAgent:
 | **Debugging methodology** | Can identify the failure type | Systematic approach: isolate → diagnose → fix, with concrete tools at each step |
 | **RAG architecture** | Understands retrieval and generation pipeline | Deep knowledge of chunking, embedding, retrieval, re-ranking trade-offs |
 | **Production monitoring** | Mentions latency and error rate | Full observability stack: input distribution, calibration, faithfulness, drift detection |
-| **Cost optimization** | Knows about prompt compression | Multi-tier strategy: compression + caching + routing + model selection |
+| **Cost optimization** | Knows about prompt compression | Attributes the increase first; then prompt caching, token budgets, routing, batch API, with evals guarding quality |
 | **Safety & security** | Mentions prompt injection | Defense-in-depth: input validation, RBAC, tenant isolation, encryption, human-in-loop |
 | **Enterprise concerns** | Mentions auth | Full enterprise stack: multi-tenancy, audit, compliance, data retention, SLA management |
 

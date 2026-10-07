@@ -4,8 +4,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Optional
 
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_core.documents import Document as LCDocument
+from langchain_community.document_loaders import PyPDFLoader
 
 
 class Document:
@@ -33,36 +32,23 @@ class DocumentLoader(ABC):
         pass
 
     def load_directory(self, directory: str) -> List[Document]:
-        """Load all supported documents from a directory."""
+        """Load all supported documents under a directory (recursively).
+
+        Dispatches on file extension, so it works whichever concrete loader
+        it is called on.
+        """
         docs = []
-        path = Path(directory)
-        for file_path in path.rglob("*"):
-            if file_path.is_file() and self._is_supported(file_path.suffix):
+        for file_path in sorted(Path(directory).rglob("*")):
+            if file_path.is_file() and is_supported(file_path.suffix):
                 try:
-                    loaded = self._get_loader(file_path.suffix).load(
-                        str(file_path))
-                    docs.extend(loaded)
+                    docs.extend(loader_for(str(file_path)).load(str(file_path)))
                 except Exception as e:
                     print(f"⚠️ Error loading {file_path}: {e}")
         return docs
 
-    def _is_supported(self, suffix: str) -> bool:
-        return suffix.lower() in {".pdf", ".txt", ".md", ".html", ".htm"}
-
-    def _get_loader(self, suffix: str) -> "DocumentLoader":
-        loaders = {
-            ".pdf": PDFLoader,
-            ".txt": TextFileLoader,
-            ".md": TextFileLoader,
-            ".html": HTMLLoader,
-            ".htm": HTMLLoader,
-        }
-        loader_class = loaders.get(suffix.lower(), TextFileLoader)
-        return loader_class()
-
 
 class PDFLoader(DocumentLoader):
-    """Loads PDF documents using PyMuPDF via LangChain."""
+    """Loads PDF documents page by page (pypdf via LangChain's PyPDFLoader)."""
 
     def load(self, path: str) -> List[Document]:
         loader = PyPDFLoader(path)
@@ -91,7 +77,7 @@ class TextFileLoader(DocumentLoader):
         return [Document(
             content=content,
             source=path,
-            metadata={"source": path, "type": path.split(".")[-1]}
+            metadata={"source": path, "type": Path(path).suffix.lstrip(".")}
         )]
 
 
@@ -106,7 +92,9 @@ class HTMLLoader(DocumentLoader):
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
         content = soup.get_text(separator="\n", strip=True)
-        title = soup.title.string if soup.title else ""
+        # soup.title.string is None when <title> is empty or has child tags;
+        # Chroma rejects None metadata values, so coerce to "".
+        title = (soup.title.string or "") if soup.title else ""
         return [Document(
             content=content,
             source=path,
@@ -116,3 +104,24 @@ class HTMLLoader(DocumentLoader):
                 "type": "html",
             }
         )]
+
+
+_LOADERS = {
+    ".pdf": PDFLoader,
+    ".txt": TextFileLoader,
+    ".md": TextFileLoader,
+    ".html": HTMLLoader,
+    ".htm": HTMLLoader,
+}
+
+
+def is_supported(suffix: str) -> bool:
+    return suffix.lower() in _LOADERS
+
+
+def loader_for(path: str) -> DocumentLoader:
+    """Factory: pick the loader for a file by its extension."""
+    suffix = Path(path).suffix.lower()
+    if suffix not in _LOADERS:
+        raise ValueError(f"Unsupported file type: {suffix or '(none)'}")
+    return _LOADERS[suffix]()

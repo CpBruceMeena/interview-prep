@@ -1,12 +1,15 @@
 # 🤖 AI Agent Fundamentals — Architectures, Patterns & Orchestration
 
-> **Target:** Staff/Principal Engineer | **Focus:** Production-grade agent system design from first principles
+> **Target:** Staff/Principal Engineer | **Focus:** Production-grade agent system design from first principles | **Reviewed:** October 2026
 
 ---
 
 ## 1. WHAT IS AN AI AGENT?
 
-An **AI agent** is an autonomous system that uses an LLM to reason, plan, and execute actions in pursuit of a goal. Unlike a simple chatbot that generates text, an agent can:
+!!! tip "30-second answer"
+    An agent is **an LLM running in a loop that chooses its own next action**: it reads the goal and the context, emits a tool call (structured JSON the runtime executes), sees the result, and repeats until it decides it is done or hits a budget. The model supplies the *decisions*; your code supplies the tools, the loop, the limits, the state and the permissions. Most of the engineering is in the second half.
+
+An **AI agent** is a system that uses an LLM to reason, plan, and execute actions in pursuit of a goal. Unlike a chatbot that only generates text, an agent can:
 
 - **Reason** about its goal and break it into sub-tasks
 - **Use tools** to interact with external systems (databases, APIs, file systems)
@@ -52,6 +55,40 @@ User Goal
 
 **Rule of thumb:** Start with a workflow. Graduate to an agent only when the problem requires dynamic decision-making that can't be pre-programmed.
 
+The useful vocabulary (from Anthropic's *Building effective agents*, now widely used) is a ladder of increasing autonomy:
+
+| Rung | Who decides the control flow | Example |
+|------|------------------------------|---------|
+| Single LLM call (+ retrieval) | Your code | Classify a ticket |
+| **Prompt chaining** | Your code, fixed sequence | Draft → check → translate |
+| **Routing** | LLM picks one of N fixed paths | Send billing questions to the billing prompt |
+| **Parallelization** | Your code fans out, then votes or merges | Run 3 graders, take the majority |
+| **Orchestrator-workers** | LLM decomposes, code runs the workers | Multi-file code change |
+| **Evaluator-optimizer** | LLM critiques and retries | Translation with a reviewer |
+| **Agent** | LLM decides every step and when to stop | Open-ended debugging |
+
+Every rung up buys flexibility and costs predictability, latency, tokens and testability. In an interview, justify the rung you pick.
+
+### 1.2 How a tool call actually works
+
+The model never executes anything. With native tool calling (Anthropic Messages `tools`, OpenAI Responses/Chat Completions `tools`), the loop is:
+
+```
+1. Request: system prompt + messages + tool definitions (name, description, JSON Schema)
+2. Model reply: a structured tool call {id, name, arguments}  (stop_reason "tool_use" on Anthropic)
+3. Your runtime: validate args → authorize → execute → capture result or error
+4. Next request: append the model's tool call AND a tool result that references its id
+5. Repeat until the model replies with plain text (no tool call) or you hit a limit
+```
+
+Consequences interviewers probe:
+
+- **The API is stateless.** The whole transcript, including every tool result, is resent each turn, so cost grows roughly quadratically with turn count unless you use prompt caching, result truncation or compaction.
+- **Tool definitions are prompt.** Names, descriptions and schemas consume tokens on every call and steer selection quality more than almost anything else.
+- **Parallel tool calls:** one model turn can request several tools; run them concurrently and return all results together in the next message.
+- **Errors are observations.** Return a tool error as a result (Anthropic: `is_error: true`) so the model can recover, rather than crashing the loop.
+- **Schema guarantees:** strict/structured modes (Anthropic `strict: true`, OpenAI `strict` function schemas) make arguments schema-valid, but not *correct*; still validate business rules server-side.
+
 ---
 
 ## 2. CORE AGENT ARCHITECTURES
@@ -71,7 +108,11 @@ Loop:
 
 **When to use:** Interactive problem-solving, debugging, customer support — any scenario where the agent needs to adapt based on intermediate results.
 
-**Key consideration:** The agent can loop indefinitely if not bounded. Always set `max_steps`.
+**Key consideration:** The agent can loop indefinitely if not bounded. Always set a step limit *and* a token/cost budget.
+
+**Then vs now:** the original ReAct paper (Yao et al., 2022) had the model write `Thought:` / `Action:` text that the harness parsed. Today the "Action" is a native structured tool call and the "Thought" is either visible text or the model's built-in reasoning (Anthropic adaptive thinking, OpenAI reasoning models). The loop is the same; the parsing failure mode is gone.
+
+**Failure modes:** repeating the same failing call (detect identical consecutive calls), drifting off-goal over long runs (restate the goal, keep a task list in state), and acting on stale or injected tool output (treat tool results as untrusted data).
 
 ### 2.2 Plan-and-Execute
 
@@ -99,6 +140,8 @@ Phase 2 — Execute:
 
 **Disadvantage:** The plan may be wrong from the start, wasting time on a bad plan.
 
+**Fix in practice:** allow *re-planning* when a step fails or an observation contradicts the plan, and use a cheaper model for executing well-specified steps while the stronger model plans.
+
 ### 2.3 Orchestrator-Worker
 
 A central **orchestrator** agent decomposes tasks and delegates to specialized **worker** agents.
@@ -121,6 +164,8 @@ A central **orchestrator** agent decomposes tasks and delegates to specialized *
 
 **Key challenge:** Workers can run in parallel or sequentially, and the orchestrator must merge results coherently.
 
+**Why it works:** each worker gets a fresh, focused context window instead of one context bloated with every intermediate result. **Why it costs:** tokens multiply. Anthropic reported its multi-agent research system used roughly 15x the tokens of a chat interaction, so it only pays off for high-value, parallelizable tasks. Workers also lose context the orchestrator had, so the delegation message must be self-contained (objective, output format, boundaries, tools).
+
 ### 2.4 Reflection (Critic-Refiner)
 
 A two-agent loop where a **producer** generates output and a **critic** evaluates it against quality rubrics.
@@ -135,7 +180,7 @@ Loop:
 
 **When to use:** Code generation, writing, any task where quality iteration matters more than speed.
 
-**Trade-off:** 2-3x latency cost for significant quality improvement.
+**Trade-off:** each critique round adds a full generate-and-review cycle of latency and tokens. It helps most when the critic has a signal the producer lacked: tests to run, a linter, a rubric, retrieved sources. A critic that is the same model with no new information often just rubber-stamps or churns. Cap the rounds.
 
 ### 2.5 Memory-Augmented Agent
 
@@ -176,13 +221,15 @@ class ToolSpec:
     rate_limit_rps: float = 10     # Max calls per second
 ```
 
+**Tool design matters more than the loop.** Fewer, well-scoped tools beat many overlapping ones; names and descriptions should say *when* to use the tool and what it returns; return concise, high-signal results (paginate or summarize large payloads) because every byte goes back into the context. With very large tool catalogues, load tools on demand (tool search) instead of sending every schema on every call.
+
 ### 3.2 Tool Categories
 
 | Category | Examples | Security Model |
 |----------|----------|---------------|
 | **Read-only** | `query_database`, `read_file`, `search_web` | Read-only credentials, output filtering |
 | **Write** | `send_email`, `create_ticket`, `update_record` | Human approval for high-impact writes |
-| **Idempotent** | `set_status`, `cache_clear` | Safe to retry, no side effects |
+| **Idempotent** | `set_status("closed")`, `upsert_record` | Has side effects, but repeating the call gives the same end state, so it is safe to retry. Make non-idempotent writes retry-safe with an idempotency key |
 | **Destructive** | `delete_record`, `drop_table` | Always requires human approval |
 
 ### 3.3 Tool Call Lifecycle
@@ -221,8 +268,9 @@ LLM decides to call tool
 The LLM's context window. Managed via:
 
 - **Sliding window:** Keep last N turns, drop oldest
-- **Summary compression:** Summarize early turns into a single bullet
-- **Token budget:** Reserve 70% for tools/results, 30% for conversation
+- **Summary compression (compaction):** Summarize early turns; some APIs now do this server-side (e.g. Anthropic's compaction beta)
+- **Tool-result clearing:** Drop or truncate old, bulky tool outputs once they have been used (Anthropic "context editing")
+- **Token budget:** Cap each section (system, tools, retrieved docs, history, tool results) explicitly. The split is workload-specific; measure rather than copying a fixed ratio. Leave headroom for the response and reasoning tokens
 
 ### 4.2 Working Memory (Task Context)
 
@@ -235,7 +283,7 @@ class WorkingMemory:
     completed_steps: List[str]
     remaining_steps: List[str]
     intermediate_results: Dict[str, Any]
-    errors_encountered: List[str]
+    errors: List[str]
 ```
 
 ### 4.3 Long-Term Memory (Persistent Facts)
@@ -266,6 +314,8 @@ class LongTermMemory:
         # Encode query, find nearest neighbors in vector space
         pass
 ```
+
+Two rules that interviewers check: **scope long-term memory per user/tenant** (a shared store leaks data across users), and **treat writes to memory as a security boundary** (an injected instruction saved as a "fact" will be replayed into every future session: memory poisoning).
 
 ### 4.4 Episodic Memory (Past Resolutions)
 
@@ -328,31 +378,53 @@ Synthesizer: "For this use case (heterogeneous document data with infrequent joi
        └─────────┘   └─────────┘    └─────────┘
 ```
 
+Deep org-chart hierarchies look appealing but compound errors and latency at every level, and each hand-off loses context. In practice, one level of orchestrator → workers covers most real systems; add depth only with evidence.
+
 ---
 
 ## 6. AGENT FRAMEWORKS COMPARISON (2026)
 
-| Framework | Pattern | Best For | Protocol Support |
-|-----------|---------|----------|-----------------|
-| **LangGraph** | Graph-based state machine | Regulated production systems | MCP, custom |
-| **CrewAI** | Role-based orchestration | Fast prototyping | MCP |
-| **OpenAI Agents SDK** | Built-in tool use | GPT-native workflows | OpenAI tools |
-| **Pydantic AI** | Type-safe agents | Engineering rigor, reliability | MCP, custom |
-| **Google ADK** | Hierarchical agents | GCP-native, multimodal | MCP |
+Frameworks churn quickly; know the *shape* of each and why you would pick one, not version trivia.
+
+| Framework | Model | Best for | Notes |
+|-----------|-------|----------|-------|
+| **LangGraph** (1.x) | Explicit graph/state machine with checkpointing | Long-running, resumable, human-in-the-loop workflows | Durable state per `thread_id`, `interrupt()` for approvals. LangChain v1's `create_agent` runs on it |
+| **OpenAI Agents SDK** | Agents + tools + handoffs + guardrails + tracing | Multi-agent handoffs, quick start on OpenAI's Responses API | Supports MCP servers; other providers via adapters |
+| **Claude Agent SDK** (Anthropic) | The Claude Code harness as a library: built-in file/shell/web tools, subagents, hooks | Coding and file-system agents on your own infra | MCP-native. Distinct from the Messages API "tool runner" helper |
+| **Google ADK** | Hierarchical agents, workflow agents | GCP/Vertex-centric stacks | MCP and A2A support |
+| **Pydantic AI** | Type-safe agents, validated structured outputs | Python teams that want typing and testability | Provider-agnostic, MCP support |
+| **CrewAI** | Role-based crews | Fast prototyping of role-play multi-agent flows | Less control over the loop |
+| **No framework** | Your own `while` loop over the provider SDK | Simple agents, maximum control and debuggability | Often the right answer: the loop is ~50 lines |
+
+**What interviewers probe:** "Why a framework at all?" Good answer: you want durable state, resumability, human approval, streaming and tracing without building them. Bad answer: "because everyone uses it". The cost is abstraction you must debug through and churn you must track.
+
+**Protocols to name:** **MCP** (Model Context Protocol) standardizes how an agent host connects to tool/data servers (tools, resources, prompts) over stdio or Streamable HTTP; it turns N agents × M tools integrations into N + M. **A2A** (Agent2Agent) targets agent-to-agent delegation across vendors. Neither does orchestration for you.
 
 ---
 
 ## 7. PRODUCTION READINESS CHECKLIST
 
-| Requirement | Check | Implementation |
-|------------|-------|---------------|
-| **Max step limit** | ✅ | `max_iterations=25` prevents infinite loops |
-| **Human-in-the-loop** | ✅ | Approval for high-impact actions |
-| **Rate limiting** | ✅ | Per-client token bucket |
-| **Observability** | ✅ | Full trace logging of every decision |
-| **Error recovery** | ✅ | Retry with backoff, circuit breaker |
-| **Token budgeting** | ✅ | Context window management |
-| **Testing harness** | ✅ | Automated evaluation of agent outputs |
+| Requirement | Implementation |
+|------------|---------------|
+| **Bounded execution** | Step limit (tuned per task, often 10-30) plus a token/cost budget and a wall-clock timeout |
+| **Human-in-the-loop** | Approval gate for irreversible or high-impact actions; durable pause/resume |
+| **Least privilege** | Per-tool scoped credentials, per-user authorization, no ambient admin tokens |
+| **Prompt-injection posture** | Treat tool output and retrieved text as untrusted data; separate read and write tools; confirm side effects |
+| **Rate limiting** | Per-user and per-provider limits; backoff on 429s |
+| **Observability** | Trace every model call and tool call (OpenTelemetry GenAI conventions), with tokens, latency, cost |
+| **Error recovery** | Retry transient errors with backoff and jitter; idempotency keys on writes; circuit breakers on flaky tools |
+| **Context management** | Caching of stable prefixes, truncation/compaction of history and tool results |
+| **Evaluation** | Offline eval set (task success, trajectory checks) run in CI on every prompt/model/tool change, plus online monitoring |
+
+---
+
+## 8. WHAT INTERVIEWERS PROBE NEXT
+
+- **"Workflow or agent here?"** Show you can name the cheapest rung that works and what would make you move up.
+- **"How do you stop it looping or running up a bill?"** Step and token budgets, repeated-call detection, a final "give up and escalate" path.
+- **"How do you test something non-deterministic?"** Fixed eval sets with graded outcomes, trajectory assertions on tool choice, LLM-as-judge calibrated against human labels, pass@k for reliability.
+- **"What happens when a tool returns malicious text?"** Indirect prompt injection: the model may follow it. Mitigate with least privilege, approvals on writes and output filtering; you cannot fully solve it with prompting.
+- **"Single agent or multi-agent?"** Single by default; multi-agent when sub-tasks are parallel and context isolation helps, accepting the token multiplier.
 
 ---
 

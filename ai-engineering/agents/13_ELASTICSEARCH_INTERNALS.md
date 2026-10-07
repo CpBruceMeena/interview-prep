@@ -1,6 +1,9 @@
 # 📊 Elasticsearch: Architecture & Internals
 
-> **Target:** Staff/Principal Engineer | **Focus:** Elasticsearch architecture, inverted index, BM25 scoring, analysis pipeline, and fuzzy search
+> **Target:** Staff/Principal Engineer | **Focus:** Elasticsearch architecture, inverted index, BM25 scoring, analysis pipeline, and fuzzy search | **Reviewed:** October 2026 (Elasticsearch 9.x / Lucene 10; OpenSearch is the Apache-licensed fork with the same core)
+
+!!! tip "30-second answer"
+    An index is split into **shards**, each a Lucene index made of immutable **segments**. Writes go to an in-memory buffer and a **translog**; a **refresh** (every 1 s by default) turns the buffer into a new searchable segment, which is why search is *near* real-time; a **flush** commits segments to disk and trims the translog; background **merges** combine small segments and purge deleted docs. Text is **analyzed** into terms stored in an **inverted index** (term → postings list); a query is analyzed the same way, run on every relevant shard (*query phase*: each returns its top-k doc ids and scores), merged by the coordinating node, then the winners are fetched (*fetch phase*). Relevance is **BM25** by default.
 
 ---
 
@@ -18,16 +21,21 @@
    │            │         │            │         │            │
    │ ┌────────┐ │         │ ┌────────┐ │         │ ┌────────┐ │
    │ │Index A │ │         │ │Index A │ │         │ │Index B │ │
-   │ │Shard 1 │ │         │ │Shard 2 │ │         │ │Shard 1 │ │
-   │ │(Primary)││         │ │(Replica)││         │ │(Primary)││
+   │ │Shard 0 │ │         │ │Shard 1 │ │         │ │Shard 0 │ │
+   │ │(Primary)││         │ │(Primary)││         │ │(Primary)││
    │ └────────┘ │         │ └────────┘ │         │ └────────┘ │
    │ ┌────────┐ │         │ ┌────────┐ │         │ ┌────────┐ │
-   │ │Index B │ │         │ │Index A │ │         │ │Index A │ │
-   │ │Shard 2 │ │         │ │Shard 1 │ │         │ │Shard 1 │ │
-   │ │(Replica)││         │ │(Primary)││         │ │(Replica)││
+   │ │Index A │ │         │ │Index B │ │         │ │Index A │ │
+   │ │Shard 1 │ │         │ │Shard 0 │ │         │ │Shard 0 │ │
+   │ │(Replica)││         │ │(Replica)││         │ │(Replica)││
    │ └────────┘ │         │ └────────┘ │         │ └────────┘ │
    └────────────┘         └────────────┘         └────────────┘
+
+Index A: 2 primary shards, 1 replica each. Index B: 1 primary, 1 replica.
+A primary and its replica are never placed on the same node.
 ```
+
+A document's shard is `hash(_routing) % number_of_primary_shards` (routing defaults to `_id`), which is why the primary shard count is fixed at index creation: changing it means `_split`, `_shrink` or a reindex. Replicas can be changed any time and also serve reads.
 
 ## 2. CORE CONCEPTS
 
@@ -35,7 +43,7 @@
 |---------|-------------|---------|
 | **Cluster** | Collection of nodes (servers) | A data center |
 | **Node** | Single Elasticsearch instance | A server in the data center |
-| **Index** | Collection of documents | A database table |
+| **Index** | Collection of documents (one mapping per index; mapping *types* were removed in 7.x/8.x) | A database table |
 | **Shard** | Horizontal partition of an index | A partition of a table |
 | **Replica** | Copy of a shard for redundancy | A backup partition |
 | **Document** | A JSON record | A database row |
@@ -67,6 +75,33 @@ Search: "Harry Potter"
   → Score by relevance (TF-IDF / BM25)
 ```
 
+Real postings lists also store term frequencies and positions (for phrase queries), and the term dictionary is kept compact as an FST. Next to the inverted index, Lucene keeps **doc values** (a column store per field) for sorting and aggregations, and `_source` (the original JSON) for returning documents.
+
+### 3.1 Segments, Refresh, Flush and Merge
+
+```
+index request ─► in-memory buffer + translog (append, fsync per request by default)
+                     │ refresh (default every 1 s; skipped while an index is search-idle)
+                     ▼
+              new immutable SEGMENT  ─── now searchable (near real-time)
+                     │ flush: Lucene commit to disk, translog trimmed
+                     ▼
+              background MERGE: small segments → larger ones, deleted docs purged
+```
+
+- Segments are **immutable**, so an update is "mark old doc deleted + index new doc", and deletes only free space at merge time.
+- The **translog** makes acknowledged writes durable between Lucene commits; on crash, it is replayed.
+- Bulk loading: set `refresh_interval: -1` (and replicas to 0) during the load, then restore. Use `?refresh=wait_for` when a caller must read its own write.
+
+### 3.2 Distributed Search: Query Then Fetch
+
+1. The **coordinating node** sends the query to one copy (primary or replica) of every shard.
+2. **Query phase:** each shard returns only the ids and scores of its top `from + size` hits.
+3. The coordinator merges them into the global top `size`.
+4. **Fetch phase:** it fetches those documents from the shards that hold them.
+
+Consequences: deep pagination costs `shards × (from + size)` (capped by `index.max_result_window`, 10,000 by default), so use `search_after` with a point-in-time (PIT) instead; and scores use *per-shard* term statistics, which can skew relevance on small indexes (`dfs_query_then_fetch` fixes it at extra cost).
+
 ## 4. TEXT ANALYSIS PIPELINE
 
 ```
@@ -88,17 +123,22 @@ Input Text: "Harry Potter and the Chamber of Secrets"
 │     ├─ Lowercase → ["harry", "potter", ...]   │
 │     ├─ Stop words → ["harry", "potter",        │
 │     │                "chamber", "secrets"]     │
-│     ├─ Stemming → ["harri", "pott", ...]      │
-│     └─ Synonyms → {"harry" → "potter"}        │
+│     ├─ Stemming (Porter) → ["harri", "potter",│
+│     │                "chamber", "secret"]      │
+│     └─ Synonyms → e.g. "hp" ↔ "harry potter"  │
 │                                                │
-│  Output: ["harri", "pott", "chamber", "secret"]│
+│  Output: ["harri", "potter", "chamber",        │
+│           "secret"]                            │
 └─────────────────────────────────────────────┘
 ```
+
+The built-in `standard` analyzer only tokenizes and lowercases (stop words are off by default); stemming and stop words come from language analyzers such as `english` or a custom analyzer. The **same analysis must apply at index and query time** (or a deliberately compatible `search_analyzer`), otherwise the query terms won't match the indexed terms. Use the `_analyze` API to see exactly what a field produces.
 
 ## 5. SEARCH SCORING: BM25
 
 ```python
 import math
+import re
 
 class BM25Scorer:
     """
@@ -128,9 +168,12 @@ class BM25Scorer:
         Compute BM25 score for a term in a document.
         
         BM25(t, d) = IDF(t) × (TF(t,d) × (k1 + 1)) / (TF(t,d) + k1 × (1 - b + b × |d|/avgdl))
+
+        (Lucene drops the constant (k1 + 1) factor; it doesn't change ranking.)
         """
-        tf = document.count(term)  # Term frequency in this doc
-        doc_length = len(document)
+        tokens = re.findall(r"\w+", document.lower())  # toy analyzer
+        tf = tokens.count(term)       # count TOKENS: str.count("cat") also matches "category"
+        doc_length = len(tokens)      # length in terms, not characters
         
         # IDF component
         idf = math.log(1 + (total_docs - docs_with_term + 0.5) / (docs_with_term + 0.5))
@@ -142,6 +185,12 @@ class BM25Scorer:
         
         return idf * tf_component
 ```
+
+Why BM25 beats plain TF-IDF: term frequency **saturates** (the 10th occurrence adds far less than the 2nd, controlled by `k1`), and length normalization (`b`) stops long documents winning just by containing more words.
+
+### 5.1 Beyond BM25: Vector and Hybrid Search
+
+Elasticsearch and OpenSearch also do approximate kNN over `dense_vector` fields (HNSW graphs per segment, with scalar or binary quantization to cut memory). Common production setups run **hybrid search**: BM25 and vector kNN in one request, fused with reciprocal rank fusion (RRF) or a learned/linear combination, then optionally re-ranked by a cross-encoder. Lexical matching still matters for exact terms (SKUs, names, error codes) that embeddings blur.
 
 ## 6. ELASTICSEARCH QUERY: Fuzzy Search Implementation
 
@@ -161,7 +210,9 @@ GET /books/_search
   }
 }
 
-// Autocomplete (edge n-grams)
+// Autocomplete (edge n-grams). (Each PUT /books below is an alternative
+// index definition; creating an existing index fails. Settings like the
+// analyzer can't be changed on a live index without close/reopen or reindex.)
 PUT /books
 {
   "settings": {
@@ -192,7 +243,7 @@ PUT /books
   }
 }
 
-// Phonetic search (Soundex/Metaphone)
+// Phonetic search (Soundex/Metaphone): needs the analysis-phonetic plugin
 PUT /books
 {
   "settings": {
@@ -218,16 +269,20 @@ PUT /books
 
 ```python
 from elasticsearch import Elasticsearch
-from elasticsearch_dsl import Search, Q
+# The DSL lives inside the client since 8.18 / 9.0 (the separate
+# elasticsearch-dsl package is now just a compatibility shim).
+from elasticsearch.dsl import Search, Q
 
 class SearchEngine:
     """
-    Production search engine with autocorrect and fuzzy search.
+    Search with fuzzy fallback and "did you mean" (uses Autocorrect from
+    the previous note).
     """
     
-    def __init__(self, hosts: list = ["http://localhost:9200"]):
-        self.es = Elasticsearch(hosts)
-        self.autocorrect = Autocorrect(self._load_dictionary())
+    def __init__(self, hosts: list | None = None, index: str = "books"):
+        self.es = Elasticsearch(hosts or ["http://localhost:9200"])
+        self.index = index
+        self.autocorrect = Autocorrect(self._load_dictionary(index))
     
     def search(self, query: str, index: str = "books", 
                size: int = 10) -> dict:
@@ -239,8 +294,9 @@ class SearchEngine:
         if exact_results["hits"]["total"]["value"] > 0:
             return exact_results
         
-        # Step 2: Apply autocorrect
-        corrected = self.autocorrect.correct(query)
+        # Step 2: Apply autocorrect (whole query, token by token)
+        suggestions = self.autocorrect.suggest(query)
+        corrected = suggestions[0] if suggestions else query
         if corrected != query:
             fuzzy_results = self._fuzzy_search(corrected, index, size)
             fuzzy_results["did_you_mean"] = corrected
@@ -285,17 +341,18 @@ class SearchEngine:
         response = s.execute()
         return response.suggest.title_suggest[0].options
     
-    def _load_dictionary(self) -> list:
-        """Load dictionary from Elasticsearch index for autocorrect."""
-        # Aggregation to get all unique terms
+    def _load_dictionary(self, index: str) -> dict:
+        """Word -> frequency for autocorrect.
+
+        A terms aggregation on `title.keyword` would return whole TITLES, not
+        words. Better sources: your query logs, or a separate keyword field
+        holding individual words. In practice ES's own term/phrase suggesters
+        often replace this custom dictionary entirely.
+        """
         s = Search(using=self.es, index=index)
-        s.aggs.bucket("all_titles", "terms", field="title.keyword", size=10000)
+        s.aggs.bucket("words", "terms", field="title_words", size=10000)  # keyword field of single words
         response = s.execute()
-        
-        return [
-            bucket.key 
-            for bucket in response.aggregations.all_titles.buckets
-        ]
+        return {b.key: b.doc_count for b in response.aggregations.words.buckets}
 ```
 
 ## 8. SEARCH ARCHITECTURE SUMMARY

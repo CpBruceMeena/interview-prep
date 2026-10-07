@@ -1,8 +1,9 @@
 """CLI entry point for the RAG chatbot."""
 
 import argparse
-import sys
+import logging
 import os
+import sys
 
 from config import settings
 from rag_pipeline import RAGPipeline
@@ -10,7 +11,7 @@ from rag_pipeline import RAGPipeline
 
 def setup_argparse() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="RAG Chatbot — Retrieval-Augmented Generation with Gemma 4B",
+        description="RAG Chatbot — Retrieval-Augmented Generation with a local LLM via LM Studio",
     )
     parser.add_argument(
         "--index", action="store_true",
@@ -18,7 +19,7 @@ def setup_argparse() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--docs", type=str, default=settings.data_directory,
-        help="Path to documents directory (default: ./data/documents)"
+        help=f"Path to documents directory (default: {settings.data_directory})"
     )
     parser.add_argument(
         "--query", "-q", type=str,
@@ -68,6 +69,7 @@ def interactive_mode(pipeline: RAGPipeline):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = setup_argparse()
     args = parser.parse_args()
 

@@ -1,38 +1,32 @@
 # 🔧 Harness & Loop Engineering
 
-> **The emerging disciplines of building production-grade scaffolding around AI models and designing autonomous agentic loops.**
+> **Building the production scaffolding around a model (the harness) and the iterative control flow that drives it (the loop).**
 
 ---
 
 ## Overview
 
-As AI models converge in raw intelligence, the **differentiator** for enterprise systems is the quality of the infrastructure surrounding them. **Harness Engineering** and **Loop Engineering** are the two pillars of this infrastructure layer.
+A model on its own only turns tokens into tokens. Everything that lets it act safely in production (tools, sandboxes, permissions, verification, memory, tracing) is the **harness**, and the control flow that repeatedly calls the model, runs tools and decides when to stop is the **loop**. When teams use comparable frontier models, these two layers decide most of the reliability, cost and safety differences you see in production.
 
-```ascii
-┌─────────────────────────────────────────────────────────────────┐
-│                    AI SYSTEM ARCHITECTURE                         │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │                  THE HARNESS (Scaffolding)                   │ │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐  │ │
-│  │  │Guardrails│ │Execution │ │Verifcation│ │Observability │  │ │
-│  │  │(Safety)  │ │Sandbox   │ │(Testing)  │ │(Tracing)     │  │ │
-│  │  └──────────┘ └──────────┘ └──────────┘ └──────────────┘  │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                             │                                     │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │                   THE LOOP (Orchestration)                   │ │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐  │ │
-│  │  │ Perceive │ →  Reason  │ →   Act    │ →   Observe    │  │ │
-│  │  └──────────┘ └──────────┘ └──────────┘ └──────┬───────┘  │ │
-│  │                                                │           │ │
-│  │  └────────────────── Iterate ──────────────────┘           │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                   │
-│  Agent = Model + Harness                                          │
-│  Quality = Loop Design × Harness Robustness                       │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph H["Harness (scaffolding)"]
+        G["Guardrails and permissions"]
+        S["Execution sandbox"]
+        V["Verification (tests, validators, judges)"]
+        O["Observability (traces, cost, audit)"]
+    end
+    subgraph L["Loop (orchestration)"]
+        C["Assemble context"] --> M["Call model"]
+        M --> A["Run requested tools"]
+        A --> E["Observe results"]
+        E -->|"not done, within budget"| C
+        E -->|"done or budget hit"| X["Exit"]
+    end
+    H -. "wraps every step of" .-> L
 ```
+
+The common shorthand is **Agent = Model + Harness**: the harness is everything except the model weights. The term was popularised in early 2026 by OpenAI's write-up on building with Codex and by Birgitta Böckeler's article on martinfowler.com, which frames the harness as *guides* (feedforward controls) and *sensors* (feedback controls). Anthropic's engineering posts ("Building effective agents", "Effective harnesses for long-running agents", "Effective context engineering for AI agents") cover the same ground with concrete patterns.
 
 ---
 
@@ -40,22 +34,20 @@ As AI models converge in raw intelligence, the **differentiator** for enterprise
 
 | # | Document | Description |
 |---|----------|-------------|
-| 1 | [Harness Engineering](01_HARNESS_ENGINEERING.md) | Evaluation harnesses, agent scaffolding, guardrails, verification loops, enterprise runtime |
-| 2 | [Loop Engineering](02_LOOP_ENGINEERING.md) | Agentic loops, ReAct patterns, feedback cycles, termination logic, production loop design |
+| 1 | [Harness Engineering](01_HARNESS_ENGINEERING.md) | Evaluation vs agent harnesses, guardrails, prompt-injection containment, sandboxing, verification, budgets |
+| 2 | [Loop Engineering](02_LOOP_ENGINEERING.md) | The tool-use loop, ReAct, plan-and-execute, evaluator-optimizer, orchestrator-workers, termination, context management in long loops |
 
 ---
 
 ## Key Insight
 
-> **"The model is the brain. The harness is the body. The loop is the circulatory system."**
-
-- **Harness Engineering** answers: *How do we make the agent safe, observable, and controllable?*
-- **Loop Engineering** answers: *How do we make the agent autonomous, iterative, and goal-directed?*
+- **Harness engineering** answers: *How do we make the agent safe, observable and controllable?*
+- **Loop engineering** answers: *How do we make the agent make progress towards a goal, and stop at the right time?*
 
 ---
 
 ## Related Modules
 
-- **[Agents](../agents/README.md)** — Agent architectures, orchestration, tool-use patterns
-- **[MCP](../mcp/README.md)** — Protocol for agent-tool communication (connectors in the harness)
-- **[RAG](../rag/README.md)** — Knowledge retrieval (memory in the harness)
+- **[Agents](../agents/README.md)**: agent architectures, orchestration, tool-use patterns
+- **[MCP](../mcp/README.md)**: the protocol for connecting tools and data sources to the harness
+- **[RAG](../rag/README.md)**: retrieval as one of the harness's memory sources

@@ -1,131 +1,105 @@
 """
 Tests for the RAG MCP server.
-Requires: pip install pytest pytest-asyncio mcp sentence-transformers chromadb
+Requires: pip install "mcp>=2" pytest pytest-asyncio
+          plus ai-engineering/rag/implementation/requirements.txt
+          (sentence-transformers, chromadb, langchain-text-splitters, pydantic-settings)
+
+The server is imported and driven in-process with a mock LLM and a throwaway
+vector store, so no LM Studio and no writes into the repo. The module is
+skipped when the RAG dependencies are not installed.
 """
 
 import os
 import sys
+import tempfile
+
 import pytest
-import asyncio
 
-# Add implementation to path for imports
-_IMPL_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "rag", "implementation")
-)
-if _IMPL_DIR not in sys.path:
-    sys.path.insert(0, _IMPL_DIR)
+# Configure BEFORE importing the server: it builds the pipeline at import time.
+_TMP = tempfile.mkdtemp(prefix="rag-mcp-test-")
+os.environ["USE_MOCK_LLM"] = "true"
+os.environ["PERSIST_DIRECTORY"] = os.path.join(_TMP, "vector_store")
+os.environ["RAG_ALLOWED_ROOT"] = _TMP
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+for _dep in ("chromadb", "sentence_transformers", "langchain_text_splitters",
+             "langchain_community", "pydantic_settings"):
+    pytest.importorskip(_dep)
 
+from mcp import Client  # noqa: E402
 
-@pytest.fixture(scope="module")
-def server_params():
-    """Fixture: create server parameters for the RAG MCP server.
-
-    Uses USE_MOCK_LLM=true so tests don't need a running LM Studio instance.
-    """
-    env = os.environ.copy()
-    env["USE_MOCK_LLM"] = "true"
-
-    return StdioServerParameters(
-        command="python",
-        args=["-m", "servers.rag_server"],
-        env=env,
-    )
+from servers.rag_server import mcp as rag_server  # noqa: E402
 
 
-@pytest.fixture
-async def session(server_params):
-    """Fixture: create an MCP client session connected to the RAG server."""
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield session
+def connect() -> Client:
+    """In-process client (opened per test: see test_calculator.connect)."""
+    return Client(rag_server)
 
 
-@pytest.mark.asyncio
-async def test_list_tools(session):
-    """Verify the server exposes all expected tools."""
-    tools = await session.list_tools()
-    tool_names = [t.name for t in tools.tools]
-
-    expected = {"rag_query", "retrieve", "index_document"}
-    for name in expected:
-        assert name in tool_names, f"Missing tool: {name}"
+async def test_list_tools():
+    async with connect() as client:
+        names = {t.name for t in (await client.list_tools()).tools}
+        assert {"rag_query", "retrieve", "index_document"} <= names
 
 
-@pytest.mark.asyncio
-async def test_list_resources(session):
-    """Verify the server exposes all expected resources."""
-    resources = await session.list_resources()
-    uris = [r.uri for r in resources.resources]
-
-    expected = {"rag://status", "rag://documents"}
-    for uri in expected:
-        assert uri in uris, f"Missing resource: {uri}"
+async def test_list_resources():
+    async with connect() as client:
+        uris = {str(r.uri) for r in (await client.list_resources()).resources}
+        assert {"rag://status", "rag://documents"} <= uris
 
 
-@pytest.mark.asyncio
-async def test_rag_status_resource(session):
-    """Verify the status resource returns system information."""
-    result = await session.read_resource("rag://status")
-    assert len(result.contents) == 1
-    text = result.contents[0].text
-    assert "RAG Pipeline Status" in text
-    assert "Document count" in text
-    assert "Embedding model" in text
+async def test_rag_status_resource():
+    async with connect() as client:
+        result = await client.read_resource("rag://status")
+        assert len(result.contents) == 1
+        text = result.contents[0].text
+        assert "RAG Pipeline Status" in text
+        assert "Embedding model" in text
 
 
-@pytest.mark.asyncio
-async def test_rag_query_with_mock(session):
-    """Verify rag_query tool works with mock LLM."""
-    result = await session.call_tool(
-        "rag_query",
-        {"question": "What is RAG?", "top_k": 3}
-    )
-    assert result.content[0].text is not None
-    assert len(result.content[0].text) > 0
-    # With mock LLM, we should still get some response
-    # (the mock returns a fixed string regardless of input)
+async def test_index_then_retrieve_and_query():
+    doc = os.path.join(_TMP, "mcp_notes.md")
+    with open(doc, "w") as f:
+        f.write(
+            "# MCP transports\n\nThe Model Context Protocol defines two standard "
+            "transports: stdio for local subprocess servers and Streamable HTTP "
+            "for remote servers.\n"
+        )
+    async with connect() as client:
+        indexed = await client.call_tool("index_document", {"file_path": doc})
+        assert not indexed.is_error, indexed.content[0].text
+        assert "Indexed" in indexed.content[0].text
+
+        retrieved = await client.call_tool(
+            "retrieve", {"question": "Which transports does MCP define?", "top_k": 3}
+        )
+        assert not retrieved.is_error
+        assert "Streamable HTTP" in retrieved.content[0].text
+
+        answered = await client.call_tool(
+            "rag_query", {"question": "Which transports does MCP define?", "top_k": 3}
+        )
+        assert not answered.is_error
+        assert "mock LLM" in answered.content[0].text  # the mock's fixed answer
 
 
-@pytest.mark.asyncio
-async def test_retrieve_tool(session):
-    """Verify retrieve tool works even without indexed documents.
-
-    Should return a message indicating no documents found since
-    no indexing has been done in this test.
-    """
-    result = await session.call_tool(
-        "retrieve",
-        {"question": "test query", "top_k": 5}
-    )
-    text = result.content[0].text
-    # Should either return "no relevant documents" or actual chunks
-    assert text is not None
+async def test_index_nonexistent_file():
+    async with connect() as client:
+        result = await client.call_tool(
+            "index_document", {"file_path": os.path.join(_TMP, "missing.txt")}
+        )
+        assert result.is_error
+        assert "does not exist" in result.content[0].text
 
 
-@pytest.mark.asyncio
-async def test_index_nonexistent_file(session):
-    """Verify index_document returns error for non-existent paths."""
-    result = await session.call_tool(
-        "index_document",
-        {"file_path": "/nonexistent/path/file.txt"}
-    )
-    assert "Error" in result.content[0].text
-    assert "does not exist" in result.content[0].text
-
-
-@pytest.mark.asyncio
-async def test_rag_query_with_top_k(session):
-    """Verify rag_query accepts different top_k values."""
-    result = await session.call_tool(
-        "rag_query",
-        {"question": "How does chunking work?", "top_k": 10}
-    )
-    assert result.content[0].text is not None
+async def test_index_outside_allowed_root_is_refused():
+    """Path containment: a model must not be able to index arbitrary files."""
+    async with connect() as client:
+        result = await client.call_tool(
+            "index_document", {"file_path": os.path.join(_TMP, "..", "..", "etc", "passwd")}
+        )
+        assert result.is_error
+        assert "outside the allowed root" in result.content[0].text
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
