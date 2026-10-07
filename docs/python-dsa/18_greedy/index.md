@@ -31,8 +31,17 @@ When Greedy Works:
 When Greedy Fails:
 ──────────────────
 • 0/1 Knapsack: Greedy ratio fails — needs DP
-• Longest Path: Greedy fails due to negative cycles
-• Coin Change (some denominations): Greedy fails for non-standard coins
+• Longest simple path: always taking the longest next edge can walk
+  into a dead end; the problem is NP-hard in general (linear-time DP
+  only on DAGs)
+• Coin Change (some denominations): greedy fails for non-canonical coins
+  — [1, 3, 4] to make 6: greedy 4+1+1, optimal 3+3
+• Weighted interval scheduling: earliest-finish fails once intervals
+  carry different values (DP + binary search: Heaps Q7)
+
+How to tell in an interview:
+• Try to break your greedy rule with a 3-4 element counterexample
+  before coding it. If you can't, sketch the exchange argument.
 
 Proof Techniques:
 ─────────────────
@@ -68,8 +77,12 @@ def activity_selection(start: List[int], end: List[int]) -> List[int]:
     2. Pick first activity (earliest finish)
     3. For each remaining activity:
        - If its start ≥ last_finish_time, select it
-    4. Proof (exchange argument): Any optimal solution can have the
-       earliest-finish activity swapped in without worsening
+    4. Proof (exchange argument): take any optimal schedule and replace
+       its first activity with the earliest-finishing one. It ends no
+       later, so nothing after it conflicts → still optimal. Repeat on
+       the remaining activities.
+    5. Sorting by START time or by DURATION fails: e.g. one long early
+       activity blocks several short ones.
 
     COMPLEXITY:
     ──────────
@@ -83,7 +96,7 @@ def activity_selection(start: List[int], end: List[int]) -> List[int]:
     activities.sort(key=lambda x: (x[1], x[0]))
 
     selected = []
-    last_finish = -1
+    last_finish = float('-inf')   # Not -1: start times may be negative
 
     for s, e, idx in activities:
         if s >= last_finish:
@@ -132,12 +145,19 @@ def huffman_encode(text: str) -> Tuple[dict, str]:
     4. Assign codes: Left = '0', Right = '1'
     5. Greedy choice: Merging smallest frequencies ensures optimal
        prefix-free code (minimum weighted path length)
-    6. Proof: Exchange argument — swapping any two nodes with different
-       depths would increase total cost
+    6. Proof sketch (exchange argument): in some optimal tree the two
+       least frequent symbols are siblings at the deepest level — if a
+       more frequent symbol sat deeper, swapping it with a rarer one
+       could only lower the cost. Merge them into one symbol and repeat.
+    7. Prefix-free (no code is a prefix of another) is what makes the
+       bit string decodable without separators: every symbol is a leaf.
+    8. Edge case: a single distinct symbol gets code '0' (a 1-node tree
+       would otherwise give it the empty code).
 
     COMPLEXITY:
     ──────────
-    Time: O(n log m) — n text length, m unique chars
+    Time: O(n + m log m) — count n chars, then m - 1 heap merges
+          (m unique chars)
     Space: O(m) — Tree size
     """
     if not text:
@@ -217,7 +237,11 @@ def jump(nums: List[int]) -> int:
     3. When we reach the end of the current jump's range, we must
        take a jump (increment jumps counter)
     4. Set new range boundary to farthest reachable so far
-    5. This is greedy because we always extend the farthest reach
+    5. Equivalent view: BFS where "level j" = all indices reachable in
+       exactly j jumps; each level is a contiguous range, so we only
+       track its right end. That is why it's O(n), not O(n²) like DP.
+    6. Assumes the end is reachable (the problem guarantees it). For
+       Jump Game I (can we reach?), just check i <= farthest at every i.
 
     COMPLEXITY:
     ──────────
@@ -266,9 +290,14 @@ def can_complete_circuit(gas: List[int], cost: List[int]) -> int:
     1. If total gas < total cost, impossible → return -1
     2. At each position, track current tank balance
     3. If balance < 0, this starting point fails; try next station
-    4. The key insight: If we fail at station k, any start between
-       the previous start and k also fails (proved by exchange)
-    5. This is greedy because we reset and try the next candidate
+    4. The key insight: if starting at s we run dry at station k, every
+       start between s and k also runs dry by k — each of them arrives
+       at k with no more fuel than we had (we reached them with a
+       non-negative tank). So jump straight to k + 1.
+    5. Why total >= 0 guarantees the final candidate works: the deficit
+       before `start` is covered by the surplus from `start` to the end.
+       (Several starts can work in general, e.g. all-zero inputs;
+       LeetCode guarantees a unique answer, and this returns the first.)
 
     COMPLEXITY:
     ──────────
@@ -357,7 +386,10 @@ def maximum_units(box_types: List[List[int]], truck_size: int) -> int:
     2. Take as many boxes as possible from the highest-unit type
     3. This is greedy: local optimum (most units per box) leads to
        global optimum
-    4. This works because boxes are indistinguishable (0/1 not required)
+    4. Why greedy is safe here but not for 0/1 knapsack: every box costs
+       the same capacity (1 slot), so units-per-box is also value per
+       unit of capacity and any box can be swapped for a better one.
+       With different weights you need DP.
 
     COMPLEXITY:
     ──────────
@@ -443,8 +475,10 @@ def candy(ratings: List[int]) -> int:
        - Left-to-right: If rating[i] > rating[i-1], give 1 more than left
        - Right-to-left: If rating[i] > rating[i+1], take max(current, right+1)
     2. The two passes ensure both neighbor constraints are satisfied
-    3. Greedy: At each position, we give the minimum needed to satisfy
-       the constraint with the previous pass
+    3. Taking max() in the second pass keeps the left-neighbour rule
+       satisfied while fixing the right-neighbour rule
+    4. Equal ratings impose no constraint: [1, 2, 2] → 1, 2, 1
+    5. O(1)-space variant exists (count up/down slopes) — mention only
 
     COMPLEXITY:
     ──────────
@@ -490,10 +524,12 @@ def least_interval_greedy(tasks: List[str], n: int) -> int:
        is just len(tasks) (no idle needed)
     4. Greedy: Schedule the most frequent task first, then fill
        idle slots with other tasks
+    5. Same problem simulated with a heap + cooldown queue: Queues Q4
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Count frequencies + compute formula
+    Time: O(m) — m = number of tasks: count frequencies + formula
+          (n here is the cooldown, not the input size)
     Space: O(1) — At most 26 counters
     """
     from collections import Counter

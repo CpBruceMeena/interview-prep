@@ -15,13 +15,22 @@ Core Concepts:
 ──────────────
 • Complete binary tree where parent ≤ children (min-heap) or
   parent ≥ children (max-heap)
-• Python's heapq implements MIN-heap (import heapq)
-• For max-heap: store negative values (-val) or use custom wrapper
+• Python's heapq functions operate on a plain list as a MIN-heap
+• Max-heap: Python 3.14+ adds heapify_max / heappush_max / heappop_max;
+  on older versions (and in most interview environments) store negated
+  values (-val) or wrap items in a class with a reversed __lt__. The code
+  here negates, so it runs on any Python 3
+• No decrease-key and no delete-by-value: push a new entry and skip
+  stale ones on pop ("lazy deletion", see Dijkstra and Q8)
+• Ties: push (priority, counter, item) so equal priorities never fall
+  through to comparing the items themselves
 • Heap operations:
   - heappush(heap, val): O(log n)
   - heappop(heap): O(log n) — removes and returns smallest
   - heap[0]: O(1) — peek at smallest element
-  - heapify(list): O(n) — converts list to heap in-place
+  - heapify(list): O(n) — converts list to heap in-place (bottom-up
+    sift-down; most nodes are near the leaves, so the sum is O(n), not
+    O(n log n))
   - nlargest/nsmallest(k, iter): O(n log k)
 • Heap property: heap[i] ≤ heap[2*i+1] and heap[i] ≤ heap[2*i+2]
 
@@ -80,6 +89,12 @@ class KthLargest:
     ──────────
     Time: O(log k) per add, O(n log k) to initialize
     Space: O(k) — Heap of size k
+
+    EDGE CASE:
+    ──────────
+    The constructor may get fewer than k numbers (LeetCode guarantees at
+    least k after the first add()), so heap[0] is only "kth largest" once
+    the heap holds k items.
     """
 
     def __init__(self, k: int, nums: List[int]):
@@ -119,10 +134,15 @@ def merge_k_lists(lists: List[Optional[ListNode]]) -> Optional[ListNode]:
     THOUGHT PROCESS:
     ────────────────
     1. Brute Force: Collect all values, sort, rebuild — O(N log N)
-    2. Divide & Conquer: Merge pairs recursively — O(N log k)
-    3. Heap-based: Push (value, list_index, node) → O(N log k)
+    2. Merging lists one by one into the result is O(N·k) — the naive
+       trap (early lists get re-scanned k times)
+    3. Divide & Conquer: Merge pairs recursively — O(N log k), O(1) extra
+    4. Heap-based: Push (value, list_index, node) → O(N log k)
        - Pop smallest, add to result, push next from that list
-    4. The heap approach is clean and efficient
+       - list_index is a tie-breaker: without it, equal values make
+         Python compare ListNode objects and raise TypeError
+    5. Same pattern as the merge phase of external sorting (k sorted
+       runs on disk) and merging sorted SSTables in LSM-tree compaction
 
     COMPLEXITY:
     ──────────
@@ -179,6 +199,12 @@ class MedianFinder:
        - Min-heap: right half of numbers
        - Invariant: left heap size >= right heap size (by at most 1)
        - All elements in left ≤ all elements in right
+    FOLLOW-UPS:
+       - All numbers in [0, 100]? Keep 101 counters: O(1) add, O(100)
+         median.
+       - Deletions / sliding window? See Q8 (lazy deletion).
+       - Approximate median over huge streams: t-digest or similar
+         quantile sketches.
     2. On add:
        - Push to left (max-heap) first
        - Then balance: move largest from left to right
@@ -249,6 +275,9 @@ def k_closest(points: List[List[int]], k: int) -> List[List[int]]:
        - Negative distance gives us max-heap behavior
        - When we find a point closer than the farthest in our heap,
          pop the farthest and add the new one
+    4. Squared distances stay exact integers (no float error). In Java,
+       x*x + y*y can overflow int for coordinates near 46341; use long.
+    5. Result order is arbitrary (heap order), which the problem allows.
 
     COMPLEXITY:
     ──────────
@@ -284,26 +313,26 @@ def top_k_frequent_words(words: List[str], k: int) -> List[str]:
     THOUGHT PROCESS:
     ────────────────
     1. Count frequencies with Counter
-    2. Use min-heap of size k with custom key
-       - Key = (frequency, word) — freq asc, word desc (to pop worst)
-    3. When pushing, use (-freq, word) for max-heap behavior
-       or (freq, -word_priority) in min-heap
-    4. Alternative: Bucket sort (frequency as index)
+    2. Heapify all (-count, word) pairs — O(m) for m distinct words —
+       then pop k times. The tuple order gives exactly the required
+       ranking: higher count first, then lexicographically smaller word.
+    3. Size-k min-heap variant (O(m log k), O(k) heap): the heap must
+       evict the WORST item = lowest count, and on ties the
+       lexicographically LARGER word. Strings can't be negated, so you
+       need a wrapper class with a custom __lt__; then reverse at the end.
+    4. Alternative: Bucket sort by frequency, sorting each bucket
 
     COMPLEXITY:
     ──────────
-    Time: O(n log k) — Counting O(n) + heap O(n log k)
-    Space: O(n) — Counter + heap
+    Time: O(n + k log m) — Counting O(n), heapify O(m), k pops
+    Space: O(m) — Counter + heap
     """
     from collections import Counter
 
     freq = Counter(words)
-    # Min-heap: frequency asc, word desc (to pop lexicographically larger)
-    heap = []
-
-    for word, count in freq.items():
-        # Push (-count, word) for behavior like max-heap on count
-        heapq.heappush(heap, (-count, word))
+    # (-count, word): smallest tuple = highest count, then smallest word
+    heap = [(-count, word) for word, count in freq.items()]
+    heapq.heapify(heap)
 
     # Extract top k
     result = []
@@ -376,9 +405,15 @@ def job_scheduling(start_time: List[int], end_time: List[int], profit: List[int]
     ────────────────
     1. Sort jobs by start time
     2. Use a min-heap of (end_time, profit_earned_so_far)
-    3. Track max_profit up to current point
-    4. For each job, check heap for completed jobs, update max_profit
+    3. max_profit = best total of any chain that has ENDED by now
+    4. For each job, pop every chain that ended at or before its start
+       and fold it into max_profit (a job ending at t is compatible with
+       one starting at t)
     5. Push current job with total profit = max_profit + current_profit
+    6. Classic alternative: sort by END time; dp[i] = max(dp[i-1],
+       profit[i] + dp[j]) where j = last job ending <= start[i], found by
+       binary search. Same O(n log n). This is weighted interval
+       scheduling — greedy (Greedy Q1) only works when all weights equal.
 
     COMPLEXITY:
     ──────────
@@ -421,71 +456,90 @@ def median_sliding_window(nums: List[int], k: int) -> List[float]:
 
     THOUGHT PROCESS:
     ────────────────
-    1. Two heaps: max-heap (left) + min-heap (right) — like MedianFinder
-    2. But we need to REMOVE elements that slide out of the window
-    3. Use lazy deletion: maintain a counter of "to-be-deleted" elements
-    4. During balance, actually remove from heap tops if marked deleted
-    5. This is complex but O(n log k) — optimal for data stream
+    1. Two heaps: max-heap `small` (lower half) + min-heap `large` (upper
+       half) — like MedianFinder (Q3).
+    2. But we must REMOVE the element sliding out, and heapq can only
+       remove the top. So: lazy deletion — leave the element in the heap
+       and discard it when it surfaces at the top.
+    3. The traps that make naive versions wrong:
+       a) len(heap) counts dead entries, so keep separate counters of
+          LIVE elements per side and balance on those
+       b) After any pop/removal, prune dead entries off the top, so the
+          tops we read are always live
+       c) Duplicates: "delete one 5" is ambiguous if 5s sit in both
+          heaps. Store (value, index) pairs instead — every entry is
+          unique, and an entry is dead iff its index left the window.
+    4. Which side is the outgoing element on? Compare its (value, index)
+       with the live top of `small`: <= means it is in `small`.
 
     COMPLEXITY:
     ──────────
-    Time: O(n log k) — Each add/remove is O(log k)
-    Space: O(k) — Heaps + deletion tracker
+    Time: O(n log n) — each element pushed/popped O(1) times; heaps may
+          hold dead entries, so sizes are O(n) not O(k) in the worst case
+    Space: O(n) — Heaps including not-yet-pruned entries
+
+    SIMPLER ALTERNATIVE:
+    ────────────────────
+    A sorted container (sortedcontainers.SortedList: O(log k) add/remove)
+    or bisect.insort on a plain list (O(k) per step, O(n·k) total, often
+    fast enough). Mention it; the two-heap version is what is probed.
     """
-    from collections import defaultdict
+    small: List[Tuple[int, int]] = []   # max-heap of (-value, -index)
+    large: List[Tuple[int, int]] = []   # min-heap of (value, index)
+    small_live = large_live = 0
+    lo = 0                              # Left edge of the window
 
-    left = []   # max-heap (negatives)
-    right = []  # min-heap
-    lazy_delete = defaultdict(int)
+    def prune() -> None:
+        """Drop entries whose index has left the window from both tops."""
+        while small and -small[0][1] < lo:
+            heapq.heappop(small)
+        while large and large[0][1] < lo:
+            heapq.heappop(large)
 
-    def balance():
-        """Balance the two heaps."""
-        while len(left) > len(right) + 1:
-            val = -heapq.heappop(left)
-            heapq.heappush(right, val)
+    def small_top() -> Tuple[int, int]:
+        return (-small[0][0], -small[0][1])
 
-        while len(right) > len(left):
-            val = heapq.heappop(right)
-            heapq.heappush(left, -val)
+    def rebalance() -> None:
+        nonlocal small_live, large_live
+        while small_live > large_live + 1:            # small too big
+            v, i = small_top()
+            heapq.heappop(small)
+            heapq.heappush(large, (v, i))
+            small_live, large_live = small_live - 1, large_live + 1
+            prune()
+        while large_live > small_live:                # large too big
+            v, i = heapq.heappop(large)
+            heapq.heappush(small, (-v, -i))
+            small_live, large_live = small_live + 1, large_live - 1
+            prune()
 
-        # Clean lazy deletions from tops
-        while left and lazy_delete[-left[0]] > 0:
-            lazy_delete[-left[0]] -= 1
-            heapq.heappop(left)
-        while right and lazy_delete[right[0]] > 0:
-            lazy_delete[right[0]] -= 1
-            heapq.heappop(right)
-
-    def get_median() -> float:
-        if k % 2 == 1:
-            return float(-left[0])
-        return (-left[0] + right[0]) / 2.0
-
-    # Initialize first window
-    for i in range(k):
-        heapq.heappush(left, -nums[i])
-        if len(left) > len(right) + 1:
-            val = -heapq.heappop(left)
-            heapq.heappush(right, val)
-
-    # Balance after initial fill
-    balance()
-    result = [get_median()]
-
-    for i in range(k, len(nums)):
-        # Remove outgoing element
-        outgoing = nums[i - k]
-        lazy_delete[outgoing] += 1
-
-        # Add incoming element
-        if not left or nums[i] <= -left[0]:
-            heapq.heappush(left, -nums[i])
+    result = []
+    for i, x in enumerate(nums):
+        # 1) Add the incoming element to the correct half
+        if small_live and (x, i) <= small_top():
+            heapq.heappush(small, (-x, -i))
+            small_live += 1
         else:
-            heapq.heappush(right, nums[i])
+            heapq.heappush(large, (x, i))
+            large_live += 1
 
-        # Balance and clean
-        balance()
-        result.append(get_median())
+        # 2) Retire the outgoing element (lazily)
+        if i >= k:
+            out = (nums[i - k], i - k)
+            if out <= small_top():
+                small_live -= 1
+            else:
+                large_live -= 1
+            lo = i - k + 1
+            prune()
+
+        # 3) Restore the size invariant, then read the median
+        rebalance()
+        if i >= k - 1:
+            if k % 2:
+                result.append(float(small_top()[0]))
+            else:
+                result.append((small_top()[0] + large[0][0]) / 2.0)
 
     return result
 
@@ -511,9 +565,14 @@ def reorganize_string(s: str) -> str:
     ────────────────
     1. Count frequencies, check if possible (max_freq ≤ (n+1)/2)
     2. Max-heap of (-freq, char)
-    3. At each step, pop the most frequent char that wasn't just placed
-    4. Place it, decrement, push back if still remaining
-    5. If the most frequent char is same as last placed, use the second
+    3. At each step, pop the most frequent remaining char and place it
+    4. Hold it OUT of the heap for one round (prev_char / prev_count) and
+       push it back only after the next char is placed — so the same char
+       can never be popped twice in a row
+    5. The feasibility check guarantees the heap is never empty while a
+       held-back char still has copies left
+    6. Generalises to "k distance apart": hold back chars in a queue for
+       k rounds (Task Scheduler, Queues Q4)
 
     COMPLEXITY:
     ──────────

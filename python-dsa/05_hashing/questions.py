@@ -6,8 +6,12 @@ Core Concepts:
 ──────────────
 • Hash function maps keys to array indices — O(1) average lookup
 • Collision resolution: Chaining (linked list) vs Open Addressing (probing)
-• Python dict/set — hash table with chaining, resizes dynamically
-• Load factor (α = n/m) affects performance — resize at α > 0.75
+• CPython dict/set use OPEN ADDRESSING (perturbed probing), not chaining;
+  dicts keep insertion order (a language guarantee since Python 3.7)
+• Load factor (α = n/m) drives resizing: Java's HashMap resizes at 0.75,
+  CPython's dict at about 2/3 full. Lower α = fewer collisions, more memory
+• Worst case is O(n) per operation when keys collide (adversarial
+  inputs); Java 8+ HashMap turns long chains into red-black trees
 • Good hash functions: deterministic, uniform distribution, fast to compute
 • Hash tables trade space for time — O(1) operations vs O(n) for arrays
 
@@ -51,11 +55,21 @@ def subarray_sum(nums: List[int], k: int) -> int:
          each prefix sum has been seen
     3. For each position, add count of (current_sum - k) to result
        This gives the number of subarrays ending at current position
+    4. Seed {0: 1}: the empty prefix, so subarrays starting at index 0
+       are counted.
+    5. Why not a sliding window? With negative numbers, growing the
+       window can decrease the sum, so there is no monotonic rule for
+       when to shrink. Prefix sums work for any sign.
 
     COMPLEXITY:
     ──────────
     Time: O(n) — Single pass through the array
     Space: O(n) — Hash map stores up to n prefix sums
+
+    EDGE CASES:
+    ──────────
+    • k = 0 with zeros [0,0,0] → 6 (every subarray)
+    • Java/Go: prefix sums can overflow int; use long / int64
     """
     prefix_counts = {0: 1}  # prefix_sum -> frequency
     current_sum = 0
@@ -91,6 +105,9 @@ def longest_consecutive(nums: List[int]) -> int:
     2. Only start counting from the beginning of a sequence
        (num-1 not in set)
     3. This ensures O(n) overall (each number checked at most twice)
+    4. Iterate over the SET, not the list: with many duplicates of a
+       sequence start, looping over the list would re-walk the same run
+       (Same problem as Arrays Q10; kept here as the hash-set pattern.)
 
     COMPLEXITY:
     ──────────
@@ -143,6 +160,13 @@ def top_k_frequent(nums: List[int], k: int) -> List[int]:
     ──────────
     Time: O(n) — Counting + bucket distribution + gathering
     Space: O(n) — Hash map + bucket array
+
+    TRADE-OFF:
+    ──────────
+    Bucket sort is O(n) but allocates n+1 buckets. For a stream or when
+    k is much smaller than the number of distinct values, a size-k
+    min-heap (O(n log k), O(k) extra) is the usual production answer.
+    Ties between equal frequencies come back in arbitrary order.
     """
     # Count frequencies
     freq = Counter(nums)
@@ -181,9 +205,12 @@ def contains_nearby_duplicate(nums: List[int], k: int) -> bool:
     THOUGHT PROCESS:
     ────────────────
     1. Sliding window with hash set
-    2. Maintain a window of size k containing recent elements
+    2. Maintain a window of the previous k elements
     3. For each new element, check if it's already in the window
     4. Remove element that falls out of the window
+       (len(window) > k only after an add, and the window holds no
+       duplicates, so its size equals the number of indices it covers)
+    5. Alternative: dict of value → last index, check i - last <= k
 
     COMPLEXITY:
     ──────────
@@ -226,6 +253,12 @@ def intersect(nums1: List[int], nums2: List[int]) -> List[int]:
     ──────────
     Time: O(m + n) — Linear in both arrays
     Space: O(min(m, n)) — Hash map of smaller array
+
+    FOLLOW-UPS INTERVIEWERS ASK:
+    ────────────────────────────
+    • Both arrays sorted → two pointers, O(1) extra space
+    • nums2 on disk, too big for memory → count nums1 in memory and
+      stream nums2 in chunks (or external-sort both and merge)
     """
     # Optimize: use smaller array for counting
     if len(nums1) > len(nums2):
@@ -259,6 +292,9 @@ def is_valid_sudoku(board: List[List[str]]) -> bool:
     2. One pass: for each filled cell, check row, column, and box
     3. Box indexing: box_id = (row // 3) * 3 + (col // 3)
     4. Early exit on any duplicate
+    5. "Valid" means no rule is broken by the filled cells; it does NOT
+       mean the puzzle is solvable (that needs backtracking: see
+       Backtracking Q10)
 
     COMPLEXITY:
     ──────────
@@ -307,6 +343,10 @@ class LRUCache:
     3. Python's OrderedDict combines both: dict + doubly linked list
     4. On get: move to end (most recently used)
     5. On put: if full, remove from front, add to end
+    6. Interviewers usually ask you to build the hash map + doubly linked
+       list yourself; see Design Problems for that version (and LFU).
+    7. Not thread-safe: even get() mutates the order, so a shared cache
+       needs a lock around both operations.
 
     COMPLEXITY:
     ──────────
@@ -348,17 +388,18 @@ def group_shifted_strings(strings: List[str]) -> List[List[str]]:
     Example:
         Input: ["abc", "bcd", "acef", "xyz", "az", "ba"]
         Output: [["abc","bcd","xyz"], ["acef"], ["az","ba"]]
-    Explanation:
-        "abc" → (0,1,1), "bcd" → (0,1,1), "xyz" → (0,1,1) — same pattern
-        "az" → (0,25), "ba" → (0,25) — same pattern (wrapping around)
+    Explanation (key = gaps between neighbouring letters, mod 26):
+        "abc", "bcd", "xyz" → (1, 1)
+        "az" → (25,), "ba" → (-1 mod 26) = (25,) — same key via wrap-around
 
     THOUGHT PROCESS:
     ────────────────
     1. Generate a canonical key for each string based on character differences
     2. For "abc": diffs are (b-a=1, c-b=1) → key = "1,1"
-    3. For wrapping ("az"): z-a = 25, but we need to normalize:
-       diff = (ord(next) - ord(curr) + 26) % 26
-    4. Group by this key
+    3. For wrapping ("ba"): a-b = -1, so normalize with % 26 → 25.
+       (Python's % is already non-negative; in Java/Go write
+       (diff + 26) % 26 because their % keeps the sign.)
+    4. Group by this key; all 1-letter strings share the empty key
 
     COMPLEXITY:
     ──────────
@@ -368,10 +409,6 @@ def group_shifted_strings(strings: List[str]) -> List[List[str]]:
     groups = defaultdict(list)
 
     for s in strings:
-        if len(s) == 1:
-            groups["single"].append(s)
-            continue
-
         # Build key from consecutive character differences
         diffs = []
         for i in range(1, len(s)):
@@ -382,6 +419,92 @@ def group_shifted_strings(strings: List[str]) -> List[List[str]]:
         groups[key].append(s)
 
     return list(groups.values())
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 9: Design HashMap (Separate Chaining + Resizing)
+# ════════════════════════════════════════════════════════════════════════
+
+class MyHashMap:
+    """
+    QUESTION:
+    ─────────
+    Design a hash map without built-in hash tables, supporting
+    put(key, value), get(key) (return -1 if absent) and remove(key).
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. An array of buckets; bucket index = hash(key) % capacity.
+    2. Collisions: separate chaining (each bucket is a list of [key, value]
+       pairs) is simplest to get right. Open addressing (probe for the
+       next free slot) is more cache-friendly but needs tombstones on
+       delete, otherwise lookups stop early at the hole.
+    3. Keep the load factor bounded: when size / capacity exceeds 0.75,
+       double the capacity and rehash every entry. Doubling makes the
+       total rehash cost O(n) over n inserts → amortized O(1) per put.
+    4. Use a prime or power-of-two capacity? Power of two lets
+       `hash & (cap - 1)` replace `%`, but then the hash must mix its
+       high bits (Java's HashMap XORs h ^ (h >>> 16) for this reason).
+
+    COMPLEXITY:
+    ──────────
+    Time: O(1) average for put/get/remove (amortized for put);
+          O(n) worst case if every key lands in one bucket
+    Space: O(n + capacity)
+
+    WHAT THEY PROBE NEXT:
+    ─────────────────────
+    • Hash flooding (attacker picks colliding keys) → randomized hash
+      seeds (Python salts str hashes per process) or tree bins (Java 8+)
+    • Concurrent access → lock striping per bucket range, or a
+      ConcurrentHashMap-style design with CAS on bucket heads
+    • Incremental rehashing (Redis): spread the resize over many
+      operations to avoid a latency spike
+    """
+
+    _MAX_LOAD = 0.75
+
+    def __init__(self, capacity: int = 8):
+        self._capacity = capacity
+        self._size = 0
+        self._buckets: List[List[list]] = [[] for _ in range(capacity)]
+
+    def _bucket(self, key: int) -> List[list]:
+        return self._buckets[hash(key) % self._capacity]
+
+    def put(self, key: int, value: int) -> None:
+        bucket = self._bucket(key)
+        for pair in bucket:
+            if pair[0] == key:
+                pair[1] = value          # Update in place
+                return
+        bucket.append([key, value])
+        self._size += 1
+        if self._size / self._capacity > self._MAX_LOAD:
+            self._resize(self._capacity * 2)
+
+    def get(self, key: int) -> int:
+        for k, v in self._bucket(key):
+            if k == key:
+                return v
+        return -1
+
+    def remove(self, key: int) -> None:
+        bucket = self._bucket(key)
+        for i, (k, _) in enumerate(bucket):
+            if k == key:
+                bucket[i] = bucket[-1]   # Swap-with-last: O(1) delete
+                bucket.pop()
+                self._size -= 1
+                return
+
+    def _resize(self, new_capacity: int) -> None:
+        old = self._buckets
+        self._capacity = new_capacity
+        self._buckets = [[] for _ in range(new_capacity)]
+        for bucket in old:
+            for k, v in bucket:
+                self._buckets[hash(k) % new_capacity].append([k, v])
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -464,6 +587,17 @@ def demo():
     strings = ["abc", "bcd", "acef", "xyz", "az", "ba"]
     print(f"   Input: {strings}")
     print(f"   Groups: {group_shifted_strings(strings)}")
+
+    # Q9
+    print("\n9️⃣  Design HashMap")
+    print("-" * 40)
+    hm = MyHashMap(capacity=2)
+    for key in range(5):
+        hm.put(key, key * 10)
+    hm.put(3, 333)
+    hm.remove(1)
+    print(f"   put 0..4 (x10), put(3, 333), remove(1)")
+    print(f"   get(3): {hm.get(3)}, get(1): {hm.get(1)}, capacity grew to {hm._capacity}")
 
     print("\n" + "=" * 70)
 

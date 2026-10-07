@@ -17,8 +17,9 @@ Common Patterns:
 • Reversal (in-place iterative, recursive)
 • Dummy head for edge cases (deleting head node)
 • Merge two sorted lists
-• Find intersection point
-• LRU Cache (doubly linked list + hash map)
+• Find intersection point (two pointers that switch to the other
+  list's head at the end: both walk a + b + c steps, so they meet)
+• LRU Cache (doubly linked list + hash map) — see Design Problems
 """
 
 from typing import List, Optional
@@ -123,8 +124,11 @@ def has_cycle(head: Optional[ListNode]) -> bool:
        - If they meet, there's a cycle
        - If fast reaches end (None), no cycle
     3. Why O(1) space? Only two pointers, no extra storage
-    4. Why must they meet? If cycle exists, fast and slow are in a
-       closed loop. Fast reduces distance by 1 each step → must meet.
+    4. Why must they meet? Once both are inside the cycle, the gap
+       from fast to slow shrinks by exactly 1 per step, so it hits 0
+       before fast can jump over slow (it cannot skip a gap of 1).
+    5. Compare nodes by identity (`is`), never by value: two distinct
+       nodes can hold equal values.
 
     COMPLEXITY:
     ──────────
@@ -136,7 +140,7 @@ def has_cycle(head: Optional[ListNode]) -> bool:
     while fast and fast.next:
         slow = slow.next
         fast = fast.next.next
-        if slow == fast:
+        if slow is fast:
             return True
 
     return False
@@ -163,9 +167,11 @@ def detect_cycle_start(head: Optional[ListNode]) -> Optional[ListNode]:
        - Let distance from head to cycle start = a
        - Let distance from cycle start to meeting point = b
        - Slow traveled: a + b
-       - Fast traveled: a + b + k*cycle_len
-       - Since fast = 2 * slow: 2(a+b) = a+b+k*cycle_len → a+b = k*cycle_len
-       - From meeting point, a steps forward = cycle start
+       - Fast traveled: a + b + k*L  (L = cycle length, k ≥ 1 laps)
+       - Since fast = 2 * slow: 2(a+b) = a+b+k*L → a = k*L - b
+       - So walking a steps from the meeting point lands exactly on the
+         cycle start (k*L - b = finish this lap, plus whole laps), and
+         walking a steps from head lands there too → they meet there
 
     COMPLEXITY:
     ──────────
@@ -178,10 +184,10 @@ def detect_cycle_start(head: Optional[ListNode]) -> Optional[ListNode]:
     while fast and fast.next:
         slow = slow.next
         fast = fast.next.next
-        if slow == fast:
+        if slow is fast:
             # Found cycle, find start
             slow = head
-            while slow != fast:
+            while slow is not fast:
                 slow = slow.next
                 fast = fast.next
             return slow
@@ -261,6 +267,14 @@ def remove_nth_from_end(head: Optional[ListNode], n: int) -> Optional[ListNode]:
     ──────────
     Time: O(n) — Single pass
     Space: O(1) — Only pointers
+
+    EDGE CASES:
+    ──────────
+    • n == length → removes the head; the dummy node makes this the
+      same code path (slow stays on dummy)
+    • Single node, n = 1 → returns None
+    • Assumes 1 ≤ n ≤ length (LeetCode constraint); otherwise the
+      n+1 advance would hit None
     """
     dummy = ListNode(0, head)
     slow = fast = dummy
@@ -307,8 +321,13 @@ def middle_node(head: Optional[ListNode]) -> Optional[ListNode]:
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Half the speed of fast
+    Time: O(n) — Fast covers the list in n/2 iterations
     Space: O(1) — Only pointers
+
+    VARIANT:
+    ────────
+    For the FIRST middle on even lengths (needed when splitting for merge
+    sort), loop on `while fast.next and fast.next.next`.
     """
     slow = fast = head
 
@@ -393,11 +412,13 @@ def is_palindrome(head: Optional[ListNode]) -> bool:
        b) Reverse the second half
        c) Compare first and reversed second half
     2. This avoids O(n) extra space for an array copy
-    3. Restore the list (optional, good practice)
+    3. Restore the list by reversing the second half back. Mutating a
+       caller's input inside a "read-only" check is a real bug; mention
+       it, and that the list is not safe to read concurrently meanwhile.
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Three linear passes
+    Time: O(n) — A constant number of linear passes
     Space: O(1) — In-place modifications
     """
     def reverse(head: Optional[ListNode]) -> Optional[ListNode]:
@@ -416,17 +437,159 @@ def is_palindrome(head: Optional[ListNode]) -> bool:
         fast = fast.next.next
 
     # Reverse second half
-    second_half = reverse(slow)
-    first_half = head
+    tail = reverse(slow)
+    first_half, second_half = head, tail
 
     # Compare
+    result = True
     while second_half:
         if first_half.val != second_half.val:
-            return False
+            result = False
+            break
         first_half = first_half.next
         second_half = second_half.next
 
-    return True
+    # Restore the original list (slow's predecessor still points at slow)
+    reverse(tail)
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 9: Reverse Nodes in k-Group
+# ════════════════════════════════════════════════════════════════════════
+
+def reverse_k_group(head: Optional[ListNode], k: int) -> Optional[ListNode]:
+    """
+    QUESTION:
+    ─────────
+    Reverse the nodes of a linked list k at a time. If the number of
+    remaining nodes is less than k, leave them as they are. Only change
+    links, not values. O(1) extra space.
+
+    Example:
+        Input: 1 → 2 → 3 → 4 → 5, k = 2
+        Output: 2 → 1 → 4 → 3 → 5
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. It is Q1 (reverse a list) applied to consecutive segments; the
+       hard part is the wiring between segments.
+    2. Keep `group_prev` = the node just before the current group
+       (a dummy for the first group).
+    3. Walk k nodes ahead from group_prev. If we run out, stop: the tail
+       stays as it is.
+    4. Reverse the k nodes, starting with prev = the node AFTER the group,
+       so the reversed group's new tail already points at the rest.
+    5. Reconnect: group_prev.next = new group head; the old group head is
+       now the group's tail and becomes the next group_prev.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — Each node is visited twice (count ahead, then reverse)
+    Space: O(1) — Pointer juggling only (recursive versions use O(n/k))
+
+    EDGE CASES:
+    ──────────
+    • k = 1 → unchanged;  k = n → whole list reversed
+    • n not a multiple of k → last partial group untouched
+    """
+    dummy = ListNode(0, head)
+    group_prev = dummy
+
+    while True:
+        # Find the k-th node of this group
+        kth = group_prev
+        for _ in range(k):
+            kth = kth.next
+            if kth is None:
+                return dummy.next          # Fewer than k left
+        group_next = kth.next
+
+        # Reverse the group; prev starts at group_next to keep it linked
+        prev, curr = group_next, group_prev.next
+        while curr is not group_next:
+            nxt = curr.next
+            curr.next = prev
+            prev = curr
+            curr = nxt
+
+        old_group_head = group_prev.next   # Becomes the group's tail
+        group_prev.next = kth              # kth is the new group head
+        group_prev = old_group_head
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 10: Copy List with Random Pointer
+# ════════════════════════════════════════════════════════════════════════
+
+class RandomNode:
+    """Node with an extra pointer to any node in the list (or None)."""
+    def __init__(self, val: int, next_node: Optional['RandomNode'] = None,
+                 random: Optional['RandomNode'] = None):
+        self.val = val
+        self.next = next_node
+        self.random = random
+
+
+def copy_random_list(head: Optional[RandomNode]) -> Optional[RandomNode]:
+    """
+    QUESTION:
+    ─────────
+    Each node has `next` and `random` pointers. Return a deep copy: new
+    nodes only, with the same next/random structure.
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. The problem: when copying node X, X.random's copy may not exist
+       yet.
+    2. Hash map old → new (two passes: create all copies, then wire next
+       and random through the map). O(n) space. This is the answer to
+       lead with; it also generalises to Clone Graph (Graphs Q5).
+    3. O(1) extra space: interleave copies into the original list
+       A → A' → B → B' → ...
+       - Pass 1: insert each copy right after its original
+       - Pass 2: copy.random = original.random.next (the random's copy
+         sits right after it)
+       - Pass 3: unweave the two lists, restoring the original
+       Implemented below.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — Three linear passes
+    Space: O(1) — Extra beyond the copied nodes themselves
+
+    EDGE CASES:
+    ──────────
+    • random is None, or points to the node itself
+    • Empty list → None
+    • The original must be restored exactly (pass 3)
+    """
+    if not head:
+        return None
+
+    # Pass 1: A → A' → B → B' ...
+    node = head
+    while node:
+        node.next = RandomNode(node.val, node.next)
+        node = node.next.next
+
+    # Pass 2: set random pointers on the copies
+    node = head
+    while node:
+        if node.random:
+            node.next.random = node.random.next
+        node = node.next.next
+
+    # Pass 3: separate the lists
+    copy_head = head.next
+    node = head
+    while node:
+        copy = node.next
+        node.next = copy.next
+        copy.next = copy.next.next if copy.next else None
+        node = node.next
+
+    return copy_head
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -504,6 +667,29 @@ def demo():
     head2 = list_to_linked([1, 2])
     print(f"   List: [1, 2]")
     print(f"   Is palindrome: {is_palindrome(head2)}")
+
+    # Q9
+    print("\n9️⃣  Reverse Nodes in k-Group")
+    print("-" * 40)
+    for k in (2, 3):
+        head = list_to_linked([1, 2, 3, 4, 5])
+        print(f"   [1, 2, 3, 4, 5], k={k} → {linked_to_list(reverse_k_group(head, k))}")
+
+    # Q10
+    print("\n🔟  Copy List with Random Pointer")
+    print("-" * 40)
+    nodes = [RandomNode(v) for v in (7, 13, 11, 10, 1)]
+    for a, b in zip(nodes, nodes[1:]):
+        a.next = b
+    for i, r in enumerate([None, 0, 4, 2, 0]):
+        nodes[i].random = nodes[r] if r is not None else None
+    copy = copy_random_list(nodes[0])
+    pairs, node = [], copy
+    while node:
+        pairs.append([node.val, node.random.val if node.random else None])
+        node = node.next
+    print(f"   Copy as [val, random.val]: {pairs}")
+    print(f"   Shares no nodes with original: {copy is not nodes[0]}")
 
     print("\n" + "=" * 70)
 

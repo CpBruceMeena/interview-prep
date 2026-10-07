@@ -6,17 +6,18 @@ Run all category demos to see implementations, thought processes,
 and complexity analysis for each data structure and algorithm.
 
 Usage:
-    python main.py          # Run all demos
-    python main.py -l       # List all available categories
+    python3 main.py          # Run all demos; exit status 1 if any fails
+    python3 main.py -l       # List all available categories
 
 To run a specific category:
-    python 01_arrays/questions.py
-    python 03_stacks/questions.py
+    python3 01_arrays/questions.py
+    python3 03_stacks/questions.py
 """
 
 import importlib
 import sys
 import time
+import traceback
 
 
 CATEGORIES = [
@@ -50,8 +51,10 @@ def list_categories():
     print("\n")
 
 
-def run_all():
+def run_all() -> int:
+    """Run every category's demo(); return the number that failed."""
     total_start = time.time()
+    failed = []
 
     for module, name in CATEGORIES:
         print(f"\n{'#' * 70}")
@@ -59,24 +62,30 @@ def run_all():
         print(f"{'#' * 70}")
 
         try:
+            # Folder names start with a digit, so they can't be imported
+            # with a plain `import` statement; importlib accepts them.
             mod = importlib.import_module(f"{module}.questions")
             if hasattr(mod, 'demo'):
                 mod.demo()
-        except ModuleNotFoundError as e:
-            print(f"   ❌ Could not load {module}: {e}")
-        except Exception as e:
-            print(f"   ❌ Error in {name}: {e}")
+        except Exception:
+            failed.append(name)
+            print(f"   ❌ Error in {name}:")
+            traceback.print_exc()
 
         print()
 
     total_time = time.time() - total_start
     print(f"\n{'=' * 70}")
-    print(f"✅ All categories completed in {total_time:.2f} seconds!")
+    if failed:
+        print(f"❌ {len(failed)} categories failed: {', '.join(failed)}")
+    else:
+        print(f"✅ All {len(CATEGORIES)} categories completed in {total_time:.2f} seconds!")
     print(f"{'=' * 70}")
+    return len(failed)
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "-l":
         list_categories()
     else:
-        run_all()
+        sys.exit(1 if run_all() else 0)

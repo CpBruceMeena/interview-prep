@@ -10,7 +10,10 @@ Core Concepts:
   2. Overlapping Subproblems: Same subproblems solved repeatedly
 • Two approaches:
   - Top-down (Memoization): Recursive + caching, more intuitive
-  - Bottom-up (Tabulation): Iterative, O(1) space possible, more efficient
+  - Bottom-up (Tabulation): Iterative, no recursion-depth limit, and
+    often allows rolling-array space savings (keep only the rows needed)
+• Interview flow that works: brute-force recursion → add memo (top-down)
+  → convert to a table (bottom-up) → shrink the table
 
 Thinking Framework:
 ───────────────────
@@ -44,10 +47,15 @@ def fibonacci(n: int) -> int:
 
     THOUGHT PROCESS:
     ────────────────
-    1. Recursive: fib(n) = fib(n-1) + fib(n-2) — O(2ⁿ) exponential!
+    1. Recursive: fib(n) = fib(n-1) + fib(n-2) — exponential, O(φⁿ)
+       ≈ O(1.618ⁿ) calls (often quoted loosely as O(2ⁿ))
     2. Memoization: Cache results — O(n) time, O(n) space
+       (in Python: @functools.cache; still recursion-depth limited)
     3. Tabulation: Build from bottom — O(n) time, O(1) space
     4. Key insight: We only need last two values, not entire array
+    5. Faster: matrix exponentiation / fast doubling — O(log n)
+       arithmetic operations. In Java/Go, fib(93) already overflows a
+       signed 64-bit integer; LeetCode-style problems ask for it mod 1e9+7.
 
     COMPLEXITY:
     ──────────
@@ -130,6 +138,12 @@ def coin_change(coins: List[int], amount: int) -> int:
     3. Base: dp[0] = 0 (0 coins to make amount 0)
     4. Initialize dp with amount+1 (sentinel for "impossible")
     5. For each amount, try every coin — this is a classic unbounded knapsack
+    6. Why not greedy (largest coin first)? It fails for non-canonical
+       coin systems: coins [1, 3, 4], amount 6 → greedy 4+1+1 = 3 coins,
+       optimal 3+3 = 2 coins.
+    7. Variant "number of ways" (Coin Change II): loop coins OUTER and
+       amounts inner, so each combination is counted once, not once per
+       ordering.
 
     COMPLEXITY:
     ──────────
@@ -174,7 +188,12 @@ def length_of_lis(nums: List[int]) -> int:
        - For each num, use binary search to find where it fits
        - If num > all tails, append; else, replace the smallest tail ≥ num
     3. Key insight: We only care about the smallest possible tail value
-       for each subsequence length (greedy)
+       for each subsequence length (greedy). `tails` stays sorted, which
+       is what makes the binary search valid.
+    4. Caveat: `tails` is NOT itself an LIS; to reconstruct one, store a
+       predecessor index for each element.
+    5. bisect_left gives STRICTLY increasing; use bisect_right for
+       non-decreasing subsequences.
 
     COMPLEXITY:
     ──────────
@@ -268,7 +287,12 @@ def knapsack(weights: List[int], values: List[int], capacity: int) -> int:
        - Skip item i: dp[i-1][w]
        - Take item i (if weight[i] ≤ w): value[i] + dp[i-1][w - weight[i]]
     3. dp[i][w] = max(skip, take)
-    4. Space optimization: 1D array, iterate capacity backwards
+    4. Space optimization: 1D array, iterate capacity BACKWARDS so that
+       dp[w - weight] still holds the previous item's row. Iterating
+       forwards would let the same item be taken again — which is
+       exactly the unbounded knapsack.
+    5. O(n × capacity) is pseudo-polynomial: polynomial in the VALUE of
+       capacity, exponential in its bit length. 0/1 knapsack is NP-hard.
 
     COMPLEXITY:
     ──────────
@@ -312,11 +336,15 @@ def min_distance(word1: str, word2: str) -> int:
            dp[i-1][j-1]   # Replace
          )
     3. Base: dp[i][0] = i (delete all), dp[0][j] = j (insert all)
+    4. The code swaps the strings so the row is the shorter one. That is
+       safe because edit distance is symmetric (an insert one way is a
+       delete the other way).
 
     COMPLEXITY:
     ──────────
     Time: O(m × n) — Full DP table
-    Space: O(min(m, n)) — Optimized
+    Space: O(min(m, n)) — Optimized (needs the full table if you must
+           reconstruct the actual edit script)
     """
     m, n = len(word1), len(word2)
 
@@ -366,6 +394,9 @@ def max_product_subarray(nums: List[int]) -> int:
        - min_ending = min(nums[i], max_ending * nums[i], min_ending * nums[i])
     3. A negative number can turn min into max (and vice versa)
     4. Key insight: Need to track both extremes, not just max
+    5. Zeros reset both extremes (the `num` candidate restarts the run)
+    6. Java/Go: products overflow quickly; LeetCode guarantees the answer
+       fits in 32 bits, but intermediate min/max may not — use long
 
     COMPLEXITY:
     ──────────
@@ -415,6 +446,8 @@ def rob(nums: List[int]) -> int:
        - Skip it: dp[i-1]
     3. dp[i] = max(nums[i] + dp[i-2], dp[i-1])
     4. Space optimize: only need prev and prev2
+    5. Variants: houses in a circle (run twice: without the first house,
+       without the last); houses in a tree (return (rob, skip) per node)
 
     COMPLEXITY:
     ──────────
@@ -458,6 +491,9 @@ def unique_paths(m: int, n: int) -> int:
     3. Base: dp[0][j] = 1 (only one way along top row)
        dp[i][0] = 1 (only one way along left column)
     4. Space optimize: only need current and previous row
+    5. Closed form: choose which (m-1) of the (m+n-2) moves go down:
+       C(m+n-2, m-1) — math.comb in Python. The DP still matters because
+       it extends to obstacles and weighted grids.
 
     COMPLEXITY:
     ──────────
@@ -498,8 +534,9 @@ def min_cut(s: str) -> int:
 
     COMPLEXITY:
     ──────────
-    Time: O(n²) — Double loop + palindrome check
-    Space: O(n²) — Palindrome table (can be optimized)
+    Time: O(n²) — O(n²) to build the palindrome table, O(n²) for the cuts
+    Space: O(n²) — Palindrome table (O(n) with center expansion that
+           updates dp directly)
     """
     n = len(s)
     if n <= 1:
@@ -526,6 +563,115 @@ def min_cut(s: str) -> int:
                     dp[i] = min(dp[i], 1 + dp[j])
 
     return dp[-1]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 12: Word Break
+# ════════════════════════════════════════════════════════════════════════
+
+def word_break(s: str, word_dict: List[str]) -> bool:
+    """
+    QUESTION:
+    ─────────
+    Return True if s can be split into a sequence of one or more
+    dictionary words (words may be reused).
+
+    Example:
+        Input: s = "applepenapple", wordDict = ["apple", "pen"]
+        Output: True
+        Input: s = "catsandog", wordDict = ["cats","dog","sand","and","cat"]
+        Output: False
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Brute force recursion tries every prefix: exponential on inputs
+       like "aaaa...ab" with dict ["a", "aa", "aaa"].
+    2. The subproblem "can s[i:] be segmented?" repeats → DP.
+    3. State: dp[i] = True if s[:i] can be segmented. dp[0] = True.
+       dp[i] = any(dp[j] and s[j:i] in words) over j < i.
+    4. Only try j within the longest word's length of i: that bounds the
+       inner loop by L instead of n.
+    5. Word Break II (return all sentences) can produce exponentially many
+       answers; memoize suffix → list of sentences, and check the boolean
+       version first.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n · L · L) — n end positions, L start positions each, and
+          O(L) to slice and hash each candidate (L = longest word)
+    Space: O(n + total dictionary size)
+
+    EDGE CASES:
+    ──────────
+    • Empty dictionary → False for any non-empty s
+    • A trie over the dictionary lets one walk from j find all words
+      starting at j without slicing (helps with huge dictionaries)
+    """
+    words = set(word_dict)
+    max_len = max(map(len, words), default=0)
+    n = len(s)
+    dp = [False] * (n + 1)
+    dp[0] = True
+
+    for i in range(1, n + 1):
+        for j in range(max(0, i - max_len), i):
+            if dp[j] and s[j:i] in words:
+                dp[i] = True
+                break
+
+    return dp[n]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 13: Decode Ways
+# ════════════════════════════════════════════════════════════════════════
+
+def num_decodings(s: str) -> int:
+    """
+    QUESTION:
+    ─────────
+    Letters are encoded 'A' → "1" ... 'Z' → "26". Given a digit string,
+    count the ways to decode it.
+
+    Example:
+        Input: "226"
+        Output: 3  ("BZ" = 2|26, "VF" = 22|6, "BBF" = 2|2|6)
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Climbing-stairs shape (Q2): the last step consumes one digit or
+       two, so dp[i] = (ways using one digit) + (ways using two).
+    2. Conditions are the whole problem:
+       - One digit s[i-1] is valid iff it is not '0'
+       - Two digits s[i-2:i] are valid iff 10 ≤ value ≤ 26
+         ("06" is NOT a valid two-digit code)
+    3. dp[0] = 1 (empty prefix). Only the last two values are needed.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — One pass
+    Space: O(1) — Two rolling variables
+
+    EDGE CASES:
+    ──────────
+    • Leading '0' or "00" anywhere → 0
+    • "10", "20" → 1 (the zero must pair with the digit before it)
+    • "27" → 1 (27 is not a letter)
+    """
+    if not s:
+        return 0
+
+    prev2, prev1 = 1, 1 if s[0] != '0' else 0   # dp[i-2], dp[i-1]
+
+    for i in range(2, len(s) + 1):
+        current = 0
+        if s[i - 1] != '0':
+            current += prev1                     # Single digit
+        if 10 <= int(s[i - 2:i]) <= 26:
+            current += prev2                     # Two digits
+        prev2, prev1 = prev1, current
+
+    return prev1
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -589,6 +735,17 @@ def demo():
     print("-" * 40)
     print(f"   \"aab\": {min_cut('aab')}")
     print(f"   \"ab\": {min_cut('ab')}")
+
+    print("\n1️⃣2️⃣  Word Break")
+    print("-" * 40)
+    print(f"   \"applepenapple\", [apple, pen]: {word_break('applepenapple', ['apple', 'pen'])}")
+    print(f"   \"catsandog\", [cats, dog, sand, and, cat]: "
+          f"{word_break('catsandog', ['cats', 'dog', 'sand', 'and', 'cat'])}")
+
+    print("\n1️⃣3️⃣  Decode Ways")
+    print("-" * 40)
+    for code in ("12", "226", "06", "10"):
+        print(f"   \"{code}\": {num_decodings(code)}")
 
     print("\n" + "=" * 70)
 

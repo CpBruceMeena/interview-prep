@@ -60,6 +60,14 @@ def num_islands(grid: List[List[str]]) -> int:
     ──────────
     Time: O(m × n) — Visit each cell at most once
     Space: O(m × n) — Worst-case recursion stack for DFS (all land)
+
+    PRODUCTION NOTE:
+    ────────────────
+    Recursive DFS on a 1000×1000 all-land grid needs a million stack
+    frames: Python raises RecursionError (default limit ~1000) and Java
+    throws StackOverflowError. Use BFS or an explicit stack when the grid
+    can be large. Sinking cells mutates the caller's grid; copy it or use
+    a visited set if that matters.
     """
     if not grid:
         return 0
@@ -110,12 +118,18 @@ def ladder_length(begin_word: str, end_word: str, word_list: List[str]) -> int:
     4. Wildcard: "hot" → ["*ot", "h*t", "ho*"]
        All words matching a wildcard are neighbors
 
+    5. Mark words visited when ENQUEUED, not when dequeued, or the same
+       word is queued many times.
+    6. Bidirectional BFS (expand the smaller frontier from both ends)
+       cuts the explored states dramatically: roughly b^(d/2) twice
+       instead of b^d.
+
     COMPLEXITY:
     ──────────
-    Time: O(m² × n) — n words of length m, generating m wildcards each
-    Space: O(m × n) — Adjacency list for wildcards
+    Time: O(m² × n) — n words, m patterns each, each pattern O(m) to build
+    Space: O(m² × n) — n·m pattern keys of length m
     """
-    if end_word not in word_list:
+    if end_word not in set(word_list):
         return 0
 
     # Build adjacency: wildcard → list of matching words
@@ -214,6 +228,11 @@ def find_order(num_courses: int, prerequisites: List[List[int]]) -> List[int]:
     ────────────────
     1. Same as can_finish but also track the topological order
     2. Kahn's algorithm naturally produces a valid ordering
+    3. DFS alternative: three colours (unvisited / in progress / done);
+       reaching an in-progress node means a cycle; the reverse of the
+       post-order is a topological order
+    4. Need the lexicographically smallest order? Swap the queue for a
+       min-heap: O((V + E) log V)
 
     COMPLEXITY:
     ──────────
@@ -311,15 +330,21 @@ def network_delay_time(times: List[List[int]], n: int, k: int) -> int:
     THOUGHT PROCESS:
     ────────────────
     1. This is a shortest path from single source problem
-    2. Dijkstra's algorithm (positive weights only):
+    2. Dijkstra's algorithm (non-negative weights only):
        - Min-heap priority queue: (distance, node)
        - Update distances to neighbors if shorter path found
+       - Python's heapq has no decrease-key, so we push duplicates and
+         skip "stale" entries whose distance is worse than dist[u]
+         ("lazy deletion")
     3. The answer is the maximum distance among all reachable nodes
+    4. Why non-negative: once a node is popped, its distance is final
+       because any other path is at least as long. One negative edge
+       breaks that; use Bellman-Ford (Q11) instead.
 
     COMPLEXITY:
     ──────────
-    Time: O(E log V) — Each edge relaxed once, heap operations log V
-    Space: O(V + E) — Adjacency list + distance array
+    Time: O(E log V) — Up to E heap pushes, each O(log E) = O(log V)
+    Space: O(V + E) — Adjacency list + distance array + heap
     """
     # Build adjacency list: graph[u] = [(v, w), ...]
     graph = [[] for _ in range(n + 1)]
@@ -364,12 +389,21 @@ class UnionFind:
     2. find(x): recursively find the root of x
        - With path compression: set parent to root (flattens tree)
     3. union(x, y): connect the sets containing x and y
-       - With union by rank: attach smaller tree under larger root
+       - With union by rank: attach the root of LOWER rank under the
+         higher one. Rank is an upper bound on tree height; it is not
+         updated by path compression. (Union by size works equally well
+         and also gives you component sizes.)
     4. connected(x, y): check if x and y have same root
+    5. Either optimisation alone gives O(log n); both together give
+       O(α(n)) amortized. With union by rank the tree height is at most
+       log n, so the recursive find cannot hit Python's recursion limit.
+    6. Limitation: no efficient "split"/delete. For deletions, process
+       edges offline in reverse, or use other structures.
 
     COMPLEXITY:
     ──────────
-    Time: O(α(n)) — Inverse Ackermann, practically O(1)
+    Time: O(α(n)) amortized per operation — inverse Ackermann, ≤ 4 for
+          any realistic n
     Space: O(n) — Parent and rank arrays
     """
 
@@ -467,7 +501,8 @@ def pacific_atlantic(heights: List[List[int]]) -> List[List[int]]:
     COMPLEXITY:
     ──────────
     Time: O(m × n) — Each cell visited twice (Pacific + Atlantic)
-    Space: O(m × n) — Two boolean matrices
+    Space: O(m × n) — Two boolean matrices (+ recursion depth; use an
+           explicit stack/BFS for large grids)
     """
     if not heights:
         return []
@@ -529,11 +564,15 @@ def alien_order(words: List[str]) -> str:
     2. Build graph from these precedence relations
     3. Topological sort (Kahn's algorithm) to find character order
     4. Edge cases: "abc" before "ab" → invalid (prefix issue)
+    5. Only the FIRST differing character of each adjacent pair gives
+       information; everything after it says nothing about order.
+    6. Letters that appear but have no constraints can go anywhere, so
+       several outputs may be valid.
 
     COMPLEXITY:
     ──────────
     Time: O(C) — C = total characters across all words
-    Space: O(1) — At most 26 unique characters
+    Space: O(1) — At most 26 unique characters (26² edges)
     """
     # Initialize graph
     graph = {c: set() for word in words for c in word}
@@ -571,6 +610,115 @@ def alien_order(words: List[str]) -> str:
         return ""  # Cycle detected
 
     return ''.join(order)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 11: Cheapest Flights Within K Stops (Bellman-Ford)
+# ════════════════════════════════════════════════════════════════════════
+
+def find_cheapest_price(n: int, flights: List[List[int]], src: int, dst: int, k: int) -> int:
+    """
+    QUESTION:
+    ─────────
+    n cities, flights[i] = [from, to, price]. Return the cheapest price
+    from src to dst using at most k stops (k + 1 edges), or -1.
+
+    Example:
+        Input: n=4, flights=[[0,1,100],[1,2,100],[2,0,100],[1,3,600],[2,3,200]],
+               src=0, dst=3, k=1
+        Output: 700  (0 → 1 → 3; 0 → 1 → 2 → 3 costs 400 but has 2 stops)
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Plain Dijkstra is wrong here: it finalizes the cheapest route to a
+       node even if that route used too many stops, and may discard a
+       pricier route that had stops left.
+    2. Bellman-Ford fits the constraint exactly: after round i, prices[v]
+       is the cheapest cost using at most i edges. Run k + 1 rounds.
+    3. Each round must read from the PREVIOUS round's prices (copy the
+       array). Relaxing in place could chain two edges in one round and
+       silently exceed the stop limit.
+    4. General Bellman-Ford: V - 1 rounds give shortest paths with
+       negative edges allowed; if a V-th round still relaxes an edge,
+       there is a negative cycle reachable from the source.
+    5. Alternatives: BFS by levels with pruning, or Dijkstra on states
+       (node, stops_used).
+
+    COMPLEXITY:
+    ──────────
+    Time: O(k · E) — k + 1 rounds over all edges (general BF: O(V · E))
+    Space: O(V) — Two price arrays
+    """
+    INF = float("inf")
+    prices = [INF] * n
+    prices[src] = 0
+
+    for _ in range(k + 1):
+        nxt = prices[:]                       # Read old, write new
+        for u, v, w in flights:
+            if prices[u] != INF and prices[u] + w < nxt[v]:
+                nxt[v] = prices[u] + w
+        prices = nxt
+
+    return -1 if prices[dst] == INF else prices[dst]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 12: Min Cost to Connect All Points (MST — Kruskal / Prim)
+# ════════════════════════════════════════════════════════════════════════
+
+def min_cost_connect_points(points: List[List[int]]) -> int:
+    """
+    QUESTION:
+    ─────────
+    Given points on a 2-D plane, the cost to connect two points is their
+    Manhattan distance. Return the minimum cost to connect all points
+    (a minimum spanning tree over the complete graph).
+
+    Example:
+        Input: [[0,0],[2,2],[3,10],[5,2],[7,0]]
+        Output: 20
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. "Connect everything at minimum total cost" = MST.
+    2. Kruskal: sort all edges by weight, add each edge unless it joins
+       two nodes already connected (Union-Find, Q7). Stop at V - 1 edges.
+       O(E log E). Best for sparse graphs given as an edge list.
+    3. Prim: grow one tree from any node, always adding the cheapest edge
+       leaving it. With a heap: O(E log V). On a dense / complete graph
+       the array version (implemented below) is O(V²) with no heap and no
+       edge list, which beats Kruskal's O(V² log V) here.
+    4. Both are greedy and correct by the cut property: the lightest edge
+       crossing any cut belongs to some MST.
+
+    COMPLEXITY:
+    ──────────
+    Time: O(V²) — V iterations, each scanning all V points
+    Space: O(V) — min_cost and in_tree arrays
+    """
+    n = len(points)
+    if n <= 1:
+        return 0
+
+    in_tree = [False] * n
+    min_cost = [float("inf")] * n     # Cheapest edge from tree to node i
+    min_cost[0] = 0
+    total = 0
+
+    for _ in range(n):
+        # Pick the cheapest point not yet in the tree
+        u = min((i for i in range(n) if not in_tree[i]), key=min_cost.__getitem__)
+        in_tree[u] = True
+        total += min_cost[u]
+        ux, uy = points[u]
+        for v in range(n):
+            if not in_tree[v]:
+                d = abs(ux - points[v][0]) + abs(uy - points[v][1])
+                if d < min_cost[v]:
+                    min_cost[v] = d
+
+    return total
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -612,6 +760,15 @@ def demo():
     print("\n4️⃣  Course Schedule II")
     print("-" * 40)
     print(f"   Order: {find_order(4, [[1,0],[2,0],[3,1],[3,2]])}")
+
+    # Q5
+    print("\n5️⃣  Clone Graph")
+    print("-" * 40)
+    a, b, c = GraphNode(1), GraphNode(2), GraphNode(3)
+    a.neighbors, b.neighbors, c.neighbors = [b, c], [a, c], [a, b]
+    a2 = clone_graph(a)
+    print(f"   Triangle 1-2-3 cloned; clone of 1 has neighbours "
+          f"{[n.val for n in a2.neighbors]}, new object: {a2 is not a}")
 
     # Q6
     print("\n6️⃣  Network Delay Time (Dijkstra)")
@@ -657,6 +814,20 @@ def demo():
     alien_words = ["wrt", "wrf", "er", "ett", "rftt"]
     print(f"   Words: {alien_words}")
     print(f"   Order: \"{alien_order(alien_words)}\"")
+
+    # Q11
+    print("\n1️⃣1️⃣  Cheapest Flights Within K Stops (Bellman-Ford)")
+    print("-" * 40)
+    flights = [[0, 1, 100], [1, 2, 100], [2, 0, 100], [1, 3, 600], [2, 3, 200]]
+    print(f"   0 → 3 with k=1: {find_cheapest_price(4, flights, 0, 3, 1)}")
+    print(f"   0 → 3 with k=2: {find_cheapest_price(4, flights, 0, 3, 2)}")
+
+    # Q12
+    print("\n1️⃣2️⃣  Min Cost to Connect All Points (MST)")
+    print("-" * 40)
+    pts = [[0, 0], [2, 2], [3, 10], [5, 2], [7, 0]]
+    print(f"   Points: {pts}")
+    print(f"   MST cost: {min_cost_connect_points(pts)}")
 
     print("\n" + "=" * 70)
 

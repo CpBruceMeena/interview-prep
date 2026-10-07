@@ -51,7 +51,12 @@ def inorder_traversal(root: Optional[TreeNode]) -> List[int]:
     2. Iterative: Use stack to simulate recursion
        - Go left as far as possible, pushing nodes
        - Pop, visit, then go right
-    3. Morris Traversal: Use threaded pointers for O(1) space
+    3. Morris Traversal: temporarily thread each left subtree's rightmost
+       node back to its ancestor, giving O(1) extra space (it mutates the
+       tree while running, then restores it)
+    4. Prefer the iterative form in Python for deep trees: recursion
+       depth is capped at ~1000 by default, and a skewed tree of 10⁴
+       nodes raises RecursionError
 
     COMPLEXITY:
     ──────────
@@ -203,6 +208,11 @@ def is_valid_bst(root: Optional[TreeNode]) -> bool:
        - For each node, keep a valid range (low, high)
        - Left child must be in (low, root.val)
        - Right child must be in (root.val, high)
+    4. Bounds start at ±infinity, not at INT_MIN/INT_MAX: in Java a node
+       holding Integer.MIN_VALUE would wrongly fail. Use Long bounds or
+       null-able bounds there.
+    5. Duplicates: this treats them as invalid (strict <). Ask which side
+       duplicates go on if the interviewer allows them.
 
     COMPLEXITY:
     ──────────
@@ -305,13 +315,19 @@ def lowest_common_ancestor(root: Optional[TreeNode], p: TreeNode, q: TreeNode) -
        - If both sides return non-None → current is LCA
        - If only one side returns non-None → propagate that up
     2. This is a bottom-up approach — finds the deepest common ancestor
+    3. Assumes both p and q are in the tree. If one may be missing, this
+       returns the other node (wrong); count how many of p, q were
+       actually found and return None unless both were.
+    4. If nodes have parent pointers: walk up from p recording ancestors
+       in a set, then walk up from q (or use the two-pointer trick from
+       linked-list intersection).
 
     COMPLEXITY:
     ──────────
     Time: O(n) — Worst case visit all nodes
     Space: O(h) — Recursion stack
     """
-    if not root or root == p or root == q:
+    if not root or root is p or root is q:
         return root
 
     left = lowest_common_ancestor(root.left, p, q)
@@ -336,9 +352,14 @@ def serialize(root: Optional[TreeNode]) -> str:
     THOUGHT PROCESS:
     ────────────────
     1. Use preorder traversal with a delimiter (',') and null marker ('#')
-    2. Preorder naturally encodes tree structure
-    3. Deserialize: Use queue to process nodes in order
-    4. Alternative: Level order BFS with nulls
+    2. Preorder + explicit null markers uniquely encodes the structure
+       (without null markers you need two traversals, e.g. preorder +
+       inorder, and distinct values)
+    3. Deserialize: consume tokens from an iterator in the same preorder;
+       each '#' ends a branch
+    4. Alternative: Level order BFS with nulls (LeetCode's format)
+    5. For a BST, preorder WITHOUT nulls is enough: rebuild using
+       (low, high) bounds — a more compact encoding
 
     COMPLEXITY:
     ──────────
@@ -436,6 +457,9 @@ def kth_smallest(root: Optional[TreeNode], k: int) -> int:
     1. Inorder traversal of BST gives sorted order
     2. Iterative inorder: stop after k elements
     3. This is O(h + k) because we stop early
+    4. Follow-up "the BST is modified often and kth is queried often":
+       store subtree sizes in each node (order-statistic tree), then
+       walk down in O(h): go left if k <= size(left), etc.
 
     COMPLEXITY:
     ──────────
@@ -502,6 +526,117 @@ def diameter_of_binary_tree(root: Optional[TreeNode]) -> int:
 
     depth(root)
     return diameter
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 11: Binary Tree Maximum Path Sum
+# ════════════════════════════════════════════════════════════════════════
+
+def max_path_sum(root: Optional[TreeNode]) -> int:
+    """
+    QUESTION:
+    ─────────
+    A path is any sequence of nodes connected by edges, each node used at
+    most once; it need not pass through the root. Return the maximum sum
+    of node values over all non-empty paths. Values may be negative.
+
+    Example:
+        Input: [-10, 9, 20, None, None, 15, 7]
+        Output: 42  (15 → 20 → 7)
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. Same skeleton as Diameter (Q10): every path has a single highest
+       node where it "bends". At that node the path is
+       node.val + best downward chain on the left + on the right.
+    2. A recursive helper returns the best DOWNWARD chain starting at the
+       node (it can extend only one side to its parent):
+         gain(node) = node.val + max(0, gain(left), gain(right))
+       and clamps child gains at 0: a negative chain is dropped, not used.
+    3. While recursing, update a global answer with the bent path
+         node.val + max(0, gain(left)) + max(0, gain(right))
+    4. Two values per node — "what I return to my parent" vs "best path
+       that peaks here" — is the reusable pattern (diameter, longest
+       univalue path, house robber III).
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — Each node visited once
+    Space: O(h) — Recursion stack
+
+    EDGE CASES:
+    ──────────
+    • All negative → the single largest node (start the answer at -inf,
+      not 0)
+    • Single node → its value
+    """
+    best = float("-inf")
+
+    def gain(node: Optional[TreeNode]) -> int:
+        nonlocal best
+        if not node:
+            return 0
+        left = max(gain(node.left), 0)     # Drop negative chains
+        right = max(gain(node.right), 0)
+        best = max(best, node.val + left + right)   # Path peaking here
+        return node.val + max(left, right)          # Chain for the parent
+
+    gain(root)
+    return best
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUESTION 12: Construct Binary Tree from Preorder and Inorder
+# ════════════════════════════════════════════════════════════════════════
+
+def build_tree_pre_in(preorder: List[int], inorder: List[int]) -> Optional[TreeNode]:
+    """
+    QUESTION:
+    ─────────
+    Given the preorder and inorder traversals of a binary tree with
+    DISTINCT values, reconstruct the tree.
+
+    Example:
+        preorder = [3, 9, 20, 15, 7], inorder = [9, 3, 15, 20, 7]
+        → 3 → (9, 20 → (15, 7))
+
+    THOUGHT PROCESS:
+    ────────────────
+    1. preorder[0] is the root. Its position in inorder splits inorder
+       into the left subtree (before it) and the right subtree (after).
+    2. The left subtree's size tells how many of the next preorder
+       entries belong to it; the rest belong to the right subtree.
+    3. Naive slicing + inorder.index() is O(n²). Fix both:
+       - Precompute value → inorder index in a hash map
+       - Recurse on index ranges and consume preorder with a moving
+         pointer instead of slicing
+    4. Why distinct values: with duplicates the root's inorder position
+       is ambiguous and the tree is not unique.
+    5. Preorder + postorder alone is NOT enough in general (a node with a
+       single child could be left or right).
+
+    COMPLEXITY:
+    ──────────
+    Time: O(n) — Each node created once, O(1) index lookups
+    Space: O(n) — Index map, plus O(h) recursion
+    """
+    index_of = {val: i for i, val in enumerate(inorder)}
+    pre_idx = 0
+
+    def build(lo: int, hi: int) -> Optional[TreeNode]:
+        """Build the subtree whose inorder range is [lo, hi]."""
+        nonlocal pre_idx
+        if lo > hi:
+            return None
+        root_val = preorder[pre_idx]
+        pre_idx += 1
+        mid = index_of[root_val]
+        node = TreeNode(root_val)
+        node.left = build(lo, mid - 1)     # Left first: preorder order
+        node.right = build(mid + 1, hi)
+        return node
+
+    return build(0, len(inorder) - 1)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -605,6 +740,20 @@ def demo():
     dia_tree = build_tree([1, 2, 3, 4, 5])
     print(f"   Tree: [1, 2, 3, 4, 5]")
     print(f"   Diameter: {diameter_of_binary_tree(dia_tree)}")
+
+    # Q11
+    print("\n1️⃣1️⃣  Binary Tree Maximum Path Sum")
+    print("-" * 40)
+    mps_tree = build_tree([-10, 9, 20, None, None, 15, 7])
+    print(f"   Tree: [-10, 9, 20, null, null, 15, 7]")
+    print(f"   Max path sum: {max_path_sum(mps_tree)}")
+
+    # Q12
+    print("\n1️⃣2️⃣  Construct Tree from Preorder + Inorder")
+    print("-" * 40)
+    rebuilt = build_tree_pre_in([3, 9, 20, 15, 7], [9, 3, 15, 20, 7])
+    print(f"   preorder=[3, 9, 20, 15, 7], inorder=[9, 3, 15, 20, 7]")
+    print(f"   Rebuilt level order: {level_order(rebuilt)}")
 
     print("\n" + "=" * 70)
 

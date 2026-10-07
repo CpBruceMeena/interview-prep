@@ -55,8 +55,16 @@ def length_of_longest_substring(s: str) -> int:
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Each character visited at most twice
+    Time: O(n) — One pass; `left` jumps instead of stepping, so each
+          character is processed once (the set-based variant that shrinks
+          one step at a time visits each character at most twice)
     Space: O(min(m, n)) — Hash map of unique chars (m = charset size)
+
+    EDGE CASES:
+    ──────────
+    • "abba" — the `char_index[char] >= left` check stops `left` moving
+      BACKWARDS when we meet a stale occurrence outside the window
+    • Empty string — 0
     """
     char_index = {}  # character -> last seen index
     max_length = 0
@@ -158,12 +166,24 @@ def my_atoi(s: str) -> int:
        - +/- after whitespace but before digits
        - Overflow → clamp to 32-bit integer range
     3. Overflow detection: Before multiplying by 10, check if
-       result > (MAX_INT - digit) / 10
+       result > (MAX_INT - digit) // 10
+       - In Java/Go/C this check is the whole point: result * 10 + digit
+         would silently wrap in a 32-bit int. Python ints never overflow,
+         so the check only implements the clamping rule here.
+       - For negatives the same test is still correct: the only magnitude
+         that fits as negative but not positive is 2³¹, which clamps to
+         INT_MIN anyway.
 
     COMPLEXITY:
     ──────────
     Time: O(n) — Single pass through relevant characters
     Space: O(1) — No extra space
+
+    EDGE CASES:
+    ──────────
+    • "+-12" → 0 (only one sign allowed)
+    • "words 987" → 0 (stop at the first non-digit)
+    • "  0000012" → 12 (leading zeros)
     """
     if not s:
         return 0
@@ -226,9 +246,19 @@ def is_anagram(s: str, t: str) -> bool:
     ──────────
     Time: O(n) — Single pass through each string
     Space: O(1) — At most 26 or 128 entries (constant charset)
+
+    EDGE CASES:
+    ──────────
+    • The 26-slot array only works for lowercase a-z. In Python a stray
+      'A' gives index -32, which silently wraps to another slot instead of
+      failing, so we fall back to a Counter for any other input
+      (Unicode follow-up: Counter / hash map, O(k) space for k distinct)
     """
     if len(s) != len(t):
         return False
+
+    if not all('a' <= c <= 'z' for c in s + t):
+        return Counter(s) == Counter(t)
 
     # Use array for lowercase letters (or dict for general)
     counts = [0] * 26
@@ -305,8 +335,16 @@ def longest_palindrome_manacher(s: str) -> str:
 
     COMPLEXITY:
     ──────────
-    Time: O(n) — Linear, each position examined at most twice
+    Time: O(n) — Every successful expansion step pushes `right` further,
+          and `right` never moves back, so total expansion work is O(n)
     Space: O(n) — Transformed string and radius array
+
+    WHY IT IS CORRECT:
+    ──────────────────
+    radii[i] is the palindrome radius in the transformed string, which
+    equals the palindrome LENGTH in the original string. The separators
+    make every palindrome odd-length, so one code path handles both cases.
+    (Deep dive with all radii: see Advanced Strings, Question 4.)
     """
     if not s:
         return ""
@@ -421,7 +459,16 @@ def min_window(s: str, t: str) -> str:
     COMPLEXITY:
     ──────────
     Time: O(m + n) — Each character visited twice (expand + contract)
-    Space: O(k) — k = unique characters in t
+    Space: O(|Σ|) — Counts for t plus counts for every char seen in s
+           (bounded by the alphabet size)
+
+    WHY `formed` INSTEAD OF COMPARING MAPS:
+    ───────────────────────────────────────
+    Comparing the two maps on every step costs O(|Σ|) each time.
+    `formed` counts how many distinct chars currently meet their quota,
+    so the validity check is O(1). It only changes when a count crosses
+    the quota exactly, which is why we test == on the way up and < on
+    the way down.
     """
     if not s or not t:
         return ""
@@ -541,12 +588,14 @@ def find_repeated_dna_sequences(s: str) -> List[str]:
        - Each 10-letter sequence → 20-bit integer
        - Rolling hash: drop leftmost, add rightmost using bit operations
        - O(n) time, no string slicing overhead
-    3. This is a classic use case for rolling hash optimization
+    3. Here the "hash" is exact, not probabilistic: 10 chars × 2 bits
+       = 20 bits, so distinct sequences never collide and no string
+       comparison is needed (general Rabin-Karp must verify matches)
 
     COMPLEXITY:
     ──────────
     Time: O(n) — Linear scan with constant-time rolling hash
-    Space: O(n) — Store seen sequences
+    Space: O(n) — Store seen sequences (at most min(n, 4¹⁰) ints)
     """
     if len(s) <= 10:
         return []

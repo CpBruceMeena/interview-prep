@@ -438,7 +438,7 @@ nav:
     - Compression: tools-interview/compression/INTERVIEW_QUESTIONS.md
     - CI/CD Deployment: tools-interview/ci-cd-deployment/DEPLOYMENT_GUIDE.md
 
-  - 🐍 Python DSA (171 Questions):
+  - 🐍 Python DSA (190 Questions):
     - Overview: python-dsa/index.md
     - Arrays: python-dsa/01_arrays/index.md
     - Strings: python-dsa/02_strings/index.md

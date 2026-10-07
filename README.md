@@ -76,7 +76,7 @@
 ║  ├── kv-store                      TTL · sync.RWMutex               ║
 ║  └── task-queue                    Worker Pool · Channels            ║
 ║                                                                      ║
-║  🐍 python-dsa/               ← 171 DSA Questions (20 Categories)       ║
+║  🐍 python-dsa/               ← 190 DSA Questions (20 Categories)       ║
 ║     Arrays · Strings · Trees · Graphs · DP · Backtracking            ║
 ║     Trie · Heaps · Bit Manip · Greedy · Design · Sliding Window      ║
 ║                                                                      ║
@@ -410,7 +410,7 @@ PHASE 7 ─── AI Engineering
 
 | Metric | Count |
 |--------|-------|
-| Python DSA Questions | **171** |
+| Python DSA Questions | **190** |
 | Python DSA Categories | **20** |
 | Python LLD Projects | **24** |
 | Java LLD Projects | **3** |
