@@ -427,7 +427,7 @@ class EarliestDeadlineFirstStrategy(SchedulingStrategy):
 
     def key(self, job: Job) -> SortKey:
         deadline = job.deadline if job.deadline is not None else math.inf
-        return (deadline, -job.priority, job.seq)
+        return deadline, -job.priority, job.seq
 
 
 # ════════════════════════════════════════════════════════════════════════
