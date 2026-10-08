@@ -393,6 +393,7 @@ nav:
     - Overview: python-interview/README.md
     - Interview Questions: python-interview/INTERVIEW_QUESTIONS.md
     - Multithreading & Concurrency: python-interview/MULTITHREADING_NOTES.md
+    - Async Basics (Start Here): python-interview/ASYNC_BASICS.md
     - Async/Await & Asyncio: python-interview/ASYNCIO_NOTES.md
     - Django: python-interview/DJANGO_NOTES.md
     - FastAPI: python-interview/FASTAPI_NOTES.md
@@ -402,6 +403,9 @@ nav:
     - Interview Questions: golang-interview/INTERVIEW_QUESTIONS.md
     - Concurrency & Goroutines: golang-interview/CONCURRENCY_NOTES.md
     - Pointers, Memory & Object Handling: golang-interview/POINTERS_MEMORY_NOTES.md
+    - Language Internals (Slices, Maps, Generics, defer): golang-interview/LANGUAGE_INTERNALS_NOTES.md
+    - Concurrency Coding Challenges: golang-interview/CONCURRENCY_CODING_CHALLENGES.md
+    - Production Services (HTTP, DB, Profiling): golang-interview/PRODUCTION_SERVICES_NOTES.md
 
   - ☕ Java:
     - Overview: java-interview/README.md

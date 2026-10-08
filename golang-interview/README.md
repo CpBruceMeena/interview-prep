@@ -12,6 +12,9 @@
 | [`INTERVIEW_QUESTIONS.md`](./INTERVIEW_QUESTIONS.md) | 13 in-depth questions on Go internals and production engineering, each with a 30-second answer, the mechanism, trade-offs and follow-up probes |
 | [`CONCURRENCY_NOTES.md`](./CONCURRENCY_NOTES.md) | Practical concurrency guide (goroutines, channels, `select`, `sync`, atomics, context, production patterns, debugging) plus 17 interview questions |
 | [`POINTERS_MEMORY_NOTES.md`](./POINTERS_MEMORY_NOTES.md) | Pointers, value vs pointer semantics, escape analysis (with real `-gcflags=-m` output), alignment, `unsafe`, GC impact, plus 8 interview questions |
+| [`LANGUAGE_INTERNALS_NOTES.md`](./LANGUAGE_INTERNALS_NOTES.md) | Slice growth and aliasing, maps (Swiss tables), strings/runes, generics (when and how implemented), `defer`/`recover` rules, method sets, goroutine stacks, plus 10 interview questions (all output verified) |
+| [`CONCURRENCY_CODING_CHALLENGES.md`](./CONCURRENCY_CODING_CHALLENGES.md) | 7 coding-round problems with complete `-race`-tested solutions: bounded parallel map, token bucket, singleflight cache, worker pool, pub/sub, leak-free pipeline, retry with jitter |
+| [`PRODUCTION_SERVICES_NOTES.md`](./PRODUCTION_SERVICES_NOTES.md) | `net/http` timeouts and client pooling, `database/sql` pool sizing, a pprof/trace performance-debugging playbook, project layout and modules, service checklist, plus 10 interview questions |
 
 ### Topics Covered
 

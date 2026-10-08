@@ -13,6 +13,7 @@
 | [`MULTITHREADING_NOTES.md`](./MULTITHREADING_NOTES.md) | Threads, the GIL, free-threaded Python (3.13/3.14), subinterpreters and `InterpreterPoolExecutor`, multiprocessing start methods, synchronization patterns, and 16 interview questions |
 | [`DJANGO_NOTES.md`](./DJANGO_NOTES.md) | Django 5.2 LTS / 6.0: ORM, transactions, request lifecycle, DRF, migrations, caching, Celery and the 6.0 tasks framework, async Django, production patterns, and 16 interview questions |
 | [`FASTAPI_NOTES.md`](./FASTAPI_NOTES.md) | FastAPI with Pydantic v2 and Starlette 1.x: DI and `yield` scopes, lifespan, async pitfalls, security, SQLAlchemy async, WebSockets, deployment, and 13 interview questions |
+| [`ASYNC_BASICS.md`](./ASYNC_BASICS.md) | Start here: running functions concurrently with `await`, `gather`, `TaskGroup`, timeouts, semaphores, `to_thread`, and common mistakes (all examples runnable) |
 | [`ASYNCIO_NOTES.md`](./ASYNCIO_NOTES.md) | Comprehensive guide to async/await, event loop internals, coroutines, tasks, streams, and production async patterns |
 
 ### Topics Covered

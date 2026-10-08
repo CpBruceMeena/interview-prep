@@ -186,7 +186,7 @@
 | # | Topic | Why | Resources |
 |---|-------|-----|-----------|
 | 5 | **Python** | GIL, async/await, metaclasses, C extensions | [Python Q&A](python-interview/INTERVIEW_QUESTIONS.md) + [Async](ai-engineering/agents/06_PYTHON_ASYNC_AWAIT.md) |
-| 5 | **Golang** (alternative) | GMP scheduler, GC, channels, interfaces | [Go Q&A](golang-interview/INTERVIEW_QUESTIONS.md) + [Concurrency](golang-interview/CONCURRENCY_NOTES.md) |
+| 5 | **Golang** (alternative) | GMP scheduler, GC, channels, interfaces | [Go Q&A](golang-interview/INTERVIEW_QUESTIONS.md) + [Concurrency](golang-interview/CONCURRENCY_NOTES.md) + [Coding Challenges](golang-interview/CONCURRENCY_CODING_CHALLENGES.md) + [Production](golang-interview/PRODUCTION_SERVICES_NOTES.md) |
 | 5 | **Java** (alternative) | JVM internals, GC tuning, Spring Boot | [Java Q&A](java-interview/INTERVIEW_QUESTIONS.md) + [JVM](java-interview/JVM_INTERNALS_NOTES.md) |
 
 ### Phase 3: Low-Level Design (3-4 weeks)
@@ -357,7 +357,7 @@
         <span class="module-card-title">Python Deep-Dive</span>
     </div>
     <div class="module-card-body">
-        <span class="module-card-count">12 questions + guides</span>
+        <span class="module-card-count">13 questions + 5 guides</span>
         <span class="module-card-desc">CPython internals: GIL, event loops, metaclasses, memory management. Includes multithreading notes with GIL workarounds, async patterns.</span>
     </div>
     <div class="module-card-footer">
@@ -390,7 +390,7 @@
     </div>
     <div class="module-card-body">
         <span class="module-card-count">12 questions + guides</span>
-        <span class="module-card-desc">Go runtime: GMP scheduler, GC, channels, interfaces, memory model. Includes concurrency notes with goroutines, channels, lock-free patterns.</span>
+        <span class="module-card-desc">Go runtime: GMP scheduler, GC, channels, interfaces, memory model. Includes concurrency notes, 7 tested coding challenges, language internals, and production HTTP/DB/profiling guides.</span>
     </div>
     <div class="module-card-footer">
         <span class="module-card-tag">Runtime</span>
