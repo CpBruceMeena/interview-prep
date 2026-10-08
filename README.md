@@ -112,7 +112,7 @@
 
 ---
 
-## 🔥 **26 Low-Level Design Projects**
+## 🔥 **30 Low-Level Design Projects**
 
 <details open>
 <summary><b>Click to expand/collapse</b></summary>
