@@ -47,3 +47,4 @@ crg-cache/
 .cache/code-review-graph/
 .cache/crg/
 *.crg
+.playwright-mcp/

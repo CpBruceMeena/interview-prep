@@ -99,6 +99,9 @@
 ║  🐹 golang-interview/          ← 13 Q — Go Runtime Internals         ║
 ║     GMP Scheduler · GC · Channels · Interfaces · sync.Map            ║
 ║                                                                      ║
+║  🏗️ system-design-interview/   ← Framework + 8 HLD case studies     ║
+║     URL shortener · Feed · Chat · Typeahead · Ads · Video · Sync     ║
+║  🧑‍💼 staff-engineer-interview/  ← Behavioral · Design docs · SRE     ║
 ║  ☁️ aws-interview/             ← Compute · Networking · Security     ║
 ║                                                                      ║
 ║  🖥️ cs-interview/              ← 8 Core CS Topics (90+ Questions)   ║
@@ -418,6 +421,8 @@ PHASE 7 ─── AI Engineering
 | Staff-Level Questions | **200+** |
 | CS Core Topics | **8** |
 | Language Deep-Dives | **3 (Python + Go + Java)** |
+| System Design Case Studies | **8** |
+| Staff Craft Guides | **3** |
 | RAG Guides | **7** |
 | MCP Guides | **5** |
 | Agent Guides | **11** |
