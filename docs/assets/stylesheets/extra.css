@@ -1817,12 +1817,12 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
 .path-card .path-title { font-size: 0.85rem; font-weight: 700; }
 .path-card .path-desc { font-size: 0.7rem; line-height: 1.5; color: var(--md-default-fg-color--light); }
 
-/* Landing page: keep the site name in the header (with sticky tabs, Material
-   swaps in the page title "Home" before the user has scrolled). */
-body:has(.hero-section) .md-header__title--active .md-header__topic:first-child {
+/* Header always shows the site name. The page title it swaps in on scroll
+   duplicates the H1 and breadcrumb, and reads "Overview" on section landings. */
+.md-header__title--active .md-header__topic:first-child {
     opacity: 1; transform: none; pointer-events: auto;
 }
-body:has(.hero-section) .md-header__title--active .md-header__topic + .md-header__topic {
+.md-header__title--active .md-header__topic + .md-header__topic {
     opacity: 0; pointer-events: none;
 }
 
