@@ -1841,3 +1841,17 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
 .md-sidebar--primary:hover .md-sidebar__scrollwrap { scrollbar-color: rgba(139, 92, 246, 0.35) transparent; }
 .md-sidebar--primary .md-sidebar__scrollwrap::-webkit-scrollbar-thumb { background: transparent; }
 .md-sidebar--primary:hover .md-sidebar__scrollwrap::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.35); }
+
+/* Home: the Home tab has no sidebar pages, so the left column was empty and
+   the content looked off-centre. Drop it and centre the landing content. */
+@media screen and (min-width: 60em) {
+    .md-main__inner:has(.hero-section) .md-sidebar--primary { display: none; }
+    .md-main__inner:has(.hero-section) .md-content {
+        max-width: 58rem;
+        margin-left: auto;
+        margin-right: auto;
+        flex: 1 1 auto;
+    }
+    .md-main__inner:has(.hero-section) .md-content__inner { max-width: none; }
+}
+.md-main__inner:has(.hero-section) .hero-section { margin-top: 1.25rem; border-radius: 1.25rem; }
