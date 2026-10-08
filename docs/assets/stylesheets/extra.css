@@ -1293,9 +1293,23 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
     margin: 0;
 }
 
-/* ── Hide TOC (right sidebar) ──────────────────────────────── */
-.md-sidebar--secondary {
-    display: none !important;
+/* ── Right-hand TOC ────────────────────────────────────────
+   Pages here run to 1,000+ lines; the in-page "On this page" rail is the
+   fastest way to jump between questions, so keep it visible. */
+.md-sidebar--secondary .md-nav__title {
+    font-size: 0.65rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--md-default-fg-color--light);
+}
+.md-sidebar--secondary .md-nav__link {
+    font-size: 0.68rem;
+    line-height: 1.35;
+    padding: 0.15rem 0;
+}
+.md-sidebar--secondary .md-nav__link--active {
+    color: var(--md-accent-fg-color);
+    font-weight: 600;
 }
 
 /* ── Content fade-in animation ─────────────────────────────── */
@@ -1703,3 +1717,127 @@ body, .md-typeset, .md-nav, .md-header__title, .md-tabs__link {
 .md-footer-copyright {
     font-size: 0.72rem;
 }
+
+/* ═══════════════════════════════════════════════════════════
+   UX pass: tabs, reading rail, headings
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── Top tabs: quiet, same palette as the page, clear active state ── */
+.md-tabs {
+    background: rgba(13, 17, 23, 0.92);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.md-tabs__link {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, ui-sans-serif, system-ui, sans-serif !important;
+    font-size: 0.74rem;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    opacity: 1;
+    color: var(--md-default-fg-color--light);
+    margin-top: 0;
+    padding: 0.85rem 0 0.7rem;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+}
+.md-tabs__item { margin-right: 0.35rem; padding: 0 0.6rem 0 0.3rem; }
+.md-tabs__link:hover { color: var(--md-default-fg-color); }
+.md-tabs__item--active .md-tabs__link {
+    color: #c084fc;
+    font-weight: 600;
+    border-bottom-color: #c084fc;
+}
+
+/* ── Sidebar: the active tab already names the section, so drop the
+      duplicate collapsible header and start with its children. ── */
+@media screen and (min-width: 76.25em) {
+    .md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav__link,
+    .md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav__container {
+        display: none;
+    }
+    .md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav > .md-nav__list {
+        padding-left: 0;
+    }
+    .md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav > .md-nav__title { display: none; }
+    .md-sidebar--primary { top: 6.1rem; height: calc(100vh - 6.1rem); }
+}
+
+/* ── Right rail: question-level only. h3 sub-entries ("Answer",
+      "Animated Sequence Diagram", …) repeat under every question. ── */
+.md-sidebar--secondary .md-nav__list .md-nav__list { display: none; }
+.md-sidebar--secondary .md-nav__link { padding-right: 0.5rem; }
+
+/* ── Headings: calmer H1, no permalink noise on it ── */
+.md-typeset h1 { font-size: 2rem; line-height: 1.2; letter-spacing: -0.015em; }
+.md-typeset h1 .headerlink { display: none; }
+.md-typeset h2 { margin-top: 2.2em; }
+
+/* ── Breadcrumb ── */
+.md-path { font-size: 0.7rem; opacity: 0.85; }
+
+/* ── Reading comfort: readable measure, comfortable leading ── */
+.md-typeset { font-size: 0.78rem; line-height: 1.7; }
+.md-content__inner { max-width: 54rem; margin-left: auto; margin-right: auto; }
+.md-typeset table:not([class]) { font-size: 0.72rem; }
+
+/* ── Home page ── */
+/* Hero sat under the sticky tab bar (its -1.5rem top margin predates tabs). */
+.hero-section { margin-top: 0.5rem; }
+/* Home is a landing page: no right rail, stats stay on one row. */
+.md-main__inner:has(.hero-section) .md-sidebar--secondary { display: none; }
+.hero-stats { flex-wrap: wrap; }
+.hero-stat { min-width: 8.5rem; }
+
+/* "Start here" grid: one card per interview round, each linking to a tab. */
+.path-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+    gap: 0.75rem;
+    margin: 1rem 0 2rem;
+}
+.path-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--card-border);
+    border-radius: 0.6rem;
+    background: var(--card-bg);
+    color: var(--md-default-fg-color) !important;
+    text-decoration: none !important;
+    transition: border-color 0.15s, transform 0.15s, background 0.15s;
+}
+.path-card:hover {
+    border-color: #c084fc;
+    background: rgba(192, 132, 252, 0.06);
+    transform: translateY(-2px);
+}
+.path-card .path-round { font-size: 0.62rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--md-default-fg-color--light); }
+.path-card .path-title { font-size: 0.85rem; font-weight: 700; }
+.path-card .path-desc { font-size: 0.7rem; line-height: 1.5; color: var(--md-default-fg-color--light); }
+
+/* Landing page: keep the site name in the header (with sticky tabs, Material
+   swaps in the page title "Home" before the user has scrolled). */
+body:has(.hero-section) .md-header__title--active .md-header__topic:first-child {
+    opacity: 1; transform: none; pointer-events: auto;
+}
+body:has(.hero-section) .md-header__title--active .md-header__topic + .md-header__topic {
+    opacity: 0; pointer-events: none;
+}
+
+/* H1: solid colour. The gradient text-fill made every emoji in a heading
+   render as a flat coloured block instead of the glyph. */
+.md-typeset h1 {
+    background: none;
+    -webkit-background-clip: border-box;
+    background-clip: border-box;
+    -webkit-text-fill-color: currentColor;
+    color: #c4b5fd;
+}
+
+/* Sidebar scrollbar: only visible while hovering the sidebar. */
+.md-sidebar--primary .md-sidebar__scrollwrap { scrollbar-color: transparent transparent; }
+.md-sidebar--primary:hover .md-sidebar__scrollwrap { scrollbar-color: rgba(139, 92, 246, 0.35) transparent; }
+.md-sidebar--primary .md-sidebar__scrollwrap::-webkit-scrollbar-thumb { background: transparent; }
+.md-sidebar--primary:hover .md-sidebar__scrollwrap::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.35); }
