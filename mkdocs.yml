@@ -129,15 +129,14 @@ nav:
   - System Design:
     - Overview: system-design-interview/README.md
     - Framework & Estimation: system-design-interview/00_FRAMEWORK_AND_ESTIMATION.md
-    - Case Studies:
-      - URL Shortener: system-design-interview/01_URL_SHORTENER.md
-      - News Feed: system-design-interview/02_NEWS_FEED.md
-      - Chat & Messaging: system-design-interview/03_CHAT_MESSAGING.md
-      - Typeahead / Search Suggestions: system-design-interview/04_TYPEAHEAD_SEARCH_SUGGESTIONS.md
-      - Ad Click Aggregation: system-design-interview/05_AD_CLICK_AGGREGATION.md
-      - Video Streaming: system-design-interview/06_VIDEO_STREAMING.md
-      - File Storage & Sync: system-design-interview/07_FILE_STORAGE_AND_SYNC.md
-      - Payments Ledger: system-design-interview/08_PAYMENTS_LEDGER.md
+    - URL Shortener: system-design-interview/01_URL_SHORTENER.md
+    - News Feed: system-design-interview/02_NEWS_FEED.md
+    - Chat & Messaging: system-design-interview/03_CHAT_MESSAGING.md
+    - Typeahead / Search Suggestions: system-design-interview/04_TYPEAHEAD_SEARCH_SUGGESTIONS.md
+    - Ad Click Aggregation: system-design-interview/05_AD_CLICK_AGGREGATION.md
+    - Video Streaming: system-design-interview/06_VIDEO_STREAMING.md
+    - File Storage & Sync: system-design-interview/07_FILE_STORAGE_AND_SYNC.md
+    - Payments Ledger: system-design-interview/08_PAYMENTS_LEDGER.md
 
   - Coding (DSA):
     - Overview: python-dsa/index.md
