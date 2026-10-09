@@ -1,7 +1,7 @@
 # 🦦 Go Concurrency & Multithreading — Practical Notes
 
 > **A hands-on guide to writing concurrent Go code: goroutines, channels, synchronization, and production patterns**
-> *From basics to staff-level depth. Current as of Go 1.27 (August 2026); version-specific behaviour is tagged, e.g. (Go 1.25+). Code assumes a module with `go 1.22` or later in `go.mod` (per-iteration loop variables).*
+> *From basics to staff-level depth. Current as of Go 1.27 (August 2026); version-specific behaviour is tagged, e.g. (Go 1.25+). Code assumes a module with `go 1.23` or later in `go.mod`: 1.22 gives per-iteration loop variables, and 1.23 gives the new timer semantics (GC-able unreferenced timers, unbuffered timer channels) used in Sections 6 and 11.*
 
 ---
 
@@ -390,11 +390,19 @@ func merge(ctx context.Context, producers ...<-chan int) <-chan int {
         wg.Add(1)
         go func(ch <-chan int) {
             defer wg.Done()
-            for v := range ch {
+            for {
                 select {
-                case out <- v:
-                case <-ctx.Done():
-                    return
+                case v, ok := <-ch:
+                    if !ok {
+                        return
+                    }
+                    select {
+                    case out <- v:
+                    case <-ctx.Done():
+                        return
+                    }
+                case <-ctx.Done(): // also exit while idle: `for v := range ch` only
+                    return         // notices cancel on a send, so an idle input leaks it
                 }
             }
         }(p)
@@ -408,6 +416,9 @@ func merge(ctx context.Context, producers ...<-chan int) <-chan int {
     
     return out
 }
+// `out` is unbuffered, not unbounded: with no reader the senders just park
+// (backpressure). The caller must drain `out` or cancel ctx.
+// Producers must honour ctx on THEIR sends too, or they block forever once merge stops reading.
 
 // ── Single producer, multiple consumers ─────────────────────
 func distribute(ctx context.Context, in <-chan int, n int) []<-chan int {
@@ -525,7 +536,12 @@ type Ring[T any] struct {
     dropped int
 }
 
-func NewRing[T any](capacity int) *Ring[T] { return &Ring[T]{buf: make([]T, capacity)} }
+func NewRing[T any](capacity int) *Ring[T] {
+    if capacity < 1 {
+        panic("ring: capacity must be >= 1") // 0 would divide by zero in Push
+    }
+    return &Ring[T]{buf: make([]T, capacity)}
+}
 
 func (r *Ring[T]) Push(v T) {
     r.mu.Lock()
@@ -635,6 +651,7 @@ type Worker struct {
     ID       int
     JobQueue chan Job
     Quit     chan struct{}
+    stopOnce sync.Once
 }
 
 func NewWorker(id int) *Worker {
@@ -667,7 +684,7 @@ func (w *Worker) Start(ctx context.Context, results chan<- Result) {
 }
 
 func (w *Worker) Stop() {
-    close(w.Quit)
+    w.stopOnce.Do(func() { close(w.Quit) }) // a second Stop would otherwise panic
 }
 
 func (w *Worker) execute(job Job) Result {
@@ -721,6 +738,7 @@ type Service struct {
     
     // Internal channels
     stopCh    chan struct{}
+    stopOnce  sync.Once
     readyCh   chan struct{}
     
     // State
@@ -769,7 +787,7 @@ func (s *Service) WaitReady() {
 }
 
 func (s *Service) Stop() {
-    close(s.stopCh)
+    s.stopOnce.Do(func() { close(s.stopCh) })
 }
 ```
 
@@ -1454,7 +1472,11 @@ func fetchData(ctx context.Context, url string) (<-chan Data, <-chan error) {
         defer close(dataCh)
         defer close(errCh)
         
-        req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+        req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if err != nil {
+            errCh <- err
+            return
+        }
         resp, err := http.DefaultClient.Do(req)
         if err != nil {
             errCh <- err
@@ -1663,7 +1685,7 @@ Stages that change type (`int` → `string`) can't share one `Stage[T]` type in 
 
 ```go
 // ── Fan-Out: Distribute work ────────────────────────────────
-func fanOut[T any](in <-chan T, n int) []<-chan T {
+func fanOut[T any](ctx context.Context, in <-chan T, n int) []<-chan T {
     channels := make([]<-chan T, n)
     for i := 0; i < n; i++ {
         ch := make(chan T)
@@ -1671,7 +1693,11 @@ func fanOut[T any](in <-chan T, n int) []<-chan T {
         go func(out chan<- T) {
             defer close(out)
             for v := range in {
-                out <- v
+                select {
+                case out <- v:
+                case <-ctx.Done(): // a bare `out <- v` leaks if the consumer is gone
+                    return
+                }
             }
         }(ch)
     }
@@ -1687,10 +1713,18 @@ func fanIn[T any](ctx context.Context, channels ...<-chan T) <-chan T {
         wg.Add(1)
         go func(c <-chan T) {
             defer wg.Done()
-            for v := range c {
+            for {
                 select {
-                case out <- v:
-                case <-ctx.Done():
+                case v, ok := <-c:
+                    if !ok {
+                        return
+                    }
+                    select {
+                    case out <- v:
+                    case <-ctx.Done():
+                        return
+                    }
+                case <-ctx.Done(): // exit while idle too, not only when sending
                     return
                 }
             }
@@ -1715,7 +1749,7 @@ func processBatch(ctx context.Context, items []int, workers int) []int {
     close(source)
     
     // Stage 2: Fan out to workers
-    pipelines := fanOut(source, workers)
+    pipelines := fanOut(ctx, source, workers)
     
     // Stage 3: Each worker doubles (could be any processing)
     double := MapStage(func(n int) int { return n * 2 })
@@ -1820,7 +1854,14 @@ func (b *Breaker) Do(fn func() error) error {
     if err != nil {
         return err // fail fast: don't even try the dependency
     }
+    done := false
+    defer func() {
+        if !done { // fn panicked: count it as a failure, or a probe leaves probeInFlight stuck true
+            b.record(probe, errors.New("panic"))
+        }
+    }()
     err = fn() // NOT under the lock
+    done = true
     b.record(probe, err)
     return err
 }

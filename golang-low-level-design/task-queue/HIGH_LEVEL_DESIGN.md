@@ -31,9 +31,9 @@
 │  │  (Priority)   │         │       │       │      │     │
 │  └──────┬───────┘          │       ▼       ▼      │     │
 │         │                  │  ┌────────────────┐  │     │
-│         ▼                  │  │  Results Chan  │  │     │
+│         ▼                  │  │Done chan (Wait)│  │     │
 │  ┌──────────────┐          │  └────────────────┘  │     │
-│  │  TTL / Retry │          └──────────────────────┘     │
+│  │ Retry (heap) │          └──────────────────────┘     │
 │  └──────────────┘                                       │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -44,8 +44,8 @@
 flowchart LR
   C["API / client: enqueue"] --> Q["Task queue (priority)"]
   Q --> W["Worker pool W1..WN"]
-  W --> R["Results channel"]
-  W -. "retry with backoff" .-> T["TTL / retry (delayed heap)"]
+  W --> R["Per-task done channel (Wait)"]
+  W -. "retry with backoff" .-> T["Delayed heap (retry / backoff)"]
   T --> Q
 ```
 

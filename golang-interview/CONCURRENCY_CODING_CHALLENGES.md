@@ -34,11 +34,16 @@ import (
 // flight. Results keep input order; the first error cancels the rest.
 func ParallelMap[In, Out any](ctx context.Context, in []In, limit int, fn func(context.Context, In) (Out, error)) ([]Out, error) {
 	out := make([]Out, len(in)) // each goroutine writes its own index: no lock needed
-	g, ctx := errgroup.WithContext(ctx)
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(limit)
+	stopped := false
 	for i, v := range in {
+		if gctx.Err() != nil { // first error or caller cancel: don't start more work
+			stopped = true
+			break
+		}
 		g.Go(func() error { // Go 1.22+: i and v are per-iteration
-			r, err := fn(ctx, v)
+			r, err := fn(gctx, v)
 			if err != nil {
 				return err
 			}
@@ -48,6 +53,9 @@ func ParallelMap[In, Out any](ctx context.Context, in []In, limit int, fn func(c
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+	if stopped { // cancelled by the caller with no fn error: don't return a partial result as success
+		return nil, context.Cause(ctx)
 	}
 	return out, nil
 }
@@ -152,8 +160,8 @@ type entry[V any] struct {
 	expires time.Time
 }
 
-// LoadingCache returns cached values, and on a miss makes exactly one load per
-// key no matter how many goroutines ask at once (cache-stampede protection).
+// LoadingCache returns cached values, and on a miss runs at most one concurrent
+// load per key no matter how many goroutines ask at once (cache-stampede protection).
 type LoadingCache[V any] struct {
 	mu    sync.RWMutex
 	items map[string]entry[V]
@@ -178,6 +186,14 @@ func (c *LoadingCache[V]) Get(ctx context.Context, key string) (V, error) {
 	// The shared load must not die because the *first* caller's ctx was cancelled,
 	// so it runs on a detached context with its own timeout.
 	v, err, _ := c.group.Do(key, func() (any, error) {
+		// Re-check: a flight that finished after our miss may have filled the cache,
+		// and we would otherwise start a second load for the same key.
+		c.mu.RLock()
+		if e, ok := c.items[key]; ok && c.now().Before(e.expires) {
+			c.mu.RUnlock()
+			return e.val, nil
+		}
+		c.mu.RUnlock()
 		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		val, err := c.load(lctx, key)
@@ -392,6 +408,9 @@ func (s *Sub[T]) Unsubscribe() {
 	if set, ok := s.b.subs[s.topic]; ok {
 		if _, ok := set[s]; ok {
 			delete(set, s)
+			if len(set) == 0 {
+				delete(s.b.subs, s.topic) // don't leak an empty map per churned topic
+			}
 			close(s.ch)
 		}
 	}
@@ -525,9 +544,9 @@ import (
 )
 
 // Retry calls fn up to attempts times with exponential backoff and full jitter
-// (sleep a random duration in [0, min(max, base*2^i))). Full jitter avoids
+// (sleep a random duration in [0, min(maxDelay, base*2^i))). Full jitter avoids
 // synchronized retry storms. Permanent errors stop immediately.
-func Retry(ctx context.Context, attempts int, base, max time.Duration, retryable func(error) bool, fn func(context.Context) error) error {
+func Retry(ctx context.Context, attempts int, base, maxDelay time.Duration, retryable func(error) bool, fn func(context.Context) error) error {
 	var err error
 	for i := 0; i < attempts; i++ {
 		if err = fn(ctx); err == nil || !retryable(err) {
@@ -536,8 +555,12 @@ func Retry(ctx context.Context, attempts int, base, max time.Duration, retryable
 		if i == attempts-1 {
 			break
 		}
-		ceiling := min(max, base<<i)
-		timer := time.NewTimer(rand.N(ceiling) + 1)
+		ceiling := base // double per attempt, stopping at maxDelay (base<<i would overflow)
+		for j := 0; j < i && ceiling < maxDelay; j++ {
+			ceiling *= 2
+		}
+		ceiling = max(time.Nanosecond, min(ceiling, maxDelay)) // rand.N panics on <= 0
+		timer := time.NewTimer(rand.N(ceiling))
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
@@ -553,7 +576,7 @@ func Retry(ctx context.Context, attempts int, base, max time.Duration, retryable
 
 - **Full jitter** (random in `[0, cap)`) spreads clients out; plain exponential backoff keeps them synchronized.
 - **Retry only idempotent operations,** or send an idempotency key. Retrying a non-idempotent POST double-charges.
-- **Cap attempts and total time;** respect `ctx`. Use a `Timer` (not `time.After`) so it can be stopped.
+- **Cap attempts and total time;** respect `ctx`. Use a `Timer` and `Stop` it on the ctx path to free it promptly (needed before Go 1.23 to avoid a leak).
 - **Retry budgets:** at scale, cap retries to a fraction of traffic (e.g. ~10%), or a partial outage becomes a full one.
 
 *Exponential backoff with full jitter: the cap doubles each attempt, the actual sleep is random in `[0, cap)`, and ctx or the attempt limit stops it.*
@@ -720,7 +743,7 @@ The race detector is the grader. Run it with `go test -race -count=3 ./...`.
     	b.Close()
     }
 
-    func TestPipelineNoLeak(t *testing.T) {
+    func TestPipeline(t *testing.T) { // checks results and early stop; add synctest.Test for a real leak check
     	ctx, cancel := context.WithCancel(context.Background())
     	out := Merge(ctx, Square(ctx, Gen(ctx, 1, 2, 3)), Square(ctx, Gen(ctx, 4, 5, 6)))
     	sum := 0
@@ -781,7 +804,7 @@ Same toolbox, different wrapper. Try each yourself before looking up solutions.
 ## Common review comments (what interviewers flag)
 
 - `go func() { ... }()` with no way to stop it or learn its error.
-- `time.After` in a loop (timer garbage until it fires); use `time.NewTimer` + `Stop`/`Reset`.
+- `time.After` in a loop on Go < 1.23 (timers live until they fire). On 1.23+ it is collectable, but a reusable `time.Timer` with `Reset` still avoids a per-iteration allocation.
 - Closing a channel from the receiver, or from more than one sender.
 - Holding a mutex across a channel operation, a network call, or a callback.
 - Passing `context.Context` in a struct field instead of the first parameter.

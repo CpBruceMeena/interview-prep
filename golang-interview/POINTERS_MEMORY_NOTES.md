@@ -2,7 +2,7 @@
 
 > **Category:** Language Fundamentals — Memory Model & Pointer Semantics  
 > **Target Level:** Staff/Principal Engineer (10+ years)  
-> **Why this matters at Staff level:** Aliasing bugs (shared slice backing arrays, captured pointers), the nil-interface trap, and allocation-heavy hot paths are among the most common Go production problems. Staff engineers can explain *where* a value lives, *who* can see it, and *what it costs the GC*.  \
+> **Why this matters at Staff level:** Aliasing bugs (shared slice backing arrays, captured pointers), the nil-interface trap, and allocation-heavy hot paths are among the most common Go production problems. Staff engineers can explain *where* a value lives, *who* can see it, and *what it costs the GC*.
 > **Current as of:** Go 1.27. Escape-analysis output below was produced with `go build -gcflags=-m` on Go 1.27.1; exact messages vary slightly by version.
 
 ---
@@ -206,7 +206,7 @@ func NewUserPtr(name string, age int) *User {
 
 ### The Stack
 
-- Each goroutine has its own stack. It starts at 2 KB (adaptive since Go 1.19) and grows by **copying** to a bigger block, which is why Go code never holds raw pointers into stacks across growth.
+- Each goroutine has its own stack. It starts at 2 KB (adaptive since Go 1.19) and grows by **copying** to a bigger block, the runtime rewrites pointers into the old stack, which is why no heap object or other goroutine may hold a pointer to a stack variable (escape analysis enforces this).
 - Allocation is free: the function's frame size is fixed at compile time, and entering the function adjusts SP once for all locals.
 - Deallocation is free: the frame disappears on return. The GC still *scans* live stack frames for pointers, but never frees anything there.
 - Hot in cache, and nothing to collect.
@@ -470,7 +470,7 @@ arr := [3]int{1, 2, 3}
 p := &arr[0]
 
 // 🔴 COMPILE ERROR: Go doesn't allow this
-q := p + 1  // invalid operation: p + 1 (type *int does not support +)
+q := p + 1  // invalid operation: p + 1 (mismatched types *int and untyped int)
 ```
 
 **Why?** Memory safety. Unchecked pointer arithmetic is behind whole classes of C/C++ vulnerabilities (buffer overflows, out-of-bounds reads). Go puts bounds checks on slices and strings and gives you no way to forge a pointer without `unsafe`. That also lets the GC know exactly where every pointer is.

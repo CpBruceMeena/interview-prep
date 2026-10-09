@@ -29,7 +29,7 @@ func newServer(h http.Handler) *http.Server {
         Handler:           h,
         ReadHeaderTimeout: 5 * time.Second,  // slow-loris defence
         ReadTimeout:       15 * time.Second, // whole request incl. body
-        WriteTimeout:      30 * time.Second, // handler + response write
+        WriteTimeout:      30 * time.Second, // handler + response write (clock starts after headers are read, so it overlaps body reading)
         IdleTimeout:       60 * time.Second, // keep-alive connections
         MaxHeaderBytes:    1 << 20,
     }
@@ -93,7 +93,7 @@ Classic bugs this prevents:
 | Forgot `resp.Body.Close()` | goroutine + FD leak, "too many open files" | `defer` right after the error check |
 | Didn't drain body | new TCP+TLS handshake per request, high latency | drain (bounded) before close |
 | `MaxIdleConnsPerHost` = 2 | connection churn under concurrency to one host | raise to match concurrency |
-| One shared client **per request** | no reuse, ephemeral port exhaustion | create once, reuse (it's goroutine-safe) |
+| New `http.Client`/`Transport` **per request** | no connection reuse, ephemeral port exhaustion | create once, reuse (it's goroutine-safe) |
 | No timeout | goroutines pile up behind a hung dependency | `Client.Timeout` and ctx deadlines |
 | `ReadAll` on untrusted body | OOM | `LimitReader` / `http.MaxBytesReader` on the server |
 
@@ -180,7 +180,7 @@ flowchart LR
 3. **Profile in production, safely.** Expose `net/http/pprof` on an **internal-only port** (never the public mux).
 
 ```bash
-go tool pprof -http=:8081 http://svc:6060/debug/pprof/profile?seconds=30   # CPU
+go tool pprof -http=:8081 'http://svc:6060/debug/pprof/profile?seconds=30'   # CPU
 go tool pprof -http=:8081 http://svc:6060/debug/pprof/heap                  # live memory (inuse_space)
 go tool pprof -sample_index=alloc_space .../heap                            # allocation churn → GC pressure
 go tool pprof http://svc:6060/debug/pprof/goroutine                         # leaks, blocked goroutines
@@ -221,7 +221,7 @@ flowchart TD
 |---|---|---|
 | Goroutines grow linearly | leak: unbuffered send with no receiver, missing ctx, ticker not stopped | goroutine profile grouped by stack |
 | `inuse_space` grows, goroutines flat | unbounded cache/map, retained sub-slices, global slices | heap profile top entries |
-| RSS ≫ `inuse_space` | fragmentation, huge transient allocations not yet returned to the OS, cgo/mmap | `runtime.MemStats`, `GODEBUG=madvdontneed=1`, check non-Go memory |
+| RSS ≫ `inuse_space` | fragmentation, huge transient allocations not yet returned to the OS, cgo/mmap | `runtime.MemStats` (`HeapIdle` vs `HeapReleased`), check non-Go memory |
 | Sawtooth RSS, frequent GC, high CPU | allocation churn | `alloc_space` profile, `GODEBUG=gctrace=1` |
 | OOM-killed but heap looks fine | goroutine stacks, cgo, `GOMEMLIMIT` unset, limit too close | `StackInuse`, `/proc/<pid>/smaps` |
 

@@ -643,6 +643,9 @@ func (s *Store[V]) DeleteExpired() int {
 // RunJanitor calls DeleteExpired every interval until ctx is cancelled.
 // It blocks; the caller owns the goroutine: `go store.RunJanitor(ctx, d)`.
 func (s *Store[V]) RunJanitor(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("janitor: interval must be > 0, got %v", interval) // NewTicker would panic
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -714,7 +717,9 @@ type snapshotRecord[V any] struct {
 // Snapshot writes all live entries as JSON. Shards are copied one at a time
 // and encoding happens outside the locks, so it is consistent per shard, not
 // a point-in-time image of the whole store (fine for a cache; a database
-// would need copy-on-write or a WAL position).
+// would need copy-on-write or a WAL position). V is encoded after the lock is
+// released, so it must be a value type or immutable once stored: a pointer, map
+// or slice that callers keep mutating would race with the encoder.
 func (s *Store[V]) Snapshot(w io.Writer) error {
 	now := s.now()
 	var recs []snapshotRecord[V]
@@ -740,6 +745,7 @@ func (s *Store[V]) Snapshot(w io.Writer) error {
 // Restore loads a snapshot, skipping entries that expired in the meantime.
 // Versions are preserved and the revision counter is advanced past them so
 // a CAS issued before the restart cannot succeed against a different value.
+// A live key whose version is already >= the snapshot's is kept as is.
 func (s *Store[V]) Restore(r io.Reader) error {
 	var recs []snapshotRecord[V]
 	if err := json.NewDecoder(r).Decode(&recs); err != nil {
@@ -762,6 +768,10 @@ func (s *Store[V]) Restore(r io.Reader) error {
 		}
 		sh := s.shardFor(rec.Key)
 		sh.mu.Lock()
+		if cur, ok := sh.items[rec.Key]; ok && !cur.expired(now) && cur.version >= rec.Version {
+			sh.mu.Unlock() // never move a live key's version backwards: an old CAS holder could match
+			continue
+		}
 		err := s.putLocked(sh, rec.Key, rec.Value, exp, rec.Version, now)
 		sh.mu.Unlock()
 		if err != nil {

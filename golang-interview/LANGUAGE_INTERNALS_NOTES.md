@@ -289,7 +289,7 @@ var a Animal = &Dog{}     // OK
 
 - A new goroutine starts with a small stack (on the order of **2 KB**; the runtime may adapt the initial size using observed averages).
 - The compiler inserts a stack check in function prologues. When the stack is full the runtime **allocates a larger one (about 2×), copies the old one over, and adjusts pointers** into it. Stacks can also shrink during GC.
-- This is why **you can't hold a pointer to a stack variable across a stack move**, which is part of why escape analysis decides what lives on the stack, and why pointers into stacks never appear in the heap.
+- Stack contents move on growth and the runtime rewrites pointers into the stack. So a stack address may never be stored where the runtime can't find and adjust it (the heap, or a `uintptr`), which is why escape analysis decides what lives on the stack.
 - Deep recursion works until the limit (1 GB on 64-bit by default) and then **fatal error: stack overflow**, which can't be recovered.
 - This is what makes a goroutine ~2 KB while an OS thread reserves ~1–8 MB, and why 100k+ goroutines are routine.
 
