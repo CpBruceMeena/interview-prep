@@ -307,7 +307,16 @@ func main() {
     ctx, cancel := context.WithTimeout(context.Background(), time.Second)
     defer cancel()
     src := make(chan int)
-    go func() { defer close(src); for i := range 5 { src <- i } }() // range-over-int: Go 1.22+
+    go func() {
+        defer close(src)
+        for i := range 5 { // range-over-int: Go 1.22+
+            select {
+            case src <- i:
+            case <-ctx.Done(): // a bare send would leak this goroutine on timeout
+                return
+            }
+        }
+    }()
     for v := range Square(ctx, Square(ctx, src)) {
         fmt.Println(v) // 0 1 16 81 256
     }
@@ -327,7 +336,7 @@ func main() {
 |-----------|----------------------|
 | **Internal structure** | Knows hchan, sudog, recvq/sendq, ring buffer, direct hand-off to a parked receiver |
 | **Patterns** | Implements fan-out, fan-in, pipeline, tee, or-done naturally |
-| **Cancellation** | Every blocking send/receive also selects on `ctx.Done()`. No goroutine leaks |
+| **Cancellation** | Every blocking **send** also selects on `ctx.Done()`; receives are guarded by a ctx-aware upstream that closes on cancel (or by `OrDone`). No goroutine leaks |
 | **Deadlock detection** | Knows the runtime detector only catches global deadlock; knows nil-channel and closed-channel behaviour |
 
 *Channel send: hand off directly to a parked receiver, else buffer, else park the sender on `sendq`; a close wakes all waiters.*
@@ -764,15 +773,17 @@ func (p *Pool[T]) Acquire(ctx context.Context) (T, error) {
 // Release returns a connection; broken=true if the caller saw an I/O error on it.
 func (p *Pool[T]) Release(c T, broken bool) {
     defer func() { <-p.sem }() // ALWAYS free the slot
-    if broken || p.isClosed() {
-        p.closeFn(c)
-        return
+    p.mu.Lock() // hold across the closed check AND the send: Close sets closed under this lock
+    if !broken && !p.closed { // before draining, so no connection can slip in after the drain
+        select {
+        case p.idle <- c:
+            p.mu.Unlock()
+            return
+        default: // more idle than maxIdle: shrink
+        }
     }
-    select {
-    case p.idle <- c:
-    default:
-        p.closeFn(c) // more idle than maxIdle: shrink
-    }
+    p.mu.Unlock()
+    p.closeFn(c)
 }
 
 func (p *Pool[T]) Close() {
@@ -1429,7 +1440,7 @@ func TestUserService_CreateUser(t *testing.T) {
 //go:build integration
 
 // ── 2. Integration: real Postgres via testcontainers-go's postgres module ──
-// (the //go:build line must be the first line of the file; run with `go test -tags integration`)
+// (the //go:build constraint must come before the package clause, preceded only by blank lines and line comments; run with `go test -tags integration`)
 package store_test
 
 func TestPostgresStore(t *testing.T) {
@@ -1642,7 +1653,7 @@ func run(ctx context.Context, log *slog.Logger, addr string, drainDelay time.Dur
 
     srv := &http.Server{
         Addr:              addr,
-        Handler:           Chain(Recover(log), Logging(log))(mux),
+        Handler:           Chain(Logging(log), Recover(log))(mux), // Logging outermost: a panic becomes a logged 500, not a missing log line
         ReadHeaderTimeout: 5 * time.Second,  // Slowloris protection: the one timeout you must set
         ReadTimeout:       15 * time.Second,
         WriteTimeout:      30 * time.Second, // per response; streaming endpoints extend it via ResponseController

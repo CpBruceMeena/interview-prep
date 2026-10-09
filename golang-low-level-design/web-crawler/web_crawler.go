@@ -62,6 +62,8 @@ type Fetcher interface {
 }
 
 // HTTPFetcher is the production Fetcher: bounded body size, explicit User-Agent.
+// shortcut: Client follows redirects without re-applying AllowHosts, robots.txt or
+// the per-host delay; set Client.CheckRedirect to enforce them before crawling untrusted sites.
 type HTTPFetcher struct {
 	Client    *http.Client
 	UserAgent string
@@ -79,7 +81,11 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, rawURL string) (*Response, erro
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, f.MaxBody)) // never trust Content-Length
+	limit := f.MaxBody
+	if limit <= 0 {
+		limit = 2 << 20 // a zero limit would silently return empty bodies
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit)) // never trust Content-Length
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +249,7 @@ func ParseRobots(body []byte, userAgent string) *Robots {
 				if star == nil {
 					star = g
 				}
-			} else if strings.Contains(ua, a) {
+			} else if a != "" && strings.Contains(ua, a) { // empty agent would match every UA
 				return &Robots{rules: g.rules, crawlDelay: g.delay}
 			}
 		}
@@ -283,23 +289,31 @@ func robotsMatch(pattern, path string) bool {
 	return wildcardMatch(pattern, path, false)
 }
 
+// wildcardMatch splits the pattern on '*' and matches the pieces greedily left
+// to right. Greedy is exact here (taking the earliest match leaves the most room
+// for later pieces) and avoids the exponential backtracking a recursive matcher
+// has on a hostile robots.txt like "/*a*a*a*a*b".
 func wildcardMatch(p, s string, anchored bool) bool {
-	for len(p) > 0 {
-		if p[0] == '*' {
-			p = strings.TrimLeft(p, "*")
-			for i := 0; i <= len(s); i++ {
-				if wildcardMatch(p, s[i:], anchored) {
-					return true
-				}
-			}
-			return false
-		}
-		if len(s) == 0 || s[0] != p[0] {
-			return false
-		}
-		p, s = p[1:], s[1:]
+	parts := strings.Split(p, "*")
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
 	}
-	return !anchored || len(s) == 0
+	s = s[len(parts[0]):]
+	if len(parts) == 1 {
+		return !anchored || len(s) == 0
+	}
+	for _, seg := range parts[1 : len(parts)-1] {
+		i := strings.Index(s, seg)
+		if i < 0 {
+			return false
+		}
+		s = s[i+len(seg):]
+	}
+	last := parts[len(parts)-1]
+	if anchored {
+		return strings.HasSuffix(s, last)
+	}
+	return strings.Contains(s, last)
 }
 
 // ============================================================
@@ -404,7 +418,7 @@ type Page struct {
 type Options struct {
 	Workers      int           // default 8
 	MaxDepth     int           // seeds are depth 0
-	MaxPages     int           // fetch budget; 0 = unlimited
+	MaxPages     int           // dispatch budget (robots-blocked and failed jobs count too); 0 = unlimited
 	PerHostDelay time.Duration // floor on the gap between requests to one host
 	FetchTimeout time.Duration // per request; default 10s
 	UserAgent    string

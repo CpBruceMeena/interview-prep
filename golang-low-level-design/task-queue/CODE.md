@@ -478,9 +478,12 @@ func (q *Queue) acquire() (*task, <-chan struct{}, time.Duration) {
 		t := heap.Pop(&q.ready).(*task)
 		t.status = StatusRunning
 		t.attempts++
-		ctx, cancel := context.WithCancel(q.baseCtx)
+		var ctx context.Context
+		var cancel context.CancelFunc
 		if t.spec.Timeout > 0 {
 			ctx, cancel = context.WithTimeout(q.baseCtx, t.spec.Timeout)
+		} else {
+			ctx, cancel = context.WithCancel(q.baseCtx)
 		}
 		t.ctx, t.cancel = ctx, cancel
 		return t, nil, 0
