@@ -16,6 +16,16 @@
 - To make reads truly read-only: use sampled LRU (Redis stores a last-access timestamp per key, updated atomically, and evicts the oldest of K random samples), or buffer access events and apply them in batches (Caffeine's read buffer).
 - `sync.Map` fits append-mostly or disjoint-key workloads. It doesn't help with eviction bookkeeping.
 
+*Figure: sharding the keyspace so each shard has its own lock, map, policy and heap.*
+
+```mermaid
+flowchart LR
+  K[key] --> H["hash(key) % N"]
+  H --> S0["Shard 0: mutex, map, policy, heap"]
+  H --> S1["Shard 1: mutex, map, policy, heap"]
+  H --> SN["Shard N-1: mutex, map, policy, heap"]
+```
+
 ## Q3: How would you implement distributed sharding?
 
 **Answer:**
@@ -31,6 +41,17 @@
 - **Snapshots:** a periodic full dump, like Redis RDB, which uses `fork()` and copy-on-write to get a point-in-time image without blocking writers. Recover by loading the snapshot and then replaying the WAL from the snapshot's offset.
 - This implementation's `Snapshot` is consistent per shard, not per store. To make it point-in-time you'd have to briefly lock all shards in a fixed order, or use copy-on-write.
 - Keep versions across restore, otherwise a CAS issued before the restart could succeed against a different value.
+
+*Figure: recovery loads the snapshot, then replays the WAL written after it.*
+
+```mermaid
+flowchart LR
+  A["Mutation"] --> W["Append to WAL, fsync per policy"]
+  W --> ACK[Acknowledge]
+  SN["Periodic snapshot"] --> R["Recovery: load snapshot"]
+  R --> P["Replay WAL after snapshot"]
+  P --> OK["Store restored, versions kept"]
+```
 
 ## 🔁 Follow-ups interviewers actually push on
 

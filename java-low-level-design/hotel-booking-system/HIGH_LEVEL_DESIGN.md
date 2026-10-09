@@ -44,12 +44,38 @@
   └─────────────┘  └─────────────┘  └─────────────┘
 ```
 
+*Figure: clients, booking service and stores.*
+
+```mermaid
+flowchart TB
+  G1["Guest app"] --> G["API gateway"]
+  A["Admin panel"] --> G
+  OT["OTA channel"] --> G
+  G --> S["Hotel booking service: pricing, inventory, booking, notification"]
+  S --> P[("PostgreSQL: bookings + inventory")]
+  S --> R[("Redis: search cache")]
+  S --> Q["Message queue"]
+```
+
 ## 3. BOOKING LIFECYCLE
 
 ```
 SEARCH (no state) → HELD ──pay──▶ CONFIRMED ──▶ CHECKED_IN ──▶ CHECKED_OUT
                       │  └─TTL──▶ EXPIRED          │
                       └─────────▶ CANCELLED ◀──────┘ (refund per policy)
+```
+
+*Figure: booking lifecycle.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> HELD: hold from search
+  HELD --> CONFIRMED: pay
+  HELD --> EXPIRED: TTL
+  HELD --> CANCELLED
+  CONFIRMED --> CHECKED_IN
+  CONFIRMED --> CANCELLED: refund per policy
+  CHECKED_IN --> CHECKED_OUT
 ```
 
 ## 4. PRICING STRATEGY
@@ -95,6 +121,18 @@ SEARCH (no state) → HELD ──pay──▶ CONFIRMED ──▶ CHECKED_IN ─
 | Same room sold via an OTA (Booking.com) and direct | The channel manager pushes availability to OTAs with a delay, so OTAs can oversell. Accept OTA bookings into the same constraint-checked path; on conflict, reject or relocate and treat it as an overbooking case |
 | Cache shows rooms that are gone | Expected; `hold` fails cleanly with "no longer available" and the cache entry is invalidated |
 | Sweeper and confirm race on one hold | Conditional `UPDATE ... WHERE status='HELD'`; whichever commits first wins, the other affects 0 rows |
+
+*Figure: hold with TTL; confirm and the sweeper both use a conditional update, so exactly one wins.*
+
+```mermaid
+flowchart TD
+  H["hold: reserve rooms, status HELD, expires_at"] --> P["Guest pays"]
+  P --> C{"UPDATE ... WHERE status = HELD affects 1 row?"}
+  C -- Yes --> OK[CONFIRMED]
+  C -- No --> V["Void or refund payment"]
+  H --> S["Sweeper: UPDATE WHERE HELD and expired"]
+  S --> EX[EXPIRED, release rooms]
+```
 
 **Capacity:** 55K bookings/day is trivial for one Postgres primary per region; the hard part is search (~50M searches/day at a 1000:1 look-to-book ratio, ~600/s average, a few thousand/s at peak), which is why search runs off a cache or search index rather than the booking database.
 

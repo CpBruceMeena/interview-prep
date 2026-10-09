@@ -316,6 +316,15 @@ Step 4: Safety & Observability
 | **Design an on-premise AI deployment** | Air-gapped, no external APIs, local model, data sovereignty |
 | **Design an agent evaluation platform** | Test case management, automated scoring, regression tracking, human review |
 
+*Figure: the four-step AI system design framework.*
+
+```mermaid
+flowchart LR
+  A["1. Clarify requirements"] --> B["2. Design AI pipeline"]
+  B --> C["3. Design infrastructure"]
+  C --> D["4. Safety and observability"]
+```
+
 ---
 
 ## 6. Forward Deploy Engineer — Special Preparation
@@ -400,6 +409,17 @@ Action: What I built/deployed
 Trade-off: Why I chose this approach over the perfect solution
 Impact: Measurable outcome (50% faster, 30% cost reduction)
 Lesson: What I'd do differently
+```
+
+*Figure: structure for each behavioral story.*
+
+```mermaid
+flowchart LR
+  A["Context"] --> B["Challenge"]
+  B --> C["Action"]
+  C --> D["Trade-off"]
+  D --> E["Impact"]
+  E --> F["Lesson"]
 ```
 
 ---

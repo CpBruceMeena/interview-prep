@@ -83,6 +83,17 @@ trainer.train()
 
 Gains vary by domain and data quality, so measure Recall@k and nDCG on a held-out set before and after.
 
+*Figure: contrastive training with in-batch negatives.*
+
+```mermaid
+flowchart LR
+  A["(query, positive passage) pairs"] --> B["Batch of N pairs"]
+  B --> C["Embed queries and passages"]
+  C --> D["Other passages in batch act as negatives"]
+  D --> E["MultipleNegativesRankingLoss"]
+  E --> F["Update embedding model"]
+```
+
 ---
 
 ## 3. FINE-TUNING THE RETRIEVER (RERANKER)
@@ -162,6 +173,17 @@ Use the model's **chat template**, with the retrieved context in the prompt and 
 
 **RAFT (Retrieval-Augmented Fine-Tuning, Zhang et al., 2024):** train with the relevant document **plus distractors**, and for a fraction of examples **only distractors**, with answers that quote the evidence. This teaches the model to pick the right chunk and to abstain, which is exactly the RAG failure mode. Include "not in context → I don't know" examples, or the model learns to always answer.
 
+*Figure: QLoRA keeps the quantised base frozen and trains small adapters.*
+
+```mermaid
+flowchart LR
+  A["Base model"] --> B["Load frozen in 4-bit (NF4)"]
+  B --> C["Add LoRA adapters"]
+  C --> D["SFT on chat-formatted grounded examples"]
+  D --> E["Train adapter weights only"]
+  E --> F["Adapter merged or loaded with base"]
+```
+
 ---
 
 ## 5. WHEN TO FINE-TUNE VS. WHEN TO USE RAG
@@ -180,6 +202,17 @@ Use the model's **chat template**, with the retrieved context in the prompt and 
 - Relevant docs present but ranked low → **reranker**
 - Good context, but the model ignores it, won't abstain, or breaks the output schema after prompt work → **generator** (and check if structured outputs / a bigger model fixes it first)
 - Latency or cost: **distil** a large model's behaviour into a smaller fine-tuned one
+
+*Figure: start with RAG and tune only the component that eval shows is failing.*
+
+```mermaid
+flowchart TD
+  A["Eval shows persistent failure"] --> B{"Where does it fail?"}
+  B -- "Retrieval misses domain terms" --> C["Fine-tune embeddings"]
+  B -- "Relevant docs ranked low" --> D["Fine-tune reranker"]
+  B -- "Good context, model ignores it or breaks format" --> E["Fine-tune generator"]
+  B -- "Latency or cost too high" --> F["Distil into smaller model"]
+```
 
 ---
 

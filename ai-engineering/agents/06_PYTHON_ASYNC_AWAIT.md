@@ -103,6 +103,24 @@ Task C:                |──fetch──|
 Total: ~5 time units — I/O wait is overlapped!
 ```
 
+*Figure: tasks hand control to the loop at every await, so I/O waits overlap.*
+
+```mermaid
+sequenceDiagram
+  participant L as Event loop
+  participant A as Task A
+  participant B as Task B
+  L->>A: Run until first await
+  A-->>L: Suspend (waiting on I/O)
+  L->>B: Run until first await
+  B-->>L: Suspend (waiting on I/O)
+  Note over L: I/O completes for A
+  L->>A: Resume
+  A-->>L: Done
+  L->>B: Resume
+  B-->>L: Done
+```
+
 ---
 
 ## 3. PRACTICAL PATTERNS FOR AGENT SYSTEMS
@@ -384,6 +402,17 @@ async def process_batch(items: list) -> list:
     )
 ```
 
+*Figure: pick the concurrency tool by workload type.*
+
+```mermaid
+flowchart TD
+  A["Work to run concurrently"] --> B{"I/O-bound?"}
+  B -- "yes" --> C{"Async library available?"}
+  C -- "yes" --> D["asyncio (default for agents)"]
+  C -- "no, blocking library" --> E["asyncio.to_thread"]
+  B -- "no, CPU-bound" --> F["ProcessPoolExecutor via run_in_executor"]
+```
+
 ---
 
 ## 5. COMMON PITFALLS
@@ -662,6 +691,25 @@ asyncio.run(outer())
 │  24. outer() continues: f"outer got: middle got: inner done"    │
 │  25. outer() returns the final result                           │
 └──────────────────────────────────────────────────────────────────┘
+```
+
+*Figure: awaiting a nested coroutine suspends the whole chain back to the event loop.*
+
+```mermaid
+sequenceDiagram
+  participant E as Event loop
+  participant O as outer()
+  participant M as middle()
+  participant I as inner()
+  E->>O: Run Task
+  O->>M: await middle()
+  M->>I: await inner()
+  I->>E: await sleep(0.1) suspends the whole chain
+  Note over E: Runs other tasks for 100ms
+  E->>I: Future resolved, resume Task
+  I-->>M: return "inner done"
+  M-->>O: return "middle got: inner done"
+  O-->>E: Task finished
 ```
 
 ### 8.3 The Call Stack (How It Really Works)

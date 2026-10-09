@@ -82,6 +82,19 @@ The short window makes the alert reset quickly once fixed; the long window preve
 
 **Heuristics:** "What changed?" is the most productive first question (deploys, config, flags, traffic, dependencies, certificates, quotas, clock/date). If a recent change correlates, roll it back before understanding it. Don't make several changes at once; you lose causality. Hand off cleanly on long incidents; tired responders make errors.
 
+*Figure: the incident loop. Mitigate before root cause, then learn.*
+
+```mermaid
+flowchart LR
+  A[Detect] --> B[Triage: impact and severity]
+  B --> C[Mitigate first]
+  C --> D[Communicate on cadence]
+  D --> E[Resolve and verify with SLIs]
+  E --> F[Postmortem and action items]
+  C -. "what changed?" .-> G[Rollback or disable flag]
+  G --> E
+```
+
 ---
 
 ## 4. Blameless postmortems
@@ -128,6 +141,17 @@ For schemas and APIs, never make a breaking change in one step:
 4. **Switch reads** to new, gradually, behind a flag.
 5. **Stop writing old;** observe.
 6. **Contract:** remove the old column/field after a safe window.
+
+*Figure: expand/contract migration, each step independently deployable and reversible.*
+
+```mermaid
+flowchart LR
+  A[Expand: add new field] --> B[Dual-write and backfill]
+  B --> C[Verify old vs new]
+  C --> D[Switch reads gradually]
+  D --> E[Stop writing old]
+  E --> F[Contract: remove old]
+```
 
 Every step must be deployable and rollback-able independently. Code must tolerate both versions running at once (rolling deploys guarantee that).
 
@@ -193,6 +217,19 @@ Partition the system into independent **cells**, each a complete stack serving a
 - **Scalability:** add cells instead of scaling unbounded shared components.
 - **Safer rollouts:** deploy cell by cell.
 - **Costs:** routing layer becomes critical (keep it simple and static-stable); cross-cell queries and operations are harder; capacity is fragmented.
+
+*Figure: a thin router maps each customer to one cell, so a bad deploy hits only that cell.*
+
+```mermaid
+flowchart TB
+  R[Cell router: customer to cell]
+  R --> C1[Cell 1: full stack]
+  R --> C2[Cell 2: full stack]
+  R --> C3[Cell N: full stack]
+  C1 --> D1[(Data 1)]
+  C2 --> D2[(Data 2)]
+  C3 --> D3[(Data N)]
+```
 
 ### Shuffle sharding
 

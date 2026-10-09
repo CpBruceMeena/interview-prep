@@ -117,6 +117,18 @@ func (b *TokenBucket) AllowN(n int) bool {
 - **Production note:** use `golang.org/x/time/rate` (it also has `Wait(ctx)` and reservations). Per-key limits need a map with eviction (LRU or TTL) or you leak memory under key churn.
 - **Distributed version:** a Redis Lua script holding `(tokens, last)` per key, or a sliding-window counter. A local limiter is per-instance, so the real limit is `rate × instances`.
 
+*Lazy refill: tokens are recomputed from elapsed time on each call, so no ticker goroutine is needed.*
+
+```mermaid
+flowchart TD
+    A["Allow()"] --> L["Lock"]
+    L --> E["elapsed = now - last"]
+    E --> T["tokens = min(burst, tokens + elapsed * rate)"]
+    T --> C{"tokens >= 1?"}
+    C -->|yes| Y["tokens -= 1, return true"]
+    C -->|no| N["return false"]
+```
+
 ---
 
 ## Challenge 3: Cache with stampede protection (singleflight)
@@ -192,6 +204,27 @@ func (c *LoadingCache[V]) Get(ctx context.Context, key string) (V, error) {
 - **Errors are not cached** here. For a failing backend, add negative caching with a short TTL or you will hammer it on every request.
 - **Missing on purpose (say it out loud):** no max size or eviction, no stale-while-revalidate, no jittered TTLs (synchronized expiry causes the next stampede).
 
+*singleflight collapses concurrent misses on one key into a single backend load, and every waiter gets the same result.*
+
+```mermaid
+sequenceDiagram
+    participant G1 as Caller 1
+    participant G2 as Caller 2
+    participant G3 as Caller 3
+    participant SF as singleflight.Group
+    participant DB as Backend
+    G1->>SF: Do(key)
+    SF->>DB: load (first caller leads)
+    G2->>SF: Do(key)
+    Note over SF: load in flight, caller 2 waits
+    G3->>SF: Do(key)
+    Note over SF: caller 3 waits
+    DB-->>SF: value
+    SF-->>G1: value
+    SF-->>G2: same value
+    SF-->>G3: same value
+```
+
 ---
 
 ## Challenge 4: Worker pool with backpressure and graceful shutdown
@@ -264,6 +297,23 @@ func (p *Pool) Shutdown() {
 - **Backpressure over unbounded queues:** a full queue blocks (or fails) the producer instead of eating memory.
 - **`wg.Go` (Go 1.25)** replaces `Add(1)` / `go` / `defer Done()`.
 - **Trade-off:** `Submit` holds a read lock while blocked, and a concurrent `Shutdown` waits for it. If that matters, return `ErrQueueFull` using `select` with `default`.
+
+*Bounded queue gives backpressure on `Submit`; `Shutdown` stops intake under the lock, closes the queue, and waits for workers to drain it.*
+
+```mermaid
+flowchart LR
+    P["Producers: Submit(ctx, job)"] --> M{"RWMutex read lock: pool open?"}
+    M -->|closed| Er["Return error"]
+    M -->|open| Q["Bounded jobs channel"]
+    Q -->|"full: blocks or ctx.Done"| P
+    Q --> W1["Worker 1"]
+    Q --> W2["Worker 2"]
+    Q --> W3["Worker N"]
+    SD["Shutdown"] -->|"write lock, mark closed, close(jobs)"| Q
+    W1 --> WG["wg.Wait returns after queue drained"]
+    W2 --> WG
+    W3 --> WG
+```
 
 ---
 
@@ -445,6 +495,19 @@ func Merge[T any](ctx context.Context, ins ...<-chan T) <-chan T {
 - **Fan-in closes after `wg.Wait()`** in a separate goroutine.
 - **Prove it:** in tests use `testing/synctest` (1.25) or compare `runtime.NumGoroutine()` before/after, and the `goroutineleak` profile (1.27) in production.
 
+*Pipeline ownership: each producer closes its own output, every send is paired with `ctx.Done()`, and fan-in closes only after all workers finish.*
+
+```mermaid
+flowchart LR
+    Gen["Generator: defer close(out)"] --> S1["Stage workers"]
+    S1 --> S2["Stage workers"]
+    S2 --> FI["Fan-in: close after wg.Wait"]
+    FI --> Con["Consumer"]
+    Ctx["ctx.Done()"] -.->|"unblocks every send"| Gen
+    Ctx -.-> S1
+    Ctx -.-> S2
+```
+
 ---
 
 ## Challenge 7: Retry with exponential backoff and full jitter
@@ -492,6 +555,21 @@ func Retry(ctx context.Context, attempts int, base, max time.Duration, retryable
 - **Retry only idempotent operations,** or send an idempotency key. Retrying a non-idempotent POST double-charges.
 - **Cap attempts and total time;** respect `ctx`. Use a `Timer` (not `time.After`) so it can be stopped.
 - **Retry budgets:** at scale, cap retries to a fraction of traffic (e.g. ~10%), or a partial outage becomes a full one.
+
+*Exponential backoff with full jitter: the cap doubles each attempt, the actual sleep is random in `[0, cap)`, and ctx or the attempt limit stops it.*
+
+```mermaid
+flowchart TD
+    St["Attempt n"] --> Ok{"Success?"}
+    Ok -->|yes| Done["Return result"]
+    Ok -->|no| Tr{"Retryable and attempts left?"}
+    Tr -->|no| Fail["Return last error"]
+    Tr -->|yes| Cap["cap = min(max, base * 2^n)"]
+    Cap --> J["sleep random in [0, cap) using a Timer"]
+    J --> Cx{"ctx done?"}
+    Cx -->|yes| Fail
+    Cx -->|no| St
+```
 
 ---
 

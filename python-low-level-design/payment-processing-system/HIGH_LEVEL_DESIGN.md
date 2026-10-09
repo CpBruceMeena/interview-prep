@@ -54,6 +54,18 @@
 └──────────────────────────────────────┘
 ```
 
+*Figure: payment service, gateways and stores.*
+
+```mermaid
+flowchart TB
+  C[Customer app] --> G["API gateway: rate limit, idempotency key, TLS"]
+  M[Merchant dashboard] --> G
+  G --> PS["Payment service: validation, fraud, routing"]
+  PS --> S1[Stripe gateway]
+  PS --> S2[PayPal gateway]
+  PS --> DB[("PostgreSQL + Redis: payments, outbox, settlements")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -96,6 +108,21 @@ def pay(merchant_id, key, request):
 ```
 Why not "check Redis, charge, then `SETEX`": two concurrent requests both miss the cache and both charge (check-then-act), and a crash between the charge and the `SETEX` loses the result. Redis can still front this as a cache of *completed* responses, but the unique constraint is the source of truth. Forwarding the key to the gateway covers the case our own table cannot: our request timed out after the provider had already charged the card.
 
+*Figure: idempotent pay(); the unique key claims the request before any charge.*
+
+```mermaid
+flowchart TD
+  A["INSERT payment PROCESSING ON CONFLICT DO NOTHING"] --> B{"Row inserted?"}
+  B -- Yes --> C["Charge gateway, forwarding the key"]
+  C --> D["One txn: update status + insert outbox"]
+  D --> R[Return result]
+  B -- No --> E{"Same request hash?"}
+  E -- No --> X["422 conflict"]
+  E -- Yes --> F{"Status PROCESSING?"}
+  F -- Yes --> Y["409 in progress"]
+  F -- No --> Z["Return stored response"]
+```
+
 ---
 
 ### Fraud Detection (Chain of Responsibility)
@@ -114,6 +141,17 @@ Why not "check Redis, charge, then `SETEX`": two concurrent requests both miss t
 5. **Feedback loop:** Confirmed fraud → retrain model. False positive → adjust threshold.
 
 Target: Catch 95% of fraud with <1% false positive rate.
+
+*Figure: layered fraud checks.*
+
+```mermaid
+flowchart LR
+  A[Payment] --> B{"Hard rules: amount, velocity"}
+  B -- Blocked --> X[Decline]
+  B -- Pass --> C["ML score 0-100"]
+  C -- "80-95" --> M["Manual review (1 h SLA)"]
+  C -- "Other" --> T["Threshold decides approve or decline"]
+```
 
 ---
 

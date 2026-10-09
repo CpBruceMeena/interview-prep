@@ -45,6 +45,21 @@
               └─────────────────────────┘
 ```
 
+*Figure: panels feed one controller that dispatches to cars; monitoring watches the cars.*
+
+```mermaid
+flowchart TB
+  FP["Floor panel (UP/DOWN)"] --> C
+  CP["Cabin panel (floor select)"] --> C
+  AC["Admin console"] --> C
+  C["Elevator controller: dispatching strategy"] --> E1["Elevator 1 (state machine)"]
+  C --> E2["Elevator 2 (state machine)"]
+  C --> EN["Elevator N (state machine)"]
+  E1 --> M["Monitoring: metrics + alerts"]
+  E2 --> M
+  EN --> M
+```
+
 ## 3. ELEVATOR STATE MACHINE
 
 ```
@@ -86,6 +101,20 @@
          └─────────> IDLE
 ```
 
+*Figure: elevator car state machine (the LLD collapses STOPPED and the door states into DOORS_OPEN).*
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> MOVING: request received
+  MOVING --> STOPPED: reached destination
+  STOPPED --> DOOR_OPENING
+  DOOR_OPENING --> DOOR_OPEN: 1 s
+  DOOR_OPEN --> DOOR_CLOSING: 2 s
+  DOOR_CLOSING --> MOVING: more stops
+  DOOR_CLOSING --> IDLE: no more stops
+```
+
 ## 4. DISPATCHING ALGORITHMS
 
 | Algorithm | Strategy | Best For | Trade-offs |
@@ -105,6 +134,18 @@
 | Emergency stop | Immediate stop + MAINTENANCE mode |
 | Power failure | Auto-stop at nearest floor + door open |
 | Re-levelling | Fine-tune floor alignment during stop |
+
+*Figure: hall call dispatch is atomic under the controller lock, so duplicates and races are harmless.*
+
+```mermaid
+flowchart TD
+  A["Hall call (floor, direction)"] --> L["Acquire controller lock"]
+  L --> B{"Already assigned?"}
+  B -- Yes --> R[Return, idempotent]
+  B -- No --> C["Choose car with lowest ETA"]
+  C --> D["Add to car, record assignment"]
+  D --> R
+```
 
 ## 6. TRADE-OFF ANALYSIS
 

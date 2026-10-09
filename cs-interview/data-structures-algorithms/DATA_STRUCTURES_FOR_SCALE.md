@@ -52,6 +52,19 @@ What would 1.8 GB buy? 28.8 bits/URL, k = 20 → p ≈ 0.0001% (1 in a million).
 Whether that's worth 800 MB depends on how much a never-crawled page costs.
 ```
 
+*Diagram: a Bloom filter sets or checks k bit positions per item.*
+
+```mermaid
+flowchart LR
+    I["Item"] --> H["k hash functions"]
+    H --> P["k bit positions in m-bit array"]
+    P --> Ins["Insert: set all k bits to 1"]
+    P --> Q{"Query: all k bits are 1?"}
+    Q -->|No| N["Definitely not present"]
+    Q -->|Yes| M["Probably present (false positives possible)"]
+```
+
+
 **Production version: a scalable Bloom filter for an unbounded stream:**
 
 ```python
@@ -240,6 +253,21 @@ print(f"buckets={cf.n} load={load:.2f} fp={fp:.4f} (2b/2^f = {8 / 4096:.4f})")
 
 Sample output: FP ≈ 0.18% (formula 0.20%), all 100,000 inserts succeed at 76% load, and deletions leave the other items intact.
 
+*Diagram: cuckoo filter insert, relocating fingerprints between two candidate buckets.*
+
+```mermaid
+flowchart TD
+    A["Compute fingerprint fp, bucket i1, alt i2 = i1 XOR hash(fp)"] --> B{"Free slot in i1 or i2?"}
+    B -->|Yes| OK["Store fp, done"]
+    B -->|No| K["Kick a random fingerprint out of a bucket"]
+    K --> S["Place fp there, move evicted one to its alternate bucket"]
+    S --> F{"Free slot found?"}
+    F -->|Yes| OK
+    F -->|No, kicks < max| K
+    F -->|No, max kicks hit| X["Insert fails: rebuild larger"]
+```
+
+
 **The Achilles' Heels:**
 
 | Problem | Why | Mitigation |
@@ -287,6 +315,19 @@ Sample output: FP ≈ 0.18% (formula 0.20%), all 100,000 inserts succeed at 76% 
 **The Core Insight:**
 
 HyperLogLog exploits a simple probabilistic fact: if you hash each element uniformly, the probability that a hash has at least `ρ−1` leading zeros is `2^−(ρ−1)`. The maximum rank observed gives a rough estimate of `log₂(n)`.
+
+*Diagram: HyperLogLog splits the hash stream across registers and combines them.*
+
+```mermaid
+flowchart LR
+    X["Element"] --> H["64-bit hash"]
+    H --> B["Top b bits select register j of m = 2^b"]
+    H --> R["Rank = leading zeros of rest + 1"]
+    B --> U["Register j keeps max rank"]
+    R --> U
+    U --> E["Harmonic mean over all registers gives cardinality estimate"]
+```
+
 
 The problem with a single register is high variance (±1 = 2× error). **Stochastic averaging** splits the stream into `m = 2^b` registers using the first `b` bits of the hash and combines them with a harmonic mean.
 
@@ -467,6 +508,18 @@ aggregator: sum sketches (same seed & dims) → re-estimate candidates → globa
 "last 5 minutes" = sum of the last 300 one-second sketches (ring buffer),
 or exponential decay (halve all counters periodically).
 ```
+
+*Diagram: the heavy-hitters pipeline merges per-node sketches.*
+
+```mermaid
+flowchart LR
+    N1["API node 1: CMS + candidates"] --> AG["Aggregator: sum sketches"]
+    N2["API node 2: CMS + candidates"] --> AG
+    N3["API node N: CMS + candidates"] --> AG
+    AG --> RE["Re-estimate candidates"]
+    RE --> TK["Global top-K"]
+```
+
 
 - **No false negatives for top-K?** Only if every true heavy hitter gets a chance to enter the candidate set. With per-node candidate lists that's usually fine because heavy items are heavy everywhere; to be safe, track more candidates (e.g. 10K) than K and re-rank at the aggregator.
 - **Alternatives:** Space-Saving (k counters, deterministic, error ≤ N/k) is often simpler when you *only* need top-K. Misra–Gries is similar and mergeable. CMS earns its place when you also need point queries for arbitrary keys ("how often was X searched?").
@@ -822,6 +875,19 @@ face, u, v = lat_lng_to_face_uv(37.7749, -122.4194)
 print(face, round(uv_to_st(u), 4), round(uv_to_st(v), 4))
 assert uv_to_st(-1) == 0 and uv_to_st(0) == 0.5 and uv_to_st(1) == 1
 ```
+
+*Diagram: S2 maps a lat/lng to a 64-bit cell ID.*
+
+```mermaid
+flowchart LR
+    L["lat, lng"] --> XYZ["Unit vector x, y, z"]
+    XYZ --> FUV["Cube face + u, v"]
+    FUV --> ST["Quadratic transform to s, t"]
+    ST --> IJ["Integer i, j on 2^30 grid"]
+    IJ --> HC["Hilbert curve position"]
+    HC --> ID["64-bit cell ID"]
+```
+
 
 **Why a Quadratic Transform?** Equal steps in u near a face's edge cover less of the sphere than near its centre. S2's documentation compares the ratio of largest to smallest cell area at a given level: linear 5.2×, quadratic 2.08×, tangent 1.41×. The tangent projection is most uniform but needs `tan`/`atan`; quadratic costs one square root and is close enough.
 

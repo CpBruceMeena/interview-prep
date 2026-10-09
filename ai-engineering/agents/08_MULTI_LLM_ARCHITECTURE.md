@@ -221,6 +221,18 @@ class HybridRouter:
         )
 ```
 
+*Figure: cheap rules first; an LLM router only for ambiguous queries.*
+
+```mermaid
+flowchart TD
+  A["Query"] --> B["Rule-based router"]
+  B --> C{"Confidence > 0.8?"}
+  C -- "yes" --> D["Use rule decision"]
+  C -- "no" --> E["LLM router decides model and complexity"]
+  D --> F["Selected model tier"]
+  E --> F
+```
+
 ---
 
 ## 3. COST MANAGEMENT
@@ -612,6 +624,18 @@ class FallbackChain:
             self.circuit_breakers[model]["state"] = "closed"
 ```
 
+*Figure: try the same tier on another provider before dropping a tier.*
+
+```mermaid
+flowchart LR
+  A["Primary: provider A frontier"] -- "fails" --> B["Provider B frontier"]
+  B -- "fails" --> C["Provider A mid"]
+  C -- "fails" --> D["Return error"]
+  A -- "ok" --> R["Response"]
+  B -- "ok" --> R
+  C -- "ok" --> R
+```
+
 ### 5.2 Graceful Degradation
 
 ```python
@@ -747,6 +771,24 @@ class MultiLLMOrchestrator:
             "latency_ms": result.latency_ms,
             "accuracy_score": accuracy.overall_score if accuracy else None,
         }
+```
+
+*Figure: the orchestrator pipeline from routing to cost tracking.*
+
+```mermaid
+flowchart TD
+  A["Query"] --> B["Route"]
+  B --> C{"Within budget?"}
+  C -- "no" --> D["Downgrade to small"]
+  C -- "yes" --> E["Execute with fallback chain"]
+  D --> E
+  E --> F{"Complex or medium?"}
+  F -- "yes" --> G["Accuracy check (judge)"]
+  G -- "fail" --> H["Retry on frontier"]
+  F -- "no" --> I["Track cost of every call"]
+  G -- "pass" --> I
+  H --> I
+  I --> J["Response"]
 ```
 
 ---

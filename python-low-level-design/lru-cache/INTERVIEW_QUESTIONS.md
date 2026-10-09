@@ -53,6 +53,21 @@ def put(self, key, value):
 | Hashmap + min-heap on last-access time | O(log n) | O(log n) | Every `get` must update the heap (decrease-key or lazy entries) |
 | List of keys | O(n) | O(n) | Removing from the middle shifts elements |
 
+*Figure: O(1) get and put with a hashmap and a doubly linked list (front = most recent).*
+
+```mermaid
+flowchart TD
+  G[get key] --> G1{"In map?"}
+  G1 -- No --> M[Miss]
+  G1 -- Yes --> G2["Move node to front, return value"]
+  P[put key, value] --> P1{"In map?"}
+  P1 -- Yes --> P2["Update value, move to front"]
+  P1 -- No --> P3{"At capacity?"}
+  P3 -- Yes --> P4["Evict back node, remove from map"]
+  P3 -- No --> P5["Insert new node at front"]
+  P4 --> P5
+```
+
 ---
 
 ## Question 2: "Now make it LFU, still O(1)"
@@ -100,6 +115,16 @@ Redis uses lazy expiry plus a periodic job that samples keys with a TTL and dele
 | Whole-cache ops are slower | `size`, `clear`, resize touch every shard, and aren't atomic across shards unless you take all locks in a fixed order |
 
 Pick N as a power of two, ~2–4× core count, with a well-mixed hash. This is how Guava's `LocalCache` segments work.
+
+*Figure: lock striping; each shard has its own lock and its own LRU.*
+
+```mermaid
+flowchart LR
+  K["key"] --> H["hash(key) % N"]
+  H --> S0["Shard 0: lock + map + list"]
+  H --> S1["Shard 1: lock + map + list"]
+  H --> S2["Shard N-1: lock + map + list"]
+```
 
 **Step 4 — what the best libraries do.** Caffeine never blocks reads on recency updates: reads append to striped lock-free ring buffers, and a maintenance task drains them into the LRU/W-TinyLFU structures under a lock acquired with `tryLock`. Lost read events are acceptable because eviction order is only a heuristic.
 

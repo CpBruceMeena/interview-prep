@@ -35,17 +35,20 @@
 
 ---
 
-## 🎯 Start Here: Pick Your Interview Round
+## 🎯 Start Here: Follow This Order (Step 1 → 8)
+
+New here? Read the [Study Guide](study-guide.md) first: tracks by target role (Backend, Staff, AI/FDE, SRE) and by language background (Python, Java, Go, other).
+
 
 <div class="path-grid">
-<a class="path-card" href="system-design-interview/00_FRAMEWORK_AND_ESTIMATION/"><span class="path-round">Round · System design</span><span class="path-title">System Design</span><span class="path-desc">45-minute framework, estimation cheat sheet, 8 end-to-end case studies.</span></a>
-<a class="path-card" href="python-dsa/"><span class="path-round">Round · Coding</span><span class="path-title">DSA</span><span class="path-desc">190 problems across 20 categories with thought process and complexity.</span></a>
-<a class="path-card" href="python-low-level-design/LLD_INTERVIEW_PLAYBOOK/"><span class="path-round">Round · Low-level design</span><span class="path-title">LLD</span><span class="path-desc">30 projects in Python, Java and Go, plus the interview playbook.</span></a>
-<a class="path-card" href="cs-interview/"><span class="path-round">Round · Fundamentals</span><span class="path-title">CS Core</span><span class="path-desc">OS, networks, databases, distributed systems, concurrency, security.</span></a>
-<a class="path-card" href="golang-interview/"><span class="path-round">Round · Language depth</span><span class="path-title">Go · Python · Java</span><span class="path-desc">Runtime internals, concurrency, coding challenges, production patterns.</span></a>
-<a class="path-card" href="aws-interview/"><span class="path-round">Round · Infrastructure</span><span class="path-title">Cloud &amp; Tools</span><span class="path-desc">AWS, Kafka, Redis, Kubernetes, Postgres tooling, observability.</span></a>
-<a class="path-card" href="ai-engineering/"><span class="path-round">Round · AI</span><span class="path-title">AI Engineering</span><span class="path-desc">RAG, MCP, agents, LLM internals, production AI systems.</span></a>
-<a class="path-card" href="staff-engineer-interview/01_STAFF_BEHAVIORAL_GUIDE/"><span class="path-round">Round · Leadership</span><span class="path-title">Staff Craft</span><span class="path-desc">Behavioral stories, design docs and RFCs, reliability and incident leadership.</span></a>
+<a class="path-card" href="cs-interview/"><span class="path-round">Step 1 · Fundamentals</span><span class="path-title">CS Core</span><span class="path-desc">OS, networks, databases, distributed systems, concurrency, security.</span></a>
+<a class="path-card" href="python-dsa/"><span class="path-round">Step 2 · Coding</span><span class="path-title">DSA</span><span class="path-desc">190 problems across 20 categories with thought process and complexity.</span></a>
+<a class="path-card" href="golang-interview/"><span class="path-round">Step 3 · Language depth</span><span class="path-title">Go · Python · Java</span><span class="path-desc">Runtime internals, concurrency, coding challenges, production patterns.</span></a>
+<a class="path-card" href="python-low-level-design/LLD_INTERVIEW_PLAYBOOK/"><span class="path-round">Step 4 · Low-level design</span><span class="path-title">LLD</span><span class="path-desc">30 projects in Python, Java and Go, plus the interview playbook.</span></a>
+<a class="path-card" href="system-design-interview/00_FRAMEWORK_AND_ESTIMATION/"><span class="path-round">Step 5 · System design</span><span class="path-title">System Design</span><span class="path-desc">45-minute framework, estimation cheat sheet, 8 end-to-end case studies.</span></a>
+<a class="path-card" href="aws-interview/"><span class="path-round">Step 6 · Infrastructure</span><span class="path-title">Cloud &amp; Tools</span><span class="path-desc">AWS, Kafka, Redis, Kubernetes, Postgres tooling, observability.</span></a>
+<a class="path-card" href="ai-engineering/"><span class="path-round">Step 7 · AI</span><span class="path-title">AI Engineering</span><span class="path-desc">RAG, MCP, agents, LLM internals, production AI systems.</span></a>
+<a class="path-card" href="staff-engineer-interview/01_STAFF_BEHAVIORAL_GUIDE/"><span class="path-round">Step 8 · Leadership</span><span class="path-title">Staff Craft</span><span class="path-desc">Behavioral stories, design docs and RFCs, reliability and incident leadership.</span></a>
 </div>
 
 ---

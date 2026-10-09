@@ -65,6 +65,25 @@ docker run -it ubuntu bash
    e. execve("bash"). The shim keeps stdio and reports the exit status. runc exits.
 ```
 
+Control flow of docker run from CLI down to the container process.
+
+```mermaid
+sequenceDiagram
+    participant CLI as docker CLI
+    participant DD as dockerd
+    participant CD as containerd
+    participant SH as shim
+    participant RC as runc
+    CLI->>DD: REST over docker.sock
+    DD->>CD: gRPC create container
+    CD->>SH: start containerd-shim-runc-v2
+    SH->>RC: runc create/start (OCI config.json)
+    RC->>RC: namespaces, cgroup, pivot_root, caps, seccomp
+    RC->>RC: execve bash
+    RC-->>SH: runc exits
+    SH-->>CD: Reports exit status later
+```
+
 **Namespace details:**
 
 | Namespace | What the container sees | Notes |
@@ -178,6 +197,22 @@ CMD ["python", "-m", "app.main"]
 
 The runtime stage has no compiler, no headers and no pip cache. The virtualenv makes the dependency copy a single directory, and running as a non-root UID is a free security win.
 
+Multi-stage build: only artifacts cross from the builder into the runtime image.
+
+```mermaid
+flowchart LR
+    subgraph Builder
+        B1["python:3.13-slim"] --> B2["Install build tools"]
+        B2 --> B3["pip install into venv"]
+    end
+    subgraph Runtime
+        R1["python:3.13-slim"] --> R2["Runtime libs only"]
+        R2 --> R3["USER 10001"]
+    end
+    B3 -->|"COPY --from=builder /opt/venv"| R2
+    R3 --> IMG["Final image"]
+```
+
 **Go: static binary on distroless:**
 
 ```dockerfile
@@ -287,6 +322,19 @@ COPY --from=build /out/server /server
 ENTRYPOINT ["/server"]
 ```
 
+Multi-arch build: one build produces a manifest list pointing at per-architecture images.
+
+```mermaid
+flowchart TB
+    CMD["docker buildx build --platform amd64,arm64"] --> A["amd64 build"]
+    CMD --> R["arm64 build"]
+    A --> IA["Image amd64"]
+    R --> IR["Image arm64"]
+    IA --> IDX["Manifest list (image index)"]
+    IR --> IDX
+    IDX --> REG["Registry tag 1.4.0"]
+```
+
 **Reproducibility:** pin base images **by digest** (`FROM python:3.13-slim@sha256:...`) and let a bot (Renovate/Dependabot) bump them. Otherwise "the same commit" builds a different image next week. `SOURCE_DATE_EPOCH` and `rewrite-timestamp=true` on the output make layers byte-for-byte reproducible.
 
 ### 🔍 Staff-Level Evaluation
@@ -356,6 +404,21 @@ docker buildx imagetools inspect reg/app@sha256:abc... --format '{{ json .Proven
 
 **Base image hygiene:** start from minimal bases that ship their own SBOM and provenance (distroless, Docker Hardened Images, Chainguard). Rebuild on a schedule even when the code hasn't changed, so base-layer CVE fixes land. Fewer packages means fewer CVEs to triage.
 
+Supply-chain chain of trust from commit to running pod.
+
+```mermaid
+flowchart LR
+    S["Source (reviewed PR)"] --> B["CI build (pinned base)"]
+    B --> T["SBOM + SLSA provenance"]
+    T --> G["cosign sign by digest"]
+    G --> R["Registry"]
+    R --> C["Scan SBOM (Trivy / Grype)"]
+    R --> A{"Admission policy"}
+    A -->|"signed, digest, provenance OK"| D["Deploy"]
+    A -->|"otherwise"| X["Reject"]
+    D --> W["Daily rescan of running digests"]
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -419,6 +482,19 @@ Fixes: match thread pools and `GOMAXPROCS` to the quota. Raise the limit. Use `c
 
 **Other limits:** `--pids-limit` (fork bombs, thread leaks), `--ulimit nofile=...`, and `--device-read-bps`/`io.max` (disk-heavy neighbours). `io.max` throttling of buffered writes only works on cgroup v2.
 
+How a CPU quota throttles a bursty app even when average CPU is low.
+
+```mermaid
+sequenceDiagram
+    participant A as App threads
+    participant S as CFS (cpu.max 200ms / 100ms)
+    A->>S: Period starts, 16 threads run
+    Note over A,S: 200 ms quota used after 12.5 ms
+    S-->>A: Throttled for remaining 87.5 ms
+    Note over A: Requests stall, p99 spikes
+    S->>A: Next period, quota refilled
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -470,6 +546,20 @@ Outbound from the container
 - Docker inserts its iptables rules ahead of UFW/firewalld rules, so a published port bypasses them. Filter in the `DOCKER-USER` chain, or don't publish. Engine 28 tightened default isolation so **unpublished** container ports are no longer reachable from other hosts on the LAN.
 - DNS: containers inherit the host's resolv.conf (filtered). Alpine's musl resolver behaves differently (search domains, TCP fallback), a frequent source of "works on Debian, fails on Alpine".
 - MTU mismatches (VPNs, overlay/VXLAN overhead) cause hangs on large packets only. Set the network MTU explicitly.
+
+Packet path for a published port, inbound and outbound.
+
+```mermaid
+flowchart LR
+    C["Client"] -->|"host:8080"| E["Host eth0"]
+    E --> N["nat PREROUTING: DNAT"]
+    N --> F["FORWARD (DOCKER-USER first)"]
+    F --> B["Bridge"]
+    B --> V["veth pair"]
+    V --> X["Container eth0:80"]
+    X -->|"reply / outbound"| M["nat POSTROUTING: MASQUERADE"]
+    M --> I["Internet"]
+```
 
 ### 🔍 Staff-Level Evaluation
 
@@ -571,6 +661,24 @@ Set `--stop-timeout` / `stop_grace_period` (Compose) / `terminationGracePeriodSe
 
 **Zombies:** a child that exits stays a zombie until its parent `wait()`s. Orphans are re-parented to PID 1 of the namespace. An app that isn't written as an init never reaps them, so the PID table fills (`pids.max`). `--init` injects tini as PID 1, which forwards signals and reaps.
 
+
+Stop sequence: SIGTERM first, SIGKILL only after the grace period.
+
+```mermaid
+sequenceDiagram
+    participant D as docker stop
+    participant P as PID 1 (app)
+    participant K as Kernel
+    D->>P: SIGTERM
+    P->>P: Mark not ready, drain in-flight requests
+    alt handler installed and exec form
+        P-->>D: Exit 0 (or 143)
+    else no handler or shell-form PID 1
+        D->>K: Wait 10 s (stop timeout)
+        K->>P: SIGKILL
+        P-->>D: Exit 137, requests dropped
+    end
+```
 **Exit codes to know:** 137 = 128+9 (SIGKILL: OOM or stop timeout), 143 = 128+15 (SIGTERM, handled by exiting), 139 = SIGSEGV.
 
 ### 🔍 Staff-Level Evaluation

@@ -46,6 +46,19 @@ User Query: "Harry Poter"
 └─────────────────────────────────────────────┘
 ```
 
+*Figure: per-token spell correction pipeline.*
+
+```mermaid
+flowchart TD
+  A["Query"] --> B["Tokenize"]
+  B --> C{"Exact match in index?"}
+  C -- "yes" --> D["Use token"]
+  C -- "no" --> E["Candidates: Levenshtein, phonetic, n-gram"]
+  E --> F["Rank by distance, frequency and context"]
+  D --> G["Suggest corrected query"]
+  F --> G
+```
+
 ## 3. LEVENSHTEIN DISTANCE IMPLEMENTATION
 
 ```python

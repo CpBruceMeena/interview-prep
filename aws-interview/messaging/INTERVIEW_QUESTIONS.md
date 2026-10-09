@@ -108,6 +108,20 @@ ReceiveMessage ──► in flight (invisible for VisibilityTimeout)
                        > maxReceiveCount ──► DLQ
 ```
 
+*SQS message lifecycle: a receive starts the visibility lease, delete ends it, expiry makes the message visible again or sends it to the DLQ.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> Visible: SendMessage
+    Visible --> InFlight: ReceiveMessage
+    InFlight --> Deleted: DeleteMessage
+    InFlight --> Visible: timeout or crash, count + 1
+    InFlight --> DLQ: receive count above maxReceiveCount
+    Deleted --> [*]
+    DLQ --> Visible: StartMessageMoveTask redrive
+```
+
+
 - Too short: the message reappears while still being processed, causing duplicate work.
 - Too long: a crashed consumer delays the retry by the whole timeout.
 - Long-running jobs: start with a moderate timeout and call `ChangeMessageVisibility` periodically. Set it to 0 to release a message immediately for retry.
@@ -216,6 +230,23 @@ SNS topic: order-events
     + subscription-level DLQ on each SNS→SQS subscription
       (catches messages SNS could not deliver to the queue)
 ```
+
+*SNS fan-out: one publish, one queue per service, each with its own DLQ and consumer.*
+
+```mermaid
+flowchart LR
+    P[Order service] --> T[SNS topic: order-events]
+    T --> Q1[payment-queue]
+    T --> Q2[inventory-queue]
+    T --> Q3[notification-queue]
+    Q1 --> C1[Payment processor]
+    Q2 --> C2[Inventory updater]
+    Q3 --> C3[Notification sender]
+    Q1 -.-> D1[payment-dlq]
+    Q2 -.-> D2[inventory-dlq]
+    Q3 -.-> D3[notification-dlq]
+```
+
 
 **Failure isolation, layer by layer:**
 
@@ -392,6 +423,20 @@ shards ≥ max( write MB/s ÷ 1,
 - Fixes: a higher-cardinality key (e.g. `userId` not `country`); salt a hot key (`key#0..N`) and accept that you lose per-key ordering across salts; or set `ExplicitHashKey` to place records deliberately.
 - Ordering is guaranteed only per shard, for records with the same partition key, in sequence-number order.
 
+*Kinesis routing: the MD5 of the partition key picks the shard whose hash range contains it, so a hot key stays on one shard.*
+
+```mermaid
+flowchart LR
+    P[Producer] -->|"partition key"| H["MD5 to 128-bit hash"]
+    H --> S1["Shard 1: low hash range"]
+    H --> S2["Shard 2: middle range"]
+    H --> S3["Shard 3: high range"]
+    S1 --> K1[Records ordered per key]
+    S2 --> K2[Records ordered per key]
+    S3 --> K3[Records ordered per key]
+```
+
+
 **Resharding (provisioned):**
 
 - `SplitShard` splits one shard's hash range into two; `MergeShards` combines two adjacent ranges. The parent shard closes; consumers must finish the parent before reading children to preserve order (the KCL does this).
@@ -433,6 +478,23 @@ shards ≥ max( write MB/s ÷ 1,
 | Typical propagation delay | ~200 ms with one consumer; grows as consumers compete for the 5 calls/s | ~70 ms |
 | Cost | Included in shard/stream price | Extra per consumer-shard-hour and per GB (provisioned and On-demand Standard) |
 | Max consumers | No hard limit, but they starve each other | 20 registered consumers per stream (50 with On-demand Advantage) |
+
+*Shared reads split one 2 MB/s per shard between consumers; EFO gives each registered consumer its own pushed stream.*
+
+```mermaid
+flowchart LR
+    subgraph Shared["Shared throughput: GetRecords pull"]
+        SH1[Shard] -->|"2 MB/s total"| A1[Consumer A]
+        SH1 --> A2[Consumer B]
+        SH1 --> A3[Consumer C]
+    end
+    subgraph EFO["Enhanced fan-out: SubscribeToShard push"]
+        SH2[Shard] -->|"2 MB/s each"| B1[Consumer A]
+        SH2 -->|"2 MB/s each"| B2[Consumer B]
+        SH2 -->|"2 MB/s each"| B3[Consumer C]
+    end
+```
+
 
 **When to use EFO:**
 

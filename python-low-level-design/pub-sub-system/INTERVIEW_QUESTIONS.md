@@ -32,6 +32,20 @@ class MessageBroker:
 
 A design with one queue per topic and a loop that delivers each message to every subscriber in turn works in the demo and fails the first follow-up ("what if one subscriber is slow?").
 
+*Figure: publish snapshots subscriptions; each subscription has its own queue and dispatcher.*
+
+```mermaid
+flowchart LR
+  P[publish topic] --> S["Snapshot subscriptions (under lock)"]
+  S --> Q1["Sub A: filter, bounded queue"]
+  S --> Q2["Sub B: filter, bounded queue"]
+  Q1 --> D1["Dispatcher A"]
+  Q2 --> D2["Dispatcher B"]
+  D1 --> H1[Subscriber A]
+  D2 --> H2[Subscriber B]
+  D1 -. "retries exhausted" .-> DLQ[Dead letter queue]
+```
+
 ---
 
 ## Question 2: Delivery Semantics
@@ -49,6 +63,20 @@ What systems actually provide is **exactly-once *effects***:
 - **Kafka EOS:** idempotent producer (producer id + sequence number, broker drops duplicates) plus transactions that atomically write output records *and* the consumer offsets. This covers Kafka → Kafka pipelines; a side effect in an external system still needs idempotency.
 
 **In this code:** at-least-once with respect to subscriber exceptions (retry, then DLQ); not durable across a process crash. `DedupingSubscriber` shows the idempotent-consumer pattern, recording an id only after success.
+
+*Figure: at-least-once delivery; a lost ack causes a redelivery that an idempotent consumer absorbs.*
+
+```mermaid
+sequenceDiagram
+  participant B as Broker
+  participant C as Consumer
+  B->>C: Deliver message id 7
+  C->>C: Process, record id 7 in same txn
+  C--xB: Ack lost
+  B->>C: Redeliver message id 7
+  C->>C: Duplicate id, skip effect
+  C-->>B: Ack
+```
 
 ---
 

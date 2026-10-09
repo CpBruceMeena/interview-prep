@@ -258,6 +258,20 @@ public class AppConfig {
 //          methods are inferred by default for @Bean)
 ```
 
+*Bean lifecycle: instantiate, populate, run init callbacks around the BeanPostProcessors (where AOP proxies replace the raw bean), then destroy callbacks on context close.*
+
+```mermaid
+flowchart TD
+    A["1. Instantiate: constructor or factory method"] --> B["2. Populate: field and setter injection"]
+    B --> C["3. Aware callbacks"]
+    C --> D["4. BPP before-init: Aware processors, @PostConstruct"]
+    D --> E["5. afterPropertiesSet"]
+    E --> F["6. Custom init method"]
+    F --> G["7. BPP after-init: AOP proxy created and replaces the raw bean"]
+    G --> H["8. Ready: SmartInitializingSingleton, SmartLifecycle.start"]
+    H --> I["Context close: @PreDestroy, DisposableBean.destroy, custom destroy"]
+```
+
 ### BeanPostProcessor — The Most Powerful Extension Point
 
 ```java
@@ -412,6 +426,20 @@ public class JdbcTemplateAutoConfiguration {
         return template;
     }
 }
+```
+
+*Auto-configuration selection: candidates from every `AutoConfiguration.imports` file are pre-filtered by metadata, then each surviving class is applied only if its conditions match, backing off when the user defines the bean.*
+
+```mermaid
+flowchart TD
+    A["@EnableAutoConfiguration: AutoConfigurationImportSelector (deferred)"] --> B["Read AutoConfiguration.imports from every jar"]
+    B --> C["Import filter: drop candidates whose @ConditionalOnClass cannot match (no class loading)"]
+    C --> D["Evaluate remaining classes after user @Configuration is parsed"]
+    D --> E{"Class-level conditions match?"}
+    E -->|no| X["Skip configuration"]
+    E -->|yes| F{"@Bean method: @ConditionalOnMissingBean satisfied?"}
+    F -->|"user already defined a bean"| Y["Back off: user bean wins"]
+    F -->|yes| Z["Register auto-configured bean"]
 ```
 
 ### @Conditional Mechanism
@@ -631,6 +659,23 @@ public class UserRegistration {
 //        itself, so self-calls (and private methods) are advised. More build setup.
 ```
 
+*Self-invocation: callers hold the proxy, but inside the target `this` is the raw object, so an internal call skips the transactional advice (REQUIRES_NEW is ignored).*
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant P as Proxy
+    participant T as Target UserService
+    C->>P: createUser(user)
+    P->>P: interceptor chain: begin transaction
+    P->>T: createUser(user)
+    T->>T: this.sendWelcomeEmail(email), plain Java call
+    Note over T: no proxy involved, REQUIRES_NEW ignored, same transaction
+    T-->>P: return
+    P->>P: commit
+    P-->>C: return
+```
+
 ### AspectJ Pointcut Expressions
 
 ```java
@@ -751,6 +796,23 @@ public class LoggingAspect {
 //   all block until the pool's connectionTimeout (Hikari default 30 s), then fail.
 // - If the inner transaction touches rows the outer one has locked, it waits for
 //   the outer transaction, which waits for it: a self-deadlock until lock timeout.
+```
+
+*REQUIRES_NEW suspends the outer transaction (its connection stays checked out), runs the inner method on a second connection, then resumes the outer one.*
+
+```mermaid
+sequenceDiagram
+    participant O as Outer tx method
+    participant TM as TransactionManager
+    participant DB as Connection pool
+    O->>TM: call REQUIRES_NEW method
+    TM->>TM: suspend: unbind connection holder, keep outer tx open
+    TM->>DB: borrow a second connection, autoCommit false
+    TM->>TM: run inner method
+    TM->>DB: commit or rollback inner, release connection
+    TM->>TM: resume: rebind outer resources
+    TM-->>O: return
+    Note over O,DB: two connections held at once, risk of pool starvation
 ```
 
 ### Isolation Levels
@@ -1098,6 +1160,23 @@ public class User {
 //    - Denied → AccessDeniedException → handled by step 5
 ```
 
+*A request enters Spring Security through `FilterChainProxy`, which picks the first matching chain; authentication filters populate the SecurityContext, and authorization failures are translated to 401 or 403.*
+
+```mermaid
+flowchart TD
+    R["HTTP request"] --> D["DelegatingFilterProxy, then FilterChainProxy: first matching SecurityFilterChain"]
+    D --> S["SecurityContextHolderFilter: load context lazily"]
+    S --> CS["CsrfFilter, LogoutFilter"]
+    CS --> AU["Authentication filter (Bearer, form login, Basic) via AuthenticationManager"]
+    AU --> ET["ExceptionTranslationFilter"]
+    ET --> AZ["AuthorizationFilter: AuthorizationManager decision"]
+    AZ -->|allowed| APP["Continue to DispatcherServlet"]
+    AZ -->|denied| EX["AccessDeniedException"]
+    EX --> ET
+    ET -->|"not authenticated"| E401["AuthenticationEntryPoint: 401 or login redirect"]
+    ET -->|"authenticated but denied"| E403["AccessDeniedHandler: 403"]
+```
+
 ### Authentication Flow
 
 ```java
@@ -1228,6 +1307,28 @@ DispatcherServlet (front controller)
 
 (Theme support, ThemeResolver, was removed in Framework 7. HiddenHttpMethodFilter
  is off by default in Boot since 2.2.)
+```
+
+*Spring MVC request path: servlet filters, then `DispatcherServlet` finds a handler, runs interceptors and the handler method, and `afterCompletion` always runs.*
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant F as Servlet filters
+    participant D as DispatcherServlet
+    participant H as HandlerMapping
+    participant I as Interceptors
+    participant A as HandlerAdapter and controller
+    C->>F: HTTP request on a worker thread
+    F->>D: through filter chain (incl. Security)
+    D->>H: find handler and interceptors
+    D->>I: preHandle
+    D->>A: resolve arguments, invoke controller method
+    A-->>D: return value via HttpMessageConverter or view
+    D->>I: postHandle (skipped if handler threw)
+    Note over D: exceptions go to HandlerExceptionResolvers
+    D->>I: afterCompletion (always)
+    D-->>C: response
 ```
 
 ### HandlerMethodArgumentResolver — Custom

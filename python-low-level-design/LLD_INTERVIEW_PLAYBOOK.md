@@ -67,6 +67,19 @@ The phases are the same for every length; only the budget changes.
 
 In a 45-minute round, tests are often only *described*. In a 90-minute round you are expected to have runnable tests.
 
+*Figure: the time-boxed script (45-minute budget), with a checkpoint after each phase.*
+
+```mermaid
+flowchart LR
+  A["Clarify (5)"] --> B["Entities + interfaces (7)"]
+  B --> C["Happy-path code (18)"]
+  C --> D["Edge cases + concurrency (8)"]
+  D --> E["Extension (4)"]
+  E --> F["Tests + wrap-up (3)"]
+  A -. checkpoint .-> B
+  B -. checkpoint .-> C
+```
+
 ### What to say out loud, phase by phase
 
 **Clarify (write the answers as a comment block at the top of the file):**
@@ -213,6 +226,20 @@ class Order:
 ```
 
 **Table vs State pattern:** use the table when states differ only in *which transitions are allowed*. Use the State pattern (one class per state) when each state handles the **same events differently** (vending machine: `insert_coin` means different things in `Idle`, `HasMoney`, `Dispensing`).
+
+*Figure: the order lifecycle encoded by the TRANSITIONS table above.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> CREATED
+  CREATED --> PAID
+  CREATED --> CANCELLED
+  PAID --> SHIPPED
+  PAID --> CANCELLED
+  SHIPPED --> DELIVERED
+  DELIVERED --> [*]
+  CANCELLED --> [*]
+```
 
 ### When NOT to apply a pattern
 
@@ -482,6 +509,18 @@ Other deadlock tools: `tryLock` with a timeout plus back-off, or a single coarse
 | Best when | Contention is high (hot seat, hot SKU) | Contention is low; reads dominate |
 | In memory | `Lock` / `synchronized` / `Mutex` | CAS (`AtomicReference.compareAndSet`, `atomic.CompareAndSwapInt64`), or a version check under a short lock |
 | In the DB | `SELECT … FOR UPDATE` inside a transaction | `version` column + conditional `UPDATE` |
+
+*Figure: optimistic update loop; zero affected rows means another writer won.*
+
+```mermaid
+flowchart TD
+  A[Read row and version] --> B[Compute new value]
+  B --> C["UPDATE ... WHERE version = read_version"]
+  C --> D{"Rows affected = 1?"}
+  D -- Yes --> E[Committed]
+  D -- No --> F[Reload and retry]
+  F --> A
+```
 
 ```sql
 -- Pessimistic: row lock held until COMMIT
@@ -777,6 +816,17 @@ class CompositePricing:
 - A new **state** (`HELD`) and two transitions (`AVAILABLE → HELD`, `HELD → BOOKED | AVAILABLE`) are added to the transition table.
 - Expiry uses the injected `Clock`: either lazy (treat `HELD` with `held_until < now` as available on read) or a sweeper thread. **Lazy is simpler and race-free**; say so.
 - **Risk:** payment succeeds after the hold expired. Confirm with a conditional transition (`HELD by this hold_id → BOOKED`); on failure, refund automatically.
+
+*Figure: seat states after adding the 10-minute hold (Example C).*
+
+```mermaid
+stateDiagram-v2
+  [*] --> AVAILABLE
+  AVAILABLE --> HELD: hold for 10 min
+  HELD --> BOOKED: pay with same hold_id
+  HELD --> AVAILABLE: expiry or release
+  BOOKED --> [*]
+```
 
 ---
 

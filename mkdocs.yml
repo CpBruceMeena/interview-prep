@@ -125,20 +125,25 @@ extra_javascript:
 
 nav:
   - Home: index.md
+  - Study Guide: study-guide.md
 
-  - System Design:
-    - Overview: system-design-interview/README.md
-    - Framework & Estimation: system-design-interview/00_FRAMEWORK_AND_ESTIMATION.md
-    - URL Shortener: system-design-interview/01_URL_SHORTENER.md
-    - News Feed: system-design-interview/02_NEWS_FEED.md
-    - Chat & Messaging: system-design-interview/03_CHAT_MESSAGING.md
-    - Typeahead / Search Suggestions: system-design-interview/04_TYPEAHEAD_SEARCH_SUGGESTIONS.md
-    - Ad Click Aggregation: system-design-interview/05_AD_CLICK_AGGREGATION.md
-    - Video Streaming: system-design-interview/06_VIDEO_STREAMING.md
-    - File Storage & Sync: system-design-interview/07_FILE_STORAGE_AND_SYNC.md
-    - Payments Ledger: system-design-interview/08_PAYMENTS_LEDGER.md
+  - 1. CS Core:
+    - Overview: cs-interview/README.md
+    - Operating Systems: cs-interview/operating-systems/INTERVIEW_QUESTIONS.md
+    - Computer Networks: cs-interview/computer-networks/INTERVIEW_QUESTIONS.md
+    - Database Systems: cs-interview/database-systems/INTERVIEW_QUESTIONS.md
+    - PostgreSQL Deep Dive: cs-interview/database-systems/POSTGRESQL_DEEP_DIVE.md
+    - DynamoDB Deep Dive: cs-interview/database-systems/DYNAMODB_DEEP_DIVE.md
+    - Concurrency & Parallelism: cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md
+    - Distributed Systems: cs-interview/distributed-systems/INTERVIEW_QUESTIONS.md
+    - Distributed Transactions: cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS.md
+    - Data Structures & Algorithms: cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS.md
+    - Data Structures for Scale: cs-interview/data-structures-algorithms/DATA_STRUCTURES_FOR_SCALE.md
+    - Design Patterns: cs-interview/software-architecture/DESIGN_PATTERNS.md
+    - Software Architecture: cs-interview/software-architecture/INTERVIEW_QUESTIONS.md
+    - Security: cs-interview/security/INTERVIEW_QUESTIONS.md
 
-  - Coding (DSA):
+  - 2. Coding (DSA):
     - Overview: python-dsa/index.md
     - Arrays: python-dsa/01_arrays/index.md
     - Strings: python-dsa/02_strings/index.md
@@ -161,24 +166,34 @@ nav:
     - Math & Number Theory: python-dsa/19_math_number_theory/index.md
     - Design Problems: python-dsa/20_design_problems/index.md
 
-  - Low-Level Design:
+  - 3. Languages:
+    - Python:
+      - Overview: python-interview/README.md
+      - Multithreading & Concurrency: python-interview/MULTITHREADING_NOTES.md
+      - Async Basics (Start Here): python-interview/ASYNC_BASICS.md
+      - Async/Await & Asyncio: python-interview/ASYNCIO_NOTES.md
+      - Django: python-interview/DJANGO_NOTES.md
+      - FastAPI: python-interview/FASTAPI_NOTES.md
+      - Interview Questions: python-interview/INTERVIEW_QUESTIONS.md
+    - Go:
+      - Overview: golang-interview/README.md
+      - Language Internals (Slices, Maps, Generics, defer): golang-interview/LANGUAGE_INTERNALS_NOTES.md
+      - Pointers, Memory & Object Handling: golang-interview/POINTERS_MEMORY_NOTES.md
+      - Concurrency & Goroutines: golang-interview/CONCURRENCY_NOTES.md
+      - Concurrency Coding Challenges: golang-interview/CONCURRENCY_CODING_CHALLENGES.md
+      - Production Services (HTTP, DB, Profiling): golang-interview/PRODUCTION_SERVICES_NOTES.md
+      - Interview Questions: golang-interview/INTERVIEW_QUESTIONS.md
+    - Java:
+      - Overview: java-interview/README.md
+      - JVM Internals & GC: java-interview/JVM_INTERNALS_NOTES.md
+      - Object Handling, References & Memory: java-interview/OBJECT_HANDLING_MEMORY_NOTES.md
+      - Spring Boot Deep-Dive: java-interview/SPRING_BOOT_NOTES.md
+      - Interview Questions: java-interview/INTERVIEW_QUESTIONS.md
+
+  - 4. Low-Level Design:
     - 🎯 Interview Playbook: python-low-level-design/LLD_INTERVIEW_PLAYBOOK.md
     - Python (24 projects):
       - Overview: python-low-level-design/README.md
-      - Parking Lot:
-        - python-low-level-design/parking-lot/index.md
-        - Thought Process: python-low-level-design/parking-lot/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/parking-lot/CODE.md
-        - Schema: python-low-level-design/parking-lot/DB_SCHEMA.md
-        - HLD: python-low-level-design/parking-lot/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/parking-lot/INTERVIEW_QUESTIONS.md
-      - Chess Game:
-        - python-low-level-design/chess-game/index.md
-        - Thought Process: python-low-level-design/chess-game/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/chess-game/CODE.md
-        - Schema: python-low-level-design/chess-game/DB_SCHEMA.md
-        - HLD: python-low-level-design/chess-game/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/chess-game/INTERVIEW_QUESTIONS.md
       - Tic-Tac-Toe:
         - python-low-level-design/tic-tac-toe/index.md
         - Thought Process: python-low-level-design/tic-tac-toe/THOUGHT_PROCESS.md
@@ -191,6 +206,13 @@ nav:
         - Code: python-low-level-design/snakes-and-ladders/CODE.md
         - HLD: python-low-level-design/snakes-and-ladders/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/snakes-and-ladders/INTERVIEW_QUESTIONS.md
+      - Parking Lot:
+        - python-low-level-design/parking-lot/index.md
+        - Thought Process: python-low-level-design/parking-lot/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/parking-lot/CODE.md
+        - Schema: python-low-level-design/parking-lot/DB_SCHEMA.md
+        - HLD: python-low-level-design/parking-lot/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/parking-lot/INTERVIEW_QUESTIONS.md
       - Vending Machine:
         - python-low-level-design/vending-machine/index.md
         - Thought Process: python-low-level-design/vending-machine/THOUGHT_PROCESS.md
@@ -203,6 +225,19 @@ nav:
         - Code: python-low-level-design/lru-cache/CODE.md
         - HLD: python-low-level-design/lru-cache/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/lru-cache/INTERVIEW_QUESTIONS.md
+      - Library Management:
+        - python-low-level-design/library-management/index.md
+        - Thought Process: python-low-level-design/library-management/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/library-management/CODE.md
+        - HLD: python-low-level-design/library-management/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/library-management/INTERVIEW_QUESTIONS.md
+      - Chess Game:
+        - python-low-level-design/chess-game/index.md
+        - Thought Process: python-low-level-design/chess-game/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/chess-game/CODE.md
+        - Schema: python-low-level-design/chess-game/DB_SCHEMA.md
+        - HLD: python-low-level-design/chess-game/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/chess-game/INTERVIEW_QUESTIONS.md
       - Rate Limiter:
         - python-low-level-design/rate-limiter/index.md
         - Thought Process: python-low-level-design/rate-limiter/THOUGHT_PROCESS.md
@@ -215,6 +250,12 @@ nav:
         - Code: python-low-level-design/pub-sub-system/CODE.md
         - HLD: python-low-level-design/pub-sub-system/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/pub-sub-system/INTERVIEW_QUESTIONS.md
+      - Logging Framework:
+        - python-low-level-design/logging-framework/index.md
+        - Thought Process: python-low-level-design/logging-framework/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/logging-framework/CODE.md
+        - HLD: python-low-level-design/logging-framework/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/logging-framework/INTERVIEW_QUESTIONS.md
       - Movie Ticket Booking:
         - python-low-level-design/movie-ticket-booking/index.md
         - Thought Process: python-low-level-design/movie-ticket-booking/THOUGHT_PROCESS.md
@@ -227,26 +268,12 @@ nav:
         - Code: python-low-level-design/splitwise-expense-sharing/CODE.md
         - HLD: python-low-level-design/splitwise-expense-sharing/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/splitwise-expense-sharing/INTERVIEW_QUESTIONS.md
-      - Cab Booking (Uber):
-        - python-low-level-design/cab-booking-uber/index.md
-        - Thought Process: python-low-level-design/cab-booking-uber/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/cab-booking-uber/CODE.md
-        - Schema: python-low-level-design/cab-booking-uber/DB_SCHEMA.md
-        - HLD: python-low-level-design/cab-booking-uber/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/cab-booking-uber/INTERVIEW_QUESTIONS.md
-      - Library Management:
-        - python-low-level-design/library-management/index.md
-        - Thought Process: python-low-level-design/library-management/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/library-management/CODE.md
-        - HLD: python-low-level-design/library-management/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/library-management/INTERVIEW_QUESTIONS.md
-      - Car Rental:
-        - python-low-level-design/car-rental-platform/index.md
-        - Thought Process: python-low-level-design/car-rental-platform/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/car-rental-platform/CODE.md
-        - Schema: python-low-level-design/car-rental-platform/DB_SCHEMA.md
-        - HLD: python-low-level-design/car-rental-platform/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/car-rental-platform/INTERVIEW_QUESTIONS.md
+      - Inventory Management:
+        - python-low-level-design/inventory-management/index.md
+        - Thought Process: python-low-level-design/inventory-management/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/inventory-management/CODE.md
+        - HLD: python-low-level-design/inventory-management/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/inventory-management/INTERVIEW_QUESTIONS.md
       - ATM/Banking:
         - python-low-level-design/atm-banking-system/index.md
         - Thought Process: python-low-level-design/atm-banking-system/THOUGHT_PROCESS.md
@@ -254,18 +281,39 @@ nav:
         - Schema: python-low-level-design/atm-banking-system/DB_SCHEMA.md
         - HLD: python-low-level-design/atm-banking-system/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/atm-banking-system/INTERVIEW_QUESTIONS.md
-      - Inventory Management:
-        - python-low-level-design/inventory-management/index.md
-        - Thought Process: python-low-level-design/inventory-management/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/inventory-management/CODE.md
-        - HLD: python-low-level-design/inventory-management/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/inventory-management/INTERVIEW_QUESTIONS.md
+      - Car Rental:
+        - python-low-level-design/car-rental-platform/index.md
+        - Thought Process: python-low-level-design/car-rental-platform/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/car-rental-platform/CODE.md
+        - Schema: python-low-level-design/car-rental-platform/DB_SCHEMA.md
+        - HLD: python-low-level-design/car-rental-platform/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/car-rental-platform/INTERVIEW_QUESTIONS.md
+      - Cab Booking (Uber):
+        - python-low-level-design/cab-booking-uber/index.md
+        - Thought Process: python-low-level-design/cab-booking-uber/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/cab-booking-uber/CODE.md
+        - Schema: python-low-level-design/cab-booking-uber/DB_SCHEMA.md
+        - HLD: python-low-level-design/cab-booking-uber/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/cab-booking-uber/INTERVIEW_QUESTIONS.md
+      - Food Delivery:
+        - python-low-level-design/food-delivery/index.md
+        - Thought Process: python-low-level-design/food-delivery/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/food-delivery/CODE.md
+        - Schema: python-low-level-design/food-delivery/DB_SCHEMA.md
+        - HLD: python-low-level-design/food-delivery/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/food-delivery/INTERVIEW_QUESTIONS.md
       - Payment Processing:
         - python-low-level-design/payment-processing-system/index.md
         - Thought Process: python-low-level-design/payment-processing-system/THOUGHT_PROCESS.md
         - Code: python-low-level-design/payment-processing-system/CODE.md
         - HLD: python-low-level-design/payment-processing-system/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/payment-processing-system/INTERVIEW_QUESTIONS.md
+      - Notification Service:
+        - python-low-level-design/notification-service/index.md
+        - Thought Process: python-low-level-design/notification-service/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/notification-service/CODE.md
+        - HLD: python-low-level-design/notification-service/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/notification-service/INTERVIEW_QUESTIONS.md
       - Job Scheduling:
         - python-low-level-design/job-scheduling-system/index.md
         - Thought Process: python-low-level-design/job-scheduling-system/THOUGHT_PROCESS.md
@@ -273,12 +321,6 @@ nav:
         - HLD: python-low-level-design/job-scheduling-system/HIGH_LEVEL_DESIGN.md
         - Airflow-Like Design: python-low-level-design/job-scheduling-system/NEW_AIRFLOW_LIKE_DESIGN.md
         - Questions: python-low-level-design/job-scheduling-system/INTERVIEW_QUESTIONS.md
-      - Notification Service:
-        - python-low-level-design/notification-service/index.md
-        - Thought Process: python-low-level-design/notification-service/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/notification-service/CODE.md
-        - HLD: python-low-level-design/notification-service/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/notification-service/INTERVIEW_QUESTIONS.md
       - Search Platform:
         - python-low-level-design/search-platform/index.md
         - Thought Process: python-low-level-design/search-platform/THOUGHT_PROCESS.md
@@ -291,6 +333,12 @@ nav:
         - Code: python-low-level-design/big-file-upload/CODE.md
         - HLD: python-low-level-design/big-file-upload/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/big-file-upload/INTERVIEW_QUESTIONS.md
+      - Circuit Breaker & Resilience:
+        - python-low-level-design/circuit-breaker/index.md
+        - Thought Process: python-low-level-design/circuit-breaker/THOUGHT_PROCESS.md
+        - Code: python-low-level-design/circuit-breaker/CODE.md
+        - HLD: python-low-level-design/circuit-breaker/HIGH_LEVEL_DESIGN.md
+        - Questions: python-low-level-design/circuit-breaker/INTERVIEW_QUESTIONS.md
       - Order Matching Engine:
         - python-low-level-design/order-matching-engine/index.md
         - Thought Process: python-low-level-design/order-matching-engine/THOUGHT_PROCESS.md
@@ -298,25 +346,6 @@ nav:
         - Schema: python-low-level-design/order-matching-engine/DB_SCHEMA.md
         - HLD: python-low-level-design/order-matching-engine/HIGH_LEVEL_DESIGN.md
         - Questions: python-low-level-design/order-matching-engine/INTERVIEW_QUESTIONS.md
-      - Circuit Breaker & Resilience:
-        - python-low-level-design/circuit-breaker/index.md
-        - Thought Process: python-low-level-design/circuit-breaker/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/circuit-breaker/CODE.md
-        - HLD: python-low-level-design/circuit-breaker/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/circuit-breaker/INTERVIEW_QUESTIONS.md
-      - Food Delivery:
-        - python-low-level-design/food-delivery/index.md
-        - Thought Process: python-low-level-design/food-delivery/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/food-delivery/CODE.md
-        - Schema: python-low-level-design/food-delivery/DB_SCHEMA.md
-        - HLD: python-low-level-design/food-delivery/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/food-delivery/INTERVIEW_QUESTIONS.md
-      - Logging Framework:
-        - python-low-level-design/logging-framework/index.md
-        - Thought Process: python-low-level-design/logging-framework/THOUGHT_PROCESS.md
-        - Code: python-low-level-design/logging-framework/CODE.md
-        - HLD: python-low-level-design/logging-framework/HIGH_LEVEL_DESIGN.md
-        - Questions: python-low-level-design/logging-framework/INTERVIEW_QUESTIONS.md
     - Java (3 projects):
       - Overview: java-low-level-design/README.md
       - Elevator System:
@@ -358,60 +387,29 @@ nav:
         - HLD: golang-low-level-design/task-queue/HIGH_LEVEL_DESIGN.md
         - Questions: golang-low-level-design/task-queue/INTERVIEW_QUESTIONS.md
 
-  - Languages:
-    - Python:
-      - Overview: python-interview/README.md
-      - Interview Questions: python-interview/INTERVIEW_QUESTIONS.md
-      - Multithreading & Concurrency: python-interview/MULTITHREADING_NOTES.md
-      - Async Basics (Start Here): python-interview/ASYNC_BASICS.md
-      - Async/Await & Asyncio: python-interview/ASYNCIO_NOTES.md
-      - Django: python-interview/DJANGO_NOTES.md
-      - FastAPI: python-interview/FASTAPI_NOTES.md
-    - Go:
-      - Overview: golang-interview/README.md
-      - Interview Questions: golang-interview/INTERVIEW_QUESTIONS.md
-      - Concurrency & Goroutines: golang-interview/CONCURRENCY_NOTES.md
-      - Pointers, Memory & Object Handling: golang-interview/POINTERS_MEMORY_NOTES.md
-      - Language Internals (Slices, Maps, Generics, defer): golang-interview/LANGUAGE_INTERNALS_NOTES.md
-      - Concurrency Coding Challenges: golang-interview/CONCURRENCY_CODING_CHALLENGES.md
-      - Production Services (HTTP, DB, Profiling): golang-interview/PRODUCTION_SERVICES_NOTES.md
-    - Java:
-      - Overview: java-interview/README.md
-      - Interview Questions: java-interview/INTERVIEW_QUESTIONS.md
-      - JVM Internals & GC: java-interview/JVM_INTERNALS_NOTES.md
-      - Object Handling, References & Memory: java-interview/OBJECT_HANDLING_MEMORY_NOTES.md
-      - Spring Boot Deep-Dive: java-interview/SPRING_BOOT_NOTES.md
+  - 5. System Design:
+    - Overview: system-design-interview/README.md
+    - Framework & Estimation: system-design-interview/00_FRAMEWORK_AND_ESTIMATION.md
+    - URL Shortener: system-design-interview/01_URL_SHORTENER.md
+    - News Feed: system-design-interview/02_NEWS_FEED.md
+    - Chat & Messaging: system-design-interview/03_CHAT_MESSAGING.md
+    - Typeahead / Search Suggestions: system-design-interview/04_TYPEAHEAD_SEARCH_SUGGESTIONS.md
+    - Ad Click Aggregation: system-design-interview/05_AD_CLICK_AGGREGATION.md
+    - Video Streaming: system-design-interview/06_VIDEO_STREAMING.md
+    - File Storage & Sync: system-design-interview/07_FILE_STORAGE_AND_SYNC.md
+    - Payments Ledger: system-design-interview/08_PAYMENTS_LEDGER.md
 
-  - CS Core:
-    - Overview: cs-interview/README.md
-    - Operating Systems: cs-interview/operating-systems/INTERVIEW_QUESTIONS.md
-    - Computer Networks: cs-interview/computer-networks/INTERVIEW_QUESTIONS.md
-    - Database Systems: cs-interview/database-systems/INTERVIEW_QUESTIONS.md
-    - PostgreSQL Deep Dive: cs-interview/database-systems/POSTGRESQL_DEEP_DIVE.md
-    - DynamoDB Deep Dive: cs-interview/database-systems/DYNAMODB_DEEP_DIVE.md
-    - Distributed Systems: cs-interview/distributed-systems/INTERVIEW_QUESTIONS.md
-    - Distributed Transactions: cs-interview/distributed-systems/DISTRIBUTED_TRANSACTION_PATTERNS.md
-    - Concurrency & Parallelism: cs-interview/concurrency-parallelism/INTERVIEW_QUESTIONS.md
-    - Data Structures & Algorithms: cs-interview/data-structures-algorithms/INTERVIEW_QUESTIONS.md
-    - Data Structures for Scale: cs-interview/data-structures-algorithms/DATA_STRUCTURES_FOR_SCALE.md
-    - Software Architecture: cs-interview/software-architecture/INTERVIEW_QUESTIONS.md
-    - Design Patterns: cs-interview/software-architecture/DESIGN_PATTERNS.md
-    - Security: cs-interview/security/INTERVIEW_QUESTIONS.md
-
-  - Infrastructure & Cloud:
+  - 6. Infrastructure & Cloud:
     - AWS:
       - Overview: aws-interview/README.md
       - Compute: aws-interview/compute/INTERVIEW_QUESTIONS.md
       - Networking: aws-interview/networking/INTERVIEW_QUESTIONS.md
       - Storage & Database: aws-interview/storage-database/INTERVIEW_QUESTIONS.md
       - Security: aws-interview/security/INTERVIEW_QUESTIONS.md
-      - Architecture: aws-interview/architecture/INTERVIEW_QUESTIONS.md
       - Messaging: aws-interview/messaging/INTERVIEW_QUESTIONS.md
+      - Architecture: aws-interview/architecture/INTERVIEW_QUESTIONS.md
     - Tools & Platforms:
       - Overview: tools-interview/README.md
-      - Kafka: tools-interview/kafka/INTERVIEW_QUESTIONS.md
-      - Redis: tools-interview/redis/INTERVIEW_QUESTIONS.md
-      - Elasticsearch: tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md
       - Docker:
         - Interview Questions: tools-interview/docker/INTERVIEW_QUESTIONS.md
       - Kubernetes:
@@ -419,63 +417,20 @@ nav:
         - Pod Lifecycle & Monitoring: tools-interview/kubernetes/POD_LIFECYCLE_AND_MONITORING.md
         - Production Control: tools-interview/kubernetes/PRODUCTION_CONTROL.md
         - Multi-Container Versioning: tools-interview/kubernetes/VERSIONING_MULTI_CONTAINER.md
-      - MongoDB: tools-interview/mongodb/INTERVIEW_QUESTIONS.md
-      - Prometheus & Grafana: tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md
-      - Terraform: tools-interview/terraform/INTERVIEW_QUESTIONS.md
       - Nginx: tools-interview/nginx/INTERVIEW_QUESTIONS.md
       - Compression: tools-interview/compression/INTERVIEW_QUESTIONS.md
+      - Redis: tools-interview/redis/INTERVIEW_QUESTIONS.md
+      - Kafka: tools-interview/kafka/INTERVIEW_QUESTIONS.md
+      - MongoDB: tools-interview/mongodb/INTERVIEW_QUESTIONS.md
+      - Elasticsearch: tools-interview/elasticsearch/INTERVIEW_QUESTIONS.md
+      - Terraform: tools-interview/terraform/INTERVIEW_QUESTIONS.md
       - CI/CD Deployment: tools-interview/ci-cd-deployment/DEPLOYMENT_GUIDE.md
+      - Prometheus & Grafana: tools-interview/prometheus-grafana/INTERVIEW_QUESTIONS.md
 
-  - AI Engineering:
+  - 7. AI Engineering:
     - Overview: ai-engineering/README.md
-    - 📚 RAG:
-      - Overview: ai-engineering/rag/README.md
-      - RAG Fundamentals: ai-engineering/rag/01_RAG_FUNDAMENTALS.md
-      - LM Studio Integration: ai-engineering/rag/02_LM_STUDIO_INTEGRATION.md
-      - Fine-Tuning Guide: ai-engineering/rag/03_FINE_TUNING.md
-      - RAG Interview Questions: ai-engineering/rag/04_INTERVIEW_QUESTIONS.md
-      - Code Base Design: ai-engineering/rag/05_CODE_BASE_DESIGN.md
-      - Low-Level Design: ai-engineering/rag/06_LOW_LEVEL_DESIGN.md
-      - High-Level Design: ai-engineering/rag/07_HIGH_LEVEL_DESIGN.md
-      - Implementation: ai-engineering/rag/implementation/index.md
-      - Reference Corpus:
-        - Architecture Overview: ai-engineering/rag/data/01_rag_architecture_overview.md
-        - Chunking Strategies: ai-engineering/rag/data/02_chunking_strategies.md
-        - Embedding Models: ai-engineering/rag/data/03_embedding_models.md
-        - Retrieval Strategies: ai-engineering/rag/data/04_retrieval_strategies.md
-        - LM Studio Setup: ai-engineering/rag/data/05_lm_studio_setup.md
-    - 🏭 Production AI:
-      - Overview: ai-engineering/production-ai/index.md
-      - Interview Questions: ai-engineering/production-ai/INTERVIEW_QUESTIONS.md
-    - 🔌 MCP:
-      - Overview: ai-engineering/mcp/README.md
-      - MCP Fundamentals: ai-engineering/mcp/01_MCP_FUNDAMENTALS.md
-      - MCP Interview Questions: ai-engineering/mcp/02_MCP_INTERVIEW_QUESTIONS.md
-      - MCP Implementation & RAG: ai-engineering/mcp/03_MCP_IMPLEMENTATION.md
-      - MCP Production Architecture: ai-engineering/mcp/04_MCP_PRODUCTION_ARCHITECTURE.md
-      - 🎯 MCP Explained (draw.io): ai-engineering/mcp/05_MCP_EXPLAINER_WITH_DRAWIO.md
-      - Servers: ai-engineering/mcp/servers/index.md
-      - Common Library: ai-engineering/mcp/common/index.md
-      - Clients: ai-engineering/mcp/clients/index.md
-      - Tests: ai-engineering/mcp/tests/index.md
-    - 🤖 Agents:
-      - Overview: ai-engineering/agents/README.md
-      - Agent Fundamentals: ai-engineering/agents/01_AGENT_FUNDAMENTALS.md
-      - Agent Interview Questions: ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md
-      - Agent Implementation Guide: ai-engineering/agents/03_AGENT_IMPLEMENTATION_GUIDE.md
-      - Agent Production Architecture: ai-engineering/agents/04_AGENT_PRODUCTION_ARCHITECTURE.md
-      - LangGraph Notes: ai-engineering/agents/05_LANGGRAPH_NOTES.md
-      - Python Async/Await: ai-engineering/agents/06_PYTHON_ASYNC_AWAIT.md
-      - Agent Observability: ai-engineering/agents/07_AGENT_OBSERVABILITY.md
-      - Multi-LLM Architecture: ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE.md
-      - Multi-LLM Production Ops: ai-engineering/agents/14_MULTI_LLM_PRODUCTION_OPS.md
-      - Agent Deployment (ECS): ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md
-      - System/User/Assistant Roles: ai-engineering/agents/10_SYSTEM_USER_ASSISTANT_ROLES.md
-      - Redis Lease: ai-engineering/agents/11_REDIS_LEASE.md
-      - Search Autocorrect: ai-engineering/agents/12_SEARCH_AUTOCORRECT.md
-      - Elasticsearch Internals: ai-engineering/agents/13_ELASTICSEARCH_INTERNALS.md
-      - Implementation Code: ai-engineering/agents/implementation/index.md
-      - Tests: ai-engineering/agents/tests/index.md
+    - 🎯 Preparation Strategy:
+      - AI Engineer & FDE Strategy: ai-engineering/AI_PREPARATION_STRATEGY.md
     - 🤖 LLM Internals:
       - Overview: ai-engineering/llm-internals/README.md
       - How Claude Works: ai-engineering/llm-internals/01_HOW_CLAUDE_WORKS.md
@@ -485,18 +440,64 @@ nav:
       - Prompt Engineering: ai-engineering/llm-internals/05_SYSTEM_PROMPT_ENGINEERING.md
       - How Claude Makes Code Changes: ai-engineering/llm-internals/06_HOW_CLAUDE_MAKES_CODE_CHANGES.md
       - Cost Optimization: ai-engineering/llm-internals/07_COST_OPTIMIZATION_BEST_PRACTICES.md
+    - 📚 RAG:
+      - Overview: ai-engineering/rag/README.md
+      - RAG Fundamentals: ai-engineering/rag/01_RAG_FUNDAMENTALS.md
+      - Reference Corpus:
+        - Architecture Overview: ai-engineering/rag/data/01_rag_architecture_overview.md
+        - Chunking Strategies: ai-engineering/rag/data/02_chunking_strategies.md
+        - Embedding Models: ai-engineering/rag/data/03_embedding_models.md
+        - Retrieval Strategies: ai-engineering/rag/data/04_retrieval_strategies.md
+        - LM Studio Setup: ai-engineering/rag/data/05_lm_studio_setup.md
+      - LM Studio Integration: ai-engineering/rag/02_LM_STUDIO_INTEGRATION.md
+      - Fine-Tuning Guide: ai-engineering/rag/03_FINE_TUNING.md
+      - Code Base Design: ai-engineering/rag/05_CODE_BASE_DESIGN.md
+      - High-Level Design: ai-engineering/rag/07_HIGH_LEVEL_DESIGN.md
+      - Low-Level Design: ai-engineering/rag/06_LOW_LEVEL_DESIGN.md
+      - Implementation: ai-engineering/rag/implementation/index.md
+      - RAG Interview Questions: ai-engineering/rag/04_INTERVIEW_QUESTIONS.md
+    - 🔌 MCP:
+      - Overview: ai-engineering/mcp/README.md
+      - MCP Fundamentals: ai-engineering/mcp/01_MCP_FUNDAMENTALS.md
+      - 🎯 MCP Explained (draw.io): ai-engineering/mcp/05_MCP_EXPLAINER_WITH_DRAWIO.md
+      - MCP Implementation & RAG: ai-engineering/mcp/03_MCP_IMPLEMENTATION.md
+      - Servers: ai-engineering/mcp/servers/index.md
+      - Common Library: ai-engineering/mcp/common/index.md
+      - Clients: ai-engineering/mcp/clients/index.md
+      - Tests: ai-engineering/mcp/tests/index.md
+      - MCP Production Architecture: ai-engineering/mcp/04_MCP_PRODUCTION_ARCHITECTURE.md
+      - MCP Interview Questions: ai-engineering/mcp/02_MCP_INTERVIEW_QUESTIONS.md
+    - 🤖 Agents:
+      - Overview: ai-engineering/agents/README.md
+      - Agent Fundamentals: ai-engineering/agents/01_AGENT_FUNDAMENTALS.md
+      - System/User/Assistant Roles: ai-engineering/agents/10_SYSTEM_USER_ASSISTANT_ROLES.md
+      - Python Async/Await: ai-engineering/agents/06_PYTHON_ASYNC_AWAIT.md
+      - Agent Implementation Guide: ai-engineering/agents/03_AGENT_IMPLEMENTATION_GUIDE.md
+      - LangGraph Notes: ai-engineering/agents/05_LANGGRAPH_NOTES.md
+      - Implementation Code: ai-engineering/agents/implementation/index.md
+      - Tests: ai-engineering/agents/tests/index.md
+      - Agent Production Architecture: ai-engineering/agents/04_AGENT_PRODUCTION_ARCHITECTURE.md
+      - Agent Observability: ai-engineering/agents/07_AGENT_OBSERVABILITY.md
+      - Multi-LLM Architecture: ai-engineering/agents/08_MULTI_LLM_ARCHITECTURE.md
+      - Multi-LLM Production Ops: ai-engineering/agents/14_MULTI_LLM_PRODUCTION_OPS.md
+      - Agent Deployment (ECS): ai-engineering/agents/09_AGENT_DEPLOYMENT_ECS.md
+      - Redis Lease: ai-engineering/agents/11_REDIS_LEASE.md
+      - Elasticsearch Internals: ai-engineering/agents/13_ELASTICSEARCH_INTERNALS.md
+      - Search Autocorrect: ai-engineering/agents/12_SEARCH_AUTOCORRECT.md
+      - Agent Interview Questions: ai-engineering/agents/02_AGENT_INTERVIEW_QUESTIONS.md
     - 🧠 Agent Memory Systems:
       - Overview: ai-engineering/agents/15_AGENT_MEMORY_SYSTEMS.md
-    - 🚀 Forward Deploy Engineer:
-      - Overview: ai-engineering/FORWARD_DEPLOY_ENGINEER_GUIDE.md
-    - 🎯 Preparation Strategy:
-      - AI Engineer & FDE Strategy: ai-engineering/AI_PREPARATION_STRATEGY.md
     - 🔧 Harness & Loop Engineering:
       - Overview: ai-engineering/harness-engineering/README.md
       - Harness Engineering: ai-engineering/harness-engineering/01_HARNESS_ENGINEERING.md
       - Loop Engineering: ai-engineering/harness-engineering/02_LOOP_ENGINEERING.md
+    - 🏭 Production AI:
+      - Overview: ai-engineering/production-ai/index.md
+      - Interview Questions: ai-engineering/production-ai/INTERVIEW_QUESTIONS.md
+    - 🚀 Forward Deploy Engineer:
+      - Overview: ai-engineering/FORWARD_DEPLOY_ENGINEER_GUIDE.md
 
-  - Staff Craft:
+  - 8. Staff Craft:
     - Overview: staff-engineer-interview/README.md
     - Behavioral & Leadership: staff-engineer-interview/01_STAFF_BEHAVIORAL_GUIDE.md
     - Design Docs, RFCs & ADRs: staff-engineer-interview/02_DESIGN_DOCS_AND_RFCS.md

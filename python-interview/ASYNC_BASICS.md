@@ -15,6 +15,24 @@ While one function waits on something slow (a network call, a database query, a 
 !!! note "Concurrent, not truly parallel"
     asyncio runs on **one thread**. Tasks take turns, switching only at `await`. That is perfect for **I/O-bound** work (HTTP calls, DB queries, file and network waits). It does **not** speed up **CPU-bound** work (number crunching); for that, see [section 7](#cpu-heavy-work-use-processes).
 
+*One thread, one event loop: a task runs until it hits `await`, then the loop hands the thread to another ready task.*
+
+```mermaid
+sequenceDiagram
+    participant L as Event loop
+    participant A as Task A
+    participant B as Task B
+    L->>A: run
+    A->>L: await slow I/O (pause)
+    L->>B: run
+    B->>L: await slow I/O (pause)
+    Note over L: nothing ready, loop waits for I/O
+    L->>A: I/O done, resume
+    A->>L: return result
+    L->>B: I/O done, resume
+    B->>L: return result
+```
+
 ---
 
 ## 2. Your first async function
@@ -106,6 +124,22 @@ Running a dynamic list works the same way:
 results = await asyncio.gather(*(fetch(f"job-{i}", 1) for i in range(10)))
 ```
 
+*Sequential `await`s add up to 3s, while `gather` starts all three sleeps before waiting, so the total is the slowest one (1s).*
+
+```mermaid
+flowchart LR
+    subgraph SEQ["await, await, await: 3s"]
+        direction LR
+        s1["A: 1s"] --> s2["B: 1s"] --> s3["C: 1s"]
+    end
+    subgraph PAR["gather(A, B, C): 1s"]
+        direction TB
+        p1["A: 1s"]
+        p2["B: 1s"]
+        p3["C: 1s"]
+    end
+```
+
 ---
 
 ## 5. The modern way: `asyncio.TaskGroup` (Python 3.11+)
@@ -145,6 +179,17 @@ A done B done C done in 2.0s
 | Keep going despite failures | `return_exceptions=True` | catch errors inside each task |
 
 Default to **TaskGroup** for new code. Use `gather(..., return_exceptions=True)` when you want every result, including failures.
+
+*`gather` leaves siblings running when one task fails, while `TaskGroup` cancels them before re-raising.*
+
+```mermaid
+flowchart TD
+    F["One task raises an error"] --> W{"Which API?"}
+    W -->|gather| G["Error raised to the awaiter"]
+    G --> G2["Other tasks keep running"]
+    W -->|TaskGroup| T["Remaining tasks are cancelled"]
+    T --> T2["Error raised when the block exits"]
+```
 
 ---
 
@@ -273,6 +318,17 @@ report ready
 !!! warning "Keep a reference to every task"
     The event loop holds only a weak reference to tasks. Store each task in a variable (or use a TaskGroup); a task you don't reference can be garbage-collected before it finishes.
 
+*A `Semaphore(3)` lets only three tasks into the guarded block, so nine one-second jobs take three rounds (about 3s).*
+
+```mermaid
+flowchart LR
+    Q["9 tasks created"] --> S{"Semaphore(3)"}
+    S -->|slot free| R["Running: at most 3"]
+    S -->|no slot| Wt["Waiting in queue"]
+    R -->|"leaves block"| S
+    Wt -->|"slot released"| R
+```
+
 ---
 
 ## 7. Blocking code and CPU-heavy work
@@ -329,6 +385,18 @@ if __name__ == "__main__":                # required for process pools
 
 ```
 4 results computed in separate processes
+```
+
+*Pick the tool by the kind of work: async I/O stays on the loop, blocking calls go to a thread, CPU-bound work goes to another process.*
+
+```mermaid
+flowchart TD
+    W{"What kind of work?"} -->|"async library (await)"| L["Run on the event loop"]
+    W -->|"blocking call (requests, sync DB)"| T["asyncio.to_thread: worker thread"]
+    W -->|"CPU-bound"| P["ProcessPoolExecutor: separate process, own GIL"]
+    L --> Done["Result awaited by the loop"]
+    T --> Done
+    P --> Done
 ```
 
 ---

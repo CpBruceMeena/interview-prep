@@ -39,6 +39,20 @@
 
 ---
 
+*Figure: tables and foreign keys, generated from the DDL below (one-to-many from parent to child).*
+
+```mermaid
+erDiagram
+  floor ||--o{ parking_spot : "floor_id"
+  parking_lot ||--o{ floor : "parking_lot_id"
+  parking_lot ||--o{ rate_card : "parking_lot_id"
+  parking_lot ||--o{ reservation : "parking_lot_id"
+  parking_spot ||--o{ reservation : "spot_id"
+  parking_spot ||--o{ ticket : "spot_id"
+  ticket ||--o{ payment : "ticket_id"
+  audit_log
+```
+
 ## 🏛️ Complete DDL
 
 ```sql

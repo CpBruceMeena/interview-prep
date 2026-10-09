@@ -32,6 +32,21 @@
 
 ---
 
+*Figure: tables and foreign keys, generated from the DDL below (one-to-many from parent to child).*
+
+```mermaid
+erDiagram
+  drivers ||--o{ driver_location_history : "driver_id"
+  drivers ||--o{ rider_ratings : "driver_id"
+  drivers ||--o{ trips : "driver_id"
+  riders ||--o{ rider_ratings : "rider_id"
+  riders ||--o{ trips : "rider_id"
+  trips ||--o{ payments : "trip_id"
+  trips ||--o{ rider_ratings : "trip_id"
+  zones ||--o{ driver_location_history : "zone_id"
+  zones ||--o{ surge_pricing_log : "zone_id"
+```
+
 ## 🏛️ Complete DDL
 
 ```sql

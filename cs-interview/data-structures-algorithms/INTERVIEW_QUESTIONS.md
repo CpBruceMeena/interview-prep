@@ -205,6 +205,17 @@ class ConsistentHashRing:
         return self.mapping[self.ring[idx]]
 ```
 
+*Diagram: a key is hashed onto the ring and owned by the first virtual node clockwise.*
+
+```mermaid
+flowchart LR
+    K["Key"] --> H["Hash to ring position"]
+    H --> S["Find first virtual node clockwise (binary search)"]
+    S --> N["Map virtual node to physical node"]
+    N --> R["Route request"]
+```
+
+
 **Key Redistribution (Virtual Nodes):**
 
 ```
@@ -465,6 +476,22 @@ Merkle tree solution:
   - For 1B records and 1 difference: ~60 hashes + 1 record ≈ 3 KB
   - Catch: each side still reads and hashes its 1 TB locally to build the tree
 ```
+
+*Diagram: anti-entropy compares roots, then recurses only into differing subtrees.*
+
+```mermaid
+sequenceDiagram
+    participant A as Replica A
+    participant B as Replica B
+    A->>B: Root hash
+    B-->>A: Differs
+    A->>B: Request child hashes
+    B-->>A: 2 child hashes
+    Note over A,B: Recurse only into differing children
+    A->>B: Leaf level reached, request differing record
+    B-->>A: Record, A repairs
+```
+
 
 **Merkle Tree Construction, Proofs and Anti-Entropy (runnable):**
 
@@ -1175,6 +1202,21 @@ except ValueError as e:
     print(e)
 ```
 
+*Diagram: Kahn's algorithm repeatedly removes nodes with no remaining dependencies.*
+
+```mermaid
+flowchart TD
+    A["Compute in-degree of every node"] --> B["Queue all nodes with in-degree 0"]
+    B --> C{"Queue empty?"}
+    C -->|No| D["Pop node, append to order"]
+    D --> E["Decrement in-degree of dependents, enqueue those at 0"]
+    E --> C
+    C -->|Yes| F{"All nodes in order?"}
+    F -->|Yes| OK["Valid topological order"]
+    F -->|No| CY["Cycle exists"]
+```
+
+
 **Cycle Detection with the Exact Cycle (DFS, runnable):**
 
 Kahn's algorithm tells you *that* a cycle exists (some nodes never reach indegree 0). To show the user *which* targets form it, run a three-colour DFS: reaching a GRAY node means you found a back edge.
@@ -1349,6 +1391,22 @@ class LRUCache:
         self._add_to_head(node)
 ```
 
+*Diagram: LRU get and put using a hash map plus a doubly-linked list.*
+
+```mermaid
+flowchart TD
+    G["get(key)"] --> H{"In hash map?"}
+    H -->|No| M["Return miss"]
+    H -->|Yes| F["Move node to front of list, return value"]
+    P["put(key, value)"] --> E{"Key exists?"}
+    E -->|Yes| U["Update value, move to front"]
+    E -->|No| C{"At capacity?"}
+    C -->|Yes| V["Evict tail node, delete from map"]
+    C -->|No| I["Insert new node at front"]
+    V --> I
+```
+
+
 **LFU — Frequency Buckets (runnable):**
 
 ```python
@@ -1460,6 +1518,18 @@ new key ─► [ window ] ──evicted "candidate"──►  compare frequency 
            frequency sketch: 4-bit Count-Min counters over recent accesses (all keys,
            including ones not in the cache); every W accesses all counters are HALVED (aging)
 ```
+
+*Diagram: W-TinyLFU admits a window candidate only if it beats the main region's victim.*
+
+```mermaid
+flowchart LR
+    N["New key"] --> W["Window LRU (~1%)"]
+    W --> C["Evicted candidate"]
+    C --> D{"freq(candidate) > freq(victim)?"}
+    D -->|Yes| A["Admit to main region, victim evicted"]
+    D -->|No| X["Candidate discarded"]
+```
+
 
 - **Admission, not just eviction:** a new key gets in only if it's been accessed more often (per the sketch) than the key it would displace. One-off scans never pollute the main region.
 - **The window** gives brand-new keys a short LRU life so bursty keys can build up frequency before facing admission.

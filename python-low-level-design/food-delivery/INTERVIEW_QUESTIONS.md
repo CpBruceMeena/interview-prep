@@ -22,6 +22,24 @@ Then the seams: `AssignmentStrategy` (dispatch), `PricingRule` chain (fees, surg
 
 Key decisions to state: one restaurant per cart; prices snapshotted into `OrderLine`; `Decimal` money; placement idempotent on a client key; partner assigned on accept so travel overlaps cooking.
 
+*Figure: order state machine; cancellation rules depend on the actor and the state.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> PLACED
+  PLACED --> ACCEPTED
+  PLACED --> REJECTED
+  ACCEPTED --> PREPARING
+  PREPARING --> READY
+  READY --> PICKED_UP
+  PICKED_UP --> DELIVERED
+  PLACED --> CANCELLED
+  ACCEPTED --> CANCELLED
+  PREPARING --> CANCELLED
+  READY --> CANCELLED
+  PICKED_UP --> CANCELLED
+```
+
 ---
 
 ## Question 2: "The user taps Place Order twice / the network retried. What happens?"
@@ -40,6 +58,21 @@ The client generates an idempotency key when the checkout screen opens and sends
 And the key is passed through to the PSP, so a crash *after* charging but *before* persisting the order is still safe: the retry gets the same `payment_id` back.
 
 **Follow-up: "Why not dedup on (customer, restaurant, items) within 30 s?"** Because a user can legitimately order the same thing twice (office lunch for two people). Content-based dedup guesses intent; a client key states it.
+
+*Figure: idempotent order placement keyed by the client key.*
+
+```mermaid
+flowchart TD
+  A["Request with idempotency key"] --> B{"Key already seen?"}
+  B -- No --> C["Claim key, charge (key passed to PSP), persist order"]
+  C -- "Attempt failed" --> D["Delete slot, key may be retried"]
+  B -- Yes --> E{"Same body?"}
+  E -- No --> X["IdempotencyConflictError"]
+  E -- Yes --> F{"First attempt still in flight?"}
+  F -- Yes --> G["Wait for first"]
+  F -- No --> H["Return original order"]
+  G --> H
+```
 
 ---
 

@@ -249,6 +249,19 @@ Better still, enforce it in Postgres with Row-Level Security and `SET app.org_id
 
 **What they probe next:** "The server needs to call GitHub as the user. Can it reuse the client's token?" No: that's token passthrough, forbidden by the spec (confused deputy, audit gaps). Use OAuth token exchange (RFC 8693) or a separate OAuth flow to the downstream API, with its own consent.
 
+*Figure: a tool call passes validation and sandboxing layers before touching the system.*
+
+```mermaid
+flowchart TD
+  A["Tool call from model"] --> B{"Command on allow-list?"}
+  B -- "no" --> X["ToolError"]
+  B -- "yes" --> C["Resolve path, check inside ROOT"]
+  C -- "outside" --> X
+  C -- "inside" --> D["Run argv list, no shell, timeout"]
+  D --> E["Sandboxed container: non-root, read-only FS"]
+  E --> F["Truncated output to model"]
+```
+
 ---
 
 ## Question 4: Production Rate Limiting & Backpressure
@@ -311,6 +324,17 @@ There is no standard MCP rate-limit error code; don't invent one and expect host
 **The real fix for loops is in the host:** a tool-call budget per turn, identical-call detection ("same tool, same args, same error three times: stop"), and exponential backoff with jitter.
 
 **What they probe next:** "Is the error message itself an attack surface?" Yes: never echo raw driver errors (they leak hostnames, SQL, sometimes credentials). SDK v2 masks unexpected exceptions as "Error executing tool X" and only forwards messages you raise deliberately as `ToolError`.
+
+*Figure: three places to bound a runaway agent.*
+
+```mermaid
+flowchart LR
+  A["Agent loop"] --> H["Host: tool-call and retry budget"]
+  H --> G["MCP edge: token bucket, 429"]
+  G --> D["Dependency: pool, timeout, circuit breaker"]
+  D --> DB["Database"]
+  G -- "isError: rate limited, retry after 2 s" --> A
+```
 
 ---
 
@@ -379,6 +403,22 @@ def cached_search(question: str, top_k: int, index_version: str) -> tuple:
 Include the index version in the key so re-indexing invalidates results, and never share a cache across tenants with different document permissions.
 
 **What they probe next:** "How do you enforce document-level permissions?" Filter at retrieval time with ACL metadata from the caller's token (pre-filtering in the vector store), never by post-filtering what the model already saw.
+
+*Figure: exposing RAG as search and fetch tools so the host model does the reasoning.*
+
+```mermaid
+sequenceDiagram
+  participant M as Host LLM
+  participant S as RAG MCP server
+  participant R as Retriever
+  M->>S: tools/call search(question)
+  S->>R: hybrid search + rerank
+  R-->>S: chunks with source and score
+  S-->>M: hits
+  M->>S: tools/call fetch_document(doc_id)
+  S-->>M: full text
+  M->>M: Reason and cite
+```
 
 ---
 
@@ -559,6 +599,20 @@ Putting the tenant in the URI (`database://{tenant_id}/...`) and then checking i
 `requestState` is attacker-controlled input (it round-trips through the client), so the server must integrity-protect it and bind it to the user, a short expiry and the original request; anything that must happen at most once still needs a server-side check.
 
 **What they probe next:** "Long-running jobs?" The tasks extension (`io.modelcontextprotocol/tasks`): the server returns a task handle, the client polls `tasks/get`. Also: sampling, roots and logging are **deprecated** in 2026-07-28; call your LLM provider directly, pass paths as tool arguments, and log to stderr or OpenTelemetry.
+
+*Figure: MRTR lets a stateless server ask for input without keeping session state.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as Server (any replica)
+  C->>S: tools/call id 1
+  S-->>C: input_required + inputRequests + sealed requestState
+  C->>C: Ask user (elicitation)
+  C->>S: Retry id 2 with inputResponses + requestState
+  S->>S: Verify requestState (user, expiry, request digest)
+  S-->>C: Final result
+```
 
 ---
 

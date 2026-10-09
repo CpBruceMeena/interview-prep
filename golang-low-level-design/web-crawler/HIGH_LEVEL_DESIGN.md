@@ -35,6 +35,16 @@
                      Fetcher (HTTPFetcher | FakeWeb)
 ```
 
+*Figure: one coordinator owns the state; workers only do I/O through unbuffered channels.*
+
+```mermaid
+flowchart LR
+  C["Coordinator: frontier, seen-set, counters"] -->|"jobs"| W["Workers x N"]
+  W -->|"results"| C
+  W --> H["hostTable: robots, per-host turn"]
+  W --> F["Fetcher (HTTP or fake)"]
+```
+
 ## 3. CRAWL FLOW
 
 ```
@@ -44,6 +54,21 @@
 4. Worker extracts and resolves links from 2xx text/html → sends a result
 5. Coordinator: update stats, admit new links (normalize → filter → depth → seen), call OnPage
 6. Stop when the frontier is empty AND inFlight == 0, or the budget is spent, or ctx is done, or OnPage returns an error
+```
+
+*Figure: crawl flow, with admission of new links at the coordinator.*
+
+```mermaid
+flowchart TD
+  S["Seeds"] --> N["Normalize, filter, depth, seen-set"]
+  N --> FR["Frontier (FIFO)"]
+  FR --> D["Coordinator dispatches to idle worker"]
+  D --> R["Worker: robots.txt, host turn, fetch"]
+  R --> L["Extract links from 2xx HTML"]
+  L --> RES["Result to coordinator: stats, OnPage"]
+  RES --> N
+  RES --> T{"Frontier empty and inFlight = 0?"}
+  T -- Yes --> DONE[Stop]
 ```
 
 ## 4. POLITENESS STRATEGY

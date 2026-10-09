@@ -48,6 +48,20 @@ Web/Mobile App
               └───────────────┘
 ```
 
+*Figure: services and stores behind the gateway.*
+
+```mermaid
+flowchart TB
+  C[Web / mobile app] --> G["API gateway: rate limit, JWT"]
+  G --> M["Matchmaking (Go)"]
+  G --> E["Game engine (Python)"]
+  G --> A["AI service (Python)"]
+  M --> R[("Redis: game state, sessions, queue")]
+  E --> R
+  A --> R
+  R --> P[("PostgreSQL: users, games")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -130,6 +144,24 @@ Web/Mobile App
 | Redis down | New games can't start; in-flight games pause. Finished results are already in PostgreSQL |
 
 **Consistency choice:** strong consistency *within a game* (single writer, ordered moves), eventual consistency for everything derived (leaderboards, stats, spectator views).
+
+*Figure: one move with an expected move_number, so client retries are safe.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant E as Game engine
+  participant R as Redis
+  C->>E: move (game_id, move_number)
+  E->>R: Load game state under per-game writer
+  alt move_number already applied by same player
+    E-->>C: Return stored result
+  else next expected move
+    E->>E: Validate and apply
+    E->>R: Save state, move_number + 1
+    E-->>C: New state
+  end
+```
 
 ---
 

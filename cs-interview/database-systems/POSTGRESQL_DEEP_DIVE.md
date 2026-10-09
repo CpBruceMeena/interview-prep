@@ -51,6 +51,20 @@ PostgreSQL uses a **multi-process architecture**: each client connection gets a 
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
+*Diagram: the postmaster forks one backend per connection; all share one memory region.*
+
+```mermaid
+flowchart TD
+    C1["Client 1"] --> PM["Postmaster (port 5432)"]
+    C2["Client 2"] --> PM
+    PM -->|fork| B1["Backend 1"]
+    PM -->|fork| B2["Backend 2"]
+    B1 --> SM["Shared memory: shared buffers, WAL buffers, locks, proc array"]
+    B2 --> SM
+    BG["Background processes: checkpointer, bgwriter, WAL writer, autovacuum"] --> SM
+```
+
+
 **Key design decisions:**
 
 - **Processes, not threads:** a crash in one backend can't corrupt another's private memory, but the postmaster still restarts *all* backends after any backend crash, because shared memory may be damaged. The cost is per-connection memory and fork/setup overhead, which is why production deployments put a pooler in front ([Q13 in the interview questions](INTERVIEW_QUESTIONS.md#13-connection-pooling-pgbouncer-internals)).
@@ -313,6 +327,24 @@ T_C (READ COMMITTED, starts later): SELECT balance FROM accounts WHERE id = 1;
        → 900
 ```
 
+*Diagram: the snapshot visibility trace for the three transactions above.*
+
+```mermaid
+sequenceDiagram
+    participant A as T_A (REPEATABLE READ)
+    participant R as Row id=1
+    participant B as T_B (READ COMMITTED)
+    participant C as T_C (starts later)
+    A->>R: SELECT, snapshot xmax=240
+    R-->>A: 1000
+    B->>R: UPDATE to 900 (XID 240), then COMMIT
+    A->>R: SELECT again, same snapshot
+    R-->>A: 1000 (T_B invisible to snapshot)
+    C->>R: SELECT, snapshot xmax=241
+    R-->>C: 900
+```
+
+
 If T_A then tried to UPDATE row 1, it would get `ERROR: could not serialize access due to concurrent update`, because REPEATABLE READ is first-updater-wins. Under READ COMMITTED it would instead wait for T_B, re-evaluate its WHERE clause against the new version (EvalPlanQual), and update that.
 
 ### 4.4 Vacuum Mechanics
@@ -534,6 +566,18 @@ checkpoint_warning = 30s            # log if requested checkpoints come closer t
 log_checkpoints = on                # default on since PG15
 ```
 
+*Diagram: checkpoint triggers and the sequence of steps.*
+
+```mermaid
+flowchart TD
+    T["Trigger: checkpoint_timeout, max_wal_size nearing, or CHECKPOINT command"] --> RP["1. Record redo point"]
+    RP --> WB["2. Write buffers dirty at that moment, paced by completion target"]
+    WB --> FS["3. fsync data files"]
+    FS --> CR["4. Write checkpoint record, update pg_control"]
+    CR --> RC["5. Recycle WAL older than redo point"]
+```
+
+
 Monitoring (PG17+; on PG16 and earlier these columns were in `pg_stat_bgwriter`):
 
 ```sql
@@ -584,6 +628,19 @@ SQL text
   ▼
 Result rows
 ```
+
+*Diagram: stages a query passes through, from SQL text to rows.*
+
+```mermaid
+flowchart LR
+    S["SQL text"] --> P["Parser: raw parse tree"]
+    P --> A["Analyzer: Query tree"]
+    A --> R["Rewriter: views, rules, RLS"]
+    R --> PL["Planner: cheapest Plan tree"]
+    PL --> E["Executor: pulls tuples"]
+    E --> O["Result rows"]
+```
+
 
 Prepared statements skip parse/analyze/rewrite on each execution, and can reuse a **generic plan** after five executions if it isn't estimated to be worse than the custom plans (`plan_cache_mode` controls this).
 
@@ -1525,6 +1582,19 @@ Speeding up the 5 TB initial copy:
 5. Repoint the pooler or DNS to PG18 and resume traffic.
 6. Rollback path: before resuming, create a reverse publication on PG18 and a subscription on PG13 (`copy_data = false`), so PG13 stays current for a quick fallback.
 7. Afterwards: `ANALYZE` if statistics weren't carried over, compare p99 latency per `queryid`, then drop the old slot (an abandoned slot retains WAL until the disk fills).
+
+*Diagram: cutover runbook for the logical replication upgrade.*
+
+```mermaid
+flowchart TD
+    F["DDL freeze"] --> S["Stop writes (pooler PAUSE)"]
+    S --> L["Wait until slot lag is 0"]
+    L --> Q["Sync sequences with setval"]
+    Q --> RV["Create reverse replication PG18 to PG13"]
+    RV --> P["Repoint pooler or DNS to PG18, resume traffic"]
+    P --> D["Afterwards: ANALYZE, compare latency, drop old slot"]
+```
+
 
 **Not replicated, so check each:** DDL, sequences (before PG19), large objects (`pg_largeobject`), materialized view contents (refresh after cutover), and unlogged tables. Tables without a PK or replica identity can't replicate UPDATE or DELETE. Collation-version changes (glibc upgrades) can silently corrupt text indexes in an in-place upgrade; logical replication sidesteps that because the new cluster builds fresh indexes.
 

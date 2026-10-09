@@ -60,6 +60,23 @@
 └───────┘  └─────────┘  └───────────┘
 ```
 
+*Figure: apps, services, Kafka bus and stores.*
+
+```mermaid
+flowchart TB
+  R["Rider app"] --> G["API gateway"]
+  D["Driver app"] --> G
+  G --> RS["Rider svc (Go)"]
+  G --> DS["Driver svc (Go)"]
+  G --> TS["Trip svc (Python)"]
+  RS --> K["Kafka bus"]
+  DS --> K
+  TS --> K
+  K --> RG[("Redis GEO")]
+  K --> PG[("PostgreSQL + PostGIS")]
+  K --> CA[("Cassandra: location history")]
+```
+
 ### Data Flow for a Ride Request
 
 ```
@@ -72,6 +89,26 @@
 7. Trip Service creates the trip in REQUESTED (+ outbox row) and sends the offer to the driver
 8. Driver accepts → ACCEPTED; declines or times out → claim released, re-match excluding them
 9. Trip events relayed from the outbox to Kafka 'trip.events'; Payment pre-authorises asynchronously
+```
+
+*Figure: ride request flow, from pickup to driver acceptance.*
+
+```mermaid
+sequenceDiagram
+  participant R as Rider
+  participant RS as Rider svc
+  participant DS as Driver svc
+  participant G as Redis GEO
+  participant T as Trip svc
+  participant D as Driver
+  R->>RS: Pickup location
+  RS->>DS: Find driver
+  DS->>G: GEOSEARCH radius (expand on miss)
+  G-->>DS: Nearby drivers
+  DS->>DS: Rank, claim best atomically
+  DS->>T: Create trip REQUESTED
+  T->>D: Offer
+  D-->>T: Accept (ACCEPTED) or decline (re-match)
 ```
 
 ### 🎬 Animated Sequence Diagram
@@ -130,6 +167,19 @@
 - **Backpressure:** If Redis is slow, pause partitions (Kafka buffers durably). After a long lag, skip to the newest pings per driver: a stale position is worth less than a fresh one
 - **Scaling:** Partition by `driver_id`, add partitions/consumers per region. Isolate blast radius per region (cluster per region), not per city
 
+*Figure: GPS ingestion pipeline, partitioned by driver_id.*
+
+```mermaid
+flowchart LR
+  A["Driver app (GPS every 3 s)"] --> W[WebSocket gateway]
+  W --> K1["Kafka: raw updates"]
+  K1 --> P[GPS stream processor]
+  P --> G["Redis GEOADD"]
+  P --> Z["Zone lookup (H3)"]
+  Z --> K2["Kafka: enriched locations"]
+  P -. malformed .-> DLQ[gps.dlq]
+```
+
 ---
 
 ## 4. GEORADIUS DRIVER MATCHING
@@ -175,6 +225,19 @@ Pickup Location
 - **Read-replicas:** replicas lag the primary (async replication), so a replica may still list a just-booked driver. Fine, because the claim below is the authority
 - **Race condition:** the search result is stale the moment it returns. Reserve with an atomic claim (`SET driver:{id}:assignment {trip} NX PX 15000` or `UPDATE drivers SET status='BOOKED' WHERE id=? AND status='AVAILABLE'`); on failure try the next candidate
 - **Key layout:** shard by city and cab type → `drivers:available:{city}:mini`. One GEO key lives on one Redis shard, so this is also how you spread load; remove a driver from the key when they are booked
+
+*Figure: progressive radius expansion for driver search.*
+
+```mermaid
+flowchart TD
+  A[Pickup] --> B{"Drivers within 2 km?"}
+  B -- Yes --> Z[Pick closest, claim atomically]
+  B -- No --> C{"Within 5 km?"}
+  C -- Yes --> Z
+  C -- No --> D{"Within 10 km?"}
+  D -- Yes --> Z
+  D -- No --> N["No cabs available"]
+```
 
 ---
 

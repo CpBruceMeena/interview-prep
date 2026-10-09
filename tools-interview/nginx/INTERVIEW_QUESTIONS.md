@@ -105,6 +105,33 @@ kill -QUIT "$(cat /var/run/nginx.pid)"         # new master and workers exit
 
 **What they probe next:** "Why does `nginx -s reload` not drop WebSocket connections, and why can that be a problem?" (old workers stay alive holding them; set `worker_shutdown_timeout`). "How would you run nginx in a container?" (master as PID 1 with `daemon off;`, SIGQUIT for graceful stop, which is what the official image's `STOPSIGNAL` is set to).
 
+*Reload: new workers start with the new config, old workers drain and exit; listening sockets are inherited.*
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant M as Master
+    participant Old as Old workers
+    participant New as New workers
+    Op->>M: SIGHUP (nginx -s reload)
+    M->>M: parse config (invalid: keep old workers)
+    M->>New: fork with new config
+    M->>Old: SIGQUIT
+    Note over Old: stop accepting, finish in-flight, close idle keep-alives
+    Old-->>M: exit
+```
+
+*Zero-downtime binary upgrade with USR2, WINCH and QUIT, and the rollback path.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> OldOnly
+    OldOnly --> Both: kill USR2 (new master and workers start)
+    Both --> NewOnly: WINCH then QUIT to old master
+    Both --> OldOnly: rollback HUP old master, QUIT new master
+    NewOnly --> [*]
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -366,6 +393,18 @@ proxy_next_upstream_timeout 5s; # total time budget for retries
 
 **What they probe next:** "How does least_conn behave with 3 nginx replicas and 2 workers each?" (six independent views unless `zone` is shared; across replicas they're always independent, which is where P2C helps). "How do you drain a backend for deploy?" (remove from endpoints and let in-flight requests finish; `server ... drain` only affects sticky-bound requests).
 
+*Passive health check: max_fails failures within fail_timeout take a server out for fail_timeout.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> Available
+    Available --> Available: success
+    Available --> Unavailable: max_fails failures within fail_timeout
+    Unavailable --> Probing: after fail_timeout
+    Probing --> Available: request succeeds
+    Probing --> Unavailable: request fails
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -471,6 +510,21 @@ resolver 127.0.0.53 valid=300s;    # nginx needs its own resolver to reach the O
 
 **What they probe next:** "Why is RSA so much more expensive than ECDSA to sign but cheap to verify?" "How do you rotate ticket keys across 200 nodes without breaking resumption?" (distribute new key as decrypt-only first, then promote it). "Why might 0-RTT be dangerous for `POST /transfer`?"
 
+*Handshake CPU decision: resume if possible, otherwise pay the server signature, which ECDSA makes cheap.*
+
+```mermaid
+flowchart TD
+    A["Client hello"] --> B{"Session ID or ticket valid?"}
+    B -- yes --> C["Resume: skip server signature"]
+    B -- no --> D["Full handshake: key exchange"]
+    D --> E{"Certificate type"}
+    E -- "ECDSA P-256" --> F["Sign: tens of microseconds"]
+    E -- "RSA-2048" --> G["Sign: about 1 ms"]
+    C --> H["Encrypted app data"]
+    F --> H
+    G --> H
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -575,6 +629,15 @@ server {
     `add_header` directives are inherited from the enclosing level **only if the current level defines none**. The `/assets/` block above therefore does not get any security headers set at `server` level; you must repeat them (or use an `include` snippet). nginx 1.29.3 added `add_header_inherit merge;` to make the inheritance additive. This silently drops HSTS or CSP from part of a site more often than any other nginx misconfiguration.
 
 **What they probe next:** "Why did enabling HTTPS halve static throughput?" (lost sendfile; kTLS). "Why is `immutable` safe only with fingerprinted file names?" "What does `open_file_cache` do to deploys that overwrite files in place?" (stale metadata for up to `open_file_cache_valid`; deploy to new paths and switch a symlink).
+
+*Static file path: sendfile moves page-cache data to the socket without a user-space copy; TLS and gzip force the slower path.*
+
+```mermaid
+flowchart LR
+    Disk --> PC["Page cache"]
+    PC -- "sendfile zero-copy" --> Sock["Socket buffer"] --> NIC
+    PC -. "TLS or gzip: read to user space" .-> U["nginx user buffer"] -. "encrypt or compress, write" .-> Sock
+```
 
 ### 🔍 Staff-Level Evaluation
 

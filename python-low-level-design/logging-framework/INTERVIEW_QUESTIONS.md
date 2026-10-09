@@ -37,6 +37,19 @@ The f-string is built before the call, even when DEBUG is off. With `%s` + args,
 
 **Yes.** The level decision is made once, at the originating logger, against its *effective* level (DEBUG). Propagation then offers the record to ancestor *handlers* and checks each handler's own level, but never re-checks ancestor *logger* levels. To stop DEBUG at the console, set the console *handler's* level. That's log4j and Python semantics, and the tests pin it (`test_ancestor_logger_level_not_rechecked_but_handler_level_is`).
 
+*Figure: the level is checked once at the originating logger; handlers filter, format and emit, then the record propagates up.*
+
+```mermaid
+flowchart TD
+  A["logger.log(level, msg)"] --> B{"Level >= effective level?"}
+  B -- No --> X[Dropped, no formatting]
+  B -- Yes --> C["Create immutable LogRecord"]
+  C --> D["Each handler: filter, format, emit (under handler lock)"]
+  D --> E{"propagate?"}
+  E -- Yes --> F["Parent logger handlers, up to root"]
+  E -- No --> G[Stop]
+```
+
 **Follow-up: "How do you stop `app.db` lines reaching root's handlers entirely?"** `propagate = False` on `app.db` (or on `app`).
 
 ---
@@ -72,6 +85,18 @@ Emit the drop counter as a metric (and log "dropped N records" periodically, *sy
 **Follow-up: "Why not just an unbounded queue?"** It converts a slow disk into unbounded memory growth and an OOM kill, which then loses *everything* still queued.
 
 **Follow-up: "Drop oldest or newest?"** Newest is cheaper (`put_nowait`). Oldest keeps the most recent context, which is usually what you want at the moment of a crash, but needs a deque + condition variable rather than `queue.Queue`.
+
+*Figure: AsyncHandler decouples callers from slow I/O with a bounded queue and an overflow policy.*
+
+```mermaid
+flowchart LR
+  C["Caller thread"] --> Q{"Bounded queue full?"}
+  Q -- No --> E[Enqueue]
+  Q -- Yes --> P["Policy: DROP, BLOCK, BLOCK + timeout, or level-aware"]
+  P --> E
+  E --> W["Worker thread: format + I/O"]
+  P -. dropped .-> M["Drop counter metric"]
+```
 
 ---
 

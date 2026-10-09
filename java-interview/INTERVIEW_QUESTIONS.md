@@ -392,6 +392,18 @@ Pause time in the STW collectors is proportional to the **live** data they copy 
 | **Barriers** | Load barrier self-healing and concurrent relocation; store barrier for remembered set and marking |
 | **Real tuning** | Sizes the heap and headroom, minimal flags, monitors allocation stalls, questions the allocation rate itself |
 
+*Collector choice by goal: pause-sensitive large heaps go to generational ZGC, general services to G1 (the default), pause-tolerant batch to Parallel, tiny heaps or single CPU to Serial.*
+
+```mermaid
+flowchart TD
+    G{"Primary goal?"} -->|"Single-digit ms pauses on a very large heap"| Z["Generational ZGC: concurrent mark and relocation"]
+    G -->|"Typical service, balanced"| G1["G1 (default): region evacuation, 200 ms goal"]
+    G -->|"Batch throughput, pauses tolerated"| P["Parallel GC"]
+    G -->|"Small heap or 1 CPU container"| S["Serial GC"]
+    Z --> ZN["Needs spare cores and heap headroom"]
+    G1 --> GN["Full GC means sizing or allocation problem"]
+```
+
 ---
 
 ## Question 3: The `synchronized` vs `Lock` vs `Lock-Free` Showdown
@@ -601,6 +613,21 @@ public class TreiberStack<T> {
 | **Lock-free stack** | Correct Treiber stack; explains when ABA can and can't happen in a GC'd language |
 | **Cost model** | Reasons about CAS, cache-line contention, spinning vs parking, `LongAdder` striping rather than quoting nanoseconds |
 | **JIT and runtime** | Lock elision and coarsening; biased locking removed; virtual-thread pinning history |
+
+*Picking a locking tool: `synchronized` by default, `ReentrantLock` for timeouts, interruptibility, fairness or conditions, `StampedLock` for read-mostly data, atomics or `LongAdder` for single variables and counters.*
+
+```mermaid
+flowchart TD
+    N{"What do you need to protect?"} -->|"Short critical section"| SY["synchronized: simplest, JIT-optimized"]
+    N -->|"tryLock with timeout, interruptible, fair, several Conditions"| RL["ReentrantLock"]
+    N -->|"Read-mostly data"| SL["StampedLock: optimistic read (not reentrant)"]
+    N -->|"One variable or small lock-free structure"| AT["Atomics or VarHandle CAS"]
+    N -->|"Hot counter"| LA["LongAdder"]
+    SY --> RF["Under heavy contention: reduce sharing instead"]
+    RL --> RF
+    SL --> RF
+    AT --> RF
+```
 
 ---
 
@@ -1117,6 +1144,19 @@ Compared with `ExecutorService` + `Future`: if `fetchUser` fails, the other subt
 | **Structured concurrency** | Knows it's preview, the scope/joiner model, cancellation and no-orphan guarantee |
 | **Sizing** | Uses Little's law and the CPU vs I/O split rather than guessing pool sizes |
 
+*ThreadPoolExecutor order of decisions: core threads first, then the queue, and only when the queue is full does the pool grow toward max, after which the rejection handler decides.*
+
+```mermaid
+flowchart TD
+    S["execute(task)"] --> C{"Threads below corePoolSize?"}
+    C -->|yes| NC["Start a new thread for the task"]
+    C -->|no| Q{"Queue accepts the task?"}
+    Q -->|yes| QU["Task waits in the queue"]
+    Q -->|no| M{"Threads below maxPoolSize?"}
+    M -->|yes| NM["Start an extra thread"]
+    M -->|no| RJ["Rejection handler: Abort, CallerRuns, Discard"]
+```
+
 ---
 
 ## Question 6: Java Collections Framework — Internals & Performance
@@ -1306,6 +1346,26 @@ Add the key and value objects themselves (a boxed `Integer` is another 16 B). Co
 | **CHM reads** | Lock-free acquire reads, safe publication of nodes, weakly consistent iteration |
 | **CHM writes and resize** | CAS on empty bin, per-bin lock, cooperative transfer with ForwardingNode, striped size counter |
 | **LRU cache** | `accessOrder` + `removeEldestEntry`, knows its thread-safety limits and reaches for Caffeine |
+
+*HashMap put: index is `(n-1) & hash`, an empty bin takes a new node, a long list treeifies only when the table has at least 64 slots, and crossing the load threshold doubles the table.*
+
+```mermaid
+flowchart TD
+    P["put(key, value)"] --> H["hash = h XOR h>>>16, index = (n-1) & hash"]
+    H --> B{"Bin state?"}
+    B -->|empty| NN["Place new Node"]
+    B -->|"tree bin"| TI["Red-black tree insert"]
+    B -->|"linked list"| LW["Walk list: key equal replaces value, else append at tail"]
+    LW --> L8{"List longer than 8?"}
+    L8 -->|"yes, table length at least 64"| TR["Treeify the bin"]
+    L8 -->|"yes, table smaller"| RS["Resize instead"]
+    L8 -->|no| SZ
+    NN --> SZ{"size over capacity * 0.75?"}
+    TI --> SZ
+    TR --> SZ
+    SZ -->|yes| RZ["Resize: double table, each node stays at i or moves to i + oldCap"]
+    SZ -->|no| DN["Done"]
+```
 
 ---
 
@@ -2458,6 +2518,19 @@ private static <T> CompletableFuture<T> attempt(Supplier<T> call, int n, int max
 | **Cancellation** | Knows timeouts don't stop the underlying work and how to actually stop it |
 | **Executor control** | Chooses the executor deliberately (virtual threads for I/O), avoids the common pool |
 | **Retries** | Non-blocking backoff with jitter, idempotency, retry budgets, circuit breaker |
+
+*CompletableFuture composition: independent calls start together, `thenCombine` zips two results, `thenCompose` chains an async step, and timeout plus fallback guard each call.*
+
+```mermaid
+flowchart LR
+    A["supplyAsync(callA, executor)"] --> TA["orTimeout"]
+    B["supplyAsync(callB, executor)"] --> TB["orTimeout"]
+    TA --> CB["thenCombine: zip A and B"]
+    TB --> CB
+    CB --> CP["thenCompose: next async step returns a future"]
+    CP --> EX["handle or exceptionally: fallback"]
+    EX --> R["Result (errors arrive as CompletionException)"]
+```
 
 ---
 

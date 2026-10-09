@@ -105,6 +105,16 @@ Use **STAR** (Situation, Task, Action, Result) but weight it toward Staff signal
 | **Result** | ~20% | Numbers; durable change; org-level effect |
 | Reflection | ~10% | What you'd change, what you learned |
 
+*Figure: how to build a Staff-level answer, with the share of time for each part.*
+
+```mermaid
+flowchart LR
+  H["Headline (1 sentence)"] --> S["Situation + Task (~15%)"]
+  S --> A["Action: decisions, trade-offs, alignment (~55%)"]
+  A --> R["Result with numbers (~20%)"]
+  R --> F["Reflection (~10%)"]
+```
+
 Delivery tips:
 
 - **2–3 minutes** per answer. Rehearse out loud and time it. Stop when done; let them probe.
@@ -246,5 +256,15 @@ Good questions signal Staff-level thinking:
 | 5 | Mock interview with a peer; get feedback on clarity and "I vs. we" |
 | 6 | Research the company: product, tech blog, incidents, strategy; draft your questions |
 | 7 | Light review only; sleep |
+
+*Figure: the one-week prep loop.*
+
+```mermaid
+flowchart LR
+  A["Days 1-2: pick stories, write cards"] --> B["Days 3-4: rehearse aloud, timed"]
+  B --> C["Day 5: mock with a peer"]
+  C --> D["Day 6: research company"]
+  D --> E["Day 7: light review, sleep"]
+```
 
 **Tell me about yourself (2 minutes):** present role and scope → two or three highlights that map to the target role (with numbers) → what you're looking for next and why this company. End on the future, not the past.

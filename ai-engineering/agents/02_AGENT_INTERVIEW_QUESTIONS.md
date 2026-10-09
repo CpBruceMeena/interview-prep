@@ -57,6 +57,19 @@ class CustomerSupportAgent:
 - **Failure modes to name:** confident wrong answers on policy questions, prompt injection inside ticket text, PII leaking into logs, escalation summaries that drop key facts
 - **What they probe next:** how you roll out (shadow mode → agent-drafted, human-sent → auto-send for low-risk intents), how you prevent the agent promising refunds, and the cost per ticket
 
+*Figure: a support workflow with a bounded agent core and a grounded escalation gate.*
+
+```mermaid
+flowchart TD
+  T["Ticket"] --> C["Classify intent (cheap model)"]
+  C --> R["Resolve: retrieval + read-only tools (bounded loop)"]
+  R --> G{"Grounded, cited and policy-checked?"}
+  G -- "yes" --> A["Auto-reply"]
+  G -- "no" --> E["Escalate to human with summary of work"]
+  A --> L["Feedback becomes eval cases"]
+  E --> L
+```
+
 ---
 
 ## Question 2: Tool Hallucination & Safety
@@ -298,6 +311,20 @@ class AgentState:
 ```
 
 **What they probe next:** cost (multi-agent runs can use many times the tokens of a single agent), what a worker does when its brief is ambiguous (ask the orchestrator vs guess), how to stop two workers duplicating work, and how you'd debug a bad final report (one trace spanning all workers).
+
+*Figure: the orchestrator plans, dispatches workers in parallel or sequence, then merges and gates.*
+
+```mermaid
+flowchart TD
+  A["Task"] --> B["Plan and decompose"]
+  B --> C["Dispatch workers (parallel where independent)"]
+  C --> D["Structured results"]
+  D --> E["Resolve conflicts by rules or cited synthesizer"]
+  E --> F{"Quality gate passed?"}
+  F -- "yes" --> G["Output"]
+  F -- "no" --> B
+  S[("Durable state by task id")] <--> C
+```
 
 ---
 
@@ -606,6 +633,20 @@ class CheckpointManager:
 ```
 
 Two bugs the naive version had: `KEYS` is O(N) over the whole keyspace and blocks Redis, and `sorted()` on string keys puts step 10 before step 9. Frameworks such as LangGraph give you this for free (a checkpointer persists state after every node, keyed by `thread_id`).
+
+*Figure: classify the failure, then choose the recovery strategy.*
+
+```mermaid
+flowchart TD
+  A["Tool failure at step 4"] --> B{"Failure type?"}
+  B -- "Transient: timeout, 429, 5xx" --> C["Backoff with jitter, bounded retries (idempotent only)"]
+  B -- "Auth" --> D["Refresh credentials once"]
+  B -- "Permanent" --> E["Feed error to model to re-plan"]
+  B -- "Critical or retries exhausted" --> F["Checkpointed partial result and human escalation"]
+  C --> G["Resume from last checkpoint"]
+  D --> G
+  E --> G
+```
 
 ---
 

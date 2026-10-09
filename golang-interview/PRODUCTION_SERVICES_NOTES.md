@@ -42,6 +42,19 @@ func newServer(h http.Handler) *http.Server {
 - Go 1.22+ `ServeMux` supports methods and wildcards: `mux.HandleFunc("GET /items/{id}", ...)` with `r.PathValue("id")`. The standard mux is enough for many services.
 - **Graceful shutdown:** `srv.Shutdown(ctx)` stops accepting, waits for in-flight requests. On Kubernetes, sleep a few seconds first (readiness propagation), then shut down, then exit; see Interview Q12.
 
+*Where each server timeout applies in one connection's life: header read, whole-request read, handler plus write, then keep-alive idle.*
+
+```mermaid
+flowchart LR
+    A["Connection accepted"] -->|"ReadHeaderTimeout"| B["Headers read"]
+    B -->|"ReadTimeout: whole request incl. body"| C["Body read"]
+    C --> D["Handler runs"]
+    D -->|"WriteTimeout: handler + response write"| E["Response written"]
+    E -->|"IdleTimeout"| F["Idle keep-alive"]
+    F -->|"next request"| B
+    F -->|"timeout"| X["Connection closed"]
+```
+
 ### The client: `http.DefaultClient` has no timeout
 
 ```go
@@ -86,6 +99,20 @@ Classic bugs this prevents:
 
 HTTP/2 is enabled automatically for HTTPS (client and server). Custom `Transport` fields that disable it (e.g. custom `DialContext` without `ForceAttemptHTTP2`) are a common reason for "why isn't this using h2".
 
+*Client response handling: always close the body, and drain a bounded amount on error paths so the connection returns to the idle pool for reuse.*
+
+```mermaid
+flowchart TD
+    Do["c.Do(req)"] --> E{"err?"}
+    E -->|yes| Ret["Return error"]
+    E -->|no| Df["defer resp.Body.Close()"]
+    Df --> S{"Status 200?"}
+    S -->|no| Dr["Drain up to 4 KB, return error"]
+    S -->|yes| Rd["ReadAll via LimitReader 1 MB"]
+    Dr --> Reuse["Connection reusable (keep-alive)"]
+    Rd --> Reuse
+```
+
 ---
 
 ## 2. `database/sql`
@@ -126,6 +153,22 @@ func withTx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) (err error)
 
 For anything beyond simple queries consider `pgx` (native Postgres, better types and batching) and code generators (`sqlc`) over heavy ORMs: you keep SQL visible and type-checked at compile time.
 
+*`*sql.DB` is a pool: requests borrow a connection, and when all `MaxOpenConns` are in use new requests wait, which shows up as rising `WaitDuration`.*
+
+```mermaid
+flowchart LR
+    R["Requests"] --> P{"Free connection in pool?"}
+    P -->|yes| U["Borrow idle connection"]
+    P -->|"no, under MaxOpenConns"| N["Open new connection"]
+    P -->|"no, at MaxOpenConns"| W["Wait: WaitCount and WaitDuration rise"]
+    U --> Q["Run query or tx"]
+    N --> Q
+    W --> U
+    Q -->|"rows.Close or Commit/Rollback"| Rel["Release to idle pool"]
+    Rel --> P
+    Q -.->|"leaked Rows or Tx"| Leak["Connection pinned forever"]
+```
+
 ---
 
 ## 3. Performance debugging playbook
@@ -153,6 +196,24 @@ curl -o trace.out 'http://svc:6060/debug/pprof/trace?seconds=5' && go tool trace
 8. **Use PGO** (`default.pgo` from a production CPU profile, in the main package directory) for typically single-digit-percent wins at no code cost.
 9. **Race and leak checks:** `go test -race` in CI; compare goroutine profiles over time; `goleak` or `synctest` in tests; the `goroutineleak` profile (1.27) in prod.
 10. **Write down** what the root cause was and add a regression benchmark or alert.
+
+*Triage order for a slow service: symptom with numbers, cheap global signals, then profile according to whether the time is on-CPU or blocked.*
+
+```mermaid
+flowchart TD
+    S["Define symptom with numbers and start time"] --> G["Check goroutines, db.Stats, GC, CPU throttling, downstream latency"]
+    G --> P["Profile via pprof on internal port"]
+    P --> Q{"CPU high?"}
+    Q -->|yes| C["CPU profile"]
+    C --> GC{"GC or mallocgc near top?"}
+    GC -->|yes| A["Reduce allocations, check escape analysis"]
+    GC -->|no| H["Optimise the hot function"]
+    Q -->|"no, latency high"| B["Block, mutex and goroutine profiles, trace"]
+    A --> F["Benchmark with benchstat"]
+    H --> F
+    B --> F
+    F --> Wr["Write down root cause, add regression check"]
+```
 
 ### Memory growth triage
 

@@ -88,6 +88,15 @@ Brief note on what is solid (omit if nothing notable).
 </output_format>"""
 ```
 
+*Figure: a system prompt feeds every turn of the conversation.*
+
+```mermaid
+flowchart LR
+  S["System prompt: role, rules, format"] --> M["Model"]
+  U["User message"] --> M
+  M --> R["Response"]
+```
+
 ---
 
 ## 3. PROMPT ENGINEERING PRINCIPLES
@@ -332,6 +341,19 @@ for name, prompt in {"v1": PROMPT_V1, "v2": PROMPT_V2}.items():
 ```
 
 For real comparisons: use enough cases to see a difference (a handful is noise), run each case a few times because outputs vary, and use the Batch API (50% cheaper) for large eval runs.
+
+*Figure: iterate on a system prompt with an evaluation loop.*
+
+```mermaid
+flowchart LR
+  A["Draft prompt"] --> B["Run on test cases"]
+  B --> C["Score outputs"]
+  C --> D{"Better than baseline?"}
+  D -- "yes" --> E["Adopt as new baseline"]
+  D -- "no" --> F["Revise prompt"]
+  E --> F
+  F --> B
+```
 
 ---
 

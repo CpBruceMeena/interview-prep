@@ -76,6 +76,22 @@
 └────────────────┘ └───────────────┘ └───────────────┘
 ```
 
+*Figure: clients, gateway, services, event bus and stores.*
+
+```mermaid
+flowchart TB
+  C["Clients: web, mobile, desktop"] -->|"HTTPS / WebSocket"| G["API gateway: auth, rate limit, WS upgrade"]
+  G --> M["Matchmaking (Go)"]
+  G --> E["Game engine (Python)"]
+  G --> A["Analysis (Python)"]
+  M --> K["Kafka / Redis PubSub"]
+  E --> K
+  A --> K
+  K --> P[("PostgreSQL: users, history, ratings")]
+  K --> R[("Redis: game state, sessions, queues")]
+  K --> S[("S3: replays, analysis")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -128,6 +144,17 @@
 4. Background worker polls each bracket: `ZRANGEBYSCORE` to find opponents within range
 5. Match found → atomically remove both users, create game room
 6. Expand search range every 5 seconds if no match found
+
+*Figure: matchmaking by rating bracket with a widening search range.*
+
+```mermaid
+flowchart TD
+  A["User joins bracket sorted set (score = ELO)"] --> B["Worker: ZRANGEBYSCORE within range"]
+  B --> C{"Opponent found?"}
+  C -- Yes --> D["Atomically remove both, create game room"]
+  C -- No --> E["Wait 5 s, widen rating range"]
+  E --> B
+```
 
 ---
 
@@ -640,6 +667,25 @@ Client D ──WebSocket──→  │   - Connection mux    │  │  game:{id}
 | Same ply written twice | `PRIMARY KEY (game_id, move_number)` on `game_moves` |
 | Rating applied twice when the game-over event is redelivered | `UNIQUE (user_id, game_id, rating_type)` on rating history; consumer is idempotent |
 | Flag-fall timer races a last-second move | Both go through the game's single writer; whichever is processed first wins |
+
+*Figure: one move; it is durable in PostgreSQL before the ack, then fanned out.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant W as WebSocket gateway
+  participant E as Game engine
+  participant P as PostgreSQL
+  participant R as Redis PubSub
+  C->>W: move (expected_ply)
+  W->>E: Forward move
+  E->>E: Validate (pattern, king safety)
+  E->>P: Insert game_moves (game_id, move_number)
+  E-->>C: Ack
+  E->>R: Publish game state
+  R-->>W: State event
+  W-->>C: Push to players and spectators
+```
 
 ---
 

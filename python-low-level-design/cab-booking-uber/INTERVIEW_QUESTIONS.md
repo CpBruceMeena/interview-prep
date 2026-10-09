@@ -33,6 +33,21 @@ REQUESTED → ACCEPTED → DRIVER_ARRIVED → STARTED → COMPLETED
 3. **Pricing as Strategy + Decorator** (`SurgePricing(StandardPricing(...))`), money as `Decimal`.
 4. **Geo index behind one method** so linear scan → geohash → Redis GEO is a swap, not a rewrite.
 
+*Figure: trip lifecycle; cancellation is allowed until STARTED and a decline returns the trip to matching.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> REQUESTED
+  REQUESTED --> ACCEPTED: driver accepts
+  REQUESTED --> REQUESTED: decline, re-match
+  ACCEPTED --> DRIVER_ARRIVED
+  DRIVER_ARRIVED --> STARTED
+  STARTED --> COMPLETED
+  REQUESTED --> CANCELLED
+  ACCEPTED --> CANCELLED
+  DRIVER_ARRIVED --> CANCELLED
+```
+
 ---
 
 ## Question 2: Geo-spatial Indexing — Which and Why?
@@ -77,6 +92,18 @@ for driver in strategy.rank(pickup, candidates):
 Follow-up push: *"What if the claim succeeds but the service crashes before creating the trip?"* The Redis TTL / a reaper releases claims with no trip after N seconds. Never rely on the crashed process to clean up.
 
 Also mention the rider side: the same rider double-tapping. Reserve the rider (`_active_trip_by_rider`) before matching, or make `request_ride` idempotent with a client-supplied request id.
+
+*Figure: search, rank, then claim one driver atomically; a lost claim moves to the next candidate.*
+
+```mermaid
+flowchart TD
+  A[Geo search candidates] --> B[Rank with strategy]
+  B --> C{"try_claim: AVAILABLE to BOOKED"}
+  C -- Won --> D[Create trip REQUESTED, send offer]
+  C -- Lost --> E{"More candidates?"}
+  E -- Yes --> C
+  E -- No --> F["No driver available"]
+```
 
 ---
 

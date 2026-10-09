@@ -33,6 +33,19 @@
 !!! tip "30-second answer"
     The scheduler takes one pod at a time off a priority queue, **filters** nodes that can't run it (resources, taints, affinity, ports, volumes), **scores** the survivors with weighted plugins, picks the highest, reserves the resources in its cache and **binds** asynchronously through the API server. The scheduler only ever compares the pod's **requests** against node **allocatable** minus other pods' requests; it never looks at real usage. If nothing fits, it tries **preemption** of lower-priority pods; otherwise the pod stays `Pending` and the Cluster Autoscaler or Karpenter reacts to it.
 
+*Diagram: how one pod moves from the scheduling queue to a bound node.*
+
+```mermaid
+flowchart LR
+  Q["Priority queue"] --> F["Filter plugins"]
+  F -->|"feasible nodes"| S["Score plugins"]
+  F -->|"none fit"| P["Preemption"]
+  S --> R["Pick top score and reserve"]
+  R --> B["Bind via API server"]
+  P -->|"no victims"| U["Pending"]
+  P -->|"victims evicted"| Q
+```
+
 **Scheduling Pipeline (scheduling framework, extension points in order):**
 
 ```
@@ -134,6 +147,20 @@ spec:
             - c5.4xlarge       # Prefer this instance type (weight=80)
 ```
 
+*Diagram: what happens to a pod that fails filtering.*
+
+```mermaid
+flowchart TD
+  A["Filter fails on all nodes"] --> B["PodScheduled=False, Unschedulable"]
+  B --> C["unschedulablePods queue"]
+  C -->|"relevant cluster event or 5 min"| D["backoffQ, 1s to 10s"]
+  D --> E["Retry scheduling cycle"]
+  B --> F["PostFilter: preemption"]
+  B --> G["Cluster Autoscaler or Karpenter adds node"]
+  F --> E
+  G --> E
+```
+
 **Unschedulable Pod Handling:**
 
 ```
@@ -228,6 +255,20 @@ Example (Calico with VXLAN):
   IP-in-IP: traffic goes host → IPIP tunnel → destination host
 ```
 
+*Diagram: the kubelet-to-CNI sequence that gives a pod its IP and network path.*
+
+```mermaid
+sequenceDiagram
+  participant K as kubelet
+  participant C as CNI plugin
+  participant P as Pod netns
+  K->>C: Pod created, call CNI
+  C->>C: Allocate IP from pool
+  C->>P: Create veth pair, eth0 in pod
+  C->>C: Configure routes and masquerade
+  C-->>K: Pod IP ready
+```
+
 **Service Types (Abstraction):**
 
 ```yaml
@@ -261,6 +302,20 @@ spec:
   clusterIP: None         # No load balancing!
   # DNS returns all pod IPs (A/AAAA records)
   # Used by StatefulSets (each pod gets DNS name)
+```
+
+*Diagram: how a pod name lookup becomes a connection to a ready backend.*
+
+```mermaid
+sequenceDiagram
+  participant Pod
+  participant DNS as CoreDNS
+  participant N as Node rules
+  participant B as Ready pod
+  Pod->>DNS: my-service.my-ns.svc.cluster.local
+  DNS-->>Pod: ClusterIP from cached Services and EndpointSlices
+  Pod->>N: Connect to ClusterIP
+  N->>B: DNAT to a ready endpoint
 ```
 
 **kube-proxy Modes:**

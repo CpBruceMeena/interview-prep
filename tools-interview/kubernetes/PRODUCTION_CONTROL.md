@@ -46,6 +46,21 @@
 5. Automated: Drift detected and corrected automatically
 ```
 
+*Diagram: CI stays credential-free while an in-cluster agent pulls and reconciles.*
+
+```mermaid
+sequenceDiagram
+  participant CI
+  participant Git as Config repo
+  participant Agent as ArgoCD or Flux
+  participant K as Cluster
+  CI->>Git: Push image, bump tag
+  Agent->>Git: Pull desired state
+  Agent->>K: Compare and apply
+  K-->>Agent: Drift detected
+  Agent->>K: Reconcile to Git state
+```
+
 **GitOps Architecture:**
 
 ```
@@ -298,6 +313,18 @@ Governance            | CNCF graduated            | CNCF graduated (continues af
 #       Kubernetes-RBAC-only access, no central control plane to secure
 ```
 
+*Diagram: the automated canary analysis loop used by Flagger and Argo Rollouts.*
+
+```mermaid
+flowchart TD
+  A["New version deployed"] --> B["Shift traffic step"]
+  B --> C["Query metrics"]
+  C --> D{"Within thresholds?"}
+  D -->|"yes, more steps"| B
+  D -->|"yes, final step"| E["Promote"]
+  D -->|"no"| F["Abort and route to stable"]
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -363,6 +390,18 @@ API Request (kubectl apply, API call)
 ┌─────────────────────────────────────────────┐
 │              Object Storage (etcd)           │
 └─────────────────────────────────────────────┘
+```
+
+*Diagram: where mutating and validating admission sit in an API request.*
+
+```mermaid
+flowchart LR
+  A["API request"] --> B["AuthN and AuthZ"]
+  B --> C["Mutating admission"]
+  C --> D["Schema validation"]
+  D --> E["Validating admission"]
+  E -->|"all allow"| F[("etcd")]
+  E -->|"any deny"| G["Rejected"]
 ```
 
 **Kyverno (Kubernetes-Native Policy Engine):**
@@ -716,6 +755,15 @@ A/B Testing     | No       | Fast           | Medium     | Header based    | Hig
 # Blue-Green: Two full environments, switch traffic instantly
 # Canary: Gradual % traffic shift with rollback
 # A/B: Traffic routing by header/cookie (for testing features)
+```
+
+*Diagram: blue-green switch via the Service selector.*
+
+```mermaid
+flowchart LR
+  S["Service"] -->|"before"| Bl["Blue v1"]
+  S -.->|"after switch"| Gr["Green v2"]
+  Gr -.->|"issues: switch back"| Bl
 ```
 
 **Blue-Green Deployment:**

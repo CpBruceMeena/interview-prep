@@ -25,6 +25,18 @@ API → validate, idempotency, render, fan out → Delivery records (DB)
 - **Separate queues (or partitions) per priority**, so OTPs never wait behind a marketing blast.
 - **Provider adapters** behind one `ChannelSender` interface, with failover to a secondary provider on transient errors.
 
+*Figure: submit, queue per channel and priority, worker pipeline, and provider callbacks.*
+
+```mermaid
+flowchart TB
+  API["API: validate, idempotency, render"] --> DB[("Delivery records")]
+  API --> Q["Per-channel, per-priority queues"]
+  Q --> W["Worker: quiet hours, rate limits, send"]
+  W --> PR["Provider (failover to secondary)"]
+  W -. "retries exhausted" .-> DLQ[DLQ]
+  PR -- "delivered / bounced callbacks" --> DB
+```
+
 ---
 
 ## Q2: How do you make sure a user doesn't get the same notification twice?
@@ -55,6 +67,16 @@ delay = random.uniform(0, min(cap, base * 2 ** (attempt - 1)))   # full jitter
 ```
 
 Jitter matters because a provider outage fails thousands of deliveries at once; without jitter they all retry at the same instant and knock it over again. After `max_attempts`, move to a **dead-letter queue** with the last error, alert on DLQ growth, and provide a replay tool. Also give each message a **time-to-live**: an OTP that is 10 minutes late is useless, so drop it rather than retry forever.
+
+*Figure: how a worker classifies a send result.*
+
+```mermaid
+flowchart TD
+  A[Send result] --> B{"Error class"}
+  B -- "Transient: timeout, 5xx, 429" --> C["Retry: exponential backoff, full jitter, honour Retry-After"]
+  B -- "Permanent: bad number, hard bounce" --> D["Fail now, mark contact invalid"]
+  B -- "Policy deferral: quiet hours, rate limit" --> E["Reschedule, no attempt counted"]
+```
 
 ---
 

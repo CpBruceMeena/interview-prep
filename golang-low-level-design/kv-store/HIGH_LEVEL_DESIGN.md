@@ -42,6 +42,17 @@
 └─────────────────────────────────────────────────────────┘
 ```
 
+*Figure: every operation hashes the key to one shard and takes only that shard lock.*
+
+```mermaid
+flowchart TB
+  OP["SET / GET / DELETE"] --> H["maphash(key) % N"]
+  H --> S["shard[i].mu (Mutex)"]
+  S --> M["items map"]
+  S --> E["eviction policy (LRU / LFU)"]
+  S --> X["expiry heap (per shard)"]
+```
+
 ## 3. EVICTION POLICIES
 
 | Policy | Algorithm | Complexity | Best For |
@@ -61,6 +72,18 @@ Every operation takes exactly one shard `Mutex`. Reads take it exclusively too, 
 | DeleteExpired (janitor) | each shard's Mutex in turn | Never stalls the whole store |
 | Keys / Stats / Snapshot | each shard's Mutex in turn | Consistent per shard, **not** point-in-time across shards |
 | Watch registration / publish | `watchMu` (Lock / RLock), always taken after a shard lock | Close cannot race with send |
+
+*Figure: Get takes the shard lock because it mutates recency or frequency, and expires lazily.*
+
+```mermaid
+flowchart TD
+  A[Get key] --> L["Lock shard mutex"]
+  L --> B{"Key present?"}
+  B -- No --> M[Miss]
+  B -- Yes --> C{"Expired?"}
+  C -- Yes --> D["Remove lazily, miss"]
+  C -- No --> E["Update LRU or LFU, return value"]
+```
 
 ## 5. TRADE-OFF ANALYSIS
 

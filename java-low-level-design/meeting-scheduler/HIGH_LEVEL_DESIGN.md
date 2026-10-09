@@ -44,6 +44,19 @@
   └─────────────┘  └─────────────┘  └─────────────┘
 ```
 
+*Figure: clients, scheduler service and stores.*
+
+```mermaid
+flowchart TB
+  W["Web app"] --> G["API gateway"]
+  M["Mobile app"] --> G
+  O["Outlook / Google sync"] --> G
+  G --> S["Meeting scheduler: conflicts, rooms, notifications"]
+  S --> P[("PostgreSQL: meetings")]
+  S --> R[("Redis: calendar cache")]
+  S --> Q["Message queue"]
+```
+
 ## 3. MEETING LIFECYCLE
 
 ```
@@ -51,6 +64,18 @@ SCHEDULED → ONGOING → COMPLETED
     │          │
     ▼          ▼
 CANCELLED  RESCHEDULED → SCHEDULED
+```
+
+*Figure: meeting lifecycle.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> SCHEDULED
+  SCHEDULED --> ONGOING
+  ONGOING --> COMPLETED
+  SCHEDULED --> CANCELLED
+  ONGOING --> RESCHEDULED
+  RESCHEDULED --> SCHEDULED
 ```
 
 ## 4. CONFLICT DETECTION
@@ -84,6 +109,24 @@ CANCELLED  RESCHEDULED → SCHEDULED
 ## 7. CONSISTENCY, IDEMPOTENCY & FAILURE MODES
 
 **Write path:** a booking inserts one row per attendee calendar plus the room row in a single transaction. The room exclusion constraint makes double-booking a room impossible; for people, a conflict is usually allowed with a warning (people double-book themselves on purpose), so it is a check, not a constraint. Partition by tenant (company): every booking is single-tenant, so transactions stay on one shard.
+
+*Figure: booking write path; the room exclusion constraint decides concurrent bookings.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as Scheduler
+  participant D as PostgreSQL
+  C->>S: Create meeting (idempotency key)
+  S->>D: One txn: room row, attendee rows, outbox
+  alt overlap on room
+    D-->>S: Exclusion constraint violation
+    S-->>C: 409 Conflict
+  else free
+    D-->>S: Commit
+    S-->>C: Created
+  end
+```
 
 **Read path (free/busy):** the expensive query is "when are these 8 people free this week". Precompute per person per day a busy bitmap at 15-minute resolution (96 bits/day), cache it, and AND the bitmaps of all attendees. Invalidate on any write to that person's calendar.
 

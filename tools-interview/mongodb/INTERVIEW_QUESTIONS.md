@@ -184,6 +184,26 @@ db.payments.insertOne(
 - Members across 3 AZs/regions so any single failure leaves a majority.
 - Hidden or delayed members for analytics and "oops" recovery. They're priority 0 and can't become primary.
 
+*Failover and rollback: a w:1 write the secondaries never received is rolled back; w:majority writes survive.*
+
+```mermaid
+sequenceDiagram
+    participant A as A (old primary)
+    participant B as B (secondary)
+    participant C as C (secondary)
+    A->>B: oplog up to 99
+    A->>C: oplog up to 99
+    Note over A: applies 100, 101 acked with w:1
+    Note over A: crashes
+    Note over B,C: no heartbeat for electionTimeoutMillis
+    B->>C: RequestVote (new term)
+    C-->>B: vote (B oplog at least as fresh)
+    Note over B: primary, accepts 100', 101'
+    A->>B: rejoins, finds common point 99
+    Note over A: rolls back 100, 101 to rollback files
+    B->>A: oplog from 99
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -291,6 +311,37 @@ sh.updateZoneKeyRange("app.users",
   { country: "US", userId: MinKey }, { country: "US", userId: MaxKey }, "US")
 sh.updateZoneKeyRange("app.users",
   { country: "DE", userId: MinKey }, { country: "DE", userId: MaxKey }, "EU")
+```
+
+*Sharded cluster topology and how mongos routes requests.*
+
+```mermaid
+flowchart TD
+    App["App driver"] --> M["mongos router"]
+    M -. routing table .-> CS["Config server replica set"]
+    M --> SA["Shard A (replica set)"]
+    M --> SB["Shard B (replica set)"]
+    M --> SC["Shard C (replica set)"]
+    CS -. balancer on primary .-> SA
+```
+
+*Chunk migration from donor A to recipient B, with a short critical section at the end.*
+
+```mermaid
+sequenceDiagram
+    participant Bal as Balancer
+    participant A as Donor shard A
+    participant B as Recipient shard B
+    participant CS as Config servers
+    Bal->>A: moveRange
+    A->>B: start cloning
+    B->>A: clone documents of range R
+    Note over A: keeps serving R, records changes
+    B->>A: apply changes repeatedly
+    Note over A: critical section, writes to R blocked
+    B->>A: apply final changes
+    A->>CS: commit new owner B
+    A->>A: range deleter removes orphaned copy
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -582,6 +633,26 @@ Cost: extra majority writes and round trips per writing shard. Design shard keys
 - **Embed** the invariant in one document (single-document atomicity: order plus its line items).
 - Use a **conditional update** as the guard (the `quantity: {$gte: n}` filter above), plus an idempotent order insert.
 - Run a **saga** across services with compensating actions and an outbox, when the data spans systems anyway.
+
+*Cross-shard commit uses two-phase commit coordinated by the first shard written to.*
+
+```mermaid
+sequenceDiagram
+    participant D as Driver
+    participant M as mongos
+    participant C as Coordinator shard
+    participant S as Other writing shard
+    D->>M: commitTransaction
+    M->>C: commit with participant list
+    C->>C: durably log participants
+    C->>S: PREPARE
+    C->>C: prepare own writes
+    S-->>C: prepared (majority)
+    C->>C: durably log COMMIT decision
+    C->>S: COMMIT
+    C-->>M: committed
+    M-->>D: ok
+```
 
 ### 🔍 Staff-Level Evaluation
 

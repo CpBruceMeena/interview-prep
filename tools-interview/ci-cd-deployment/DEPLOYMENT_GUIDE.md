@@ -94,6 +94,16 @@ This section traces a change from first commit to running in production, across 
 | **5. CD / deploy** | Promote **the same artifact** through environments (dev → staging → canary → prod) | Running application |
 | **6. Production** | Serve traffic, watch SLOs, alert, roll back if needed | Live service |
 
+*Diagram: one immutable artifact is built once and promoted through environments.*
+
+```mermaid
+flowchart LR
+  A["Commit"] --> B["CI: lint, tests, scans"]
+  B --> C["Build once, push to registry"]
+  C --> D["Immutable artifact by digest"]
+  D --> E["Dev"] --> F["Staging"] --> G["Canary"] --> H["Production"]
+```
+
 **Build once, deploy many:** never rebuild per environment. The thing you tested in staging must be byte-for-byte the thing in production; only configuration differs.
 
 ---
@@ -373,6 +383,16 @@ Rollback: point it back at Blue (keep Blue running until confident)
   <em>🎬 Animated Sequence — Blue-Green Deployment — Two identical environments with instant switch and rollback. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
 
+*Diagram: blue-green switch and rollback.*
+
+```mermaid
+flowchart LR
+  U["Users"] --> L["Load balancer"]
+  L -->|"live before switch"| Bl["Blue v1"]
+  L -.->|"after switch"| Gr["Green v2"]
+  Gr -.->|"problem: flip back"| L
+```
+
 Pitfalls: DNS-based switches are slow and uneven because of client caching; long-lived connections (WebSockets, gRPC streams) stay on Blue until they reconnect; and the database is shared, so the switch doesn't roll back schema changes.
 
 ### Canary Release
@@ -394,6 +414,17 @@ Healthy → 25% → 50% → 100%.  Degraded → route 100% back to stable automa
   <br/>
   <em>🎬 Animated Sequence — Canary Release — Progressive traffic shift with metric-based gates. Click ▶ to play/pause. Created with <a href="https://remotion.dev">Remotion</a>.</em>
 </p>
+
+*Diagram: the canary promotion loop with metric gates.*
+
+```mermaid
+flowchart TD
+  A["Route 5% to canary"] --> B["Hold and compare vs stable"]
+  B --> C{"Healthy?"}
+  C -->|"yes"| D["25%, 50%, 100%"]
+  D --> B
+  C -->|"no"| E["Route 100% back to stable"]
+```
 
 **Progressive delivery** automates this loop. With **Argo Rollouts**, a `Rollout` replaces the `Deployment` and an `AnalysisTemplate` defines the metric gate:
 
@@ -875,6 +906,20 @@ Reusable pipeline templates (GitHub reusable workflows, GitLab CI components) gi
             ┌──────────────────────┐
             │ Kubernetes cluster   │
             └──────────────────────┘
+```
+
+*Diagram: the GitOps pull flow with Argo CD.*
+
+```mermaid
+sequenceDiagram
+  participant CI
+  participant Git as Env manifests in Git
+  participant Argo as Argo CD
+  participant K as Cluster
+  CI->>Git: Commit new image digest
+  Argo->>Git: Pull and diff
+  Argo->>K: Apply (sync)
+  Argo->>K: Detect drift and self-heal
 ```
 
 Why GitOps: the cluster pulls desired state, so CI needs no cluster credentials; Git history is the deployment audit log; rollback is `git revert`; drift is visible and corrected. Trade-offs: secrets need a separate solution (External Secrets Operator, Sealed Secrets, SOPS), and "deploy succeeded" now means "Argo CD synced and the app is healthy", which pipelines must wait for if they run post-deploy tests.

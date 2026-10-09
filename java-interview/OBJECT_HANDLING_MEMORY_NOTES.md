@@ -95,6 +95,22 @@ private double value;   // 0.0
 // because "user.name" is null'.
 ```
 
+*Variables hold either a primitive value or a reference: a local `String s` sits in the stack frame, while the String object and its `byte[]` live on the heap.*
+
+```mermaid
+flowchart LR
+    subgraph STACK["Thread stack frame"]
+        X["int x = 42 (value in slot)"]
+        S["String s (reference, 4 B with compressed oops)"]
+    end
+    subgraph HEAP["Heap"]
+        SO["String object: 24 B"]
+        BA["byte[5] for hello: 24 B"]
+    end
+    S --> SO
+    SO --> BA
+```
+
 ---
 
 ## 2. Pass by Value — The Most Misunderstood Concept
@@ -214,6 +230,17 @@ static void appendExclamation(StringBuilder sb) {
 // ── CLASS POINTER ──────────────────────────────────────────
 // Points to the Klass in Metaspace: field layout, vtable/itable, superclass chain,
 // and a pointer back to the java.lang.Class mirror on the heap.
+```
+
+*Object layout on a 64-bit HotSpot JVM with compressed class pointers: a 12-byte header (mark word plus class pointer), then fields, then padding to a multiple of 8.*
+
+```mermaid
+flowchart LR
+    subgraph OBJ["Object in the heap"]
+        direction LR
+        MW["Mark word: 8 B (hash, age, lock bits)"] --> KP["Class pointer: 4 B"] --> FD["Instance fields: superclass first, then subclass"] --> PD["Padding to multiple of 8"]
+    end
+    KP -.->|"points to Klass in Metaspace"| KL["Klass: layout, vtable, Class mirror link"]
 ```
 
 ### Field Ordering & Alignment
@@ -341,6 +368,18 @@ obj = null;  // unreachable once NO strong path from any GC root remains.
 // - If its class overrides finalize() (deprecated), it is kept alive one more
 //   cycle so the Finalizer thread can run finalize()
 // - Registered Cleaner actions run on the Cleaner thread afterwards
+```
+
+*Object lifecycle: class init once, allocation in a TLAB with header written by `new`, the constructor, use, unreachability, then reclamation by the GC.*
+
+```mermaid
+flowchart TD
+    A["Class loaded and initialized (first active use only)"] --> B["new: allocate in TLAB, zero memory, write header"]
+    B --> C["invokespecial init: super constructor, field initializers, constructor body"]
+    C --> D["Use: virtual dispatch, fields"]
+    D --> E["Unreachable: no strong path from any GC root"]
+    E --> F["GC does not mark it: memory reclaimed by copying survivors or compaction"]
+    F --> G["Soft, weak, phantom references cleared and enqueued; Cleaner actions run"]
 ```
 
 ### Constructor Safety with `this` Escape
@@ -569,6 +608,22 @@ public final class ResourceCleaner {
 | **Weak** | Object or `null` | At the first GC (covering the referent) that finds it only weakly reachable | `WeakHashMap` metadata, canonicalizing maps, `ThreadLocalMap` keys |
 | **Phantom** | Always `null` | After the object is unreachable (and finalized, if applicable); auto-cleared since JDK 9 | Releasing native/external resources (via `Cleaner`) |
 
+*How the GC treats a referent by its strongest remaining path, and how cleared references reach a `ReferenceQueue`.*
+
+```mermaid
+flowchart TD
+    R["Referent reachability at GC time"] --> S{"Strong path from a GC root?"}
+    S -->|yes| K["Kept alive"]
+    S -->|no| SO{"Soft path?"}
+    SO -->|yes| SC["Cleared only under memory pressure, before OutOfMemoryError"]
+    SO -->|no| W{"Weak path?"}
+    W -->|yes| WC["Cleared at the first GC that examines it"]
+    W -->|no| PH["Phantom reachable: get() is null, memory freed after clear"]
+    SC --> Q["Reference object enqueued on ReferenceQueue"]
+    WC --> Q
+    PH --> Q
+```
+
 ---
 
 ## 6. ReferenceQueue & Cleaner — Resource Cleanup
@@ -771,6 +826,22 @@ public long sum(int[] values) {
 //   old regions. ZGC: large objects get their own page.
 ```
 
+*Allocation fast path: a TLAB bump needs no atomic operation, while a refill or an out-of-TLAB allocation takes a CAS on Eden, and a full Eden triggers a young GC.*
+
+```mermaid
+flowchart TD
+    N["new object"] --> T{"Fits in the thread's TLAB?"}
+    T -->|yes| B["Bump pointer: no lock, no atomic"]
+    T -->|no| L{"Much of the TLAB still free?"}
+    L -->|"yes: allocate outside TLAB"| DE["Allocate directly in Eden (CAS)"]
+    L -->|"no: little left"| NT["Retire TLAB, take a new one from Eden (CAS)"]
+    DE --> EF{"Eden full?"}
+    NT --> EF
+    EF -->|yes| GC["Young GC, then retry"]
+    EF -->|no| OK["Object allocated"]
+    B --> OK
+```
+
 ---
 
 ## 8. String Pool & Interning
@@ -800,6 +871,17 @@ String b = "hel";
 System.out.println((a + "lo") == s1);  // true  (constant expression)
 System.out.println((b + "lo") == s1);  // false (computed at runtime)
 // Never compare strings with == in application code; this is interview trivia.
+```
+
+*Literals share one pooled String, `new String` creates a separate heap object, and `intern()` returns the canonical pooled instance.*
+
+```mermaid
+flowchart LR
+    s1["s1 = literal hello"] --> P["Pooled String hello (StringTable)"]
+    s2["s2 = literal hello"] --> P
+    s3["s3 = new String(hello)"] --> H1["Separate heap String"]
+    s4["s4 = new String(hello)"] --> H2["Another heap String"]
+    s5["s5 = s3.intern()"] --> P
 ```
 
 ### String Pool Memory

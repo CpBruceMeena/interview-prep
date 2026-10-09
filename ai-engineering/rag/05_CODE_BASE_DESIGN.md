@@ -135,6 +135,25 @@ Query
 
 Retrieval runs **once** per query and the same results feed both the prompt and the returned citations, so citations always match what the model saw.
 
+*Figure: indexing path and query path through the RAG modules.*
+
+```mermaid
+flowchart TD
+  subgraph Indexing
+    L["loader_for: Document"] --> CH["Chunk with deterministic IDs"]
+    CH --> DEL["delete_source: remove old chunks"]
+    DEL --> EM["embed_batch"]
+    EM --> UP["Chroma add_chunks (upsert)"]
+  end
+  subgraph Query
+    Q["embed_query"] --> SR["store.search top_k"]
+    SR --> TH["Drop score below threshold"]
+    TH --> CTX["Format context with Source labels"]
+    CTX --> GEN["LLMService.generate"]
+    GEN --> OUT["answer, sources, latency_ms"]
+  end
+```
+
 ---
 
 ## 5. ERROR HANDLING STRATEGY
@@ -163,6 +182,19 @@ def query(self, question: str) -> Dict:
 ```
 
 **Principles:** catch narrowly (a bare `except Exception` hides bugs); degrade where a partial answer is still useful (show sources when the LLM is down); log with a request ID; never return raw exception strings to users (they can leak internals).
+
+*Figure: degrade to sources when the LLM fails, but fail hard without retrieval.*
+
+```mermaid
+flowchart TD
+  A["query"] --> B["retrieve"]
+  B -- "VectorStoreError" --> X["Raise: API returns 503"]
+  B --> C{"Any results?"}
+  C -- "no" --> D["Answer: not enough information"]
+  C -- "yes" --> E["LLM generate"]
+  E -- "timeout / unavailable" --> F["Return sources, answer None"]
+  E -- "ok" --> G["Answer with sources"]
+```
 
 ---
 

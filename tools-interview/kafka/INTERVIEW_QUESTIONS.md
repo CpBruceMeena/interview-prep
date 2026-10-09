@@ -88,6 +88,18 @@ Retention and compaction work on **closed segments only**. On a low-volume topic
 
 **Tiered storage (KIP-405, production-ready since 3.9):** closed segments are copied to object storage (S3/GCS/Azure) through a pluggable `RemoteStorageManager`. Local disk keeps only a hot tail (`local.retention.ms`). The result is long retention without big disks, and much faster reassignment and broker replacement because there's less local data to move. Fetches for old offsets are served from the remote tier, at higher latency.
 
+**Diagram: how a record flows from producer to consumer through the page cache.**
+
+```mermaid
+flowchart LR
+P["Producer batch (compressed)"] --> L["Leader: append to active segment"]
+L --> PC["OS page cache"]
+PC -. "background flush" .-> D[("Segment files on disk")]
+L --> F["Followers fetch and replicate"]
+PC -- "sendfile (zero-copy, no TLS)" --> C["Consumer socket"]
+IDX["Sparse .index (offset to position)"] -. "binary search" .-> PC
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -150,6 +162,37 @@ kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic orders
 kafka-topics.sh --bootstrap-server kafka:9092 --describe --under-replicated-partitions
 kafka-topics.sh --bootstrap-server kafka:9092 --describe --under-min-isr-partitions
 kafka-metadata-quorum.sh --bootstrap-server kafka:9092 describe --status   # KRaft controller quorum health
+```
+
+**Diagram: the acks=all write path and how the high watermark advances.**
+
+```mermaid
+sequenceDiagram
+participant P as Producer
+participant L as Leader (broker 1)
+participant F2 as Follower (broker 2)
+participant F3 as Follower (broker 3)
+P->>L: Produce batch (acks=all)
+L->>L: Append, advance LEO
+F2->>L: FETCH (offset)
+F3->>L: FETCH (offset)
+L->>L: HW = min LEO over ISR
+L-->>P: Ack once HW passes batch
+Note over L,F3: Consumers read only up to HW
+```
+
+**Diagram: ISR shrinking as brokers fail with RF=3 and min.insync.replicas=2.**
+
+```mermaid
+stateDiagram-v2
+[*] --> Full
+Full: ISR = 1,2,3 (writes OK)
+Shrunk: ISR = 1,3 (writes OK)
+BelowMin: ISR = 3 (acks=all rejected)
+Full --> Shrunk: follower 2 lags past replica.lag.time.max.ms
+Shrunk --> BelowMin: leader 1 dies, controller elects 3
+BelowMin --> Shrunk: a replica catches up
+Shrunk --> Full: replica 2 catches up
 ```
 
 ### 🔍 Staff-Level Evaluation
@@ -222,6 +265,21 @@ A restarting member with the same `group.instance.id` gets its old assignment ba
 Migration: on 4.x brokers, a group can be converted online from classic to consumer protocol during a rolling upgrade of the clients. Kafka Streams has its own equivalent, the streams rebalance protocol (KIP-1071), introduced as early access in 4.1.
 
 **Share groups (KIP-932, production-ready in 4.2):** a different consumption model, not a rebalance fix. Many consumers can read the **same partition**, with per-record acknowledgement, delivery counts and redelivery. This gives queue semantics (worker pools) without being capped at one consumer per partition. You lose per-partition ordering.
+
+**Diagram: eager rebalance versus cooperative rebalance.**
+
+```mermaid
+flowchart TD
+T["Member joins, leaves or times out"] --> E{"Protocol"}
+E -- "Eager" --> E1["All members revoke ALL partitions"]
+E1 --> E2["JoinGroup barrier, leader assigns, SyncGroup"]
+E2 --> E3["Everyone resumes"]
+E -- "Cooperative (KIP-429)" --> C1["Members rejoin, keep partitions"]
+C1 --> C2["Only moving partitions revoked"]
+C2 --> C3["Second rebalance assigns freed partitions"]
+E -- "KIP-848" --> K1["Broker computes assignment"]
+K1 --> K2["Members converge via heartbeats, no barrier"]
+```
 
 ### 🔍 Staff-Level Evaluation
 
@@ -328,6 +386,24 @@ If `commit_transaction()` raises a **fatal** error (for example, the producer wa
 - Use the **payment ID as an idempotency key** at the payment provider. A retry after a crash then can't double-charge.
 - Or write the intent to Kafka transactionally, and have a separate consumer call the provider with the idempotency key and record the outcome.
 
+**Diagram: the transaction commit protocol across coordinator and partitions.**
+
+```mermaid
+sequenceDiagram
+participant P as Producer
+participant TC as Txn coordinator
+participant B as Partitions and __consumer_offsets
+P->>TC: initTransactions (bump epoch, fence zombies)
+P->>B: send records
+P->>TC: AddPartitionsToTxn
+P->>TC: sendOffsetsToTransaction
+P->>TC: commitTransaction
+TC->>TC: Write PREPARE_COMMIT (commit point)
+TC->>B: Write COMMIT markers
+TC->>TC: Write COMPLETE_COMMIT
+Note over B: read_committed consumers read up to LSO
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -402,6 +478,19 @@ Then check the other side:
 **When to scale out:** a single Java producer instance can push hundreds of MB/s with good batching. If one instance really is saturated, with the sender thread busy and the queue backed up, run several producer instances (processes or instances per thread) over disjoint keys. Don't share one producer across hundreds of app threads and then blame Kafka.
 
 **Partitioner note:** since 3.3 (KIP-794), records **without a key** use a "sticky" partitioner that fills one partition's batch before moving on. This gives much larger batches than the old round-robin. Keyed records still hash with murmur2 on the key.
+
+**Diagram: producer pipeline from send() to broker acks.**
+
+```mermaid
+flowchart LR
+A["App: send(record)"] --> S["Serialize and partition"]
+S --> RA["RecordAccumulator: batch per partition"]
+RA -- "batch full or linger.ms elapsed" --> SN["Sender thread"]
+SN -- "ProduceRequest per broker, up to 5 in flight" --> BR["Broker"]
+BR -- "ack" --> SN
+SN --> CB["Complete Future / callback"]
+RA -. "buffer.memory full: send() blocks" .-> A
+```
 
 ### 🔍 Staff-Level Evaluation
 

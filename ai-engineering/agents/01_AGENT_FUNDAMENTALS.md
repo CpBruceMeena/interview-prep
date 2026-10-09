@@ -89,6 +89,19 @@ Consequences interviewers probe:
 - **Errors are observations.** Return a tool error as a result (Anthropic: `is_error: true`) so the model can recover, rather than crashing the loop.
 - **Schema guarantees:** strict/structured modes (Anthropic `strict: true`, OpenAI `strict` function schemas) make arguments schema-valid, but not *correct*; still validate business rules server-side.
 
+*Figure: the model proposes tool calls; your runtime executes them and resends the transcript.*
+
+```mermaid
+sequenceDiagram
+  participant R as Your runtime
+  participant M as Model API
+  R->>M: system + messages + tool definitions
+  M-->>R: tool call {id, name, arguments}
+  R->>R: Validate args, authorize, execute
+  R->>M: Append tool call and tool result with same id
+  M-->>R: Plain text answer (no tool call)
+```
+
 ---
 
 ## 2. CORE AGENT ARCHITECTURES
@@ -113,6 +126,17 @@ Loop:
 **Then vs now:** the original ReAct paper (Yao et al., 2022) had the model write `Thought:` / `Action:` text that the harness parsed. Today the "Action" is a native structured tool call and the "Thought" is either visible text or the model's built-in reasoning (Anthropic adaptive thinking, OpenAI reasoning models). The loop is the same; the parsing failure mode is gone.
 
 **Failure modes:** repeating the same failing call (detect identical consecutive calls), drifting off-goal over long runs (restate the goal, keep a task list in state), and acting on stale or injected tool output (treat tool results as untrusted data).
+
+*Figure: the ReAct loop, bounded by a step limit and budget.*
+
+```mermaid
+flowchart TD
+  A["Thought"] --> B["Action: tool call"]
+  B --> C["Observation: tool result"]
+  C --> D{"Done or limit reached?"}
+  D -- "no" --> A
+  D -- "yes" --> E["Final answer"]
+```
 
 ### 2.2 Plan-and-Execute
 
@@ -141,6 +165,19 @@ Phase 2 — Execute:
 **Disadvantage:** The plan may be wrong from the start, wasting time on a bad plan.
 
 **Fix in practice:** allow *re-planning* when a step fails or an observation contradicts the plan, and use a cheaper model for executing well-specified steps while the stronger model plans.
+
+*Figure: plan first, execute step by step, re-plan when a step fails.*
+
+```mermaid
+flowchart TD
+  A["Task"] --> B["Planner: write plan"]
+  B --> C["Execute next step"]
+  C --> D{"Step ok and plan still valid?"}
+  D -- "yes, more steps" --> C
+  D -- "no" --> E["Re-plan"]
+  E --> C
+  D -- "yes, all done" --> F["Result"]
+```
 
 ### 2.3 Orchestrator-Worker
 
@@ -181,6 +218,16 @@ Loop:
 **When to use:** Code generation, writing, any task where quality iteration matters more than speed.
 
 **Trade-off:** each critique round adds a full generate-and-review cycle of latency and tokens. It helps most when the critic has a signal the producer lacked: tests to run, a linter, a rubric, retrieved sources. A critic that is the same model with no new information often just rubber-stamps or churns. Cap the rounds.
+
+*Figure: producer and critic loop until the critic passes or rounds run out.*
+
+```mermaid
+flowchart LR
+  A["Producer: draft"] --> B["Critic: evaluate against rubric"]
+  B --> C{"Pass or max rounds?"}
+  C -- "no: feedback" --> A
+  C -- "yes" --> D["Output"]
+```
 
 ### 2.5 Memory-Augmented Agent
 
@@ -257,6 +304,24 @@ LLM decides to call tool
     │
     ▼
 7. Audit — Log full trace: prompt, params, result, latency
+```
+
+*Figure: every tool call passes validation, authorization, limits and approval before it runs.*
+
+```mermaid
+flowchart TD
+  A["LLM decides to call tool"] --> B{"Schema valid?"}
+  B -- "no" --> X["Error back to LLM"]
+  B -- "yes" --> C{"Authorized (RBAC)?"}
+  C -- "no" --> X
+  C -- "yes" --> D{"Within rate limit?"}
+  D -- "no" --> X
+  D -- "yes" --> E{"Needs approval?"}
+  E -- "yes" --> F["Pause for human OK"]
+  E -- "no" --> G["Execute with timeout"]
+  F --> G
+  G --> H["Return result to LLM"]
+  H --> I["Audit log"]
 ```
 
 ---
@@ -343,6 +408,19 @@ Orchestrator: "Research the latest AI chip benchmarks"
     ├── Worker(Search): "Find Q1 2026 GPU benchmarks"
     ├── Worker(Analyze): "Compare performance/Watt across vendors"
     └── Worker(Write): "Generate executive summary"
+```
+
+*Figure: an orchestrator delegates to workers with isolated contexts and merges their results.*
+
+```mermaid
+flowchart TD
+  O["Orchestrator"] --> W1["Worker: Search"]
+  O --> W2["Worker: Analyze"]
+  O --> W3["Worker: Write"]
+  W1 --> M["Merge results"]
+  W2 --> M
+  W3 --> M
+  M --> O
 ```
 
 ### 5.2 Debate Pattern

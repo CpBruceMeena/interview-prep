@@ -55,6 +55,17 @@ Two things changed. Models became good enough to run multi-step tasks with tools
 
 These eras overlap; treat the table as a mental model, not history.
 
+*Figure: Agent = Model + Harness; the harness wraps the model with guides, execution, sensors and state.*
+
+```mermaid
+flowchart LR
+  G["Feedforward guides: prompt, CLAUDE.md, skills, plan"] --> M["Model"]
+  M --> E["Execution sandbox: code, APIs, DB, files"]
+  E --> S["Feedback sensors: tests, linters, schema, LLM judge"]
+  S --> M
+  ST["State: context, progress files, memory"] <--> M
+```
+
 ---
 
 ## 2. TYPES OF HARNESSES
@@ -263,6 +274,19 @@ class VerificationPipeline:
 | **Human review** | Approval gate | High-stakes or irreversible actions | Approval fatigue leads to rubber-stamping |
 | **A/B or shadow comparison** | Run new version beside baseline | Regression detection | Needs enough traffic for significance |
 
+*Figure: cheap deterministic checks run before costly model-based judgement.*
+
+```mermaid
+flowchart TD
+  A["Agent output"] --> B["Schema validation"]
+  B --> C["Unit tests"]
+  C --> D["Citation / grounding check"]
+  D --> E{"All passed so far?"}
+  E -- "yes" --> F["LLM-as-a-judge against rubric"]
+  E -- "no" --> G["Fail: feed back for correction"]
+  F --> H["Verification result"]
+```
+
 ### 3.4 Context & Memory Management
 
 The harness decides what the model sees on each call. The context window is a budget: more tokens cost more, add latency, and past a point make the model worse at finding what matters. Anthropic's "Effective context engineering for AI agents" calls this keeping the *smallest set of high-signal tokens*.
@@ -315,6 +339,17 @@ Remove at least one leg for any given task. Concretely:
 - **Authorize as the user:** the agent's tool calls run with the end user's permissions, so injection can't escalate beyond what that user could do anyway.
 - **Classifiers** (input screening) as one layer, measured for false negatives, never as the only one.
 
+*Figure: the lethal trifecta; remove at least one leg per task.*
+
+```mermaid
+flowchart TD
+  A["Private data access"] --> T{"All three present?"}
+  B["Untrusted content exposure"] --> T
+  C["Outbound channel"] --> T
+  T -- "yes" --> R["Exploitable: hijacked model can exfiltrate"]
+  T -- "no, one leg removed" --> S["Bounded damage"]
+```
+
 ### 3.6 Observability
 
 Log every model call and tool call as a span in one trace per task: inputs (or hashes, if sensitive), outputs, tokens in/out, cache hits, latency, cost, the guardrail decisions and the exit reason. OpenTelemetry's GenAI semantic conventions give you standard attribute names. Without traces you can't answer the questions you'll be asked in an incident: what did the agent see, what did it do, and why did it stop?
@@ -338,6 +373,15 @@ screening        +  constraints        +  validation        +  Content filter
 ```
 
 The tool layer carries the most weight, because that is where words become side effects.
+
+*Figure: layered guardrails, with the tool layer carrying the most weight.*
+
+```mermaid
+flowchart LR
+  I["Input layer: injection screening, scope filter"] --> M["Model layer: system prompt, budget tracking"]
+  M --> T["Tool layer: schema, authz as user, sandbox, approval"]
+  T --> O["Output layer: PII redaction, grounding, schema check"]
+```
 
 ### 4.2 Least Privilege for Tools
 
@@ -383,6 +427,18 @@ Feedback (after action):
 | **Effector** | Correction mechanism | Feed the failing test output back and retry |
 
 A practical rule from teams running coding agents at scale: when the agent makes the same mistake twice, fix the **harness** (add a lint rule, a test, a line in `AGENTS.md`/`CLAUDE.md`), not just the one output.
+
+*Figure: the harness as a control loop with reference, sensor, comparator and effector.*
+
+```mermaid
+flowchart LR
+  R["Reference: task spec"] --> A["Action"]
+  A --> S["Sensor: tests, linters"]
+  S --> C{"Comparator: rubric met?"}
+  C -- "no" --> E["Effector: feed errors back, retry"]
+  E --> A
+  C -- "yes" --> D["Done"]
+```
 
 ### 4.4 Cost & Resource Governors
 

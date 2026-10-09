@@ -27,6 +27,16 @@
 
 **What it is not:** a production serving stack for many concurrent users. 0.4 added parallel requests with continuous batching and a headless daemon, which is fine for a team or a lab box. For high-QPS production, dedicated servers (vLLM, SGLang, TGI, TensorRT-LLM) give higher throughput, better observability and Kubernetes-native deployment.
 
+*Figure: a RAG app talks to a local model through the OpenAI-compatible endpoint.*
+
+```mermaid
+flowchart LR
+  A["RAG app / OpenAI client"] -- "HTTP localhost:1234/v1" --> B["LM Studio server"]
+  B --> C["Local open-weight model (GGUF / MLX)"]
+  C --> D["CPU or GPU: Metal, CUDA, Vulkan"]
+  B -- "chat completion" --> A
+```
+
 ---
 
 ## 2. INSTALLATION & SETUP

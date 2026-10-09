@@ -41,6 +41,21 @@
 
 **When *not* to write a design doc:** small, reversible changes where the code review is the design review. Rule of thumb: write one when the change is **hard to reverse, touches multiple teams, or takes more than ~2 weeks of effort**.
 
+*Figure: choosing which document to write.*
+
+```mermaid
+flowchart TD
+  Q{"Hard to reverse, multi-team, or takes weeks?"}
+  Q -- No --> CR[Code review is the design review]
+  Q -- Yes --> W{"Decide whether or how?"}
+  W -- Whether --> OP[One-pager]
+  W -- How --> X{"Cross-team or org-wide?"}
+  X -- No --> DD[Design doc]
+  X -- Yes --> RFC[RFC with named approvers]
+  DD --> ADR[ADR records the decision]
+  RFC --> ADR
+```
+
 ---
 
 ## 3. Design doc template
@@ -129,6 +144,16 @@ Benchmarks, detailed calculations, references.
 ---
 
 ## 5. Running the review
+
+*Figure: design review lifecycle.*
+
+```mermaid
+flowchart LR
+  A[Pre-socialize with affected people] --> B[Circulate doc, 3-5 day comment window]
+  B --> C[Meeting on blocking disagreements only]
+  C --> D[Decide by deadline]
+  D --> E[Record decision, update status]
+```
 
 **Before:**
 - **Pre-socialize** with the 2–3 people most affected. Nobody should be surprised in the formal review.

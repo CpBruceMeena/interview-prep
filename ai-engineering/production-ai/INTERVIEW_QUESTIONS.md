@@ -154,6 +154,20 @@ RULES:
 
 **✅ Answer:** If faithfulness remains broken after prompt changes and reranking, run the same faithfulness eval set against other models; instruction-following on grounded tasks varies a lot between model families and sizes, so this is an empirical choice, not a brand choice. Use the provider's citation/grounding features where they exist (several APIs can return citations tied to supplied documents). As a hard gate, add **factored verification**: split the answer into claims and check each with an NLI model or judge; reject or regenerate answers whose claims are not entailed. Finally, consider fine-tuning on grounded QA examples if the volume justifies it.
 
+*Figure: confirm it is a faithfulness failure, then fix in order of cost.*
+
+```mermaid
+flowchart TD
+  A["Wrong answer reported"] --> B["Log the exact context the model saw"]
+  B --> C{"Answer present in context?"}
+  C -- "no" --> D["Retrieval or knowledge gap, not faithfulness"]
+  C -- "yes" --> E["Faithfulness failure"]
+  E --> F["Fewer, better-ranked chunks"]
+  F --> G["Explicit grounded-answer instruction with citations"]
+  G --> H["Post-generation groundedness check"]
+  H --> I["Measure on faithfulness eval set"]
+```
+
 ---
 
 ## 2. RAG retrieval is too slow on large knowledge base
@@ -1071,6 +1085,17 @@ kubectl logs -l app=rag-service --tail=100 --since=1h
 5. **Version tags on every trace**: prompt version, model snapshot, embedding model, index build ID and retriever config attached to each request trace, so "what changed" is a query, not an investigation.
 6. **Canary eval on every change**: run a golden set against any new prompt, model, or index build before it takes traffic.
 
+*Figure: isolate what changed, then split retrieval from generation.*
+
+```mermaid
+flowchart TD
+  A["Answers suddenly wrong"] --> B["What changed and when? Correlate with traces"]
+  B --> C["Mitigate: roll back, pin versions"]
+  C --> D{"Right context retrieved?"}
+  D -- "no" --> E["Retrieval: index, embeddings, chunking, filters"]
+  D -- "yes" --> F["Generation: prompt, model, context assembly"]
+```
+
 ---
 
 ## 7. Design a production AI coding assistant
@@ -1428,6 +1453,19 @@ class LatencyTriage:
 
 **✅ Answer:** Make latency a managed budget rather than a surprise: (1) per-route **SLOs on TTFT and total latency** with alerts tied to token counts, cache hit rate and retry rate, so a regression points at its cause; (2) **prompt (prefix) caching**: put the static system prompt, tool definitions and shared documents first so repeated prefixes skip prefill, which cuts TTFT and input cost on cache hits (it does not speed up decode); (3) **token budgets** on history, retrieval and output; (4) **streaming** so users see the first tokens quickly; (5) **exact/semantic response caching** only for safe, repeatable intents; and (6) a **fallback path** (smaller model, other region/provider) behind a circuit breaker.
 
+*Figure: decompose end-to-end latency into your time and model time (TTFT plus decode).*
+
+```mermaid
+flowchart TD
+  A["End-to-end latency"] --> B["Your time: retrieval, tools, guardrails, retries"]
+  A --> C["Model time"]
+  C --> D["TTFT: network, queueing, prefill"]
+  C --> E["Decode: output tokens x time per token"]
+  D --> F{"Same token counts?"}
+  F -- "yes" --> G["Suspect queueing, rate limits, provider load"]
+  F -- "no" --> H["Suspect longer input or hidden reasoning output"]
+```
+
 ---
 
 ## 9. Design an enterprise AI agent
@@ -1751,6 +1789,28 @@ class ScopedToolRegistry:
 7. **Tenant data isolation**: enforced in the data layer (row-level security, per-tenant indexes/namespaces, per-tenant keys), not by the prompt.
 
 **What they probe next:** how you red-team it (an injection test suite in CI), how approvals avoid rubber-stamping (risk-tiered, batched, with clear diffs), and how you'd detect a compromised session (anomalous tool sequences, unusual destinations).
+
+*Figure: the harness, not the model, enforces security on each tool call.*
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant H as Harness
+  participant M as Model (untrusted)
+  participant T as Tool
+  U->>H: Request (authenticated)
+  H->>M: Prompt with tools allowed for this role
+  M-->>H: Proposed tool call
+  H->>H: Validate schema and policy, check user permissions
+  alt irreversible action
+    H->>U: Ask for approval
+    U-->>H: Approve
+  end
+  H->>T: Execute as the user
+  T-->>H: Result (untrusted)
+  H->>H: Write audit record, enforce budgets
+  H->>M: Result as data
+```
 
 ---
 
@@ -2576,6 +2636,18 @@ class EvalDashboard:
 3. **Semantic entropy**: sample several answers, cluster them by meaning (bidirectional entailment), and compute entropy over the clusters, not over raw token probabilities. High entropy = the model gives semantically different answers = likely confabulation. (Token-level entropy/log-probs are a cheaper, weaker signal, and only available where the API exposes them.)
 
 Combine them, but be honest about cost: methods 2 and 3 multiply inference spend, so run them on high-risk intents or a sample of traffic, and validate every detector against human labels before using it as a gate.
+
+*Figure: offline, online and feedback loops that keep the golden set current.*
+
+```mermaid
+flowchart LR
+  A["Change: prompt, model, retrieval"] --> B["Offline: golden set, code checks, LLM judge, CI gate"]
+  B --> C["Deploy: A/B or shadow"]
+  C --> D["Online: traces, sampled automated checks, user signals"]
+  D --> E["Failures and disagreements to human review"]
+  E --> F["Add labelled cases to golden set"]
+  F --> B
+```
 
 ---
 

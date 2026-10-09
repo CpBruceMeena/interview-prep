@@ -40,6 +40,33 @@
 
 ---
 
+*Figure: tables and foreign keys, generated from the DDL below (one-to-many from parent to child).*
+
+```mermaid
+erDiagram
+  game_sessions ||--o{ game_analysis : "game_id"
+  game_sessions ||--o{ game_moves : "game_id"
+  game_sessions ||--o{ tournament_matches : "game_id"
+  game_sessions ||--o{ user_rating_history : "game_id"
+  tournament_rounds ||--o{ tournament_matches : "round_id"
+  tournaments ||--o{ tournament_matches : "tournament_id"
+  tournaments ||--o{ tournament_registrations : "tournament_id"
+  tournaments ||--o{ tournament_rounds : "tournament_id"
+  users ||--o{ game_sessions : "black_player_id"
+  users ||--o{ game_sessions : "white_player_id"
+  users ||--o{ game_sessions : "winner_id"
+  users ||--o{ tournament_matches : "player1_id"
+  users ||--o{ tournament_matches : "player2_id"
+  users ||--o{ tournament_registrations : "user_id"
+  users ||--o{ tournaments : "created_by"
+  users ||--o{ user_friendships : "addressee_id"
+  users ||--o{ user_friendships : "requester_id"
+  users ||--o{ user_rating_history : "opponent_id"
+  users ||--o{ user_rating_history : "user_id"
+  users ||--o{ user_sessions : "user_id"
+  users ||--o{ user_stats : "user_id"
+```
+
 ## 🏛️ Complete DDL
 
 ```sql

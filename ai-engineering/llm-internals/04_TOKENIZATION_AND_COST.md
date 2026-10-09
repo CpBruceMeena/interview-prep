@@ -128,6 +128,16 @@ That asymmetry (general serving economics, not a published Anthropic cost model)
 
 These are uncached. In an agent loop most input is a repeated prefix, so with caching the input part typically falls by well over half.
 
+*Figure: how a request is billed.*
+
+```mermaid
+flowchart LR
+  A["Request"] --> B["Input tokens: lower rate"]
+  A --> C["Output tokens: higher rate, includes thinking"]
+  B --> D["Total cost"]
+  C --> D
+```
+
 ---
 
 ## 4. PROMPT CACHING
@@ -179,6 +189,18 @@ Turn 1 costs *more* (the 25% write premium); every later turn is far cheaper; th
 - Adding, removing or reordering tools mid-session.
 - Switching models, or changing settings that alter the rendered prompt (e.g. thinking or effort configuration).
 - Gaps longer than the TTL between requests.
+
+*Figure: a cache hit reuses the identical prefix; a changed prefix forces a rewrite.*
+
+```mermaid
+flowchart TD
+  A["New request with cache_control"] --> B{"Prefix identical to a cached one?"}
+  B -- "yes" --> C["Cache read: cheap, faster prefill"]
+  B -- "no" --> D["Cache write: process full prefix"]
+  C --> E["Process only the new suffix"]
+  D --> E
+  E --> F["Generate response"]
+```
 
 ---
 

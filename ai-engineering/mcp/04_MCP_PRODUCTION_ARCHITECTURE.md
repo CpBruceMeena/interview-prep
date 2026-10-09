@@ -49,6 +49,20 @@ The gateway may also validate tokens, but each server must still check that the 
 
 **What changed with 2026-07-28:** older Streamable HTTP servers that minted `Mcp-Session-Id`, or sent requests back to the client on an SSE stream, needed sticky routing or a shared session store. With sessions and server-initiated requests gone (MRTR instead), any replica can serve any request. Servers still speaking 2025-era clients may need both behaviours during the migration.
 
+*Figure: gateway in front of stateless MCP server replicas, with an IdP issuing tokens.*
+
+```mermaid
+flowchart TD
+  H["MCP hosts: Claude, IDEs, agents"] -- "POST /mcp with Bearer token" --> G["Gateway / load balancer: TLS, rate limits, header routing"]
+  G --> A["MCP Server A: database"]
+  G --> B["MCP Server B: ticketing API"]
+  G --> C["MCP Server C: RAG"]
+  IdP["Authorization server (IdP)"] -. "issues audience-bound tokens" .-> H
+  A --> O["OpenTelemetry traces, metrics, audit logs"]
+  B --> O
+  C --> O
+```
+
 ### 1.2 Kubernetes Deployment
 
 ```yaml
@@ -213,6 +227,19 @@ Layer 6: Observability & Audit
 └── Trace context via _meta (traceparent) end to end
 ```
 
+*Figure: layered defences between a request and the downstream system.*
+
+```mermaid
+flowchart LR
+  R["Request"] --> L1["Network: TLS, egress allow-list"]
+  L1 --> L2["AuthN/Z: token aud, scopes, RBAC"]
+  L2 --> L3["Input/output handling: schema, caps"]
+  L3 --> L4["Sandbox: container, limits"]
+  L4 --> L5["Human in the loop: confirmation"]
+  L5 --> T["Tool executes"]
+  T --> L6["Audit log and tracing"]
+```
+
 ### 2.3 Auth Middleware Implementation
 
 The repo's [`common/auth.py`](common/index.md) shows the pieces. The two mistakes it avoids are worth naming in an interview:
@@ -362,6 +389,17 @@ With stateless Streamable HTTP there is no MCP connection to manage per client; 
 | **JWKS / token introspection** | Signing keys, introspection results | Per `Cache-Control`; short for introspection | Key rotation (`kid` miss → refetch) |
 
 `cacheScope: "private"` on list results tells shared intermediaries not to cache a per-user tool list.
+
+*Figure: caching tool lists and results in front of the server and its dependencies.*
+
+```mermaid
+flowchart LR
+  A["Tool call"] --> B{"Query result cached?"}
+  B -- "hit" --> C["Return cached result"]
+  B -- "miss" --> D["Run tool: retrieval, DB"]
+  D --> E["Store with tenant and permissions in key"]
+  E --> C
+```
 
 ---
 

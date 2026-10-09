@@ -28,6 +28,22 @@ async def main():
 3. The loop runs one callback at a time on one thread: concurrency, not parallelism.
 4. **Races still exist in asyncio**, but only across `await` points. `if x not in d: await something(); d[x] = ...` is a check-then-act race. In this design `_take_next()` has no `await`, so it is atomic with respect to other coroutines.
 
+*Figure: an await suspends the coroutine and hands control back to the event loop.*
+
+```mermaid
+sequenceDiagram
+  participant L as Event loop
+  participant A as Task 1
+  participant B as Task 2
+  L->>A: Run until first await
+  A-->>L: Suspend (waiting on I/O)
+  L->>B: Run until first await
+  B-->>L: Suspend
+  L->>A: Resume when ready
+  A-->>L: Done
+  L->>B: Resume when ready
+```
+
 ---
 
 ## Question 2: GIL — Threads vs Processes
@@ -103,6 +119,20 @@ Note that `task.cancel()` does not run the target's `finally` block synchronousl
 3. The worker awaits the attempt; the outcome goes through `_finish()` or back to `_delayed` for a retry.
 
 Why not `asyncio.Queue`? It's FIFO only, so priority would only apply within whatever batch you sorted before putting. (`asyncio.PriorityQueue` would work for static priority, but not for delayed retries or dependencies.) Also, `asyncio.Queue` is **not thread-safe**. Only the loop thread may call `put`/`get`; other threads must go through `call_soon_threadsafe` or `run_coroutine_threadsafe`.
+
+*Figure: where submit() routes a job, and how a worker takes it.*
+
+```mermaid
+flowchart TD
+  S[submit] --> D{"Dependencies unmet?"}
+  D -- Yes --> BL["_blocked"]
+  D -- No --> F{"run_at in future?"}
+  F -- Yes --> DL["_delayed"]
+  F -- No --> RD["_ready heap"]
+  DL -- "due, promoted by worker" --> RD
+  RD --> W["Worker pops smallest key, marks RUNNING"]
+  W --> FIN["_finish() or back to _delayed for retry"]
+```
 
 ---
 

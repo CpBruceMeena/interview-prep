@@ -93,6 +93,20 @@ def park_vehicle(self, vehicle: Vehicle) -> ParkingTicket:
 
 Note the private `_find_spot_locked`: the public `find_available_spot` also takes the lock, and `threading.Lock` is not re-entrant, so calling the public method from inside the critical section would deadlock. Splitting "public, locks" from "private, assumes lock held" is the standard fix (an `RLock` also works but hides the layering).
 
+*Figure: park() as one critical section, so check-then-act cannot double-book a spot.*
+
+```mermaid
+flowchart TD
+  A[park vehicle] --> L["Acquire lock"]
+  L --> B{"Plate already parked?"}
+  B -- Yes --> X1[VehicleAlreadyParkedError]
+  B -- No --> C["_find_spot_locked"]
+  C --> D{"Spot found?"}
+  D -- No --> X2[ParkingFullError]
+  D -- Yes --> E["Create ticket, mark spot occupied"]
+  E --> R["Release lock, return ticket"]
+```
+
 **💼 Production-Grade Solution (Distributed):**
 
 In a real system with multiple entry/exit terminals, application-level locks don't work across processes. You'd need:

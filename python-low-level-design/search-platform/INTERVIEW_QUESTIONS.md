@@ -35,6 +35,19 @@ def upsert(self, doc):
 
 **Why an inverted index?** Without one, a query scans every document: O(total text). With one, a query touches only the posting lists of its terms: O(Σ |postings(t)|) to gather candidates, plus O(m log k) to pick the top k of m candidates. For a rare term that's tiny. For a stop-word-like term it's most of the corpus, which is why engines keep per-term statistics and use tricks like WAND/MaxScore to skip low-scoring documents.
 
+*Figure: indexing and query paths meet at the inverted index.*
+
+```mermaid
+flowchart LR
+  D[Document] --> A1["Analyzer: lowercase, split, stop words, stem"]
+  A1 --> I[("Inverted index: postings + positions")]
+  Q[Query text] --> A2["Analyzer"]
+  A2 --> P["Query parser: +must, -not, phrases"]
+  P --> I
+  I --> S["Scorer: BM25 x boosts"]
+  S --> T["Top-k results"]
+```
+
 ---
 
 ## Question 2: Ranking with TF-IDF and BM25

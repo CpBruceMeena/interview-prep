@@ -54,6 +54,18 @@ Nowhere inside the book. **One writer per symbol** (a sequencer) and a queue in 
 
 In the code: `SymbolSequencer` owns the queue, `_seq`, the `Journal` and the `OrderBook`. Callers get a `Future`.
 
+*Figure: single writer per symbol; callers submit through a queue and get a Future.*
+
+```mermaid
+flowchart LR
+  C1[Client 1] --> Q["Queue"]
+  C2[Client 2] --> Q
+  Q --> S["SymbolSequencer: assign seq"]
+  S --> J["Journal (before apply)"]
+  S --> B["OrderBook: match"]
+  B --> F["Future result + listeners"]
+```
+
 Follow-up, *"what's still shared?"* The `Journal` (readers on other threads, hence its lock), listeners (run on the sequencer thread, must be fast and non-throwing), and `MatchingEngine._sequencers` (built once in `__init__`, read-only afterwards).
 
 ---
@@ -73,6 +85,15 @@ Follow-up, *"what's still shared?"* The `Journal` (readers on other threads, hen
 What breaks determinism (and how this code avoids it): reading wall-clock time (time priority is `seq`), randomness, iterating hash sets/maps whose order isn't defined (Python dicts are insertion-ordered; `_in_heap` is never iterated), floating point, and multi-threaded mutation.
 
 Journal inputs or outputs? Inputs: they're smaller, they're what must be ordered, and outputs are derivable. You still persist outputs (trades) for downstream consumers, but they are not the recovery source of truth.
+
+*Figure: recovery from snapshot plus journal replay.*
+
+```mermaid
+flowchart LR
+  A["Engine dies"] --> B["Load latest snapshot (last applied seq)"]
+  B --> C["Replay journal from seq + 1"]
+  C --> D["Book restored, resume"]
+```
 
 ---
 

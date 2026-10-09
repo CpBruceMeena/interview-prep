@@ -202,6 +202,23 @@ PUT _cluster/settings
 - For time-series data, use **data streams with rollover on `max_primary_shard_size: 50gb`**, not one index per day. That keeps shard size steady as volume changes.
 - The old "20 shards per GB of heap" rule was replaced (8.3+) by guidance based on fields per shard. Check the heap estimate via `GET _nodes/stats`.
 
+**Diagram: peer recovery when a shard copy relocates to a new node.**
+
+```mermaid
+sequenceDiagram
+participant M as Master allocator
+participant S as Source node
+participant T as Target node
+M->>T: Start relocation of shard copy
+T->>S: Request segment files
+S-->>T: Copy files (throttled by max_bytes_per_sec)
+T->>S: Request operations since copy began
+S-->>T: Replay ops from soft-deletes history
+T->>M: Shard started
+M->>S: Remove old copy
+Note over S: Source serves reads and writes throughout
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -487,6 +504,21 @@ node.roles: []
 
 **Why dedicated masters:** the master maintains cluster state (mappings, routing table, settings) and runs allocation. If it shares a node with heavy search or indexing, GC pauses and resource contention delay cluster-state updates and can trigger re-elections. The master doesn't route search or index requests (any node can coordinate). Three dedicated masters across three zones survive the loss of one zone.
 
+**Diagram: network partition with 2 of 3 master-eligible nodes on one side.**
+
+```mermaid
+flowchart LR
+subgraph S1["Side 1: M1, M2, D1-D4"]
+A["2 of 3 voters: majority"] --> B["Keeps or elects master"]
+B --> C["Promotes replicas, writes continue"]
+end
+subgraph S2["Side 2: M3, D5-D7"]
+D["1 of 3 voters: no majority"] --> E["No master: writes blocked"]
+E --> F["Local reads may be stale"]
+end
+S1 -. "partition" .- S2
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -574,6 +606,22 @@ Adding replicas afterwards copies finished segments, which is cheaper than index
 | Enough primaries on the write index, spread across hot nodes | Parallelism. `total_shards_per_node` avoids stacking. |
 | Ingest pipelines: watch `_nodes/stats/ingest` | Grok/regex processors are often the hidden CPU cost |
 | NVMe on hot nodes, `indices.memory.index_buffer_size` (10% default) if many active shards | Disk fsync latency is the floor for `durability: request` |
+
+**Diagram: bulk write path, durable at ack but searchable only after refresh.**
+
+```mermaid
+sequenceDiagram
+participant C as Client
+participant P as Primary shard
+participant R as Replicas
+C->>P: Bulk request
+P->>P: Index into Lucene buffer, append translog
+P->>R: Forward operations (parallel)
+R->>R: Index, append translog, fsync
+P->>P: fsync translog (durability=request)
+P-->>C: Ack (durable, not yet searchable)
+Note over P: Refresh makes it searchable, flush commits and rolls translog
+```
 
 ### 🔍 Staff-Level Evaluation
 
@@ -821,6 +869,17 @@ Cold (30–90 d):  searchable snapshots: 1 local copy + S3. Or frozen tier: S3 +
 - Query the data stream with a `@timestamp` range filter. Shards whose time range doesn't overlap are skipped in the `can_match` pre-filter phase. You don't need index-name patterns or date math.
 - Keep the last 7 days on hot nodes with enough RAM for the page cache to hold the hot working set. Give dashboards pre-aggregated or downsampled data. Watch shards per query and shard sizes.
 - Run queries that reach cold or frozen data asynchronously (`_async_search`) with a looser SLA.
+
+**Diagram: index lifecycle across tiers in the ILM policy above.**
+
+```mermaid
+stateDiagram-v2
+[*] --> Hot
+Hot --> Warm: rollover, then min_age 7d (downsample, forcemerge)
+Warm --> Cold: min_age 30d (searchable snapshot)
+Cold --> Delete: min_age 90d, snapshot confirmed
+Delete --> [*]
+```
 
 ### 🔍 Staff-Level Evaluation
 

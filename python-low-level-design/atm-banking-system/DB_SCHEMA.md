@@ -38,6 +38,29 @@
 
 ---
 
+*Figure: tables and foreign keys, generated from the DDL below (one-to-many from parent to child).*
+
+```mermaid
+erDiagram
+  accounts ||--o{ cards : "account_id"
+  accounts ||--o{ daily_limits : "account_id"
+  accounts ||--o{ scheduled_payments : "account_id"
+  accounts ||--o{ transactions : "account_id"
+  atm_machines ||--o{ atm_cash_inventory : "atm_id"
+  atm_machines ||--o{ atm_sessions : "atm_id"
+  atm_machines ||--o{ transactions : "atm_id"
+  cards ||--o{ atm_sessions : "card_id"
+  cards ||--o{ fraud_alerts : "card_id"
+  cards ||--o{ transactions : "card_id"
+  customers ||--o{ accounts : "customer_id"
+  customers ||--o{ atm_sessions : "customer_id"
+  customers ||--o{ cards : "customer_id"
+  customers ||--o{ fraud_alerts : "customer_id"
+  employees ||--o{ fraud_alerts : "reviewed_by"
+  idempotency_keys
+  audit_log
+```
+
 ## 🏛️ Complete DDL
 
 ```sql

@@ -64,6 +64,20 @@ Each answer leads with a **30-second answer**, then the mechanism, then trade-of
  Ln:  holds ~90% of the data
 ```
 
+*Diagram: LSM write path and point-read path.*
+
+```mermaid
+flowchart TD
+    W["Write"] --> WAL["Append to WAL"]
+    WAL --> MT["Insert into MemTable"]
+    MT -->|"Full"| FL["Flush as L0 SSTable"]
+    FL -->|"Compaction"| LN["L1 ... Ln, one sorted run per level"]
+    R["Point read"] --> MT
+    MT -->|"Miss"| L0["Check every L0 file"]
+    L0 -->|"Miss"| LV["One file per level, Bloom filters skip most"]
+```
+
+
 L0 is the only level whose files overlap, because each is a flushed memtable. From L1 down, each level is one sorted run split into files, so a point read touches at most one file per level.
 
 **B-tree structure:** fan-out is in the hundreds (8 KB Postgres pages, 16 KB InnoDB pages), so four levels address billions of keys:
@@ -261,6 +275,22 @@ COMMIT;
                                            COMMIT;
 Result: A = 900, B = 500, total = 1400 (T1's credit to B is lost)
 ```
+
+*Diagram: the lost-update interleaving under READ COMMITTED.*
+
+```mermaid
+sequenceDiagram
+    participant T1 as T1 (transfer)
+    participant DB as accounts row B
+    participant T2 as T2 (ORM edit)
+    T2->>DB: SELECT B (balance 500)
+    T1->>DB: UPDATE B balance + 100 (600)
+    T1->>DB: COMMIT
+    T2->>DB: UPDATE B SET balance = 500
+    Note over DB: READ COMMITTED overwrites, T1's credit is lost
+    T2->>DB: COMMIT
+```
+
 
 What each engine does with T2's final UPDATE:
 
@@ -636,6 +666,19 @@ user_id ──hash──► logical shard 0..4095 ──directory (cached, versi
 5. Unfreeze; routers pick up the new version (push invalidation, or reject stale-version requests at the old shard).
 6. Keep the old copy read-only for a while as a rollback path, then delete it.
 
+*Diagram: moving one logical shard with only a brief write freeze.*
+
+```mermaid
+flowchart LR
+    A["Copy rows from consistent snapshot"] --> B["Stream changes (CDC) until lag near zero"]
+    B --> C["Freeze writes for that shard"]
+    C --> D["Verify lag = 0, checksums"]
+    D --> E["Bump directory entry, new version"]
+    E --> F["Unfreeze, routers use new target"]
+    F --> G["Keep old copy read-only, then delete"]
+```
+
+
 **Off-the-shelf:** Vitess (MySQL), Citus (PostgreSQL, including schema-based sharding), and distributed SQL (Spanner, CockroachDB, YugabyteDB, Aurora Limitless) automate placement and moves at the cost of their own constraints.
 
 **What they probe next:** hot shards (one viral user; split the hot logical shard or isolate the tenant), uneven growth (move logical shards, don't rehash), and backups and schema migrations across thousands of shards (run them as a fleet with orchestration, idempotency and canaries).
@@ -706,6 +749,23 @@ class ClockSweep:
 - **Insertion is concurrent:** a backend reserves space under a short spinlock, then copies its record into the WAL buffers holding one of 8 WAL-insertion locks. Flushing is serialised by `WALWriteLock`, and **group commit** lets one `fsync` cover every commit waiting behind it.
 - Commit = append a commit record, then flush WAL up to it (`wal_sync_method` defaults to `fdatasync` on Linux). Data pages are *not* written at commit.
 - **Full-page writes:** the first modification of a page after a checkpoint logs the whole 8 KB page, so recovery can repair a torn (partially written) page. Right after each checkpoint, WAL volume spikes.
+
+*Diagram: commit makes only WAL durable; data pages are written later by checkpoints.*
+
+```mermaid
+sequenceDiagram
+    participant B as Backend
+    participant SB as Shared buffers
+    participant W as WAL
+    participant D as Data files
+    B->>SB: Modify page, stamp with LSN
+    B->>W: Append record, then commit record
+    B->>W: fsync WAL up to commit (group commit)
+    W-->>B: Commit acknowledged
+    Note over SB,D: Later, checkpoint writes dirty pages, never before their WAL is durable
+    SB->>D: Write dirty buffers
+```
+
 
 **Checkpoint, in order:**
 
@@ -1114,6 +1174,17 @@ ALTER TABLE users DROP CONSTRAINT users_timezone_chk;
 -- CONTRACT: remove old code paths; drop a replaced column (catalog-only, still needs lock_timeout)
 ALTER TABLE users DROP COLUMN old_timezone;
 ```
+
+*Diagram: the expand, backfill, contract sequence for a schema change.*
+
+```mermaid
+flowchart LR
+    E["Expand: add nullable column, lock_timeout"] --> D["Deploy app that writes both, tolerates NULL"]
+    D --> BF["Backfill in PK-range batches, watch replica lag"]
+    BF --> EN["Enforce NOT NULL via NOT VALID constraint + VALIDATE"]
+    EN --> C["Contract: remove old code paths, drop old column"]
+```
+
 
 Why PK ranges and not `WHERE timezone IS NULL LIMIT 10000`? The latter rescans already-processed rows and dead tuples on every batch, so it gets slower as it goes; ranges keep each batch an index range scan. Each batch commits on its own, so VACUUM can keep up and replicas don't fall behind on one huge transaction.
 

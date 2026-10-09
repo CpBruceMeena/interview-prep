@@ -412,6 +412,19 @@ class CacheAwareRouter:
         return {"response": response, "source": "llm"}
 ```
 
+*Figure: exact cache, then semantic cache, then the model; prompt caching applies underneath.*
+
+```mermaid
+flowchart TD
+  A["Request"] --> B{"Exact-match hit?"}
+  B -- "yes" --> R["Return cached response"]
+  B -- "no" --> C{"Semantic cache allowed and hit?"}
+  C -- "yes" --> R
+  C -- "no" --> D["Call model (provider prompt cache applies)"]
+  D --> E["Write back to caches in background"]
+  E --> R2["Return response"]
+```
+
 ---
 
 ## 4. Retry Policies & Exponential Backoff
@@ -629,6 +642,19 @@ async def call_llm_with_retry(model: str, messages: list) -> str:
 ```
 
 Two production details: cap retries with a **retry budget** (e.g. retries may add at most 10% extra load) so a provider brown-out isn't amplified by your own traffic, and remember that a timed-out request may still have been processed and billed, so a retry can double-charge tokens.
+
+*Figure: retry only transient errors with exponential backoff, honouring retry-after.*
+
+```mermaid
+flowchart TD
+  A["Model call"] --> B{"Result"}
+  B -- "success" --> C["Return"]
+  B -- "429, 5xx, timeout, connection error" --> D{"Attempts left?"}
+  D -- "yes" --> E["Wait: exponential backoff, respect retry-after"]
+  E --> A
+  D -- "no" --> F["Fall back or fail"]
+  B -- "other 4xx" --> F
+```
 
 ---
 

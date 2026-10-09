@@ -26,6 +26,19 @@ Reservation (customer, vehicle, pickup, dropoff, quote, status) ── owns one 
 4. **State machine:** `PENDING (hold, TTL) → CONFIRMED → IN_PROGRESS → COMPLETED`, plus `CANCELLED`, `EXPIRED`.
 5. **`VehicleStatus` is physical only** (on the lot / rented). A car booked for Friday is still on the lot today.
 
+*Figure: reservation lifecycle.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING: hold with TTL
+  PENDING --> CONFIRMED: paid while hold live
+  PENDING --> EXPIRED: hold lapsed
+  PENDING --> CANCELLED
+  CONFIRMED --> IN_PROGRESS: pickup
+  CONFIRMED --> CANCELLED
+  IN_PROGRESS --> COMPLETED: dropoff
+```
+
 **Weekly view response** (projection of the intervals):
 ```json
 {"vehicle_id": "V1", "week_start": "2025-01-13",
@@ -70,6 +83,16 @@ Insert the block immediately in `PENDING` with `hold_expires_at = now + 10 min`.
 - **Expiry without cron dependence:** in memory, expired holds are purged lazily on the next read/write of that car's schedule (`purge_expired`), and `expire_holds()` sweeps statuses.
 - **In Postgres** a constraint predicate can't reference `now()` (must be immutable). So: a sweeper sets `active = false` on lapsed holds every few seconds, and on an exclusion violation the booking path checks whether the blocker is a lapsed hold, expires it with a conditional UPDATE (`... WHERE id=? AND status='PENDING' AND hold_expires_at < now()`), and retries once.
 - **Payment idempotency:** the payment call carries the reservation id as the idempotency key; a retried confirm never double-charges.
+
+*Figure: booking with an expiring hold.*
+
+```mermaid
+flowchart TD
+  A["Insert block as PENDING, hold_expires_at = now + 10 min"] --> B["Customer pays (key = reservation id)"]
+  B --> C{"Hold still live?"}
+  C -- Yes --> D[CONFIRMED]
+  C -- No --> E["EXPIRED, search again"]
+```
 
 ---
 

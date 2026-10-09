@@ -114,6 +114,20 @@
                               └────────────────────────────────────────┘
 ```
 
+*Figure: client, upload service, storage and the async processing pipeline.*
+
+```mermaid
+flowchart TB
+  CL["Client: splitter, chunk manager, TUS client"] --> GW["API gateway: auth, rate limit, TLS"]
+  GW --> US["Upload service (FastAPI)"]
+  US --> DB[("Metadata DB: PostgreSQL")]
+  US --> OS[("Object store: S3 / MinIO")]
+  US --> MQ["Message queue: file.uploaded"]
+  MQ --> VS["Virus scanner"]
+  VS --> TR["Transcoder"]
+  TR --> NO["Notifier"]
+```
+
 ---
 
 ## 3. DETAILED DESIGN FLOW
@@ -154,6 +168,18 @@
               │ (available   │ │ (flagged for │
               │  for download│ │  review)     │
               └──────────────┘ └──────────────┘
+```
+
+*Figure: upload lifecycle states.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> INITIATED
+  INITIATED --> IN_PROGRESS: first chunk
+  IN_PROGRESS --> COMPLETED: all chunks, integrity ok
+  COMPLETED --> PROCESSING: queued
+  PROCESSING --> READY: clean
+  PROCESSING --> QUARANTINED: infected
 ```
 
 ### 3.2 Step-by-Step Upload Flow
@@ -213,6 +239,32 @@ Client                Upload Service           Metadata DB          Object Store
   │                         │                      │                   │
   │                         │── PUBLISH ───────────────────────────────►│
   │                         │   file.uploaded → Kafka                  │
+```
+
+*Figure: initiate, parallel chunk upload, resume after a network drop, and complete.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant U as Upload service
+  participant D as Metadata DB
+  participant S as Object store
+  C->>U: POST /upload (filename, size, checksum)
+  U->>D: INSERT upload INITIATED
+  U-->>C: upload_id, chunk_size
+  loop chunks (parallel)
+    C->>U: PATCH chunk
+    U->>S: PUT chunk
+    U->>D: UPDATE chunk
+    U-->>C: received, checksum
+  end
+  Note over C,U: Network drops
+  C->>U: HEAD /upload/id
+  U-->>C: contiguous offset, missing chunks
+  C->>U: POST complete (checksum)
+  U->>S: Assemble multipart
+  U->>D: status COMPLETED
+  U--)S: Publish file.uploaded
 ```
 
 ### 3.3 Async Processing Flow

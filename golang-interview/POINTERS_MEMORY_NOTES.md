@@ -325,6 +325,20 @@ Measured with `testing.AllocsPerRun` (functions marked `//go:noinline`): A = 2 a
 | Calling a method through an interface | ⚠️ Maybe | The *call* doesn't allocate. Arguments can escape because the compiler can't see the callee, unless it devirtualizes (PGO helps) |
 | Method values `f := x.M` used locally | ❌ No | The bound closure can live on the stack (`l.Log does not escape`) |
 
+*Escape analysis is a static, conservative proof: if the compiler cannot show a variable is unreferenced after return (or its size is not small and known), it moves to the heap.*
+
+```mermaid
+flowchart TD
+    V["Variable in a function"] --> A{"Address outlives the frame? (returned, global, channel, escaping closure)"}
+    A -->|yes| H["Heap: moved to heap"]
+    A -->|no| I{"Passed behind an interface or reflection that retains it?"}
+    I -->|yes| H
+    I -->|no| S{"Size known and small enough? (constant make/new up to 64 KB)"}
+    S -->|no| H
+    S -->|yes| ST["Stack: free alloc and free dealloc"]
+    H --> GC["Freed later by the GC"]
+```
+
 ---
 
 ## 4. Pass by Value — But Everything Is a Copy
@@ -408,6 +422,23 @@ type slice struct {
 // reflect.SliceHeader / StringHeader are DEPRECATED (Go 1.20+): their Data
 // field is a uintptr the GC doesn't track. Use unsafe.Slice, unsafe.SliceData,
 // unsafe.String and unsafe.StringData instead.
+```
+
+*Passing a slice copies only the 24-byte header, so element writes are shared, but an `append` in the callee changes only its own copy of `len`.*
+
+```mermaid
+flowchart LR
+    subgraph CALLER["Caller"]
+        n["nums: ptr, len 3, cap 10"]
+    end
+    subgraph CALLEE["appendSlice(s)"]
+        s["s (copy): ptr, len 3 becomes 4, cap 10"]
+    end
+    subgraph ARR["Shared backing array, cap 10"]
+        a0["1"] --- a1["2"] --- a2["3"] --- a3["4 written by callee"] --- a4["unused"]
+    end
+    n --> a0
+    s --> a0
 ```
 
 ### The `map` Gotcha
@@ -562,6 +593,22 @@ func (n *Node) Sum() int {
 }
 ```
 
+*An interface is a `(type, value)` pair, so returning a typed nil pointer yields a non-nil interface: only both words nil compare equal to `nil`.*
+
+```mermaid
+flowchart LR
+    subgraph B["var b Animal = nil"]
+        b1["tab: nil"]
+        b2["data: nil"]
+    end
+    subgraph A["return (*Dog)(nil) as Animal"]
+        a1["tab: itab for Animal, *Dog"]
+        a2["data: nil"]
+    end
+    B --> BR["b == nil is true"]
+    A --> AR["a == nil is false"]
+```
+
 ---
 
 ## 7. Memory Alignment & Padding
@@ -626,6 +673,20 @@ type GoodCounter struct {
 // ✅ Fix 2 (legacy): put the int64 FIRST. sync/atomic guarantees that the first
 // word of an allocated struct, array or slice, and of a global variable, is
 // 64-bit aligned. (This does NOT hold for a struct embedded inside another one.)
+```
+
+*Field order changes padding: putting the 8-byte field first shrinks the struct from 24 to 16 bytes.*
+
+```mermaid
+flowchart TD
+    subgraph BAD["BadStruct: bool, int64, bool = 24 bytes"]
+        direction LR
+        b1["A: 1 byte"] --> b2["padding: 7"] --> b3["B: 8 bytes"] --> b4["C: 1 byte"] --> b5["padding: 7"]
+    end
+    subgraph GOOD["GoodStruct: int64, bool, bool = 16 bytes"]
+        direction LR
+        g1["B: 8 bytes"] --> g2["A: 1"] --> g3["C: 1"] --> g4["tail padding: 6"]
+    end
 ```
 
 ---
@@ -756,6 +817,18 @@ type FlatCache struct {
 ```
 
 This is the technique behind "GC-free" caches such as `bigcache` and `freecache`, and behind large in-memory indexes. The trade-offs: you manage space yourself (deletes leave holes, so you need compaction), lookups need hashing plus collision checks, and the code is harder to read. Use it for multi-GB heaps where profiles show GC mark time, not by default. Since Go 1.26 the **Green Tea** collector scans small objects span by span with better locality, which makes pointer-heavy heaps cheaper than before. It doesn't change the basic rule that pointer-free memory is the cheapest kind to have.
+
+*The GC marks from roots (globals and goroutine stacks) and scans only objects that contain pointers; pointer-free ("noscan") objects are marked live but never read.*
+
+```mermaid
+flowchart TD
+    R["Roots: globals and goroutine stacks"] --> O{"Reachable heap object"}
+    O -->|"contains pointers"| SC["Scan its fields, mark referents"]
+    O -->|"pointer-free: noscan span"| MK["Mark live, never look inside"]
+    SC --> O
+    MK --> SW["Sweep frees everything unmarked"]
+    SC --> SW
+```
 
 ### Practical GC Optimization
 

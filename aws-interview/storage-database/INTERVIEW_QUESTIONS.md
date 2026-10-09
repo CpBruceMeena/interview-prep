@@ -68,6 +68,17 @@ Rules:
     AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
 ```
 
+*The raw/ lifecycle rule above: objects age down through storage classes and finally expire.*
+
+```mermaid
+flowchart LR
+    S[S3 Standard] -->|"day 30"| IA[Standard-IA]
+    IA -->|"day 90"| GIR[Glacier Instant Retrieval]
+    GIR -->|"day 365"| DA[Deep Archive]
+    DA -->|"day 2555"| X[Expire]
+```
+
+
 - Lifecycle transitions cost a per-object request fee, and since September 2024 objects smaller than 128 KB are not transitioned by default. Millions of tiny objects can cost more to transition than to keep; compact them first.
 - Moving from IA to Glacier at day 31 is fine; deleting from Glacier IR before day 90 bills the remaining days.
 - Measure before choosing: **S3 Storage Lens** and **Storage Class Analysis** show actual access patterns per prefix.
@@ -150,6 +161,23 @@ def put_if_absent(bucket, key, body):
 def compare_and_swap(bucket, key, new_body, expected_etag):
     s3.put_object(Bucket=bucket, Key=key, Body=new_body, IfMatch=expected_etag)
 ```
+
+*Compare-and-swap on S3: the second writer's stale ETag fails the conditional PUT, so it must re-read and retry.*
+
+```mermaid
+sequenceDiagram
+    participant A as Writer A
+    participant B as Writer B
+    participant S as S3
+    A->>S: GET key (ETag v1)
+    B->>S: GET key (ETag v1)
+    A->>S: PUT key If-Match v1
+    S-->>A: 200 OK (ETag v2)
+    B->>S: PUT key If-Match v1
+    S-->>B: 412 PreconditionFailed
+    B->>S: Re-GET, then retry with v2
+```
+
 
 This is what lets table formats and simple "leader lease" or manifest files work on S3 without an external lock service. Bucket policies can require conditional writes (`s3:if-none-match` / `s3:if-match` condition keys).
 
@@ -236,6 +264,18 @@ ReplicationConfiguration:
 
 Multi-AZ doesn't help read performance with the instance deployment, and no option helps a write bottleneck: that needs query/index work, a bigger instance, batching, Aurora, or partitioning/sharding.
 
+*Multi-AZ gives availability with an unreadable standby, replicas give asynchronous read scaling, and a Multi-AZ DB cluster does both partly.*
+
+```mermaid
+flowchart LR
+    APP[Application] -->|"writes and reads"| P[Primary]
+    P ==>|"synchronous"| SB["Standby, not readable (Multi-AZ instance)"]
+    P -.->|"asynchronous"| RR["Read replica: stale reads"]
+    APP -->|"stale-tolerant reads"| RR
+    P ==>|"semi-synchronous"| RS["Two readable standbys (Multi-AZ DB cluster)"]
+```
+
+
 **Using wait events (PostgreSQL names):**
 
 | Dominant wait | Usually means | Fix |
@@ -300,6 +340,20 @@ readers ◄──── page cache invalidations      write quorum 4/6, read quo
                                             10 GiB protection groups, repaired in parallel
                                             continuous backup to S3 (PITR), up to 256 TiB
 ```
+
+*Aurora separates compute from a shared storage volume; the writer ships redo records and commits at 4 of 6 acknowledgements.*
+
+```mermaid
+flowchart TB
+    W[Writer instance] -->|"redo log records"| Q{"4 of 6 acks?"}
+    Q --> A1["AZ 1: 2 storage copies"]
+    Q --> A2["AZ 2: 2 storage copies"]
+    Q --> A3["AZ 3: 2 storage copies"]
+    Q -->|commit| W
+    R[Reader instances] -->|"read shared volume"| A1
+    A1 --> B[(Continuous backup to S3)]
+```
+
 
 - Survives loss of an entire AZ plus one more node for reads (AZ+1), and an AZ for writes.
 - Normal reads go to the one storage node known to be current; quorum reads only happen during recovery.
@@ -479,6 +533,19 @@ def get_like_count(post_id):                       # read: gather all shards (Ba
 - They appear in Streams as service deletions: `userIdentity = {"type": "Service", "principalId": "dynamodb.amazonaws.com"}`, which lets consumers tell expiry from a user delete (e.g. archive expired items to S3).
 - Metric: `TimeToLiveDeletedItemCount`.
 
+*DynamoDB change flow: TTL deletes and writes land in the stream, which feeds a consumer that updates search or archives expired items.*
+
+```mermaid
+flowchart LR
+    APP[Application writes] --> T[(DynamoDB table)]
+    TTL[TTL sweeper] -->|"deletes expired items"| T
+    T -->|"ordered per item, 24 h"| ST[DynamoDB Stream]
+    ST --> L[Lambda consumer]
+    L -->|"INSERT or MODIFY: upsert"| OS[(OpenSearch)]
+    L -->|"service delete: archive"| S3[(S3)]
+```
+
+
 **Streams → search index:**
 
 ```python
@@ -570,6 +637,23 @@ key "leaderboard:global"          → one slot → one shard (all ZADDs land the
 keys "{lb:2026-10-07}:eu", ":us"  → hash tag {…} forces the same slot, so multi-key ops work
 ```
 
+*Redis Cluster routing: the client hashes the key to a slot and sends it to the owning shard, following MOVED redirects after resharding.*
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S1 as Shard 1 (slots 0-5460)
+    participant S2 as Shard 2 (slots 5461-10922)
+    C->>C: CRC16(key) mod 16384 = slot 7000
+    C->>S2: ZADD leaderboard
+    S2-->>C: OK
+    Note over C,S1: After resharding, the old owner replies MOVED
+    C->>S1: Command for a moved slot
+    S1-->>C: MOVED slot, new shard
+    C->>S2: Retry on new owner and refresh slot map
+```
+
+
 - Clients cache the slot map and follow `MOVED`/`ASK` redirects during resharding.
 - Multi-key commands (`ZUNIONSTORE`, `MGET`, transactions) only work when all keys share a slot; use **hash tags** to co-locate related keys deliberately (and accept they share one shard's limits).
 
@@ -657,6 +741,18 @@ Lambda environments (hundreds) ──TLS──► RDS Proxy (multi-AZ, scales it
                                                                       (read-only endpoint → readers)
 ```
 
+*RDS Proxy multiplexes many client connections onto a small database pool, borrowing one per transaction.*
+
+```mermaid
+flowchart LR
+    L1[Lambda env 1] --> P[RDS Proxy]
+    L2[Lambda env 2] --> P
+    L3[Lambda env N] --> P
+    P -->|"borrow per transaction"| POOL["Small DB connection pool"]
+    POOL --> DB[(RDS or Aurora writer)]
+```
+
+
 - During Aurora or RDS Multi-AZ failover the proxy keeps client connections open and routes to the new writer, cutting failover time (AWS cites up to ~66% faster) and avoiding DNS caching issues.
 - Pricing: per vCPU-hour of the underlying instance (or per ACU-hour for Aurora Serverless v2), with a minimum.
 
@@ -739,6 +835,19 @@ conn = connect()     # module scope: reused by warm invocations
 
 !!! tip "30-second answer"
     Convert the schema first with **DMS Schema Conversion** (the managed successor to the Schema Conversion Tool), fix the code it can't convert (PL/SQL packages, `CONNECT BY`, empty-string-is-NULL semantics), and create the target schema yourself. Then run a DMS task in **full load + CDC** mode: bulk copy with secondary indexes and FKs off, CDC from Oracle redo/archive logs starting at the load's start point, then add indexes and let CDC catch up. Validate with DMS data validation plus your own aggregate checks. Cut over by stopping writes, waiting for zero CDC lag, switching the app, and keeping a reverse replication task ready for rollback. Never split live writes across both databases.
+
+*DMS migration phases: convert schema, full load, CDC catch-up, validate, then cut over.*
+
+```mermaid
+flowchart LR
+    SC[Convert schema and code] --> FL["Full load: indexes and FKs off"]
+    FL --> CDC["CDC from redo logs, catch up"]
+    CDC --> IDX[Add indexes and constraints]
+    IDX --> V[Validate data]
+    V --> CUT["Stop writes, zero lag, switch app"]
+    CUT --> RB[Reverse replication for rollback]
+```
+
 
 **Schema and type conversion (Oracle → PostgreSQL):**
 

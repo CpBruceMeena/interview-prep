@@ -117,6 +117,17 @@ Facts worth citing precisely:
 - **Claude's constitution** (published 21 Jan 2026, CC0): a long natural-language document explaining the values Anthropic wants Claude to have and *why*, rather than a list of rules. It orders priorities as broadly safe, broadly ethical, compliant with Anthropic's guidelines, then genuinely helpful, and lists a small set of hard constraints (for example, no serious uplift for weapons of mass destruction). Source: [anthropic.com/news/claude-new-constitution](https://www.anthropic.com/news/claude-new-constitution).
 - "Context window extension" as a named post-training phase is not something Anthropic documents; long-context ability comes from training and architecture choices that aren't public.
 
+*Figure: training pipeline from base model to deployed Claude.*
+
+```mermaid
+flowchart LR
+  A["Pre-training: next-token prediction"] --> B["Base model"]
+  B --> C["Supervised fine-tuning"]
+  C --> D["RLHF / RLAIF preference training"]
+  D --> E["Constitution and capability training"]
+  E --> F["Deployed Claude"]
+```
+
 ---
 
 ## 4. CONTEXT WINDOW
@@ -205,6 +216,19 @@ Then draw one token from what's left.
 ### Thinking (reasoning tokens)
 
 Current models can "think" before answering: they generate reasoning tokens in `thinking` content blocks, then the visible answer. With **adaptive thinking** the model decides how much to think, steered by `effort`. Thinking tokens are billed as output tokens. On current models the raw chain of thought is not returned: by default the thinking text is omitted, and `display: "summarized"` returns a summary. ([Thinking docs](https://platform.claude.com/docs/en/build-with-claude/thinking))
+
+*Figure: prefill runs once, decode loops one token at a time until a stop condition.*
+
+```mermaid
+flowchart TD
+  A["Input tokens"] --> B["Prefill: parallel, writes KV cache"]
+  B --> C["Logits for next token"]
+  C --> D["Sample one token"]
+  D --> E{"Stop condition?"}
+  E -- "no" --> F["Decode step: attend over KV cache, append K/V"]
+  F --> C
+  E -- "yes" --> G["Return stop_reason"]
+```
 
 ---
 

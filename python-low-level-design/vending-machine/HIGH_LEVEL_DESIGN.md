@@ -55,6 +55,22 @@ Auth  Inven-Trans-Price Moni-
     └──────┘ └──────┘
 ```
 
+*Figure: machine to cloud services.*
+
+```mermaid
+flowchart TB
+  M["Vending machine (Pi / STM32)"] -->|"MQTT, 4G backup"| E["IoT gateway / edge"]
+  E -->|"HTTPS / Kafka"| G["API gateway"]
+  G --> S1[Auth]
+  G --> S2[Inventory]
+  G --> S3[Transaction]
+  G --> S4[Pricing]
+  G --> S5[Monitoring]
+  S2 --> DB[("PostgreSQL")]
+  S3 --> DB
+  S2 --> RC[("Redis")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -75,6 +91,19 @@ Auth  Inven-Trans-Price Moni-
 - Local inventory tracking
 - Offline transaction queue
 
+*Figure: machine state machine.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Selecting: customer starts
+  Selecting --> Payment: item chosen
+  Payment --> Dispensing: payment accepted
+  Payment --> Idle: cancel or timeout
+  Dispensing --> Complete: drop sensor fires
+  Complete --> Idle
+```
+
 **🔴 Interview Question:** *"How does the machine handle transactions when the internet is down?"*
 
 **✅ Answer:**
@@ -83,6 +112,21 @@ Auth  Inven-Trans-Price Moni-
 3. **Sync on reconnect:** When connection restores, push queued transactions to cloud. Each carries a machine-generated id `(machine_id, local_seq)`, so a resend after a lost ack is deduplicated, not double-counted
 4. **Conflict resolution:** Cloud validates each transaction — if product row was restocked between offline queue and sync, adjust inventory accordingly
 5. **Machine state:** Reconcile physical inventory (count after restock) vs. cloud state
+
+*Figure: offline queue and idempotent sync on reconnect.*
+
+```mermaid
+sequenceDiagram
+  participant M as Machine
+  participant Q as Local SQLite queue
+  participant C as Cloud
+  M->>Q: Store sale (machine_id, local_seq)
+  Note over M,C: Internet is down
+  M->>C: Reconnect, push queued sales
+  C->>C: Upsert by (machine_id, local_seq)
+  C-->>M: Ack
+  M->>M: Reconcile stock after restock count
+```
 
 ---
 

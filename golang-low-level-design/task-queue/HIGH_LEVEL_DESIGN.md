@@ -38,6 +38,17 @@
 └─────────────────────────────────────────────────────────┘
 ```
 
+*Figure: clients enqueue into a priority queue served by a worker pool.*
+
+```mermaid
+flowchart LR
+  C["API / client: enqueue"] --> Q["Task queue (priority)"]
+  Q --> W["Worker pool W1..WN"]
+  W --> R["Results channel"]
+  W -. "retry with backoff" .-> T["TTL / retry (delayed heap)"]
+  T --> Q
+```
+
 ## 3. TASK LIFECYCLE
 
 ```
@@ -47,6 +58,22 @@ SUBMIT ─┬─> BLOCKED ──(deps succeeded)──┐
                                               ^               ├─> FAILED  (attempts exhausted / permanent) ─> dead letters
                                               └── SCHEDULED <─┤   (retry with backoff)
                                                               └─> CANCELLED (Cancel / shutdown deadline / dependency failed)
+```
+
+*Figure: task lifecycle.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> BLOCKED: has dependencies
+  [*] --> SCHEDULED: runAt in future
+  [*] --> READY
+  BLOCKED --> READY: deps succeeded
+  SCHEDULED --> READY: runAt reached
+  READY --> RUNNING
+  RUNNING --> SUCCEEDED
+  RUNNING --> SCHEDULED: retry with backoff
+  RUNNING --> FAILED: attempts exhausted or permanent
+  RUNNING --> CANCELLED
 ```
 
 ## 4. RETRY STRATEGY
@@ -70,6 +97,18 @@ Handlers wrap non-retryable errors (validation, 4xx) with `Permanent(err)`, so t
 3. Deadline hit → cancel the base context → in-flight handlers see ctx.Done()
 4. Wait for workers to return; mark every remaining task CANCELLED
 5. (Durable version) nothing to save: un-acked leases expire and other workers pick them up
+```
+
+*Figure: graceful shutdown sequence.*
+
+```mermaid
+flowchart TD
+  A["SIGTERM: Shutdown(ctx with deadline)"] --> B["Submit returns ErrClosed"]
+  B --> C["Workers drain ready, delayed, retrying tasks"]
+  C --> D{"Deadline hit first?"}
+  D -- No --> E[All done, workers return]
+  D -- Yes --> F["Cancel base context, handlers see ctx.Done()"]
+  F --> G["Wait for workers, mark remaining CANCELLED"]
 ```
 
 ## 6. TRADE-OFF ANALYSIS
@@ -106,6 +145,22 @@ CREATE INDEX tasks_dequeue ON tasks (priority DESC, run_at) WHERE status = 'read
 - **Dequeue:** `UPDATE tasks SET status='running', lease_id=$1, lease_until=now()+'30s', attempts=attempts+1 WHERE id IN (SELECT id FROM tasks WHERE status='ready' AND run_at<=now() ORDER BY priority DESC, run_at LIMIT 10 FOR UPDATE SKIP LOCKED) RETURNING *`.
 - **Complete:** `UPDATE … SET status='succeeded' WHERE id=$1 AND lease_id=$2`. The `lease_id` check is the fencing token. Zero rows updated means the lease was lost and someone else owns the task now.
 - **Reaper:** `UPDATE … SET status='ready' WHERE status='running' AND lease_until < now()`.
+
+*Figure: lease-based dequeue in the distributed version; lease_id fences stale workers.*
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant D as tasks table
+  participant R as Reaper
+  W->>D: Dequeue: status running, lease_id, lease_until, attempts + 1
+  alt completes in time
+    W->>D: Complete WHERE lease_id matches
+  else crash or lease lost
+    R->>D: Expired lease back to ready
+    Note over W,D: Late complete updates 0 rows
+  end
+```
 
 ## 8. FAILURE MODES
 

@@ -45,6 +45,24 @@ User submits notification request
 └────────────────────────────────────────────────────────────┘
 ```
 
+*Figure: request path from API to channel worker pools.*
+
+```mermaid
+flowchart TB
+  C[Client request] --> G["API gateway: rate limit, auth"]
+  G --> O["Orchestrator: validate, store pending, enqueue"]
+  O --> V[Channel validator]
+  O --> R["Channel router"]
+  O --> S[Schedule manager]
+  V --> D["Dispatch service"]
+  R --> D
+  S --> D
+  D --> W1[Email workers]
+  D --> W2[SMS workers]
+  D --> W3[Push workers]
+  D --> W4[Webhook workers]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -241,6 +259,26 @@ Correctness notes on this sketch:
 - **Remove-then-process loses work on a crash** between the two steps. Either keep the DB row as the source of truth (status `scheduled`, `ready_at`) and have the poller re-scan rows whose Redis entry vanished, or move due members into a "processing" set with a lease and delete them only after enqueueing.
 - **Don't re-run the due notification through `submit()`** with its original idempotency key: the key is already recorded, so it would be treated as a duplicate and never sent (the earlier version of the LLD code had exactly this bug). Enqueue the already-created deliveries instead.
 
+*Figure: scheduling with a Redis sorted set; ZREM decides which poller owns a due item.*
+
+```mermaid
+sequenceDiagram
+  participant API as Orchestrator
+  participant Z as Redis ZSET
+  participant L as Scheduler loop (every 1 s)
+  API->>Z: ZADD notification_id, send_at
+  loop every second
+    L->>Z: ZRANGEBYSCORE 0..now
+    Z-->>L: Due ids
+    L->>Z: ZREM id
+    alt removed = 1
+      L->>API: Load and submit
+    else another poller won
+      L->>L: Skip
+    end
+  end
+```
+
 ---
 
 ## 5. SCALING & PERFORMANCE
@@ -303,6 +341,20 @@ class BatchOptimizer:
 | Message too old to matter (OTP after 10 min) | Per-template TTL; expired deliveries are dropped, not sent late |
 | Redis (rate limiter) unavailable | Fail open for CRITICAL with a conservative local in-process limit; fail closed (defer) for marketing |
 | Campaign spike at 9:00 local time | Producer-side pacing per timezone; campaigns use LOW queues with capped consumer share |
+
+*Figure: delivery path with retry, failover and DLQ.*
+
+```mermaid
+flowchart TD
+  A["API commits notification + outbox row"] --> B["Relay enqueues to channel queue"]
+  B --> W["Worker: quiet hours, rate limit, send"]
+  W --> OK{"Provider result"}
+  OK -- Accepted --> DONE[Delivered, receipt later]
+  OK -- "5xx / throttle" --> RT["Backoff with jitter, secondary provider"]
+  RT --> W
+  OK -- "Permanent error" --> INV[Mark contact invalid]
+  RT -- "Retries exhausted" --> DLQ["DLQ, alert, replay"]
+```
 
 **Capacity:** 1M notifications/day ≈ 12/s average, ~120/s at a 10× peak, i.e. a few hundred DB writes per second including deliveries and status updates. One Postgres primary with daily/monthly partitions (dropping old partitions instead of `DELETE`) is enough; deliveries at ~1 KB/row are ~1 GB/day per million.
 

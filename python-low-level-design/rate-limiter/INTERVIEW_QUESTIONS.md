@@ -92,6 +92,20 @@ return 0
 - **Local counters + periodic sync** (every 100 ms push deltas, pull the global count). Sub-microsecond decisions; can overshoot by roughly `rate × sync_interval × nodes`. Fine for abuse protection, wrong for billing.
 - **Sticky routing** (consistent-hash users to limiter nodes). No shared store; rebalancing loses or duplicates state, and a hot user is a hot node.
 
+*Figure: one atomic Lua script per rate-limit decision (token bucket).*
+
+```mermaid
+sequenceDiagram
+  participant A as API server
+  participant R as Redis
+  A->>R: EVALSHA script (key, capacity, rate, cost)
+  Note over R: Atomic, no interleaving
+  R->>R: TIME, refill tokens from elapsed
+  R->>R: tokens >= cost ? consume : deny
+  R->>R: HSET tokens and ts, PEXPIRE
+  R-->>A: allowed, tokens left
+```
+
 ---
 
 ## Question 3: Concurrency in the in-process version
@@ -108,6 +122,16 @@ Fix in `RateLimiter`:
 Different keys never contend; the same key serialises, which it must. If there are millions of keys and lock objects feel heavy, use **lock striping**: `locks[hash(key) % 1024]`.
 
 Then the follow-up: *"How do you stop the map growing forever?"* `evict_idle()` drops keys whose state equals a fresh one. The race: a request has looked up the entry, the janitor evicts it, the request consumes from the orphan, and the next request gets a fresh full bucket. Fix: mark the entry `evicted` under its lock; the request re-checks under the lock and retries. The test suite forces that interleaving deterministically.
+
+*Figure: in-process limiter with a short map lock and a per-key lock.*
+
+```mermaid
+flowchart LR
+  A[try_acquire key] --> B["Map lock: get or create entry"]
+  B --> C["Per-key lock"]
+  C --> D["Check and consume"]
+  D --> E[Allow or deny]
+```
 
 ---
 

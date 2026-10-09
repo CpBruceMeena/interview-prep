@@ -47,6 +47,20 @@ Web App / Mobile App / Self-service Kiosk
 └─────────────────────────────────────────────┘
 ```
 
+*Figure: services and data stores.*
+
+```mermaid
+flowchart TB
+  C["Web / mobile / kiosk"] --> G["API gateway + auth"]
+  G --> CAT["Catalog (Elasticsearch)"]
+  G --> L["Lending service"]
+  G --> F["Fine service"]
+  L --> PG[("PostgreSQL")]
+  F --> PG
+  CAT -. "CDC / outbox" .-> PG
+  L --> R[("Redis: availability hints")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -111,6 +125,18 @@ FROM nxt WHERE r.id = nxt.id;
 -- 1 row -> copy goes ON_HOLD for that member; 0 rows -> copy goes AVAILABLE
 ```
 The queue is FCFS. When a copy comes back, only the head of the queue gets it; the copy stays `ON_HOLD` until they borrow it or the hold expires. Expiry is checked lazily (`hold_expires_at < now()` before any availability decision) and eagerly by a sweeper that re-runs the "next in queue" step and sends the notification. The lazy check means a late sweeper delays a notification but never hands a copy to the wrong person.
+
+*Figure: copy status through borrow, return and the reservation hold.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> AVAILABLE
+  AVAILABLE --> ON_LOAN: borrow
+  ON_LOAN --> AVAILABLE: return, queue empty
+  ON_LOAN --> ON_HOLD: return, queue has WAITING
+  ON_HOLD --> ON_LOAN: head of queue borrows
+  ON_HOLD --> AVAILABLE: hold expires, no next member
+```
 
 ---
 
