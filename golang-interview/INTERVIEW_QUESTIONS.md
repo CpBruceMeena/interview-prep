@@ -109,6 +109,45 @@ So 100K goroutines blocked on **sockets** cost only memory. 10K goroutines block
 | **Preemption** | Knows async preemption (1.14, SIGURG, safe points) vs the old cooperative prologue check |
 | **Containers** | Knows the Go 1.25 cgroup-aware GOMAXPROCS default and the pre-1.25 throttling problem |
 
+*GMP model: a thread (M) must hold a P to run Go code, each P has a local run queue, and idle Ps steal from busy ones or take from the global queue.*
+
+```mermaid
+flowchart TD
+    GQ["Global run queue"]
+    subgraph P1["P1 (mcache, local queue)"]
+        direction TB
+        RN1["runnext slot"]
+        LQ1["Local queue: G, G, G"]
+    end
+    subgraph P2["P2 (mcache, local queue)"]
+        direction TB
+        LQ2["Local queue: G"]
+    end
+    M1["M1: OS thread"] ---|holds| P1
+    M2["M2: OS thread"] ---|holds| P2
+    M1 --> R1["Runs current G"]
+    M2 --> R2["Runs current G"]
+    GQ -.->|"batch pulled"| P1
+    LQ1 -.->|"P2 steals half"| LQ2
+```
+
+*Order in which a P looks for its next goroutine (`findRunnable`, simplified).*
+
+```mermaid
+flowchart TD
+    A["Current G blocks, yields, is preempted or exits"] --> B{"Every 61st tick and global queue non-empty?"}
+    B -->|yes| G1["Take one G from the global queue"]
+    B -->|no| C{"Local queue (runnext first) has a G?"}
+    C -->|yes| L["Run it"]
+    C -->|no| D{"Global queue has Gs?"}
+    D -->|yes| G2["Take a batch, run one"]
+    D -->|no| E{"netpoll: ready sockets?"}
+    E -->|yes| N["Run ready G"]
+    E -->|no| F{"Steal half of another P's queue?"}
+    F -->|yes| S["Run stolen G"]
+    F -->|no| Z["Release P, park the M"]
+```
+
 ---
 
 ## Question 2: Channels — CSP, Internal Structure, and Patterns
@@ -290,6 +329,22 @@ func main() {
 | **Patterns** | Implements fan-out, fan-in, pipeline, tee, or-done naturally |
 | **Cancellation** | Every blocking send/receive also selects on `ctx.Done()`. No goroutine leaks |
 | **Deadlock detection** | Knows the runtime detector only catches global deadlock; knows nil-channel and closed-channel behaviour |
+
+*Channel send: hand off directly to a parked receiver, else buffer, else park the sender on `sendq`; a close wakes all waiters.*
+
+```mermaid
+flowchart TD
+    S["chansend"] --> NL{"c is nil?"}
+    NL -->|yes| PF["Park forever"]
+    NL -->|no| LK["Lock channel"]
+    LK --> CL{"closed?"}
+    CL -->|yes| PN["Panic: send on closed channel"]
+    CL -->|no| RQ{"recvq has a parked receiver?"}
+    RQ -->|yes| DH["Copy value to receiver's stack slot, goready"]
+    RQ -->|no| BF{"qcount < dataqsiz?"}
+    BF -->|yes| BUF["Copy into ring buffer at sendx"]
+    BF -->|no| PK["Enqueue sudog on sendq, gopark"]
+```
 
 ---
 
@@ -613,6 +668,31 @@ Never read GOGC with `debug.SetGCPercent(-1)`. That call *disables* the GC and r
 | **Tri-color + barrier** | Explains the invariant, why stacks were rescanned pre-1.8, hybrid barrier |
 | **GC pacing** | Heap-goal formula, GOGC trades CPU for memory, GOMEMLIMIT is soft with a CPU cap |
 | **Currency** | Knows Green Tea is default since 1.26; uses `runtime/metrics`; knows AddCleanup/weak |
+
+*One GC cycle: two short stop-the-world pauses around a concurrent mark, followed by lazy concurrent sweep and a background scavenger.*
+
+```mermaid
+flowchart TD
+    A["Pacer trigger (before the heap goal)"] --> B["STW 1: sweep termination, enable write barrier"]
+    B --> C["Concurrent mark: workers at about 25% of GOMAXPROCS plus mark assists"]
+    C --> D["STW 2: mark termination, disable write barrier, compute next goal"]
+    D --> E["Concurrent sweep: lazy, spans freed or reused"]
+    D --> F["Background scavenger returns pages to the OS"]
+    E --> A
+```
+
+*Tri-color marking: white objects are unseen, grey are seen but unscanned, black are scanned; whatever is still white at the end is garbage, and the write barrier shades pointers the program changes.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> White: allocated before mark
+    [*] --> Black: allocated during mark (allocate-black)
+    White --> Grey: reachable, queued for scan
+    Grey --> Black: all fields scanned
+    White --> Grey: shaded by write barrier
+    Black --> [*]: survives
+    White --> [*]: unmarked at end of mark, freed by sweep
+```
 
 ---
 
@@ -1625,6 +1705,26 @@ This compiles and passes a test that checks `/readyz` returns 503 during the dra
 | **Middleware chain** | Correct order, Unwrap/ResponseController, ErrAbortHandler re-panic |
 | **Observability** | slog, histograms by route pattern, pprof on admin port, tracing context |
 | **Production readiness** | ReadHeaderTimeout, liveness vs readiness, per-client rate limits, load shedding |
+
+*Graceful shutdown on Kubernetes: fail readiness first, keep serving while endpoints update, then `Shutdown` with a bounded deadline.*
+
+```mermaid
+sequenceDiagram
+    participant K as Kubernetes
+    participant S as Service process
+    participant LB as Load balancer
+    K->>S: SIGTERM
+    K->>LB: remove pod from endpoints (concurrent)
+    S->>S: ready = false, /readyz returns 503
+    Note over S,LB: drainDelay: still serving while removal propagates
+    S->>S: srv.Shutdown(ctx with deadline)
+    Note over S: stop accepting, wait for in-flight requests
+    alt deadline hit
+        S->>S: srv.Close() force-closes the rest
+    end
+    S->>S: flush telemetry, close DB pools
+    S-->>K: exit 0 before terminationGracePeriodSeconds
+```
 
 ---
 

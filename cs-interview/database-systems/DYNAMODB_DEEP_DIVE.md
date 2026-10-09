@@ -78,6 +78,18 @@ The sort key enables range queries within a partition: `=`, `<`, `>`, `between`,
 
 Reads hash the key again and go straight to the right partition, so lookups don't slow down as the table grows. DynamoDB adds and splits partitions automatically.
 
+*Diagram: how a key is routed to a partition and sorted within it.*
+
+```mermaid
+flowchart LR
+    R["Request with partition key"] --> H["Hash(partition key)"]
+    H --> P1["Partition A"]
+    H --> P2["Partition B"]
+    H --> P3["Partition C"]
+    P2 --> S["Items of one key, sorted by sort key"]
+```
+
+
 Approximate per-partition limits: **10 GB of data, 3,000 read units/sec, 1,000 write units/sec**.
 
 ### Hot partitions
@@ -161,6 +173,19 @@ resp = table.query(
 
 ### Gotchas
 
+*Diagram: which read operation to pick.*
+
+```mermaid
+flowchart TD
+    A{"Know the full primary key?"} -->|Yes| G["GetItem"]
+    A -->|No| B{"Know the partition key or an index key?"}
+    B -->|Yes| Q["Query (table or GSI)"]
+    B -->|No| S["Scan: reads whole table"]
+    Q --> F["Filter expression applies after read, cost unchanged"]
+    S --> F
+```
+
+
 - **Filter expressions don't reduce cost.** They're applied *after* items are read; you pay for everything read. Only the key condition narrows what's read.
 - **Pagination**: Query/Scan return at most **1 MB** per call. Use `LastEvaluatedKey` → `ExclusiveStartKey`. `Limit` caps items *evaluated*, so with a filter you may get fewer (even zero) items while more pages exist.
 
@@ -210,6 +235,22 @@ table.query(IndexName="BySender",
 - Up to **20 per table** (default quota).
 - **Own capacity and partitions.** Each relevant base write also costs an index write; an under-provisioned GSI can throttle base-table writes.
 - Hot-key rules apply to GSI keys too.
+
+*Diagram: a base-table write is propagated asynchronously to each GSI, which is why GSIs are eventually consistent.*
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant T as Base table
+    participant G as GSI
+    C->>T: PutItem
+    T-->>C: Success
+    T->>G: Propagate change (async)
+    Note over G: Briefly stale, eventually consistent
+    C->>G: Query index
+    G-->>C: Projected attributes
+```
+
 
 ### Projections
 
@@ -365,6 +406,22 @@ client.transact_write_items(TransactItems=[
 Log of item-level changes, retained **24 hours**. Each change appears exactly once, and changes to the **same item are in order** (there's no global ordering across items). View types: KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES. Usually consumed by **Lambda**.
 
 Uses: fan-out (e.g. chat list updates for a 500-member group), syncing to OpenSearch, analytics pipelines, notifications, audit logs, async aggregates, cascading deletes. Consumers must be **idempotent** (batches can be retried). Kinesis Data Streams is an alternative for longer retention.
+
+*Diagram: a Stream-driven fan-out keeps the request path short.*
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant T as Table
+    participant S as Stream
+    participant L as Lambda
+    C->>T: Put message
+    T-->>C: Success
+    T->>S: Change record
+    S->>L: Batch of changes
+    L->>T: Update each member item (idempotent)
+```
+
 
 **Why Streams for large fan-out**: doing it in the request is slow and risks partial failure; a transaction can't exceed 100 items.
 
@@ -658,6 +715,17 @@ Notes:
 | 1M specific known keys | **BatchGetItem** (100 keys/call → 10,000 calls) across threads; cost rounds up per item (~0.5 unit each eventual → ~830 units/sec over 10 min) |
 | Analytics / bulk processing | **Export to S3**, then Spark/Athena. No read capacity consumed, no impact on live traffic. |
 | Same hot data read repeatedly | **DAX** cache in front |
+
+*Diagram: choosing how to read 1M records.*
+
+```mermaid
+flowchart TD
+    A{"Access pattern"} -->|"Whole table"| P["Parallel Scan with Segment/TotalSegments"]
+    A -->|"One partition key"| Q["Paginated Query, split by sort key range"]
+    A -->|"Known keys"| B["BatchGetItem across threads"]
+    A -->|"Analytics"| E["Export to S3, then Spark/Athena"]
+```
+
 
 ### Parallel scan example
 

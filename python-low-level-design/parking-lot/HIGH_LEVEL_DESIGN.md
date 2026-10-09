@@ -51,6 +51,23 @@
           └────────────────────┘
 ```
 
+*Figure: gates, services and stores.*
+
+```mermaid
+flowchart TB
+  EN[Entry terminal] --> G["API gateway"]
+  EX[Exit terminal] --> G
+  AD[Admin dashboard] --> G
+  EN --> Q["Message queue"]
+  EX --> Q
+  G --> SA["Spot allocator (Go)"]
+  G --> FC["Fee calculator (Python)"]
+  Q --> EP["Entry/exit processor (Node.js)"]
+  SA --> DB[("PostgreSQL + Redis")]
+  FC --> DB
+  EP --> DB
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -79,6 +96,21 @@
 4. Driver parks at assigned spot
 ```
 
+*Figure: entry flow; the barrier opens only after the claim commits.*
+
+```mermaid
+sequenceDiagram
+  participant K as Entry kiosk
+  participant P as Entry processor
+  participant D as PostgreSQL
+  K->>P: Vehicle detected (ANPR)
+  P->>D: BEGIN, claim spot FOR UPDATE SKIP LOCKED
+  P->>D: Mark OCCUPIED, insert ticket (idempotency key)
+  D-->>P: COMMIT
+  P-->>K: Open barrier
+  P--)D: Outbox event parking.entry
+```
+
 ### Exit Flow
 ```
 1. Driver arrives at exit gate
@@ -92,6 +124,23 @@
    f. Publish event: parking.exit (via outbox)
    Capture, retries and reconciliation run async afterwards; the authorization cannot.
 4. Driver exits
+```
+
+*Figure: exit flow; authorization is synchronous, capture and retries are async.*
+
+```mermaid
+sequenceDiagram
+  participant K as Exit kiosk
+  participant P as Exit processor
+  participant G as Payment gateway
+  participant D as PostgreSQL
+  K->>P: Ticket read
+  P->>D: Lookup ticket, rate card
+  P->>P: Compute fee
+  P->>G: Authorize (with timeout)
+  G-->>P: Approved
+  P->>D: Ticket PAID, spot AVAILABLE, payment SUCCESS
+  P-->>K: Open barrier
 ```
 
 ---

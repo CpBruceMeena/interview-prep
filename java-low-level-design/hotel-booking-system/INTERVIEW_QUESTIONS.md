@@ -22,6 +22,21 @@
 - Race between a late `confirm` and the sweeper: both use a compare-and-set on the status (`transition(HELD, ...)`). Exactly one wins, and only the winner releases rooms.
 - In production the hold is a DB row with `expires_at`; the sweeper is a periodic job with `UPDATE ... WHERE status='HELD' AND expires_at < now()`, which is atomic per row.
 
+*Figure: two-phase booking with a TTL hold.*
+
+```mermaid
+sequenceDiagram
+  participant G as Guest
+  participant B as Booking service
+  participant P as Payment
+  G->>B: hold (idempotency key)
+  B-->>G: Hold with price lock, 15 min TTL
+  G->>P: Pay
+  P-->>B: Success
+  B->>B: transition(HELD to CONFIRMED)
+  Note over B: Sweeper transition(HELD to EXPIRED) races, one wins
+```
+
 ## Q4: The client times out and retries the booking request. What stops a duplicate booking?
 
 **Answer:**

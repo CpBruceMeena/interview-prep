@@ -89,6 +89,18 @@ Let the interviewer steer; otherwise pick the hardest parts. For each: state the
 - **Rollout:** feature flags, canary, migration plan (dual write → backfill → verify → cutover → cleanup).
 - **Cost:** the top two cost drivers and how you'd cut them.
 
+*Figure: the 45-minute round at a glance, with time boxes.*
+
+```mermaid
+flowchart LR
+  P1["1. Clarify (5 min)"] --> P2["2. Estimate (3-5)"]
+  P2 --> P3["3. API + data model (5)"]
+  P3 --> P4["4. High-level design (10)"]
+  P4 --> P5["5. Deep dives (15-20)"]
+  P5 --> P6["6. Reliability and ops (5)"]
+  P6 --> P7["7. Wrap-up (2)"]
+```
+
 ---
 
 ## 3. Back-of-the-envelope estimation

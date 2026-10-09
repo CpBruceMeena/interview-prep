@@ -83,6 +83,25 @@ With chunking + pre-signed URLs (scalable approach):
    • S3 handles durability (99.999999999%)
 ```
 
+*Figure: direct-to-storage multipart upload; the server handles metadata only.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  participant O as S3
+  C->>S: Initiate upload (size, checksum)
+  S->>O: Create multipart upload
+  S-->>C: upload_id, pre-signed UploadPart URLs
+  par parts in parallel
+    C->>O: PUT part 1
+    C->>O: PUT part N
+  end
+  C->>S: POST complete
+  S->>O: ListParts, CompleteMultipartUpload
+  S-->>C: Completed
+```
+
 !!! warning "The chunk-size trap"
     S3 multipart allows at most **10,000 parts** of 5 MiB–5 GiB each (the last part may be smaller). A fixed 5 MiB chunk caps the file at ~48.8 GiB. For 100 GiB, compute `chunk = max(5 MiB, ceil(size / 10,000))` ≈ 10.24 MiB. Interviewers love this one because "5 MB chunks, up to 100 GB" sounds fine until you multiply.
 
@@ -429,6 +448,15 @@ False positive rate target: < 0.001%
 | **Magic bytes** | Knows to validate file content, not just headers |
 | **User flagging** | Flags users who upload malware (fraud detection) |
 
+*Figure: layered upload validation, from the client to the async virus scan.*
+
+```mermaid
+flowchart LR
+  L1["1. Client: extension allowlist, size"] --> L2["2. Server at initiate: filename, MIME, rate limit"]
+  L2 --> L3["3. First chunk: magic bytes match claimed type"]
+  L3 --> L4["4. Async virus scan after completion"]
+```
+
 ---
 
 ## 5. Async Processing Pipeline
@@ -559,6 +587,20 @@ If > 2 hours:
 | **Dead-letter handling** | Separates retriable vs permanent failures |
 | **Progress feedback** | Shows progress to user (WebSocket, notifications) |
 | **Parallelism** | Considers parallel segment transcoding for speed |
+
+*Figure: async processing pipeline after upload completes.*
+
+```mermaid
+flowchart TD
+  K["Kafka: file.uploaded"] --> V["Virus scanner"]
+  V -- infected --> Q[Quarantine]
+  V -- clean --> F["Format detector"]
+  F -- unsupported --> D[Dead letter]
+  F -- "video/mp4" --> T["Transcoder (FFmpeg)"]
+  T --> R1["240p HLS"]
+  T --> R2["720p HLS"]
+  T --> R3["1080p HLS"]
+```
 
 ---
 
@@ -1388,6 +1430,17 @@ Refuse it (`ChunkInProgressError`) rather than assembling a file that's missing 
 ### "The client retries complete() after a timeout, but the first call actually succeeded."
 
 `complete()` must be idempotent: if the upload is already `COMPLETED`/`READY`, return the same result. Same for the post-processing event: publish it through an outbox in the same transaction as the status change, and make consumers idempotent on `upload_id`.
+
+*Figure: upload states around complete(); corrupt chunks send the upload back to IN_PROGRESS.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> IN_PROGRESS
+  IN_PROGRESS --> ASSEMBLING: complete() under lock
+  ASSEMBLING --> COMPLETED: all chunks verified
+  ASSEMBLING --> IN_PROGRESS: corrupt chunks, client re-sends them
+  COMPLETED --> READY: processing done
+```
 
 ### "A stored chunk got corrupted at rest. How do you find it and recover?"
 

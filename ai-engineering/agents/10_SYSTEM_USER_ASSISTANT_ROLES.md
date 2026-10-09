@@ -306,6 +306,18 @@ When you call an LLM, this is roughly how the prompt is assembled:
 
 The LLM sees all previous messages and generates the next assistant message.
 
+*Figure: roles become one token sequence; each turn the model appends the next assistant message.*
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant M as Model
+  App->>M: system + user 1 + assistant 1 + user 2
+  M-->>App: assistant 2 (generated)
+  App->>M: Same history + assistant 2 + user 3
+  M-->>App: assistant 3
+```
+
 ---
 
 ## 6. COMMON PITFALLS

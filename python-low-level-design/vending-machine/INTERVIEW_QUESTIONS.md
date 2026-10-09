@@ -51,6 +51,19 @@ Each state overrides only what it allows, so adding a state is one class and ill
 | AWAITING → IDLE (cancel / jam) | Return exact escrowed pieces; void card hold |
 | any → OUT_OF_SERVICE | Refund the open transaction first |
 
+*Figure: machine states and guarded transitions.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> AWAITING_PAYMENT: select (slot exists, qty > 0)
+  AWAITING_PAYMENT --> IDLE: vend (balance ok, change ok)
+  AWAITING_PAYMENT --> IDLE: cancel or jam, refund
+  IDLE --> OUT_OF_SERVICE: any state, refund open txn
+  AWAITING_PAYMENT --> OUT_OF_SERVICE
+  OUT_OF_SERVICE --> IDLE: exit
+```
+
 ---
 
 ## Question 2: Money and Change
@@ -96,6 +109,23 @@ Flow: **authorize → dispense → capture**; void on jam. Charging first and re
 Follow-ups:
 - *Gateway times out during authorize?* Send an idempotency key; on timeout, retry with the same key or query by it. Never authorize twice blind.
 - *Machine crashes between dispense and capture?* Journal `AUTHORIZED` and `DISPENSED` to local storage before each step; recover on boot (capture dispensed, void the rest). Uncaptured holds also expire at the issuer.
+
+*Figure: card purchase is authorize, dispense, capture; void on a jam.*
+
+```mermaid
+sequenceDiagram
+  participant M as Machine
+  participant G as Gateway
+  M->>G: Authorize (idempotency key)
+  G-->>M: Hold placed
+  M->>M: Journal AUTHORIZED, dispense
+  alt drop sensor fires
+    M->>M: Journal DISPENSED
+    M->>G: Capture
+  else jam
+    M->>G: Void authorization
+  end
+```
 
 ---
 

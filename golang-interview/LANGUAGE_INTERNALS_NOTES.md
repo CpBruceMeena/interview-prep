@@ -40,6 +40,21 @@ for i := 0; i < 2000; i++ {
 - Capacity doubles while small, then grows by a smaller factor (roughly 1.25× plus a constant for large slices). Results are also **rounded up to a size class**, which is why you see `848`, not `640`.
 - The exact sequence is an implementation detail that has changed between releases. **Never write code or tests that depend on it.** If you know the size, `make([]T, 0, n)`.
 
+*A slice header (pointer, len, cap) points into a shared backing array: `b := a[1:3]` shares the array, so an in-capacity `append` overwrites `a[3]`.*
+
+```mermaid
+flowchart LR
+    subgraph H["Slice headers"]
+        a["a: ptr, len 5, cap 5"]
+        b["b = a[1:3]: ptr, len 2, cap 4"]
+    end
+    subgraph ARR["Backing array"]
+        e0["1"] --- e1["2"] --- e2["3"] --- e3["4 then 99"] --- e4["5"]
+    end
+    a --> e0
+    b --> e1
+```
+
 ### Aliasing: the classic trap
 
 ```go
@@ -54,6 +69,18 @@ fmt.Println(a, c)      // [1 2 3 99 5] [2 3 100]
 ```
 
 Rule: **after `append`, always use the returned slice**, and if a function might retain or modify a sub-slice, hand it one with a capped capacity (`s[i:j:j]`) or a copy.
+
+*`append` writes in place while `len < cap`, and otherwise allocates a bigger array and copies, which is why the result must be reassigned.*
+
+```mermaid
+flowchart TD
+    A["append(s, x)"] --> C{"len < cap?"}
+    C -->|yes| I["Write into existing array"]
+    I --> R1["Return header, same array"]
+    C -->|no| N["Allocate larger array, rounded to size class"]
+    N --> CP["Copy old elements, add x"]
+    CP --> R2["Return header, new array"]
+```
 
 ### Memory retention
 
@@ -102,6 +129,21 @@ fmt.Println(mp)                             // map[a:{2}]
 ```
 
 During iteration: deleting an unreached entry means it won't be produced; entries added may or may not be produced.
+
+*Go 1.24+ Swiss-table map: the hash picks a group of 8 slots, and the control word is matched first to find candidate slots.*
+
+```mermaid
+flowchart TD
+    K["key"] --> Hh["hash(key)"]
+    Hh --> G["h1 selects a group of 8 slots"]
+    Hh --> TAG["h2: 7-bit tag"]
+    G --> CW["Match tag against control word"]
+    TAG --> CW
+    CW -->|"candidate slot"| EQ{"Key equal?"}
+    EQ -->|yes| HIT["Found"]
+    EQ -->|no| NX["Next candidate or next group"]
+    CW -->|"empty slot seen"| MISS["Not present"]
+```
 
 ---
 
@@ -204,6 +246,19 @@ x = 2
 6. `defer f.Close()` ignores the error. For writes, check it: `defer func() { err = errors.Join(err, f.Close()) }()`.
 7. Don't use panic for control flow. Reserve it for programmer errors and unrecoverable states. Libraries should convert internal panics to errors at their boundary.
 
+*On panic the runtime runs deferred calls LIFO; a deferred `recover` stops the unwinding, and deferred closures can still modify named results.*
+
+```mermaid
+flowchart TD
+    P["panic in f"] --> D2["Run last deferred call first (LIFO)"]
+    D2 --> RC{"recover() called directly in deferred func?"}
+    RC -->|yes| OK["Panic stopped, f returns named results"]
+    RC -->|no| D1["Run next deferred call"]
+    D1 --> MORE{"More deferred calls?"}
+    MORE -->|yes| RC
+    MORE -->|no| UP["Unwind to caller, or crash if goroutine ends"]
+```
+
 ---
 
 ## 7. Method sets and embedding
@@ -245,6 +300,20 @@ func rec(n int) int {
     return rec(n-1) + int(pad[0])
 }
 go func() { rec(10000); close(done) }()   // ~10 MB of frames from a 2 KB start: works, stack grew
+```
+
+*A goroutine stack starts small; when a function prologue finds it full, the runtime moves to a roughly 2x larger copy until the 1 GB limit.*
+
+```mermaid
+flowchart TD
+    S["Goroutine starts, about 2 KB stack"] --> PR["Function prologue: stack check"]
+    PR --> F{"Enough space?"}
+    F -->|yes| RUN["Continue running"]
+    F -->|no| GR["Allocate stack about 2x larger"]
+    GR --> CPY["Copy frames, adjust pointers"]
+    CPY --> LIM{"Over 1 GB limit?"}
+    LIM -->|no| RUN
+    LIM -->|yes| FATAL["fatal error: stack overflow"]
 ```
 
 ---

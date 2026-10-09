@@ -50,6 +50,16 @@ ATM Terminal (C/C++ on embedded Linux)
                       └───────────────┘
 ```
 
+*Figure: request path from the ATM terminal to the core banking system and HSM.*
+
+```mermaid
+flowchart TB
+  T["ATM terminal: card reader, PIN pad, dispenser"] -->|"TCP/SSL, ISO 8583"| S["ATM switch / gateway"]
+  S --> C["ATM controller (Go): session state, cash, logging"]
+  C --> B[("Core banking")]
+  C --> H["HSM: PIN verify, keys"]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -70,6 +80,19 @@ ATM Terminal (C/C++ on embedded Linux)
 - Cash dispenser management (denomination optimization)
 - Transaction logging (immutable audit trail)
 
+*Figure: ATM session lifecycle.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> CardInserted: card read
+  CardInserted --> PinEntered: PIN submitted
+  PinEntered --> Ready: PIN verified
+  PinEntered --> Idle: blocked or retained
+  Ready --> TransactionComplete: transaction done
+  TransactionComplete --> Idle: card ejected
+```
+
 **🔴 Interview Question:** *"How do you ensure a withdrawal is never double-dispensed?"*
 
 **✅ Answer:** Make every step either retryable or reversible, and decide the default for each crash point.
@@ -80,6 +103,23 @@ ATM Terminal (C/C++ on embedded Linux)
 5. **Ambiguous outcome** (jam mid-dispense, power loss): neither confirm nor reverse blindly. Flag for reconciliation; cassette counters and the reject/purge bin settle it, usually the same day.
 
 In ISO 8583 networks this is typically one financial request (0200) plus a reversal on failure rather than a separate auth/capture, but the guarantees are the same: retries are idempotent and reversals are delivered at least once.
+
+*Figure: withdrawal with idempotent request id, confirm on success, reversal on clean failure.*
+
+```mermaid
+sequenceDiagram
+  participant A as ATM
+  participant I as Issuer
+  A->>A: Check cassettes can make amount
+  A->>I: Withdraw request (unique id)
+  I-->>A: Approved (hold or debit)
+  A->>A: Dispense, sensors confirm
+  alt notes taken
+    A->>I: Confirm
+  else clean failure
+    A->>I: Reversal (stored, retried)
+  end
+```
 
 ---
 

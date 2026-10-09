@@ -35,6 +35,23 @@
 
 ---
 
+*Figure: tables and foreign keys, generated from the DDL below (one-to-many from parent to child).*
+
+```mermaid
+erDiagram
+  branches ||--o{ reservations : "branch_id"
+  branches ||--o{ vehicles : "branch_id"
+  customers ||--o{ reservations : "customer_id"
+  maintenance_schedule ||--o{ vehicle_blocks : "maintenance_id"
+  reservations ||--o{ availability_slots : "reservation_id"
+  reservations ||--o{ payments : "reservation_id"
+  reservations ||--o{ vehicle_blocks : "reservation_id"
+  vehicles ||--o{ availability_slots : "vehicle_id"
+  vehicles ||--o{ maintenance_schedule : "vehicle_id"
+  vehicles ||--o{ reservations : "vehicle_id"
+  vehicles ||--o{ vehicle_blocks : "vehicle_id"
+```
+
 ## 🏛️ Complete DDL
 
 ```sql

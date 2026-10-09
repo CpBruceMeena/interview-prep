@@ -220,6 +220,15 @@ DROP FUNCTION IF EXISTS sync_user_email();
 ALTER TABLE users DROP COLUMN email;
 ```
 
+*Diagram: the three expand-contract steps for renaming `email` to `contact_email`.*
+
+```mermaid
+flowchart LR
+  A["Expand: add contact_email, sync trigger, backfill"] --> B["Transition: deploy code using contact_email"]
+  B --> C["Old code fully gone"]
+  C --> D["Contract: drop trigger and email column"]
+```
+
 ### 3.2 Migration Tooling (Alembic Example)
 
 ```python
@@ -505,6 +514,18 @@ kubectl rollout history deployment/user-service
 # or the controller will re-apply the bad version.
 ```
 
+*Diagram: what a rollout and a rollback do to the pod template and revisions.*
+
+```mermaid
+flowchart TD
+  A["kubectl apply new pod template"] --> B["New revision, rolling update"]
+  B --> C{"Healthy?"}
+  C -->|"yes"| D["Revision becomes current"]
+  C -->|"no"| E["rollout undo --to-revision=3"]
+  E --> F["Revision 3 template re-applied as new revision 6"]
+  F --> G["Schema, ConfigMaps, other services untouched"]
+```
+
 ### 5.3 Progressive Delivery with Flagger (Automated Canary)
 
 ```yaml
@@ -552,6 +573,18 @@ spec:
 ```
 
 ---
+
+*Diagram: the Flagger automated canary loop described above.*
+
+```mermaid
+flowchart TD
+  A["New pod template detected"] --> B["Scale canary up, 5% traffic"]
+  B --> C{"Metrics and webhooks pass?"}
+  C -->|"yes, weight below 50%"| D["+5% weight"]
+  D --> C
+  C -->|"yes, at maxWeight"| E["Copy spec to primary, scale canary to 0"]
+  C -->|"threshold failures reached"| F["100% back to primary, canary to 0"]
+```
 
 ## 6. Service Mesh Versioning (Canary & Blue-Green)
 

@@ -115,6 +115,35 @@ if __name__ == "__main__":
 
 **What they probe next:** "Is `x += 1` on a shared int thread-safe with the GIL?" (No: it's load, add, store, and a switch can happen between them.) "Why can a CPU-bound thread make an I/O thread's latency worse?" (It holds the GIL up to the switch interval after the I/O completes.) "What breaks under free-threading?" (See Q11.)
 
+*GIL hand-off since 3.2: a waiting thread asks after the switch interval, the holder drops the GIL at a safe point, and forced switching stops it re-grabbing the lock.*
+
+```mermaid
+sequenceDiagram
+    participant H as Holder thread
+    participant W as Waiting thread
+    participant E as Eval breaker
+    W->>W: wait on GIL condvar, timeout 5 ms
+    Note over W: timeout expires, holder has not released
+    W->>E: set gil_drop_request
+    H->>E: check at safe point (backward jump or call)
+    H->>H: drop the GIL
+    W->>W: take the GIL
+    Note over H: forced switching: holder waits until another thread has taken the GIL
+    H-->>W: now waits to re-acquire
+```
+
+*Choosing around the GIL: blocking I/O releases it, CPU-bound pure Python needs processes (or subinterpreters or the free-threaded build).*
+
+```mermaid
+flowchart TD
+    W{"What is the workload?"} -->|"I/O-bound, many connections"| A["asyncio"]
+    W -->|"I/O-bound, sync libraries"| T["Threads: GIL released while blocked"]
+    W -->|"CPU-bound pure Python"| C{"Options"}
+    C --> P["Processes: N cores, pay pickling and IPC"]
+    C --> S["Subinterpreters (3.14): one GIL each"]
+    C --> F["Free-threaded 3.14t: threads scale across cores"]
+```
+
 ---
 
 ## Question 2: Async/Await — Event Loop Internals
@@ -295,6 +324,20 @@ asyncio.run(main())
 
 **What they probe next:** "What happens if you call `time.sleep(1)` inside a coroutine?" (The whole loop stalls; use `await asyncio.to_thread(...)`.) "Can several coroutines await the same Task?" (Yes: a Future supports many awaiters and every one gets the result. But cancelling one awaiter with `wait_for` or `timeout` cancels the shared Task for all of them; wrap it in `asyncio.shield()` if that's wrong.) "Why must you keep a reference to `create_task()` results?" (The loop holds only weak references, so an unreferenced Task can be garbage-collected mid-flight.)
 
+*The toy loop in one picture: a Task runs the coroutine until it yields a Future, registers its own `_step` as the callback, and `set_result` schedules callbacks through the ready queue, never inline.*
+
+```mermaid
+flowchart TD
+    R["Loop: pop ready callback"] --> S["Task._step: coro.send(None)"]
+    S --> Y{"Coroutine yields a Future?"}
+    Y -->|yes| CB["Append _step to Future callbacks"]
+    CB --> W["Loop sleeps until nearest timer"]
+    W --> TM["Timer fires: Future.set_result"]
+    TM --> CS["call_soon each callback (not inline)"]
+    CS --> R
+    Y -->|"StopIteration"| D["Task finished, result is e.value"]
+```
+
 ---
 
 ## Question 3: Metaclasses & Descriptors — The Object Model Under the Hood
@@ -448,6 +491,18 @@ class Model:
 
 **What they probe next:** "Where is attribute lookup implemented?" (`object.__getattribute__`: type MRO lookup for data descriptors first, then the instance dict, then non-data descriptors and class attributes, then `__getattr__`.) "How do `property`, `classmethod` and functions relate to descriptors?" (All three are descriptors; a function's `__get__` produces the bound method.)
 
+*Class creation order for a class using a metaclass: `__prepare__`, the body, `type.__new__` (which calls `__set_name__` then `__init_subclass__`), and finally `Meta.__init__`.*
+
+```mermaid
+flowchart TD
+    A["Meta.__prepare__: namespace dict"] --> B["Class body executes into the namespace"]
+    B --> C["Meta.__new__ calls type.__new__: class object created"]
+    C --> D["Descriptor.__set_name__(cls, name) for each descriptor"]
+    D --> E["Base.__init_subclass__(cls)"]
+    E --> F["Back in Meta.__new__ after super().__new__"]
+    F --> G["Meta.__init__"]
+```
+
 ---
 
 ## Question 4: Memory Management — CPython's Allocator & GC
@@ -594,6 +649,21 @@ def subscribe(cb): _listeners.append(cb)   # bound method → keeps its instance
 | **Leak patterns** | Stored exceptions/tracebacks, unbounded or `self`-keyed caches, listener registries, never-finishing tasks |
 
 **What they probe next:** "RSS grows but `tracemalloc` shows flat Python allocations: now what?" (Native allocations from C extensions or glibc malloc arenas: try `memray --native`, `MALLOC_ARENA_MAX`, or jemalloc.) "Why do forked workers' memory usage creep up even when they're idle?" (Refcount writes touch copy-on-write pages; `gc.freeze()` and immortal objects (PEP 683, 3.12) help.)
+
+*Two layers of memory management: refcounting frees most objects immediately, the cycle collector finds unreachable groups among tracked containers, and pymalloc serves small requests from arenas, pools and blocks.*
+
+```mermaid
+flowchart TD
+    D["del reference: refcount decremented"] --> Z{"refcount == 0?"}
+    Z -->|yes| FR["Freed immediately, block returned to its pool"]
+    Z -->|no| CY{"Part of an unreachable cycle?"}
+    CY -->|no| ALIVE["Object stays alive"]
+    CY -->|yes| GC["Cycle collector (tracked containers only) frees the group"]
+    subgraph PM["pymalloc: requests up to 512 bytes"]
+        AR["Arena (mmap, 1 MiB)"] --> PL["Pools (16 KiB, one size class each)"] --> BL["Blocks (16-byte classes)"]
+    end
+    FR -.-> BL
+```
 
 ---
 
@@ -1031,6 +1101,22 @@ Caveat: anything that evaluates annotations at runtime (Pydantic, `dataclasses` 
 | **Plugins in production** | Entry points, isolation of failures, security of loading code |
 
 **What they probe next:** "Why does `import a.b` sometimes work in a cycle where `from a.b import X` fails?" "How would you make a plugin's failure not take down the service?" (Isolate at import, timeouts, or run plugins in a subprocess or subinterpreter.) "What's a namespace package?" (A package with no `__init__.py`, spread across several directories, PEP 420.)
+
+*Import algorithm: `sys.modules` is the cache, finders on `sys.meta_path` locate a spec, and the module is registered in `sys.modules` before its code runs.*
+
+```mermaid
+flowchart TD
+    I["import a.b"] --> M{"a.b in sys.modules?"}
+    M -->|yes| RET["Return cached module (maybe partially initialised)"]
+    M -->|no| PAR["Import parent a first, use a.__path__"]
+    PAR --> F["Ask each finder on sys.meta_path: find_spec"]
+    F --> FD{"Spec found?"}
+    FD -->|no| ERR["ModuleNotFoundError"]
+    FD -->|yes| MK["module_from_spec"]
+    MK --> REG["sys.modules['a.b'] = module"]
+    REG --> EX["loader.exec_module(module)"]
+    EX --> ATT["setattr(a, 'b', module)"]
+```
 
 ---
 

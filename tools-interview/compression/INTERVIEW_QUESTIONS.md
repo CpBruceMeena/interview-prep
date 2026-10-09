@@ -71,6 +71,16 @@ That's the inefficiency ANS/arithmetic coding removes (Q3).
 - **Window:** a repeat further back than 32 KB is invisible to Deflate. zstd and Brotli use megabyte-scale windows.
 - **Small inputs:** too little history to find matches, plus fixed headers and table overhead, so a 50-byte input can get *bigger*. That's the motivation for dictionaries (Q7).
 
+**Diagram: the two Deflate stages, modelling then entropy coding.**
+
+```mermaid
+flowchart LR
+I["Input bytes"] --> L["LZ77: find repeats (32 KB window)"]
+L --> T["Tokens: literals, length, distance"]
+T --> H["Huffman: short codes for frequent symbols"]
+H --> O["Deflate bitstream: stored, fixed or dynamic blocks"]
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -123,6 +133,19 @@ That's the inefficiency ANS/arithmetic coding removes (Q3).
 **Libraries:** zlib (reference), **zlib-ng** (modernised, SIMD, a drop-in replacement now used by many distros and runtimes), and **libdeflate** (fastest whole-buffer Deflate, no streaming). Same format, very different speed. Swapping the library is often the cheapest win.
 
 **Protocol history:** TLS-level compression (Deflate) was removed in TLS 1.3 after the CRIME attack. See Q9 for why compression and secrets don't mix.
+
+**Diagram: gzip and zlib are sibling wrappers around the same Deflate bitstream.**
+
+```mermaid
+flowchart TD
+D["Deflate bitstream (RFC 1951)"]
+G["gzip (RFC 1952): 10 B header, CRC-32 + size trailer"] --> D
+Z["zlib (RFC 1950): 2 B header, Adler-32 trailer"] --> D
+R["Raw Deflate: no wrapper"] --> D
+G --> U1[".gz, tar.gz, Content-Encoding gzip"]
+Z --> U2["PNG IDAT, HTTP deflate, Git objects"]
+R --> U3["ZIP entries, permessage-deflate"]
+```
 
 ### 🔍 Staff-Level Evaluation
 
@@ -302,6 +325,20 @@ location /api/ {
 }
 ```
 
+**Diagram: Content-Encoding negotiation through a CDN or proxy.**
+
+```mermaid
+sequenceDiagram
+participant B as Browser
+participant X as CDN or nginx
+participant O as Origin
+B->>X: GET /app.js, Accept-Encoding: br, gzip
+X->>O: GET /app.js (identity or gzip)
+O-->>X: 200 body
+X->>X: Compress or re-encode, cache per encoding
+X-->>B: 200, Content-Encoding: br, Vary: Accept-Encoding
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -454,6 +491,21 @@ On a synthetic set of ~170-byte JSON order records, this measured **1.15:1 witho
 | **Encryption** | Compress before encrypting. Ciphertext is incompressible. |
 
 **When not to bother:** payloads dominated by high-entropy fields (UUIDs, hashes, random IDs, already-compressed blobs), batches that already compress well, or no way to coordinate producers and consumers. `zstd --long` doesn't help here: long-distance matching finds repeats far apart *within one large input*. It does nothing for independent 200-byte records.
+
+**Diagram: safe rollout of a trained zstd dictionary.**
+
+```mermaid
+flowchart TD
+S["Sample real payloads"] --> T["Train dictionary"]
+T --> E{"Better ratio on held-out data?"}
+E -- "No" --> S
+E -- "Yes" --> R["Publish to registry by dictionary ID"]
+R --> C["Consumers load new dictionary"]
+C --> P["Producers switch to new dictionary"]
+P --> M["Monitor ratio per dictionary ID"]
+M -- "Ratio degrades" --> S
+P -. "Keep dictionary while data that uses it exists" .-> R
+```
 
 ### 🔍 Staff-Level Evaluation
 
@@ -747,6 +799,21 @@ tar -cf - /data | zstd -T0 -6 -o data-$(date +%F).tar.zst
 **CDN pattern:** origin serves pre-compressed static files with `Vary: Accept-Encoding` and long `Cache-Control` for fingerprinted URLs. The CDN caches each encoding variant, and many CDNs will also compress or re-encode dynamic responses (Brotli/zstd) at the edge, so the origin can send gzip or identity. Check that the CDN cache key includes the normalised encoding.
 
 **Make it a platform default:** shared library or sidecar defaults, dashboards for `bytes_out` before and after, CPU cost per GB, and a rollback switch. The hard part at staff level is the **rollout and measurement**, not choosing the codec.
+
+**Diagram: deciding whether and how to compress a payload.**
+
+```mermaid
+flowchart TD
+A["Payload"] --> B{"Already compressed or under about 1 KB?"}
+B -- "Yes" --> N["Skip compression"]
+B -- "No" --> C{"Secret mixed with reflected input?"}
+C -- "Yes" --> N
+C -- "No" --> D{"Client is a browser?"}
+D -- "Yes" --> W["Negotiate br, zstd or gzip"]
+D -- "No" --> E{"Write once, read many?"}
+E -- "Yes" --> H["zstd high level"]
+E -- "No" --> L["zstd low level or LZ4"]
+```
 
 ### 🔍 Staff-Level Evaluation
 

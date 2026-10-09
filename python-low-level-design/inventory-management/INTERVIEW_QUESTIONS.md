@@ -92,6 +92,15 @@ Reservations carry `expires_at` (e.g. 15 minutes). A sweeper calls `expire_reser
 
 In Redis-backed designs the same idea is a key with a TTL, but key expiry alone does not give stock back to the counter, so you still need a sweeper or keyspace-notification consumer, and keyspace notifications are fire-and-forget (lost if no subscriber is connected).
 
+*Figure: reservation lifecycle; commit and the sweeper both re-check status so exactly one wins.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> ACTIVE: reserve (expires_at)
+  ACTIVE --> COMMITTED: commit before expiry
+  ACTIVE --> EXPIRED: sweeper releases stock
+```
+
 ---
 
 ## Question 6: "The client times out and retries reserve. Do we reserve twice?"

@@ -110,6 +110,21 @@ class MoveValidator:
 ```
 Raising beats returning `False`: the UI can show *why*, and tests can assert on the reason. If the rule set grows (variants, house rules), turn each check into a `MoveRule` object in a list; that's when Chain of Responsibility starts to pay.
 
+*Figure: move validation pipeline; each check fails with a precise reason.*
+
+```mermaid
+flowchart TD
+  A[Move start to end] --> B{"Piece at start?"}
+  B -- No --> X[InvalidMoveError]
+  B -- Yes --> C{"Own piece?"}
+  C -- No --> X
+  C -- Yes --> D{"End in possible moves? (pattern)"}
+  D -- No --> X
+  D -- Yes --> E{"Own king safe after move?"}
+  E -- No --> X
+  E -- Yes --> F[Apply move]
+```
+
 **Pin detection** is particularly interesting. A pinned piece (e.g., bishop pinned to king by enemy rook) shouldn't be able to move off its attack line. In our implementation, this falls out naturally from `_is_legal_move` — any move that exposes the king to check is rejected.
 
 ### 💡 Production Performance Considerations
@@ -285,6 +300,17 @@ The jump from OOP chess to competitive engine is massive. Key optimizations:
 | **Observer** | UI / spectators | Extension; only with real subscribers |
 
 `GameStatus` is an enum with transition logic in `_refresh_status`, not the State pattern. Say so rather than over-claiming.
+
+*Figure: after each move, the status depends on check and on having any legal move.*
+
+```mermaid
+flowchart TD
+  A[After a move] --> B{"Opponent has a legal move?"}
+  B -- Yes --> C[Game continues]
+  B -- No --> D{"Opponent in check?"}
+  D -- Yes --> E[Checkmate]
+  D -- No --> F[Stalemate]
+```
 
 ---
 

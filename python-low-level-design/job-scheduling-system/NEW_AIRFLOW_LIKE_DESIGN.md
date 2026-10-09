@@ -35,6 +35,16 @@ User submits Python script
 └─────────────────────────────────────────────┘
 ```
 
+*Figure: scheduler service components; the core manager gates the worker pool.*
+
+```mermaid
+flowchart TB
+  U["User submits Python script"] --> API["API layer (REST)"]
+  API --> CM["Core manager: tracks cores, prevents oversubscription"]
+  SE["Scheduler engine"] --> CM
+  CM --> WP["Worker pool: worker 1..N"]
+```
+
 ---
 
 ## 2. CORE COMPONENTS
@@ -871,6 +881,19 @@ When Job A completes:
   → Job D starts running
 ```
 
+*Figure: core allocation with an overcommit ratio; jobs queue when no slots remain.*
+
+```mermaid
+flowchart TD
+  A[Job requests N cores] --> B{"Free slots >= N? (physical + virtual up to overcommit limit)"}
+  B -- Yes --> C["Allocate physical first, then virtual"]
+  C --> D[Run job]
+  D --> E[Release cores]
+  E --> F[Queued jobs retry]
+  B -- No --> G["Queue, retry later"]
+  G --> B
+```
+
 ### 3.3 Scheduling Flow
 
 ```
@@ -902,6 +925,22 @@ When Job A completes:
     │   └── Releases cores
     └── If no cores:
         └── Requeues instance (retry later)
+```
+
+*Figure: scheduling flow from submission to execution, polled every 15 seconds.*
+
+```mermaid
+flowchart TD
+  A[User submits job with schedule] --> B[Store in database]
+  B --> C[Scheduler registers job]
+  C --> D{"Every 15 s: now >= next_run?"}
+  D -- No --> D
+  D -- Yes --> E["Create and store JobInstance"]
+  E --> F["Executor requests cores"]
+  F --> G{"Cores available?"}
+  G -- Yes --> H["Workspace, install deps, run subprocess, capture output, release cores"]
+  G -- No --> I["Requeue instance"]
+  I --> F
 ```
 
 ---

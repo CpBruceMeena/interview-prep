@@ -18,6 +18,20 @@ PROCESSING ──▶ SUCCEEDED ──▶ PARTIALLY_REFUNDED ──▶ REFUNDED
 
 Entities: `Money(Decimal, Currency)`, `PaymentRequest(idempotency_key, merchant_id, customer_id, amount, payment_token)`, `Payment` (status, gateway reference, refunds), `Refund` (own key, PENDING/SUCCEEDED/FAILED). Interfaces: `PaymentGateway` (one adapter per provider) and `RiskRule`. Lead with the two invariants: **at most one charge per idempotency key** and **refunds never exceed the captured amount**.
 
+*Figure: payment state machine; a timeout leaves the payment UNKNOWN until reconciled.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> PROCESSING
+  PROCESSING --> SUCCEEDED
+  PROCESSING --> FAILED: declined or risk
+  PROCESSING --> UNKNOWN: timeout
+  UNKNOWN --> SUCCEEDED: reconcile
+  UNKNOWN --> FAILED: reconcile
+  SUCCEEDED --> PARTIALLY_REFUNDED
+  PARTIALLY_REFUNDED --> REFUNDED
+```
+
 ---
 
 ## Question 2: "How do you guarantee idempotency?"
@@ -56,6 +70,16 @@ Classify first:
 | Read timeout, connection reset after send | **Unknown** | Retry only with the **same** idempotency key |
 
 Retry with exponential backoff and jitter (full jitter: `sleep(uniform(0, min(cap, base * 2**n)))`) so a gateway blip doesn't turn into a synchronised retry storm. When the budget is exhausted, mark the payment **UNKNOWN**, not FAILED: telling the customer "failed" invites a second payment while the first may have succeeded. A reconciler re-sends with the same key (the gateway returns the original outcome), or queries the charge by reference, or consumes the gateway's webhook. `test_timeout_after_charge_does_not_double_charge` and `test_exhausted_retries_leave_unknown_then_reconcile` cover this.
+
+*Figure: deciding whether a gateway error can be retried.*
+
+```mermaid
+flowchart TD
+  A[Gateway call result] --> B{"Outcome"}
+  B -- "Approved or declined" --> C["Record, never retry a decline"]
+  B -- "Refused or 503 before accepted" --> D["Safe to retry"]
+  B -- "Read timeout or reset after send" --> E["Retry only with the same idempotency key"]
+```
 
 ---
 

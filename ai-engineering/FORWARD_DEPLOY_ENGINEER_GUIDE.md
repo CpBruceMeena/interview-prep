@@ -159,6 +159,19 @@ The **customer-cloud** option is often the answer to "our data can't leave our e
 
 Network latency is rarely the deciding factor: LLM generation time (hundreds of milliseconds to seconds) dominates a few milliseconds of network.
 
+*Figure: choosing a deployment topology from the customer data and network constraints.*
+
+```mermaid
+flowchart TD
+  A["Customer requirements"] --> B{"No internet allowed?"}
+  B -- "yes" --> C["On-prem / air-gapped: open-weight models only"]
+  B -- "no" --> D{"Legacy systems on-prem?"}
+  D -- "yes" --> E["Hybrid: VPN / Direct Connect to cloud AI workloads"]
+  D -- "no" --> F{"Data must stay in customer cloud account?"}
+  F -- "yes" --> G["Customer cloud: managed model endpoint"]
+  F -- "no" --> H["SaaS / cloud-to-cloud"]
+```
+
 ### Containerized AI Deployment Package
 
 ```yaml
@@ -516,6 +529,23 @@ Why it's written this way:
 - Setting the checkpoint to `now()` at the end loses rows committed during the run and breaks under clock skew between your host and the database. Use the highest `updated_at` you saw, minus an overlap window, and make writes idempotent so the overlap is harmless.
 - Timestamp polling **cannot see deletes** and misses rows whose `updated_at` isn't maintained. When freshness or deletes matter, use **CDC** (Debezium, Postgres logical replication, SQL Server CDC) or the source's delta API.
 
+*Figure: incremental sync advances the checkpoint to the max timestamp seen, with an overlap window.*
+
+```mermaid
+sequenceDiagram
+  participant J as Sync job
+  participant S as Checkpoint storage
+  participant C as Source connector
+  participant V as Index (idempotent upsert)
+  J->>S: Get checkpoint
+  J->>C: Extract changes since checkpoint minus overlap
+  loop each batch of 100
+    C-->>J: Documents
+    J->>V: Upsert batch
+  end
+  J->>S: Set checkpoint to max updated_at seen
+```
+
 ---
 
 ## 6. On-Premise & Air-Gapped Deployment
@@ -570,6 +600,18 @@ def build_airgap_bundle(version: str) -> dict:
         "scripts": ["install.sh", "verify.sh", "upgrade.sh", "rollback.sh", "backup.sh"],
         "docs": ["deployment_guide.pdf", "runbook.md", "troubleshooting.md"],
     }
+```
+
+*Figure: moving a bundle into an air-gapped site, with integrity checks at each step.*
+
+```mermaid
+flowchart LR
+  A["Build bundle: images, weights, wheels, SBOM"] --> B["Sign and checksum"]
+  B --> C["Approved transfer media or data diode"]
+  C --> D["Verify checksums and signature"]
+  D --> E["Install into internal registry and model server"]
+  E --> F["Local monitoring: Prometheus, Grafana, Loki"]
+  F --> G["Export diagnostic bundle after customer review"]
 ```
 
 ### Local Model Server Setup
@@ -725,6 +767,17 @@ async def version():
    └── Document everything
 ```
 
+*Figure: the five-step customer communication loop.*
+
+```mermaid
+flowchart LR
+  A["Listen"] --> B["Clarify constraints"]
+  B --> C["Propose options"]
+  C --> D["Set expectations"]
+  D --> E["Follow up"]
+  E --> A
+```
+
 ### Handling Common Customer Objections
 
 | Objection | Response |
@@ -796,6 +849,16 @@ ROUND 5: Behavioral / customer scenario (45-60 min)
   ├── Conflict resolution with customers
   ├── "Tell me about a time you shipped something imperfect"
   └── "Tell me about a time you had to say no to a customer"
+```
+
+*Figure: a common FDE interview loop.*
+
+```mermaid
+flowchart LR
+  R1["1. Recruiter / HM screen"] --> R2["2. Practical coding"]
+  R2 --> R3["3. System design / decomposition"]
+  R3 --> R4["4. Deployment deep dive"]
+  R4 --> R5["5. Behavioral / customer scenario"]
 ```
 
 ### What Interviewers Are Looking For
@@ -976,6 +1039,23 @@ article. Here's the plan:
 3. Ongoing: feedback buttons feed our test set; we review the numbers with you weekly."
 ```
 </details>
+
+*Figure: investigate with data before proposing fixes to the escalation.*
+
+```mermaid
+flowchart TD
+  A["Customer: agents slower with the AI"] --> B["Pull metrics: acceptance rate, edit rate, time on panel"]
+  B --> C["Grade ~200 recent queries"]
+  C --> D{"Dominant cause?"}
+  D -- "Accuracy" --> E["Improve retrieval, add sources, abstain"]
+  D -- "UX" --> F["Lead with answer, inline citations"]
+  D -- "Trust" --> G["Feedback buttons, share accuracy, relaunch with champions"]
+  D -- "Metric or workflow" --> H["Agree metric, remove extra step"]
+  E --> I["Communicate plan and re-measure"]
+  F --> I
+  G --> I
+  H --> I
+```
 
 ### Question 4: System Design — AI for Enterprise
 

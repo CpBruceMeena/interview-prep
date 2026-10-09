@@ -55,6 +55,20 @@ print(f"Was truncated: {context.was_truncated}")
 print(f"Relevant info pushed out: {context.find_missing_info()}")
 ```
 
+*Figure: debugging a wrong answer by walking the trace.*
+
+```mermaid
+flowchart TD
+  A["User reports wrong answer"] --> B["Get trace by conversation id"]
+  B --> C{"Agent understood the request?"}
+  C -- "no" --> X["Root cause: intent or prompt"]
+  C -- "yes" --> D{"Right tool and good result?"}
+  D -- "no" --> Y["Root cause: tool choice or tool data"]
+  D -- "yes" --> E{"Context truncated at failure step?"}
+  E -- "yes" --> Z["Root cause: context budget"]
+  E -- "no" --> W["Root cause: model hallucination"]
+```
+
 ### 1.3 Conversation History Storage
 
 #### 1.3.1 Storage Architecture
@@ -401,6 +415,17 @@ Standard metrics: `gen_ai.client.token.usage` and `gen_ai.client.operation.durat
 
 Propagate trace context across MCP calls and sub-agents (the MCP spec documents `traceparent` in request `_meta`), so a multi-agent run is one trace, not ten.
 
+*Figure: one agent run as a single trace with child spans for model and tool calls.*
+
+```mermaid
+flowchart TD
+  A["invoke_agent support_agent"] --> B["chat model-id"]
+  A --> C["execute_tool get_order"]
+  C --> D["HTTP GET orders-service"]
+  A --> E["chat model-id"]
+  A --> F["execute_tool send_reply"]
+```
+
 ---
 
 ## 2. WHY HALLUCINATIONS OCCUR
@@ -633,6 +658,18 @@ class BudgetAwareContextManager:
         )
         # ... call LLM ...
         return summary
+```
+
+*Figure: context is assembled in priority order and trimmed to fit the budget.*
+
+```mermaid
+flowchart LR
+  A["System"] --> B["Tools"]
+  B --> C["Current task"]
+  C --> D["Relevant memory"]
+  D --> E["Conversation (compressed)"]
+  E --> F["Tool results"]
+  F --> G["Buffer for response"]
 ```
 
 ### 3.4 Monitoring Budget Usage

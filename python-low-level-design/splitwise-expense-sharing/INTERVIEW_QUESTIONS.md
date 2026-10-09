@@ -53,6 +53,17 @@ leftover = total_cents - sum(floors)                          # 0 <= leftover < 
 
 Who gets the extra cent is a product decision (first participant, payer, random). What is not negotiable: the shares sum to the total and no share is more than one cent off.
 
+*Figure: largest-remainder split in integer cents.*
+
+```mermaid
+flowchart TD
+  A["Total in cents and weights"] --> B["exact share = total * w / sum(weights)"]
+  B --> C["floors = floor(exact)"]
+  C --> D["leftover = total - sum(floors), always < n"]
+  D --> E["Give +1 cent to the largest fractional remainders"]
+  E --> F["Shares sum exactly to total"]
+```
+
 ---
 
 ## Question 3: Debt Simplification (Minimum Transactions)

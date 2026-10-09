@@ -79,6 +79,20 @@ It deliberately does **not** specify the garbage collector, the JIT, or object l
 | **Garbage collector** | Reclaims unreachable objects (Serial, Parallel, G1, ZGC, Shenandoah) |
 | **Native interfaces** | JNI (legacy), the Foreign Function & Memory API (final in JDK 22) for calling native code and managing off-heap memory, JVMTI for agents and debuggers |
 
+*HotSpot at a glance: class loading feeds the runtime data areas, which the execution engine (interpreter, JITs, GC) works on, with native interfaces on the side.*
+
+```mermaid
+flowchart TD
+    CL["Class loading: Bootstrap, Platform, Application, Custom. Load, link, initialize"] --> RD
+    subgraph RD["Runtime data areas"]
+        direction LR
+        SH["Shared: Heap, Metaspace, Code cache"]
+        TH["Per thread: Java stack, PC, native stack"]
+    end
+    RD --> EE["Execution engine: Interpreter, C1, C2, GC, safepoints"]
+    EE --> NI["Native interfaces: JNI, FFM API, JVMTI"]
+```
+
 ---
 
 ## 2. Class Loading Mechanism
@@ -133,6 +147,22 @@ protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundE
     }
 }
 // Custom loaders normally override findClass(), not loadClass(), to keep delegation.
+```
+
+*Parent-first delegation in `loadClass`: check the loader's own cache, ask the parent, and only then call `findClass` on this loader.*
+
+```mermaid
+flowchart TD
+    R["loadClass(name)"] --> A{"findLoadedClass: already defined here?"}
+    A -->|yes| RET["Return the Class"]
+    A -->|no| P{"Parent loader exists?"}
+    P -->|yes| PL["parent.loadClass(name)"]
+    P -->|no| BS["findBootstrapClassOrNull(name)"]
+    PL --> F{"Found?"}
+    BS --> F
+    F -->|yes| RET
+    F -->|"no (ClassNotFoundException)"| FC["findClass(name): this loader defines it"]
+    FC --> RET
 ```
 
 ### ClassLoader Hierarchy in Java 9+ (Modules)
@@ -270,6 +300,19 @@ ZGC: young and old generations made of pages of different sizes.
 ```
 
 A minor collection copies live Eden and from-survivor objects to the to-survivor space (or promotes them). Each survival increments the object's **age** (4 bits in the header, so at most 15 = `MaxTenuringThreshold`). The JVM promotes objects earlier when survivor space fills beyond `TargetSurvivorRatio` (50%).
+
+*Object life in the generational heap: allocate in Eden, copy survivors between survivor spaces while their age grows, promote to old, and reclaim old space with a major collection.*
+
+```mermaid
+flowchart LR
+    N["new object (TLAB bump in Eden)"] --> EF{"Eden full?"}
+    EF -->|yes| MG["Minor GC: copy live objects"]
+    MG --> D1["Dead objects: reclaimed with Eden"]
+    MG --> SV["To-survivor space, age + 1"]
+    SV -->|"age reaches threshold or survivor overflows"| OLD["Old generation (promotion)"]
+    SV -->|"survives, age below threshold"| MG
+    OLD -->|"old gen fills"| MJ["Major collection: mark, then compact"]
+```
 
 ### Allocation: TLABs and Escape Analysis
 
@@ -662,6 +705,22 @@ PHASE 4: FULL GC (STW fallback, a failure mode)
 └──────────────────────────────────────────────────────────────┘
 ```
 
+*G1 cycle: young-only pauses until old occupancy crosses IHOP, then concurrent marking, then mixed pauses that reclaim old regions; Full GC is the failure fallback.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> YoungOnly
+    YoungOnly --> ConcurrentStart: old occupancy crosses IHOP
+    ConcurrentStart --> ConcurrentMark: root regions scanned, mark runs concurrently
+    ConcurrentMark --> Remark: STW remark, cleanup
+    Remark --> Mixed: prepare mixed, candidate old regions chosen
+    Mixed --> Mixed: up to 8 mixed pauses (young + old slice)
+    Mixed --> YoungOnly: reclaimable space below G1HeapWastePercent
+    YoungOnly --> FullGC: evacuation failure or humongous alloc fails
+    Mixed --> FullGC: evacuation failure
+    FullGC --> YoungOnly
+```
+
 ### G1 Tuning Parameters
 
 Start with `-Xms`/`-Xmx` and at most a pause goal; change anything else only with GC logs that show why.
@@ -782,6 +841,23 @@ Object field = obj.someField;
 // value if marking is in progress (SATB-style) and records old→young fields in
 // the remembered set (a pair of bitmaps per old page, swapped each young cycle,
 // rather than a card table).
+```
+
+*ZGC load barrier: a reference with the good color is used directly, otherwise the slow path remaps it to the new address and heals the field so the next load is fast.*
+
+```mermaid
+flowchart TD
+    L["Load reference from heap field"] --> C{"Good color bits?"}
+    C -->|yes| FP["Fast path: strip color, use address"]
+    C -->|no| SP["Slow path"]
+    SP --> RL{"Object relocated?"}
+    RL -->|"yes, forwarding entry exists"| FW["Look up new address"]
+    RL -->|"not yet moved"| MV["Relocate it now"]
+    RL -->|"no, only stale color"| RM["Remap pointer"]
+    FW --> HL["CAS good-colored pointer back into the field (self-healing)"]
+    MV --> HL
+    RM --> HL
+    HL --> FP
 ```
 
 ### ZGC Phase Details
@@ -1084,6 +1160,20 @@ This is why immutable objects (all fields `final`, e.g. records, `String`) can b
 // Code cache: ReservedCodeCacheSize (240 MB by default with tiered compilation),
 // segmented into non-method, profiled and non-profiled code. If it fills up,
 // compilation stops and the app runs slowly; watch for "CodeCache is full".
+```
+
+*Tiered compilation: code starts interpreted, is compiled by C1 with profiling, then by C2 using that profile; a failed speculation deoptimizes back to the interpreter.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> Interpreter: level 0
+    Interpreter --> C1Profiled: level 3, hot (counters over threshold)
+    C1Profiled --> C2: level 4, optimized with the profile
+    Interpreter --> C1Limited: level 2, when C2 queue is long
+    C1Limited --> C1Profiled: upgrade
+    C1Profiled --> C1Trivial: level 1, trivial method or C2 cannot compile it
+    C2 --> Interpreter: deoptimization (uncommon trap)
+    C1Profiled --> Interpreter: deoptimization
 ```
 
 ### C2 Optimizations

@@ -63,6 +63,18 @@ class ProgressiveFine(FineCalculator):
 
 **Follow-up: "Why not just notify everyone in the queue?"** Then the fastest person wins and the queue is meaningless.
 
+*Figure: copy status through borrow, return and the reservation hold.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> AVAILABLE
+  AVAILABLE --> ON_LOAN: borrow
+  ON_LOAN --> AVAILABLE: return, nobody waiting
+  ON_LOAN --> ON_HOLD: return, head of queue gets hold
+  ON_HOLD --> ON_LOAN: that member borrows
+  ON_HOLD --> AVAILABLE: hold expires, queue empty
+```
+
 ---
 
 ## Question 4: Concurrency

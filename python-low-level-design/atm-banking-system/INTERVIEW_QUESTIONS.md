@@ -40,6 +40,19 @@ class CardInsertedState(ATMState):
 
 **Why a reject-by-default base class?** Each state lists only what it allows. Adding `MAINTENANCE` is one class, and nothing is silently allowed because someone forgot an `elif`.
 
+*Figure: ATM state machine from the table above.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> CARD_INSERTED: valid card
+  CARD_INSERTED --> AUTHENTICATED: PIN ok
+  CARD_INSERTED --> IDLE: 3rd wrong PIN, card retained
+  AUTHENTICATED --> IDLE: eject
+  AUTHENTICATED --> OUT_OF_SERVICE: cash ran out
+  OUT_OF_SERVICE --> IDLE: operator restock
+```
+
 ---
 
 ## Question 2: The Withdrawal Sequence
@@ -64,6 +77,19 @@ Then go arrow by arrow:
 - **Ambiguous jam (some notes may have been presented)** → do not guess. Mark the transaction for reconciliation; the cassette counters and the purge bin settle it at end of day.
 
 In real ISO 8583 networks this is usually a single financial request (0200) that debits on approval, followed by a reversal advice (0420) on failure that the ATM stores and forwards until acknowledged. Same effect: the default after a failure is to give the money back, and the reversal must be delivered reliably.
+
+*Figure: withdrawal sequence and what happens at each failure point.*
+
+```mermaid
+flowchart TD
+  A["plan: can cassettes make the amount?"] -- No --> X[Decline before any hold]
+  A -- Yes --> B["authorize: hold funds, PENDING"]
+  B -- Declined --> X2[Nothing to undo]
+  B -- Approved --> C[dispense]
+  C -- "Jam before notes move" --> R["reverse: release hold"]
+  C -- "Ambiguous jam" --> Q["Flag for reconciliation"]
+  C -- Notes presented --> D["capture (idempotent, retry on timeout)"]
+```
 
 ---
 

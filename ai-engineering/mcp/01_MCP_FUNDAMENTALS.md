@@ -79,6 +79,19 @@ MCP has three roles. The host owns the model and the user; each client is one co
 
 **Why one client per server:** isolation. Each server gets its own connection, credentials and failure domain; a compromised or crashing server can't read another server's traffic.
 
+*Figure: one host owns several clients, each connected to one server.*
+
+```mermaid
+flowchart TD
+  H["MCP Host (owns LLM, conversation, consent)"]
+  H --> C1["MCP Client 1"]
+  H --> C2["MCP Client 2"]
+  H --> C3["MCP Client 3"]
+  C1 -- "stdio" --> S1["Server A: filesystem"]
+  C2 -- "stdio" --> S2["Server B: calculator"]
+  C3 -- "Streamable HTTP" --> S3["Server C: remote SaaS"]
+```
+
 ---
 
 ## 3. CORE PRIMITIVES
@@ -253,6 +266,20 @@ The spec defines two standard transports. Messages are JSON-RPC 2.0 either way; 
 
 **Limitations:** network latency, TLS and an OAuth deployment to run, and proxies that buffer SSE (send `X-Accel-Buffering: no`).
 
+*Figure: Streamable HTTP (2026-07-28) sends one POST per request and gets JSON or a request-scoped SSE stream.*
+
+```mermaid
+sequenceDiagram
+  participant C as MCP Client
+  participant S as MCP Server (any replica)
+  C->>S: POST /mcp (Bearer token, Mcp-Method, Mcp-Name)
+  alt single result
+    S-->>C: 200 application/json
+  else progress then result
+    S-->>C: 200 text/event-stream (progress, then result, stream closes)
+  end
+```
+
 ---
 
 ## 5. PROTOCOL LIFECYCLE
@@ -315,6 +342,24 @@ The spec defines two standard transports. Messages are JSON-RPC 2.0 either way; 
 An unsupported version gets `UnsupportedProtocolVersionError` listing what the server supports, and the client retries. Dual-era clients (like the Python SDK v2 `Client`) probe with `server/discover` and fall back to `initialize` for legacy servers.
 
 **Multi round-trip requests (MRTR).** When a server needs something mid-call (a user confirmation via elicitation, for example), it returns `{"resultType": "input_required", "inputRequests": {...}, "requestState": "..."}`. The client gathers the input and **retries the original request** with `inputResponses` and the opaque `requestState`. The server keeps no state between the two, so it must integrity-protect `requestState` (HMAC/AEAD) and bind it to the user, a short expiry and the original request.
+
+*Figure: legacy initialize handshake versus the stateless 2026-07-28 flow.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: Legacy (2025-11-25 and earlier)
+  C->>S: initialize (version, capabilities)
+  S-->>C: result (version, capabilities)
+  C->>S: notifications/initialized
+  C->>S: tools/list, tools/call
+  Note over C,S: 2026-07-28 (stateless)
+  C->>S: tools/call with version and capabilities in _meta
+  S-->>C: input_required plus requestState (MRTR)
+  C->>S: Retry with inputResponses and requestState
+  S-->>C: Result
+```
 
 ---
 

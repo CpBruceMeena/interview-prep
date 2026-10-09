@@ -64,6 +64,20 @@ Bits 63:48 must copy bit 47 ("canonical" addresses), which splits the space into
 
 With 2 MB huge pages the PTE level disappears for that region: 3 tables total.
 
+*Diagram: a 4-level x86-64 page walk on a TLB miss.*
+
+```mermaid
+flowchart LR
+    V["Virtual address"] --> T{"TLB hit?"}
+    T -->|Yes| PA["Physical address"]
+    T -->|No| CR3["CR3 -> PGD"]
+    CR3 --> PUD["PUD"]
+    PUD --> PMD["PMD"]
+    PMD --> PTE["PTE"]
+    PTE --> PA
+```
+
+
 **5-level paging:** adds a P4D level (bits 56:48) for a 57-bit (128 PB) virtual space and up to 4 PB physical. Enabled on CPUs that support it (Intel since Ice Lake server, AMD Zen 4); 4-level paging limits virtual space to 256 TB and Linux to 64 TB of physical RAM.
 
 **What they probe next:**
@@ -192,6 +206,18 @@ struct task *pick_next(struct cfs_rq *rq) {
 | **Why it replaced CFS** | CFS needed a pile of heuristics (wakeup granularity, latency tunables) to give interactive tasks low latency; EEVDF expresses latency needs directly via slice length while keeping proportional fairness |
 
 The old CFS tunables (`sched_latency_ns`, `sched_min_granularity_ns`, `sched_wakeup_granularity_ns`) are gone in EEVDF kernels; the main knob is the base slice (`/sys/kernel/debug/sched/base_slice_ns`).
+
+*Diagram: how the fair scheduler picks the next task under EEVDF.*
+
+```mermaid
+flowchart TD
+    R["Per-CPU runqueue"] --> E{"Eligible tasks? (lag >= 0)"}
+    E -->|Yes| D["Pick earliest virtual deadline"]
+    E -->|None| W["Wait until a task becomes eligible"]
+    D --> RUN["Run task, vruntime grows by delta x 1024 / weight"]
+    RUN --> R
+```
+
 
 **Nice values:** each nice step is roughly a 1.25× weight change (≈10% CPU difference between two competing tasks).
 
@@ -380,6 +406,24 @@ do {
 } while (io_uring_peek_cqe(&ring, &cqe) == 0);       /* 0 = got one; -EAGAIN = empty */
 ```
 
+*Diagram: readiness model (epoll) versus completion model (io_uring).*
+
+```mermaid
+sequenceDiagram
+    participant A as App
+    participant K as Kernel
+    Note over A,K: epoll, readiness
+    A->>K: epoll_wait
+    K-->>A: fd 7 is readable
+    A->>K: read(fd 7)
+    K-->>A: data
+    Note over A,K: io_uring, completion
+    A->>K: Write SQEs to submission ring
+    A->>K: io_uring_enter (one syscall)
+    K-->>A: CQE with result in completion ring
+```
+
+
 **Why io_uring was a paradigm shift:**
 
 1. **Batching:** one `io_uring_enter` submits and reaps many operations; with `IORING_SETUP_SQPOLL` a kernel thread polls the submission ring, so the hot path needs no syscalls (at the cost of a busy core).
@@ -530,6 +574,20 @@ Device: ~10s of µs for NVMe flash random reads, ~5-10 ms for HDD seeks
   ▼
 Pages marked up to date, waiting reader woken, data copied into buf
 ```
+
+*Diagram: the pread() path through the page cache.*
+
+```mermaid
+flowchart TD
+    P["pread(fd, buf, len, offset)"] --> V["VFS: file to address_space"]
+    V --> C{"Page cache hit?"}
+    C -->|Yes| H["copy_to_user into buf"]
+    C -->|No| F["Filesystem: offset to disk blocks"]
+    F --> B["Block layer, then NVMe driver, DMA into cache pages"]
+    B --> U["Page marked up to date, reader woken"]
+    U --> H
+```
+
 
 **Write path and dirty page tunables:**
 
@@ -1066,6 +1124,20 @@ dmesg | grep -i -A20 "memory cgroup out of memory"   # who was killed and why
 ```
 
 Note the different thresholds: the **kernel** OOM-kills at `memory.max`; the **kubelet** evicts pods when the **node** runs low, based on "working set" (`usage − inactive_file`), which is also what `kubectl top` shows.
+
+*Diagram: why a container can be OOM-killed while node memory is fine.*
+
+```mermaid
+flowchart TD
+    A["Processes allocate anon memory, page cache and tmpfs grow"] --> L{"memory.current >= memory.max?"}
+    L -->|No| OK["Keep running"]
+    L -->|Yes| R["Reclaim clean page cache"]
+    R --> E{"Enough freed?"}
+    E -->|Yes| OK
+    E -->|No| K["OOM killer picks highest badness in the cgroup"]
+    K --> G["memory.oom.group=1: whole container killed"]
+```
+
 
 **Memory overcommit modes (`vm.overcommit_memory`):**
 

@@ -150,6 +150,18 @@ Anthropic doesn't document its serving stack or tokenizer internals. The pipelin
 
 `tool_use` isn't decided "after" generation: the model generates the tool call as tokens like any other output, and the server parses them into a structured `tool_use` block.
 
+*Figure: server-side stages from request to stop_reason.*
+
+```mermaid
+flowchart TD
+  A["JSON request"] --> B["Render and tokenize"]
+  B --> C["Prefill (reuse cached prefix if hit)"]
+  C --> D["Decode loop: sample, forward pass, stream"]
+  D --> E{"Stop?"}
+  E -- "no" --> D
+  E -- "yes" --> F["stop_reason: end_turn / tool_use / max_tokens / ..."]
+```
+
 ---
 
 ## 4. THE STREAMING RESPONSE
@@ -223,6 +235,19 @@ Total:                      26,000 input  + 2,000 output
 
 Three tool calls cost 28,000 tokens, versus ~5,500 if the same answer came in one call. In general, with a fixed prefix P and ~Δ new tokens per turn, cumulative input after N calls is about N·P + Δ·N²/2: **linear per call, quadratic in total.** With prompt caching, most of each call's input is billed as cache reads (~10% of the input rate, less on some models), which flattens that curve dramatically.
 
+*Figure: the client executes tools and resends the whole conversation each round.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant M as Messages API
+  C->>M: Request (call 1)
+  M-->>C: text + tool_use, stop_reason tool_use
+  C->>C: Validate, check permissions, execute
+  C->>M: Full history + one user message of tool_result blocks
+  M-->>C: end_turn or more tool_use
+```
+
 ---
 
 ## 6. RESPONSE POST-PROCESSING (CLIENT SIDE)
@@ -264,6 +289,20 @@ TOTAL  input 18,098   output 297
 ```
 
 At example rates of $3 / $15 per million input/output tokens: 18,098 × $3/M + 297 × $15/M ≈ $0.054 + $0.004 = **$0.059**. With the 4,500-token tools+system prefix cached (written once at 1.25× in call 1, read at 0.1× in calls 2 and 3), billed input drops by roughly 40% for this short loop; caching the growing history too, and running more turns, pushes the saving much higher.
+
+*Figure: the three calls of the health-check example.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant M as Model
+  C->>M: Call 1 (5,708 input tokens)
+  M-->>C: tool_use read_file main.py
+  C->>M: Call 2 (6,133 input tokens, with file contents)
+  M-->>C: tool_use edit main.py
+  C->>M: Call 3 (6,257 input tokens, edit applied)
+  M-->>C: Final text, end_turn
+```
 
 ---
 

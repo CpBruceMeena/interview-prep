@@ -29,6 +29,22 @@
 !!! tip "30-second answer"
     Treiber's stack is a singly linked list whose `head` is updated with compare-and-swap. The hard part is **memory reclamation**: in `pop`, a thread reads `head` and then `head->next`, but another thread may have popped and **freed** that node in between (use-after-free), or freed and **reused** its address so the CAS succeeds against a different node (ABA). **Hazard pointers** fix both: before dereferencing a node, a thread publishes its address in a per-thread slot and re-checks that it is still `head`; nodes are never freed directly, only **retired**, and a retired node is deleted only when no hazard slot points to it. Alternatives: epoch-based reclamation/RCU (cheaper reads, unbounded garbage if a thread stalls), tagged pointers (fix ABA but not use-after-free), or a garbage collector. C++26 standardises both `std::hazard_pointer` and `std::rcu`.
 
+*Diagram: the hazard-pointer protect-then-validate step in pop.*
+
+```mermaid
+flowchart TD
+    A["Read head"] --> B["Publish head in my hazard slot"]
+    B --> C{"head still the same?"}
+    C -->|No| A
+    C -->|Yes| D["Safe to read head->next"]
+    D --> E["CAS head to next"]
+    E --> F["Clear hazard slot, retire old node"]
+    F --> G{"Any hazard slot points to it?"}
+    G -->|No| H["Delete node"]
+    G -->|Yes| I["Keep in retired list, scan again later"]
+```
+
+
 **The naive stack and its two bugs:**
 
 ```cpp
@@ -403,6 +419,19 @@ The fit says: this service peaks around 14 concurrent workers. Values beyond the
 | No preemption | Locks aren't taken away | Timeouts (`lock_timeout`, `NOWAIT`) act as self-preemption |
 | Circular wait | A waits for B, B waits for A | **Global lock order** (most effective) |
 
+*Diagram: how PostgreSQL turns a lock wait into a deadlock abort or a plain wait.*
+
+```mermaid
+flowchart TD
+    W["Backend waits on a heavyweight lock"] --> T{"Waited deadlock_timeout (1 s)?"}
+    T -->|No| W
+    T -->|Yes| G["Search waits-for graph"]
+    G --> C{"Cycle through me?"}
+    C -->|Yes| X["Abort self: deadlock detected"]
+    C -->|No| K["Keep waiting: queue pile-up, not deadlock"]
+```
+
+
 **Waits-for graph cycle detection:**
 
 ```python
@@ -621,6 +650,21 @@ class Worker:
         return None                                 # caller parks the worker
 ```
 
+*Diagram: the order in which an idle worker looks for work.*
+
+```mermaid
+flowchart TD
+    S["Worker needs a task"] --> L{"Local deque empty?"}
+    L -->|No| P["Pop from own end (LIFO)"]
+    L -->|Yes| GQ{"Global queue has work?"}
+    GQ -->|Yes| G["Take from global queue"]
+    GQ -->|No| V["Pick random victim, steal from other end (FIFO)"]
+    V --> OK{"Got a task?"}
+    OK -->|Yes| R["Run it"]
+    OK -->|No| PK["Park the worker"]
+```
+
+
 **Go scheduler — G, M, P:**
 
 | | What it is |
@@ -725,6 +769,24 @@ rcu_read_unlock()                    3. synchronize_rcu()  (or call_rcu(free, ol
                                         wait until every pre-existing reader is done
                                      4. free(old)
 ```
+
+*Diagram: readers keep running on the old version while the writer swaps and later frees it.*
+
+```mermaid
+sequenceDiagram
+    participant R as Reader
+    participant H as head pointer
+    participant W as Writer
+    R->>H: rcu_read_lock, rcu_dereference
+    H-->>R: old version
+    W->>W: copy old, modify new
+    W->>H: rcu_assign_pointer(new)
+    Note over H: New readers see new, old reader keeps old
+    R->>R: rcu_read_unlock
+    W->>W: synchronize_rcu (grace period ends)
+    W->>W: free(old)
+```
+
 
 **RCU-protected linked list (Linux kernel style):**
 
@@ -1046,6 +1108,15 @@ Wait-free        ⊂  Lock-free           ⊂  Obstruction-free
 Blocking (locks) offers none of these: if the lock holder is descheduled,
 crashes or page-faults, every waiter stalls.
 ```
+
+*Diagram: each progress guarantee implies the weaker ones.*
+
+```mermaid
+flowchart LR
+    WF["Wait-free: bounded steps per thread"] -->|implies| LF["Lock-free: system always progresses"]
+    LF -->|implies| OF["Obstruction-free: progress when running alone"]
+```
+
 
 | Guarantee | Typical technique | Example |
 |---|---|---|

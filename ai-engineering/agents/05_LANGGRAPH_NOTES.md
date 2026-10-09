@@ -158,6 +158,19 @@ graph.add_conditional_edges(
 
 A node can also route itself by returning `Command(goto="next_node", update={...})` (from `langgraph.types`), which combines a state update and the routing decision. That is the idiomatic way to do agent-to-agent handoffs.
 
+*Figure: the conditional edge after call_llm routes to tools, the error handler or the end.*
+
+```mermaid
+flowchart TD
+  S["START"] --> L["call_llm"]
+  L --> R{"should_continue"}
+  R -- "tool calls present" --> T["execute_tool_node"]
+  R -- "step_count >= 10" --> E["error_node"]
+  R -- "otherwise" --> F["END"]
+  T --> L
+  E --> F
+```
+
 ---
 
 ## 3. BUILDING A PRODUCTION-GRADE AGENT
@@ -383,6 +396,25 @@ Rules interviewers check:
 - Static breakpoints (`interrupt_before=[...]` / `interrupt_after=[...]` at compile or invoke time) still exist and are handy for debugging; `interrupt()` is the production mechanism. `NodeInterrupt` is deprecated.
 - With a durable checkpointer (Postgres), an approval can take days; nothing is held open while waiting.
 
+*Figure: interrupt() checkpoints the run; Command(resume=...) with the same thread_id continues it.*
+
+```mermaid
+sequenceDiagram
+  participant C as Caller
+  participant G as Graph
+  participant K as Checkpointer
+  C->>G: invoke(input, thread_id)
+  G->>G: propose node, human_review node reaches interrupt()
+  G->>K: Save checkpoint
+  G-->>C: Return __interrupt__ payload
+  Note over C: Reviewer decides (possibly much later)
+  C->>G: invoke(Command(resume=decision), same thread_id)
+  K->>G: Load checkpoint
+  G->>G: human_review re-runs, interrupt() returns decision
+  G->>G: Route to execute or END
+  G-->>C: Final state
+```
+
 ### 4.2 Parallel Execution
 
 Use `Send` for fan-out/fan-in patterns:
@@ -485,6 +517,17 @@ async def main(dsn: str):
 ```
 
 Operational notes: checkpoints grow with every step (prune old threads), large tool outputs bloat every checkpoint (store blobs elsewhere and keep references in state), and two concurrent requests on the same `thread_id` will race (serialize per thread).
+
+*Figure: a checkpoint is written after each super-step; long-term memory lives in a separate Store.*
+
+```mermaid
+flowchart LR
+  A["Super-step n"] --> B["Write checkpoint (thread-scoped)"]
+  B --> C["Super-step n+1"]
+  B --> D[("Checkpointer: Postgres, Redis, SQLite")]
+  C --> E[("Store: cross-thread memory, namespaced per user")]
+  D -. "resume, time travel" .-> A
+```
 
 ---
 

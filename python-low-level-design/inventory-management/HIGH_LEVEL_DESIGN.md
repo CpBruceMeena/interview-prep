@@ -50,6 +50,18 @@
 └───────────────────────────────────────────────┘
 ```
 
+*Figure: services over PostgreSQL, with Redis as a stale-OK cache.*
+
+```mermaid
+flowchart TB
+  W["Warehouse clients: scanner, web, kiosk"] --> G["API gateway"]
+  G --> I["Inventory service"]
+  G --> O["Order fulfillment service"]
+  I --> P[("PostgreSQL: stock, movements, reservations")]
+  O --> P
+  P --> R[("Redis: availability cache, reorder alerts")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -84,6 +96,16 @@ WHERE product_id = :pid
 -- against the latest committed row version after waiting on a concurrent writer's row lock.
 ```
 Optimistic locking (`AND version = :v`) also prevents overselling, but on a hot SKU most attempts lose the version race and retry even when plenty of stock is left; the conditional update only fails when stock really is short. Multi-line orders do one such update per line inside one transaction, in `(product_id, warehouse_id)` order to avoid deadlocks, and roll back if any line updates 0 rows. A `CHECK (reserved_qty >= 0 AND reserved_qty <= on_hand_qty)` constraint makes the invariant enforceable by the database, not just by code.
+
+*Figure: oversell prevention with a single conditional UPDATE.*
+
+```mermaid
+flowchart TD
+  A[Order wants q units] --> B["UPDATE reserved_qty = reserved_qty + q WHERE on_hand - reserved >= q"]
+  B --> C{"Rows updated?"}
+  C -- "1" --> D[Reserved]
+  C -- "0" --> E[Insufficient stock, no retry loop]
+```
 
 ---
 

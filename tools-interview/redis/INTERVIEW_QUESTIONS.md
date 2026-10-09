@@ -271,6 +271,17 @@ replica-serve-stale-data yes  # serve old data while syncing (consistency trade-
 repl-timeout 60
 ```
 
+*PSYNC decision on reconnect: partial resync only if the replid is known and the offset is still in the backlog.*
+
+```mermaid
+flowchart TD
+    R["Replica sends PSYNC replid offset"] --> A{"replid matches replid or replid2?"}
+    A -- no --> F["+FULLRESYNC: RDB snapshot + buffered stream"]
+    A -- yes --> B{"offset still in backlog?"}
+    B -- no --> F
+    B -- yes --> C["+CONTINUE: send missing bytes"]
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -352,6 +363,29 @@ sentinel auth-pass payment-master <secret>
 
 Active-active geo-replication (CRDT-based) exists in Redis Software / Redis Cloud, not in Redis Open Source, and it trades consistency for availability rather than giving "zero loss".
 
+*Sentinel failover: SDOWN, ODOWN by quorum, leader election by majority, then promotion.*
+
+```mermaid
+sequenceDiagram
+    participant A as Sentinel A
+    participant B as Sentinel B
+    participant C as Sentinel C
+    participant M as Master
+    participant R as Best replica
+    A->>M: PING (no valid reply)
+    Note over A: SDOWN after down-after-milliseconds
+    A->>B: is-master-down-by-addr
+    B-->>A: agrees (quorum reached)
+    Note over A: ODOWN
+    A->>B: request vote for new epoch
+    A->>C: request vote for new epoch
+    B-->>A: vote
+    C-->>A: vote
+    Note over A: majority, A is leader
+    A->>R: REPLICAOF NO ONE
+    A->>B: announce +switch-master
+```
+
 ### 🔍 Staff-Level Evaluation
 
 | Criterion | What I'm Looking For |
@@ -432,6 +466,26 @@ redis-cli --cluster check existing:6379    # all 16384 slots covered, no open sl
 - **Client readiness.** Clients must handle MOVED/ASK/TRYAGAIN efficiently (refresh topology on MOVED, not on every ASK).
 - **Use atomic slot migration where available** (Redis 8.4+ `CLUSTER MIGRATION IMPORT …`, Valkey 9.0+): the target streams the slot's data and subsequent writes in the background, then ownership switches in one step.
 - `cluster-require-full-coverage no` is unrelated to resharding: it lets nodes keep serving their slots when *some* slots have no live owner (availability over consistency).
+
+*MOVED is a permanent redirect; ASK is a one-off redirect while a slot is migrating.*
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as Node A (source)
+    participant B as Node B (target)
+    C->>A: GET key
+    alt A does not own the slot
+        A-->>C: MOVED slot B
+        Note over C: update slot map
+        C->>B: GET key
+    else slot migrating and key already moved
+        A-->>C: ASK slot B
+        C->>B: ASKING
+        C->>B: GET key
+        Note over C: slot map unchanged
+    end
+```
 
 ### 🔍 Staff-Level Evaluation
 
@@ -712,6 +766,19 @@ def consume(consumer):
 | Replay | By ID range | By offset/timestamp |
 | Durability | Async replication; can lose acked writes on failover | `acks=all` + `min.insync.replicas` |
 | Fit | Low-latency job queues, modest retention, already running Redis | High volume, long retention, many consumer groups, ecosystem |
+
+*Stream entry lifecycle in a consumer group: delivery puts it in the PEL, ack removes it, idle entries are reclaimed or dead-lettered.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> New: XADD
+    New --> Pending: XREADGROUP delivers, enters PEL
+    Pending --> Acked: XACK
+    Pending --> Pending: XAUTOCLAIM by another consumer
+    Pending --> DeadLetter: deliveries over max, XADD to DLQ then XACK
+    Acked --> [*]
+    DeadLetter --> [*]
+```
 
 ### 🔍 Staff-Level Evaluation
 
@@ -1006,6 +1073,23 @@ Why it works: expensive computations (large `delta`) start refreshing earlier; w
 On invalidation, prefer **delete** over writing the new value from the write path (writing races with concurrent readers filling an older value); use versioned values or CDC-driven invalidation when ordering matters. If a delete on a very hot key would itself cause a stampede, rely on the lock/SWR machinery above.
 
 **Also:** TTL jitter (`ttl * random.uniform(0.9, 1.1)`), client-side caching with server-assisted invalidation (`CLIENT TRACKING`, Redis 6+) for the hottest keys, and a DB-side bulkhead (bounded concurrency + load shedding).
+
+*Lock-based recompute: one request refills the key, the others poll the cache briefly.*
+
+```mermaid
+flowchart TD
+    A["Request"] --> B{"Cache hit?"}
+    B -- yes --> Z["Return value"]
+    B -- no --> C{"SET lock NX PX won?"}
+    C -- yes --> D["Double-check cache"]
+    D --> E["Compute and SET with TTL"]
+    E --> F["Release lock via Lua token check"]
+    F --> Z
+    C -- no --> G["Poll cache every 20 ms"]
+    G --> H{"Value appeared before deadline?"}
+    H -- yes --> Z
+    H -- no --> T["Fail fast with timeout"]
+```
 
 ### 🔍 Staff-Level Evaluation
 

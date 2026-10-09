@@ -308,6 +308,27 @@ class PaymentProcessor:
         return result
 ```
 
+*Diagram: the payment context depends only on the strategy interface.*
+
+```mermaid
+classDiagram
+    class PaymentProcessor {
+        +process_payment()
+    }
+    class PaymentGatewayStrategy {
+        <<abstract>>
+        +charge()
+        +refund()
+        +get_rate_limit()
+        +is_available()
+    }
+    PaymentProcessor o-- PaymentGatewayStrategy
+    PaymentGatewayStrategy <|-- StripeStrategy
+    PaymentGatewayStrategy <|-- PayPalStrategy
+    PaymentGatewayStrategy <|-- SquareStrategy
+```
+
+
 **Alternatives to Strategy Pattern:**
 
 ```python
@@ -798,6 +819,30 @@ class Application:
 # print(app.render())
 # → "[ Dark Button ] [ Dark Text Field ] [☑ Dark Checkbox]"
 ```
+
+*Diagram: each Abstract Factory produces a consistent family of products.*
+
+```mermaid
+classDiagram
+    class UIFactory {
+        <<abstract>>
+    }
+    UIFactory <|-- LightUIFactory
+    UIFactory <|-- DarkUIFactory
+    LightUIFactory ..> LightButton : creates
+    LightUIFactory ..> LightTextField : creates
+    LightUIFactory ..> LightCheckbox : creates
+    DarkUIFactory ..> DarkButton : creates
+    DarkUIFactory ..> DarkTextField : creates
+    DarkUIFactory ..> DarkCheckbox : creates
+    Button <|-- LightButton
+    Button <|-- DarkButton
+    TextField <|-- LightTextField
+    TextField <|-- DarkTextField
+    Checkbox <|-- LightCheckbox
+    Checkbox <|-- DarkCheckbox
+```
+
 
 **Factory Method vs Abstract Factory:**
 
@@ -1715,6 +1760,19 @@ ROUTES = {
 
 The most expensive bug in middleware like this is a cache key of just `method:path` behind auth: `/me` cached for Alice is served to Bob. Cache keys must include everything the response varies on (user, tenant, `Accept-Encoding`, query string), or mark personalised responses `Cache-Control: private` and skip shared caching.
 
+*Diagram: the middleware chain a request passes through, outermost first.*
+
+```mermaid
+flowchart LR
+    R["Request"] --> L["Logging"]
+    L --> C["Compression"]
+    C --> RL["Rate limit"]
+    RL --> A["Auth"]
+    A --> CA["Cache"]
+    CA --> H["AppHandler"]
+```
+
+
 **Decorator vs Chain of Responsibility:**
 
 | | Decorator | Chain of Responsibility |
@@ -2125,6 +2183,26 @@ Design points:
 - **Bounded history** via `deque(maxlen=…)`; `list.pop(0)` is O(n) per trim.
 - **Collaborative editing** breaks simple position-based undo (someone else's edit shifts positions); that's where operational transforms or CRDTs come in.
 
+*Diagram: the invoker executes commands on the receiver and keeps undo and redo stacks.*
+
+```mermaid
+classDiagram
+    class Command {
+        <<abstract>>
+        +execute()
+        +undo()
+    }
+    Command <|-- InsertCommand
+    Command <|-- DeleteCommand
+    Command <|-- SaveCommand
+    Command <|-- MacroCommand
+    MacroCommand o-- Command
+    InsertCommand --> TextEditor : acts on
+    DeleteCommand --> TextEditor : acts on
+    CommandHistory o-- Command : undo and redo stacks
+```
+
+
 **Command Queue for Async Processing:**
 
 ```python
@@ -2376,6 +2454,23 @@ Things worth pointing out:
 - **Automatic transitions** (dispensing finishes, then Idle or SoldOut) happen inside the state, not because the caller remembered to call `dispense()`. A state machine that waits for a call nobody makes is stuck forever.
 - **Money is integer cents.** Floats give change like `0.30000000000000004`.
 - **Maintenance is a state with guarded entry**, not a back door that overwrites `current_state` mid-transaction and loses the customer's balance.
+
+*Diagram: the vending machine's states and the events that move between them.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> SOLD_OUT
+    IDLE --> HAS_MONEY : coin
+    HAS_MONEY --> HAS_MONEY : coin
+    HAS_MONEY --> DISPENSING : select_ok
+    HAS_MONEY --> IDLE : cancel
+    DISPENSING --> IDLE : done
+    DISPENSING --> SOLD_OUT : done_empty
+    IDLE --> MAINTENANCE : service
+    SOLD_OUT --> MAINTENANCE : service
+    MAINTENANCE --> IDLE : close
+```
+
 
 **The lighter alternative: enum + transition table**
 

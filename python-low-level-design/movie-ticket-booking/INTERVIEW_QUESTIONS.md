@@ -29,6 +29,17 @@ AVAILABLE ──hold──▶ HELD(booking, expires_at) ──confirm──▶ B
 
 **Why a HELD state at all?** Payment takes minutes. Without a hold, two users can both reach the payment page for one seat, and one of them pays for nothing. The hold is a lease: exclusive, and it times out so abandoned checkouts don't lock seats forever.
 
+*Figure: per-show seat state machine.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> AVAILABLE
+  AVAILABLE --> HELD: hold (booking, expires_at)
+  HELD --> BOOKED: confirm
+  HELD --> AVAILABLE: cancel or expiry
+  BOOKED --> AVAILABLE: cancel with refund
+```
+
 ---
 
 ## Question 2: Concurrency & Double-Booking Prevention

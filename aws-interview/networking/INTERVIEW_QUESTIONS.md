@@ -69,6 +69,22 @@ Example: 10 TB/month of S3 traffic through a NAT gateway costs ~$450 in processi
 | Cost | No hourly fee; same-AZ data free, cross-AZ/Region data charged | $0.05/hour per attachment + $0.02/GB processed | Per service-hour + per GB + per request |
 | Best for | A few VPCs with heavy traffic between them | Many VPCs, on-prem, central inspection | Microservices across accounts with IAM auth policies |
 
+*Three subnet tiers: only the public tier has an IGW route, app egress goes via NAT, and the isolated tier reaches AWS APIs through endpoints only.*
+
+```mermaid
+flowchart TB
+    Internet((Internet)) --> IGW[Internet gateway]
+    IGW --> Pub["Public subnets: ALB, NAT"]
+    Pub --> App["Private app subnets"]
+    App -->|"0.0.0.0/0"| NAT[NAT gateway]
+    NAT --> IGW
+    App --> Data["Isolated data subnets (no default route)"]
+    App -->|free| GWE["Gateway endpoint: S3, DynamoDB"]
+    App --> IFE["Interface endpoint (PrivateLink)"]
+    Data --> IFE
+```
+
+
 **What they probe next:** cross-AZ data transfer ($0.01/GB each way) as the hidden cost of "spread everything across AZs"; why NAT gateways per AZ (an AZ failure shouldn't kill egress for the others); private DNS for interface endpoints across many VPCs; IPv6-only subnets with DNS64/NAT64 to escape IPv4 charges.
 
 ### 🎬 Animated Sequence Diagram
@@ -125,6 +141,17 @@ ALB: 1,000,000 active / 3,000 per LCU   ≈ 333 LCUs × $0.008 ≈ $2.67/hour (~
 NLB: 1,000,000 active / 100,000 per NLCU =  10 NLCUs × $0.006 = $0.06/hour (~$44/month)
 (Billing uses the highest of the dimensions: new connections, active connections, bytes, and for ALB rule evaluations.)
 ```
+
+*NLB in front of an ALB: static IPs and PrivateLink from the NLB, L7 routing from the ALB.*
+
+```mermaid
+flowchart LR
+    C[Clients] -->|"static IP per AZ"| NLB[NLB: L4]
+    NLB -->|"ALB-type target group"| ALB[ALB: L7 rules]
+    ALB -->|"/ws"| WS[WebSocket targets]
+    ALB -->|"/api"| API[API targets]
+```
+
 
 **Connection draining:** both use the target group's **deregistration delay** (0–3,600 s, default 300 s). For HTTP the ALB stops routing new requests to the target and waits for in-flight ones; for WebSockets and TCP, existing connections keep flowing until they close or the delay expires, then they're cut. Design clients to reconnect with jittered backoff and have the server close connections gradually during shutdown, otherwise each deploy creates a thundering herd of reconnects.
 
@@ -223,6 +250,19 @@ worst case:  ~1.5–2 minutes for most clients; long-lived connections never re-
 Mitigations: keep TTLs at 60 s or less on failover-critical names, make clients reconnect (and re-resolve) on errors, set the JVM DNS cache TTL (`networkaddress.cache.ttl`), and pre-scale the surviving Regions, since failover doubles their load instantly.
 
 **Route 53 Application Recovery Controller (ARC):** routing controls are on/off switches backed by health checks whose state lives in a highly available cluster across five Regions. You flip them through the cluster's data-plane endpoints, so failover doesn't depend on the Route 53 control plane in us-east-1. **ARC Region switch** (2025) orchestrates a whole-application Region failover plan (DNS, Aurora global database switchover, scaling steps). Readiness checks catch capacity or config drift between Regions before you need them.
+
+*Latency records with health checks: an unhealthy Region is dropped from the answer and the next-lowest-latency Region is returned.*
+
+```mermaid
+flowchart TD
+    R[Client resolver queries api.saas.example.com] --> RT53[Route 53 latency records]
+    RT53 --> H{"Health check or EvaluateTargetHealth"}
+    H -->|"nearest Region healthy"| A[Answer: nearest ALB]
+    H -->|"nearest Region unhealthy"| B[Answer: next-lowest-latency healthy ALB]
+    A --> TTL[Resolver caches for TTL, 60 s for ELB alias]
+    B --> TTL
+```
+
 
 **Weighted canary (correct form):**
 
@@ -492,6 +532,20 @@ Route table: shared
 
 TGW isn't cheaper than peering for raw traffic (it adds a processing fee); it's cheaper to *operate*. For a few very chatty VPC pairs, add a direct peering alongside the TGW and let the more specific route win.
 
+*Environment isolation with TGW route tables: dev and prod attach to separate tables, only shared services propagate into both.*
+
+```mermaid
+flowchart LR
+    DEV[Dev VPCs] --> RTD["Route table: dev"]
+    PROD[Prod VPCs] --> RTP["Route table: prod"]
+    SH[Shared-services VPC] -->|propagates| RTD
+    SH -->|propagates| RTP
+    RTD -->|"0.0.0.0/0"| INS[Inspection VPC: Network Firewall]
+    RTP -->|"0.0.0.0/0"| INS
+    RTP -->|static| PEER[TGW peering to other Region]
+```
+
+
 **Cross-Region:** TGW peering uses the AWS backbone, is encrypted, and charges inter-Region data transfer (typically $0.02/GB between US Regions). Latency is physics: ~60–70 ms us-east-1 to us-west-2.
 
 **Inspection VPC:**
@@ -549,6 +603,20 @@ On-prem DC-B ─┬─ DX location 2: conn 2a (10G) ─┼─► DX gateway ─�
               └─ DX location 2: conn 2b (10G) ─┘
               └─ Site-to-Site VPN (backup, terminates on the TGW)
 ```
+
+*Maximum resiliency: two DX locations, two connections each, all landing on a DX gateway and Transit Gateway, with VPN as backup.*
+
+```mermaid
+flowchart LR
+    DC[On-prem data centres] --> L1["DX location 1: 2 connections"]
+    DC --> L2["DX location 2: 2 connections"]
+    L1 --> DXGW[DX gateway]
+    L2 --> DXGW
+    DXGW -->|transit VIF| TGW[Transit Gateway]
+    DC -.->|"Site-to-Site VPN backup"| TGW
+    TGW --> V[VPCs]
+```
+
 
 **BGP traffic engineering:**
 

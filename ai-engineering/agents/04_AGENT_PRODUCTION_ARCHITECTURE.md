@@ -70,6 +70,17 @@
         └─────────────────────────────────────────────┘
 ```
 
+*Figure: request path through gateway, orchestrator and tool layer, with telemetry alongside.*
+
+```mermaid
+flowchart TD
+  U["User: web, mobile, API"] --> G["API gateway: auth, rate limits, validation"]
+  G --> O["Agent orchestrator: session, runtime, memory manager"]
+  O --> T["Tool layer: MCP servers, REST APIs, RAG pipeline"]
+  O -. "telemetry" .-> Ob["Observability: traces, metrics, logs"]
+  T -. "telemetry" .-> Ob
+```
+
 ### 1.2 Kubernetes Deployment
 
 ```yaml
@@ -249,6 +260,19 @@ INPUT                     OUTPUT
 │  │  - Duplicate detection                │            │
 │  └──────────────────────────────────────┘            │
 └──────────────────────────────────────────────────────┘
+```
+
+*Figure: guards wrap the input, each tool call and the output, with runtime limits throughout.*
+
+```mermaid
+flowchart LR
+  I["Input"] --> IG["Input guard: injection, PII, length"]
+  IG --> M["Agent loop"]
+  M --> TG["Tool call guard: schema, RBAC, rate limit, approval"]
+  TG --> M
+  M --> OG["Output guard: toxicity, PII leak, fact check"]
+  OG --> O["Output"]
+  RG["Runtime guard: max steps, tokens, timeout, duplicates"] -.-> M
 ```
 
 ### 2.2 Implementation
@@ -622,6 +646,21 @@ This version is fine for a demo but wrong for production: it holds a request (an
 4. Re-validate before executing: the world may have changed while waiting.
 
 LangGraph's `interrupt()` + `Command(resume=...)` with a persistent checkpointer, the OpenAI Agents SDK's tool approval flow, or a workflow engine (Temporal signals, Step Functions task tokens) implement this pattern.
+
+*Figure: production approvals are a durable pause and resume, not a held-open request.*
+
+```mermaid
+sequenceDiagram
+  participant A as Agent run
+  participant S as Checkpoint store
+  participant H as Human reviewer
+  A->>S: Persist state and proposed action (awaiting_approval)
+  A-->>A: Return to caller
+  S->>H: Notify with exact action and diff
+  H->>S: Approve or reject callback
+  S->>A: Resume from checkpoint on any replica
+  A->>A: Re-validate, then execute or re-plan
+```
 
 ### 4.2 Escalation Rules
 

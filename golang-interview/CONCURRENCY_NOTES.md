@@ -120,6 +120,22 @@ If you need the first error, cancellation of the others, or a concurrency limit,
                   f returns ─► _Gdead (struct cached for reuse)
 ```
 
+*Goroutine states: it becomes runnable on `go f()`, runs on an M+P, parks while waiting, and the struct is cached for reuse when `f` returns.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> Runnable: go f()
+    Runnable --> Running: scheduled on an M and P
+    Running --> Waiting: blocks on chan, mutex or net
+    Waiting --> Runnable: woken (goready)
+    Running --> Runnable: preempted or Gosched
+    Running --> Syscall: blocking syscall
+    Syscall --> Running: returns and gets a P
+    Syscall --> Runnable: no P free
+    Running --> Dead: f returns
+    Dead --> [*]
+```
+
 ### Key Properties
 
 ```go
@@ -269,6 +285,21 @@ var ch chan int  // nil
 ch <- 1          // Blocks FOREVER (handy in select: disable cases)
 <-ch             // Blocks FOREVER
 close(ch)        // PANIC: close of nil channel
+```
+
+*What a send or receive does depends on channel state: a nil channel blocks forever, a closed one panics on send, and an unbuffered one needs a partner.*
+
+```mermaid
+flowchart TD
+    S["ch <- v"] --> N{"nil channel?"}
+    N -->|yes| BF["Blocks forever"]
+    N -->|no| C{"closed?"}
+    C -->|yes| PN["Panic"]
+    C -->|no| R{"Receiver waiting?"}
+    R -->|yes| HD["Hand value directly to receiver"]
+    R -->|no| B{"Buffer has room?"}
+    B -->|yes| EN["Copy into ring buffer, continue"]
+    B -->|no| BL["Park in sendq until a receiver or close"]
 ```
 
 ### Channel Types
@@ -1506,6 +1537,22 @@ func main() {
 
 Put a time bound on the drain in real services: after cancellation, wait for `wg` with a deadline and exit anyway if it passes. In Kubernetes the kill (SIGKILL) arrives `terminationGracePeriodSeconds` after SIGTERM, 30 s by default.
 
+*Context tree: cancelling a parent cancels every descendant, never the reverse, and a child's deadline is the earlier of its own and its parent's.*
+
+```mermaid
+flowchart TD
+    BG["Background"] --> T["WithTimeout"]
+    BG --> V["WithValue"]
+    T --> S1["Child 1"]
+    T --> S2["Child 2"]
+    T --> S3["Child 3"]
+    V --> WC["WithCancel"]
+    WC --> WD["WithDeadline"]
+    T -.->|"cancel or timeout propagates down"| S1
+    T -.-> S2
+    T -.-> S3
+```
+
 ---
 
 ## 10. Production Concurrency Patterns
@@ -1691,6 +1738,22 @@ func processBatch(ctx context.Context, items []int, workers int) []int {
 
 `fanOut` here gives each worker its own channel. That is only needed when stages differ per worker. For identical workers, let them all `range` over the same input channel, and the runtime load-balances for free.
 
+*Fan-out: workers share one input channel and each writes to its own output; fan-in merges the outputs and closes after all of them finish.*
+
+```mermaid
+flowchart LR
+    IN["in channel"] --> W1["Worker 1"]
+    IN --> W2["Worker 2"]
+    IN --> W3["Worker n"]
+    W1 --> O1["out 1"]
+    W2 --> O2["out 2"]
+    W3 --> O3["out n"]
+    O1 --> M["Fan-in: merge"]
+    O2 --> M
+    O3 --> M
+    M --> R["Merged channel, closed after wg.Wait"]
+```
+
 ### Tee (Split One Channel)
 
 ```go
@@ -1812,6 +1875,20 @@ Production points:
 - Many libraries use a failure *rate* over a sliding window with a minimum request count, rather than a consecutive streak. Good options: `sony/gobreaker` or a service mesh.
 - One breaker per dependency (or per host), not one global breaker.
 - Pair it with timeouts and retries that use backoff and jitter. The breaker stops retry storms from hammering a dependency that is already down.
+
+*Circuit breaker: consecutive failures open it, after the cooldown one probe request decides between closing and re-opening.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: failures reach threshold
+    Open --> HalfOpen: cooldown elapsed, one probe admitted
+    HalfOpen --> Closed: probe succeeds
+    HalfOpen --> Open: probe fails
+    note right of Open
+        Do returns ErrOpen without calling the dependency
+    end note
+```
 
 ### Rate Limiter (Token Bucket)
 

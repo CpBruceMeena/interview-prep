@@ -48,6 +48,20 @@ Mobile/Web Client (React/PWA)
               └────────────────┘
 ```
 
+*Figure: WebSocket clients, services and stores.*
+
+```mermaid
+flowchart TB
+  C["Client (WebSocket)"] --> G["API gateway: auth, rate limit, WSS"]
+  G --> L["Lobby (Go)"]
+  G --> E["Game engine (Python)"]
+  G --> B["Board gen (Python)"]
+  L --> R[("Redis: state, chat, queue")]
+  E --> R
+  B --> R
+  R --> P[("PostgreSQL: games, moves, ranks")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -150,6 +164,22 @@ CREATE TABLE boards (
 **Idempotent rolls.** Clients retry on timeouts. Store `request_id -> TurnResult` with a short TTL (or check it against the last applied move); a retry returns the original result instead of rolling again. Without this, a retry after a lost response lets a player re-roll.
 
 **Pub/sub is fire-and-forget.** A client that is disconnected during a publish misses the event. Every event carries the `version`; a client that sees a gap (or reconnects) fetches the full state. The move log, not pub/sub, is the source of truth.
+
+*Figure: a roll request is idempotent by request_id and guarded by the version (turn number).*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant E as Engine pod
+  participant R as Redis
+  C->>E: roll (game_id, player_id, request_id)
+  E->>R: Read state and version
+  E->>E: Server-side RNG, apply move
+  E->>R: Write if version unchanged
+  E-->>C: Result
+  E->>R: Publish event with version
+  Note over C,R: Duplicate request_id returns stored result
+```
 
 | Failure | Effect | Mitigation |
 |---------|--------|------------|

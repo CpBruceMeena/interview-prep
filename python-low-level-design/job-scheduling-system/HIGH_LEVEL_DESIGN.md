@@ -66,6 +66,17 @@ The code in [CODE.md](CODE.md) is the single-node core: an asyncio loop owns two
 
 At 6K dispatches/s, Postgres with `SKIP LOCKED` and a partial index on `(priority, run_at) WHERE status='PENDING'` is fine. Beyond ~10–20K/s, or with many priority classes, move the hot queue to Redis sorted sets or Kafka partitions and keep Postgres as the system of record.
 
+*Figure: stateless API, leader trigger service, worker pool and reaper around PostgreSQL.*
+
+```mermaid
+flowchart TB
+  CL[Clients] --> API["API (stateless)"]
+  API -->|"INSERT job, idempotency key"| PG[("PostgreSQL: job_runs, schedules")]
+  TR["Trigger service (leader via lease)"] -->|"INSERT due runs"| PG
+  W["Worker pool x N"] <-->|"claim SKIP LOCKED, heartbeat, finish"| PG
+  RP["Reaper"] -->|"expired leases to PENDING"| PG
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -103,6 +114,25 @@ RETURNING r.id, r.attempt;
 
 **Delivery guarantee:** at-least-once *execution*. A worker can finish the work and crash before writing `COMPLETED`, and the reaper will re-run it. Exactly-once *effects* come from idempotent jobs: an idempotency key per run (not per attempt), upserts, or a transactional outbox.
 
+*Figure: lease-based claim; attempt is the fencing token for conditional heartbeat and finish.*
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant D as PostgreSQL
+  participant R as Reaper
+  W->>D: Claim due runs (SKIP LOCKED), lease 30 s, attempt + 1
+  loop every ~10 s
+    W->>D: Heartbeat if lease_owner and attempt match
+  end
+  alt finished in time
+    W->>D: COMPLETED where attempt matches
+  else worker crashed or paused
+    R->>D: Lease expired, back to PENDING
+    Note over W,D: Late finish updates 0 rows
+  end
+```
+
 ---
 
 ## 4. FAILURE MODES
@@ -119,6 +149,18 @@ RETURNING r.id, r.attempt;
 | Downstream outage (all jobs fail together) | Error-rate spike | Backoff with full jitter + per-dependency circuit breaker + retry budget, so the recovery isn't a thundering herd |
 | DB primary failover | Connection errors | Workers retry claims with backoff; in-flight leases survive because they're time-based |
 | Thundering cron (`0 * * * *`) | Dispatch-lag spike at :00 | Spread fires with a per-job offset; autoscale workers on schedule lag |
+
+*Figure: job run lifecycle implied by claim, lease expiry and retry limits.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING
+  PENDING --> RUNNING: claim
+  RUNNING --> COMPLETED: finish
+  RUNNING --> PENDING: lease expired or retry
+  RUNNING --> TIMED_OUT: per-job timeout
+  RUNNING --> FAILED: attempts exhausted
+```
 
 ---
 

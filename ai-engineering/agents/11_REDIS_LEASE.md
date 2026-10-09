@@ -37,6 +37,17 @@ Process A wants to take a lease on "resource:job-123"
 └─────────────────────────────────────────────┘
 ```
 
+*Figure: SET NX EX decides which process holds the lease; the TTL frees it if the holder crashes.*
+
+```mermaid
+flowchart TD
+  A["Process wants lease on resource"] --> B["SET key owner NX EX 30"]
+  B --> C{"Set succeeded?"}
+  C -- "yes" --> D["Execute while lease is held"]
+  C -- "no" --> E["Wait and retry: held by another"]
+  D --> F["Release by owner, or TTL expires"]
+```
+
 ### 1.2 How It Works
 
 ```python
@@ -246,6 +257,23 @@ async def acquire_with_fence(r, resource: str, owner: str, ttl_ms: int):
 ```
 
 Even simpler, and often enough: make the side effect **idempotent** (idempotency key, conditional write on a version column) so a duplicate holder can't do damage.
+
+*Figure: the storage layer rejects a stale holder whose fencing token is older.*
+
+```mermaid
+sequenceDiagram
+  participant A as Worker A
+  participant R as Redis
+  participant B as Worker B
+  participant S as Storage
+  A->>R: Acquire lease (token 33)
+  Note over A: Long GC or network pause, lease expires
+  B->>R: Acquire lease (token 34)
+  B->>S: Write with token 34
+  S-->>B: Accepted
+  A->>S: Write with token 33
+  S-->>A: Rejected (33 < 34)
+```
 
 ### 1.6 What Interviewers Probe Next
 

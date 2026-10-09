@@ -333,6 +333,28 @@ async def modern_coro():
     return result
 ```
 
+*What `await` does: the coroutine yields a Future up to its Task, the Task registers a wake-up callback, and the loop resumes the coroutine with `send(None)` once the Future completes.*
+
+```mermaid
+sequenceDiagram
+    participant L as Event loop
+    participant T as Task
+    participant C as Coroutine
+    participant F as Future
+    L->>T: run step
+    T->>C: send(None)
+    C->>F: await (inner __await__)
+    F-->>C: not done, yield Future
+    C-->>T: suspended, Future yielded
+    T->>F: add_done_callback(wake up)
+    Note over L: runs other ready callbacks
+    F->>L: set_result (e.g. timer fired)
+    L->>T: scheduled via call_soon
+    T->>C: send(None), resume
+    C-->>T: return value, StopIteration
+    T->>T: set Task result
+```
+
 ---
 
 ## 3. Event Loop Internals
@@ -527,6 +549,17 @@ uvloop.run(main())
 
 - The "2x" in the heading is a rule of thumb. The project's own claim is "2–4x faster" on its networking benchmarks (echo servers, HTTP parsing). Real services that spend most of their time in their own Python code, ORMs or serialization see much less, so benchmark your workload.
 - Status (October 2026): uvloop 0.23 supports CPython 3.8–3.15, including free-threaded wheels. Not available on Windows. Uvicorn uses it automatically when installed (`uvicorn[standard]`).
+
+*One loop iteration (`_run_once`): compute the poll timeout, poll I/O, move due timers to the ready queue, then run only the callbacks that were ready at that moment.*
+
+```mermaid
+flowchart TD
+    P0["Phase 0: timeout = 0 if ready queue non-empty, else time to next timer"] --> P1["Phase 1: selector.select(timeout) via epoll or kqueue"]
+    P1 --> P1b["Queue callbacks for ready file descriptors"]
+    P1b --> P2["Phase 2: pop due timers from the heap into the ready queue"]
+    P2 --> P3["Phase 3: run len(ready) callbacks, FIFO"]
+    P3 -->|"callbacks scheduled meanwhile wait for the next pass"| P0
+```
 
 ---
 
@@ -745,6 +778,21 @@ asyncio.run(track_state())
 ```
 
 The four states are `CORO_CREATED`, `CORO_RUNNING`, `CORO_SUSPENDED` and `CORO_CLOSED`. A coroutine is single-use. A Task or Future can be awaited any number of times.
+
+*A coroutine object is single-use: created by calling the function, suspended at each await, and closed once it returns or raises.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> CORO_CREATED: call async def function
+    CORO_CREATED --> CORO_RUNNING: send(None)
+    CORO_RUNNING --> CORO_SUSPENDED: hits await on pending awaitable
+    CORO_SUSPENDED --> CORO_RUNNING: send(None) resumes
+    CORO_RUNNING --> CORO_CLOSED: return or exception
+    CORO_CLOSED --> [*]
+    note right of CORO_CLOSED
+        awaiting again raises RuntimeError
+    end note
+```
 
 ### The Coroutine as a Generator
 
@@ -2107,6 +2155,20 @@ async def cancellation_scopes():
 - `task.cancel(msg)` attaches a message. `task.cancelling()` / `task.uncancel()` (3.11) count pending cancel requests; that's how `timeout()` and `TaskGroup` tell their own cancellations apart from external ones.
 - Cleanup in `except CancelledError`/`finally` can itself be cancelled at its next `await` (e.g. a second Ctrl-C). Keep it short, and use `shield()` or a timeout for cleanup that must finish.
 
+*Cancellation: `task.cancel()` raises `CancelledError` at the task's current await; cleanup runs in the except block, which must re-raise so the task ends as cancelled.*
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant T as Task
+    participant Co as Coroutine at await
+    Caller->>T: task.cancel()
+    T->>Co: throw CancelledError at the await point
+    Co->>Co: except CancelledError: cleanup (may await)
+    Co-->>T: re-raise CancelledError
+    T-->>Caller: task.cancelled() is True, awaiting it raises CancelledError
+```
+
 ### Running Sync Code with AsyncIO
 
 ```python
@@ -2219,6 +2281,17 @@ async def pipeline_demo():
     )
     
     print(results[2])  # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+```
+
+*Bounded queue pipeline: a full `asyncio.Queue` suspends the producer at `put`, and an empty one suspends the consumer at `get`, which gives backpressure for free.*
+
+```mermaid
+flowchart LR
+    P["Producer"] -->|"await put"| Q["asyncio.Queue(maxsize)"]
+    Q -->|"await get"| C1["Consumer 1"]
+    Q -->|"await get"| C2["Consumer 2"]
+    Q -.->|"full: producer suspended"| P
+    Q -.->|"empty: consumers suspended"| C1
 ```
 
 ### Worker Pool Pattern
@@ -2599,6 +2672,19 @@ asyncio.run(main_service())
 
 - Without custom handlers, `asyncio.run()` (3.11+) turns the **first** Ctrl-C into cancellation of the main task, and a second one raises `KeyboardInterrupt` immediately. SIGTERM isn't handled by default, so the process just dies. Containers send SIGTERM, so install a handler.
 - Order matters: fail readiness → stop accepting → drain → cancel → close pools/clients (reverse of startup, e.g. with `AsyncExitStack`).
+
+*Graceful shutdown order: stop intake, drain in-flight work up to a deadline, cancel stragglers and wait for their cleanup, then let `asyncio.run` finalize generators and the executor.*
+
+```mermaid
+flowchart TD
+    S["SIGTERM handler sets stopping event"] --> I["1. Stop intake: workers stop taking jobs, readiness fails"]
+    I --> D["2. asyncio.wait(tasks, timeout=drain_timeout)"]
+    D --> Q{"Any tasks still pending?"}
+    Q -->|no| F["asyncio.run finalizes async generators and default executor"]
+    Q -->|yes| C["3. cancel() stragglers, gather(return_exceptions=True)"]
+    C --> F
+    F --> X["Close pools and clients, exit"]
+```
 
 ### Async Health Check
 

@@ -53,6 +53,20 @@ if not extra:
 
 Points interviewers look for: the streak is per-turn-holder and resets when the turn passes; winning on doubles ends the game rather than granting a turn; the forfeit check happens *before* moving.
 
+*Figure: one turn with doubles giving an extra turn and a doubles streak limit.*
+
+```mermaid
+flowchart TD
+  A[Roll two dice] --> B{"Doubles streak reached the limit?"}
+  B -- Yes --> F["Forfeit the move, turn passes"]
+  B -- No --> C["Move, resolve snake or ladder"]
+  C --> D{"Won?"}
+  D -- Yes --> W[Game over]
+  D -- No --> E{"Doubles?"}
+  E -- Yes --> A
+  E -- No --> N[Next player]
+```
+
 ---
 
 ## Question 3: "Now make it online — two clients can press roll at once"

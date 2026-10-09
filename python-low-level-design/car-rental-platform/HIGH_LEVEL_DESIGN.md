@@ -57,6 +57,20 @@ Web/Mobile App (Customer)       Admin/Fleet Dashboard
         └── outbox/CDC ───┘  (rebuild bitmaps on every block change)
 ```
 
+*Figure: PostgreSQL is the source of truth; Redis bitmaps are a read model rebuilt via outbox/CDC.*
+
+```mermaid
+flowchart TB
+  U["Customer app / admin dashboard"] --> G["API gateway"]
+  G --> S["Search (Go)"]
+  G --> B["Booking (Go)"]
+  G --> F["Fleet (Python)"]
+  B --> P[("PostgreSQL: EXCLUDE constraint")]
+  F --> P
+  S --> R[("Redis: 7x24 bitmaps")]
+  P -- "outbox / CDC" --> R
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -121,6 +135,26 @@ User Search Request: {pickup: 2024-01-15 10:00, return: 2024-01-15 14:00, type: 
 4. Customer pays (payment idempotency key = reservation id) → confirm: PENDING → CONFIRMED
    only if the hold is still live (conditional UPDATE ... WHERE status='PENDING' AND hold_expires_at > now())
 5. Outbox relay publishes events; bitmap builder refreshes Redis for that vehicle
+```
+
+*Figure: booking is one transaction; the exclusion constraint rejects overlaps.*
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant B as Booking svc
+  participant P as PostgreSQL
+  U->>B: Book vehicle, time range
+  B->>P: INSERT reservation PENDING, vehicle_blocks, outbox
+  alt overlap (SQLSTATE 23P01)
+    P-->>B: Exclusion violation
+    B-->>U: 409 with next free window
+  else no overlap
+    P-->>B: Commit
+    U->>B: Pay (idempotency key)
+    B->>P: UPDATE to CONFIRMED if hold still live
+    B-->>U: Confirmed
+  end
 ```
 
 **Isolation level:** READ COMMITTED is enough because the exclusion constraint is checked by the index on insert, regardless of snapshots. A plain `SELECT ... then INSERT` would need `SERIALIZABLE` (SSI aborts one of two conflicting transactions with `40001`, which you must retry) or a `SELECT ... FOR UPDATE` on the vehicle row. The constraint is simpler and can't be bypassed by a code path that forgets the check.

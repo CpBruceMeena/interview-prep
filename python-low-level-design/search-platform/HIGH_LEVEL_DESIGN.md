@@ -49,6 +49,22 @@
 └─────────────────────────────────────────────────────┘
 ```
 
+*Figure: search services over Elasticsearch, fed by a Kafka indexing pipeline.*
+
+```mermaid
+flowchart TB
+  UI["Search UI"] --> G["API gateway"]
+  G --> S["Search service"]
+  G --> A["Autocomplete service"]
+  G --> R["Recommendation service"]
+  S --> ES[("Elasticsearch cluster")]
+  A --> ES
+  R --> ES
+  PG[("PostgreSQL")] -->|"hourly full reindex"| K["Kafka + Logstash"]
+  PR["Document producers"] --> K
+  K -->|"bulk index"| ES
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -114,6 +130,17 @@ def search(query, filters, page=1, size=20):
 ```
 
 The LLD's `RecencyBoost` (half-life decay) and `PopularityBoost` (log) are the in-process version of these two functions.
+
+*Figure: multi-stage query path; business signals are applied inside the engine before top-k.*
+
+```mermaid
+flowchart LR
+  Q[Query] --> P["Parse + spell check"]
+  P --> B["BM25 match: title boost 3, content boost 1"]
+  B --> F["Filters + facet aggregations"]
+  F --> S["function_score: recency decay, log popularity"]
+  S --> T["Top-k results"]
+```
 
 ---
 

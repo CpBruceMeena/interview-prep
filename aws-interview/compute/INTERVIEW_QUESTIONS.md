@@ -152,6 +152,24 @@ ScheduledActions:
 DefaultInstanceWarmup: 120   # seconds before a new instance's metrics count
 ```
 
+*ASG instance states with lifecycle hooks on both launch and terminate.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> PendingWait: launch hook
+    PendingWait --> PendingProceed: complete action or timeout
+    Pending --> InService
+    PendingProceed --> InService
+    InService --> TerminatingState: scale-in or unhealthy
+    TerminatingState --> TerminatingWait: terminate hook, after target group drain
+    TerminatingWait --> TerminatingProceed: CONTINUE or timeout
+    TerminatingState --> TerminatingProceed
+    TerminatingProceed --> Terminated
+    Terminated --> [*]
+```
+
+
 **Lifecycle on scale-in (the order matters):**
 
 ```
@@ -255,6 +273,25 @@ SHUTDOWN
   └─ after an idle period (not documented, not guaranteed), or on scale-in/updates
 ```
 
+*Lambda execution environment: INIT runs once on a cold start, INVOKE repeats on the reused environment.*
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant L as Lambda service
+    participant E as Execution environment
+    C->>L: Invoke
+    alt no warm environment
+        L->>E: Create microVM, fetch code
+        E->>E: INIT: runtime, extensions, code outside handler
+    end
+    L->>E: INVOKE handler
+    E-->>C: Response
+    Note over E: Frozen and reused for later invokes
+    L->>E: SHUTDOWN after idle or scale-in
+```
+
+
 Since **August 1, 2025** the INIT phase is billed for all on-demand functions (previously free for zip packages on managed runtimes), so heavy init now costs money as well as latency.
 
 **Typical cold-start contributors (orders of magnitude, measure your own):**
@@ -329,6 +366,21 @@ Reused across invocations in the same environment: globals, SDK clients and thei
 
 !!! tip "30-second answer"
     Concurrency = requests per second × average duration in seconds. All functions in a Region share one account pool (1,000 by default, raisable to tens of thousands). Each function can add **1,000 execution environments every 10 seconds**. **Reserved concurrency** carves out a slice that is both a floor and a ceiling for one function, free of charge. **Provisioned concurrency** pre-initialises environments to remove cold starts, for a fee. For the scenario: request a quota increase, reserve concurrency for the API function, and cap the SQS consumer with the event source mapping's **maximum concurrency** so it can't starve the API.
+
+*How a request is admitted against reserved, provisioned and shared concurrency.*
+
+```mermaid
+flowchart TD
+    R[Request arrives] --> P{"Provisioned environment free?"}
+    P -->|yes| W[Run on warm environment]
+    P -->|no| RC{"Function has reserved concurrency?"}
+    RC -->|"yes: at its cap"| T[Throttle: 429]
+    RC -->|"yes: below cap"| N[New environment, cold start]
+    RC -->|no| POOL{"Unreserved pool has room?"}
+    POOL -->|yes| N
+    POOL -->|no| T
+```
+
 
 **The shared pool:**
 
@@ -483,6 +535,20 @@ deploymentConfiguration:
   alarms: { alarmNames: [my-app-5xx-rate], enable: true, rollback: true }
   bakeTimeInMinutes: 10          # keep the old revision for fast rollback
 ```
+
+*ECS service deployment: the new revision is checked, traffic shifts, and an alarm or circuit breaker rolls back.*
+
+```mermaid
+flowchart LR
+    NEW[New task definition revision] --> START[Start new tasks]
+    START --> HC{"Healthy in target group?"}
+    HC -->|no| RB[Roll back to old revision]
+    HC -->|yes| SHIFT[Shift traffic: rolling, canary or linear]
+    SHIFT --> AL{"Alarms OK during bake time?"}
+    AL -->|no| RB
+    AL -->|yes| DONE[Stop old tasks]
+```
+
 
 **Deployment strategies:**
 
@@ -754,6 +820,24 @@ def watch(worker):
 
 (Refresh the token before its TTL in long-running processes. In containers, the AWS Node Termination Handler on Kubernetes, or Karpenter's interruption queue, does this for you; ECS drains Spot tasks automatically when `ECS_ENABLE_SPOT_INSTANCE_DRAINING=true`.)
 
+*Spot interruption timeline: rebalance recommendation first, then the 2-minute notice, then shutdown.*
+
+```mermaid
+sequenceDiagram
+    participant EC2 as EC2 Spot
+    participant H as Interruption handler
+    participant W as Worker
+    participant S3 as S3 checkpoint
+    EC2-->>H: Rebalance recommendation (early)
+    H->>W: Stop taking new work
+    EC2-->>H: Interruption notice (2 minutes)
+    H->>W: Checkpoint now
+    W->>S3: Save progress
+    H->>W: Release current unit back to queue
+    EC2->>W: Shutdown at end of 2 minutes
+```
+
+
 **Checkpointing design:** the unit of work should be small enough to redo cheaply (minutes, not hours). For long jobs, checkpoint every N minutes to S3 with a version or sequence number, and make resume idempotent. Two minutes is not enough to upload a 50 GB checkpoint; plan for losing the work since the last periodic checkpoint.
 
 **Diversification:**
@@ -835,6 +919,19 @@ Job queue: genomics (priority 10, fair-share policy)
 ECS tasks on Batch-managed instances  (or Fargate / EKS compute environments)
         │ inputs/outputs: S3; shared reference data: EFS or FSx for Lustre
 ```
+
+*AWS Batch: jobs flow through a queue to compute environments in priority order, Spot first then On-Demand.*
+
+```mermaid
+flowchart TD
+    SUB["submit-job: array of 10,000"] --> Q[Job queue: genomics]
+    Q --> CE1{"1. Spot compute environment has capacity?"}
+    CE1 -->|yes| SPOT[Run on Spot instances]
+    CE1 -->|no| CE2[2. On-Demand compute environment]
+    SPOT --> OUT[Read and write S3]
+    CE2 --> OUT
+```
+
 
 **Job definition:**
 

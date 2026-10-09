@@ -70,6 +70,17 @@ def request_params(route: str) -> dict:
     return params
 ```
 
+*Figure: picking a model tier by task difficulty.*
+
+```mermaid
+flowchart TD
+  A["New task"] --> B{"Simple, high volume?"}
+  B -- "yes" --> C["Smaller, cheaper model"]
+  B -- "no" --> D{"Needs deep reasoning?"}
+  D -- "yes" --> E["Larger model, higher effort"]
+  D -- "no" --> F["Mid-tier model, default effort"]
+```
+
 ---
 
 ## 3. PROMPT CACHING — USUALLY THE BIGGEST SAVER
@@ -268,6 +279,21 @@ Putting 20 short items in one request saves the repeated system prompt and per-r
 | ❌ No | Items that need careful individual attention, long items, anything where one bad item shouldn't spoil the rest |
 
 Quality tends to drop as packs grow (items get skipped or blended), so measure accuracy per pack size, and prefer the Batch API plus caching when each item deserves its own request.
+
+*Figure: Message Batches API flow, matched by custom_id.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant B as Batches API
+  C->>B: Create batch (requests with custom_id)
+  B-->>C: batch id
+  loop until ended
+    C->>B: Retrieve batch status
+  end
+  C->>B: Stream results
+  B-->>C: Results in any order, match by custom_id
+```
 
 ---
 

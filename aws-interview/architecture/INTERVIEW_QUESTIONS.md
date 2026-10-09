@@ -118,6 +118,18 @@ SQS / in-flight work    (not replicated: rebuild from DB/outbox state)
 5. **Shift traffic** (T+3–4): ARC routing control on in us-west-2; DNS TTLs of 60 s or less; or Global Accelerator traffic dials for near-instant shifts.
 6. **Verify** with synthetic transactions; reconcile the replication-lag window (idempotency keys make replays safe).
 
+*Region failover runbook order: decide, fence the old primary, promote data, scale, shift traffic, verify.*
+
+```mermaid
+flowchart LR
+    D["1. Decide: Region impaired"] --> F["2. Fence old primary"]
+    F --> P["3. Promote Aurora and data stores"]
+    P --> S["4. Scale standby compute"]
+    S --> T["5. Shift traffic: ARC routing control"]
+    T --> V["6. Verify and reconcile lag window"]
+```
+
+
 **Making RPO 1 s real:** Aurora Global Database lag is *typically* under a second, not guaranteed. Aurora PostgreSQL's `rds.global_db_rpo` parameter makes the primary block commits when secondaries fall further behind than the limit, trading availability for a hard RPO. DynamoDB MREC typically replicates in under a second with last-writer-wins; for balances use MRSC (RPO 0, exactly three Regions, higher write latency, no transactions).
 
 **Active-active options:**
@@ -177,6 +189,25 @@ Reads stay local; route users to their nearest healthy Region with Route 53 late
 | Replatform | Small changes for managed services | Self-managed DB → RDS, app server → containers | DMS, MGN with modernisation options |
 | Repurchase | Move to SaaS | Non-differentiating apps (CRM, HR, ITSM) | Vendor tools |
 | Refactor | Re-architect | Apps needing scale, agility or licence escape | AWS Transform (.NET, mainframe, VMware), containers/serverless |
+
+*Choosing an R for each application in the portfolio.*
+
+```mermaid
+flowchart TD
+    A[Application] --> U{"Still used?"}
+    U -->|no| RT[Retire]
+    U -->|yes| K{"Must stay on-prem for now?"}
+    K -->|yes| RN[Retain]
+    K -->|no| SA{"Non-differentiating, SaaS exists?"}
+    SA -->|yes| RP[Repurchase]
+    SA -->|no| VM{"VMware estate, minimal change?"}
+    VM -->|yes| RL[Relocate]
+    VM -->|no| CH{"Needs re-architecture?"}
+    CH -->|yes| RF[Refactor]
+    CH -->|"small tweaks, managed services"| RPL[Replatform]
+    CH -->|"works as is, speed matters"| RH[Rehost]
+```
+
 
 AWS Server Migration Service and CloudEndure Migration were retired in favour of MGN, and **AWS Migration Hub stopped accepting new customers in November 2025**; its planning features moved into **AWS Transform** (agentic AI assistance for .NET porting, mainframe and VMware migrations).
 
@@ -356,6 +387,23 @@ Stopping production resources because spend spiked is how a successful launch be
 
 Publish events reliably with a **transactional outbox**: write the business row and the event row in one DB transaction, then relay (DynamoDB Streams → EventBridge Pipes, or Debezium/DMS CDC for relational DBs). Without it, a crash between "commit" and "publish" loses or invents events.
 
+*Transactional outbox: the business row and event row commit together, a relay publishes afterwards.*
+
+```mermaid
+sequenceDiagram
+    participant S as Order service
+    participant DB as Service DB
+    participant R as Relay (Streams or CDC)
+    participant B as EventBridge bus
+    S->>DB: One transaction: write order and outbox event
+    DB-->>S: Commit
+    R->>DB: Read new outbox events
+    R->>B: Publish event
+    B-->>R: Ack
+    Note over R,B: At-least-once, so consumers must be idempotent
+```
+
+
 **Orchestrated saga (Step Functions):**
 
 ```json
@@ -401,6 +449,24 @@ Publish events reliably with a **transactional outbox**: write the business row 
   }
 }
 ```
+
+*The order saga from the state machine above: failures route through compensations in reverse order.*
+
+```mermaid
+stateDiagram-v2
+    [*] --> ProcessPayment
+    ProcessPayment --> ReserveInventory: ok
+    ProcessPayment --> CancelOrder: error
+    ReserveInventory --> ConfirmOrder: ok
+    ReserveInventory --> RefundPayment: error
+    ConfirmOrder --> [*]: ok
+    ConfirmOrder --> ReleaseInventory: error
+    ReleaseInventory --> RefundPayment
+    RefundPayment --> CancelOrder
+    CancelOrder --> Failed
+    Failed --> [*]
+```
+
 
 - Compensations run in reverse order of completed steps and must themselves be idempotent and retried until they succeed (a refund that fails needs alerting, not silence).
 - Pass a saga ID / idempotency key to every participant so retries don't double-charge.
@@ -531,6 +597,18 @@ Phase 3  Client → Router ─ /orders/*  ─► Order svc ◄─ CDC/events ─
 Phase 4  Monolith handles nothing; zero traffic for N weeks; archive and delete
 ```
 
+*Strangler fig: the router sends migrated capabilities to new services and everything else to the monolith.*
+
+```mermaid
+flowchart LR
+    C[Client] --> RT{Router}
+    RT -->|"/inventory/*"| INV[Inventory service]
+    RT -->|"/orders/*"| ORD[Order service]
+    RT -->|"everything else"| M[Monolith]
+    M <-->|"CDC or events"| ORD
+```
+
+
 - Route by path, header, tenant or percentage (canary per capability), so you can move a few tenants first and roll back by flipping the route.
 - The hard part is **data**: during transition both systems may need the same data. Pick one owner per entity at each phase, replicate with DMS/Debezium CDC or domain events, and avoid dual writes from application code.
 - Expect the long tail: reports, batch jobs and integrations that hit the monolith's database directly. Inventory them early.
@@ -544,6 +622,22 @@ Commands: POST /orders ──► Order service ──► DynamoDB (write model, 
 Queries:  GET /orders/search, /dashboards ◄── OpenSearch (search), ElastiCache (hot views),
                                               S3 + Athena (analytics) — each a projection
 ```
+
+*CQRS: commands hit the write model, a stream feeds read-optimised projections that queries use.*
+
+```mermaid
+flowchart LR
+    CMD[Commands] --> W[Order service]
+    W --> DDB[("DynamoDB write model")]
+    DDB -->|"Streams or outbox"| P[Projector]
+    P --> OS[(OpenSearch)]
+    P --> EC[(ElastiCache)]
+    P --> S3[("S3 + Athena")]
+    Q[Queries] --> OS
+    Q --> EC
+    Q --> S3
+```
+
 
 | Use CQRS when | Avoid it when |
 |---|---|

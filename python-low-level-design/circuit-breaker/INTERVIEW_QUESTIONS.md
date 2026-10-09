@@ -31,6 +31,17 @@ A breaker remembers recent outcomes and, once the failure rate is high, **fails 
 
 Common variant: exponential backoff on `open_duration` for repeated re-opens (Envoy does this for ejection time: base × number of ejections).
 
+*Figure: circuit breaker state transitions.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> CLOSED
+  CLOSED --> OPEN: calls >= minimum and failure rate >= threshold
+  OPEN --> HALF_OPEN: open_duration elapsed
+  HALF_OPEN --> CLOSED: probes succeed
+  HALF_OPEN --> OPEN: any probe fails
+```
+
 ---
 
 ## Question 3: Concurrency

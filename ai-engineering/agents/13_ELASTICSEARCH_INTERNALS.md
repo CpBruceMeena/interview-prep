@@ -102,6 +102,29 @@ index request ─► in-memory buffer + translog (append, fsync per request by d
 
 Consequences: deep pagination costs `shards × (from + size)` (capped by `index.max_result_window`, 10,000 by default), so use `search_after` with a point-in-time (PIT) instead; and scores use *per-shard* term statistics, which can skew relevance on small indexes (`dfs_query_then_fetch` fixes it at extra cost).
 
+*Figure: write path from indexing request to searchable segment and merge.*
+
+```mermaid
+flowchart TD
+  A["Index request"] --> B["In-memory buffer + translog"]
+  B -- "refresh (default 1 s)" --> C["New immutable segment: searchable"]
+  C -- "flush: Lucene commit, translog trimmed" --> D["Committed to disk"]
+  D --> E["Background merge: small segments into larger, deletes purged"]
+```
+
+*Figure: query-then-fetch across shards.*
+
+```mermaid
+sequenceDiagram
+  participant C as Coordinating node
+  participant S as Shards (one copy each)
+  C->>S: Query phase: send query
+  S-->>C: Top from+size ids and scores
+  C->>C: Merge into global top size
+  C->>S: Fetch phase: get documents by id
+  S-->>C: Documents
+```
+
 ## 4. TEXT ANALYSIS PIPELINE
 
 ```
@@ -133,6 +156,16 @@ Input Text: "Harry Potter and the Chamber of Secrets"
 ```
 
 The built-in `standard` analyzer only tokenizes and lowercases (stop words are off by default); stemming and stop words come from language analyzers such as `english` or a custom analyzer. The **same analysis must apply at index and query time** (or a deliberately compatible `search_analyzer`), otherwise the query terms won't match the indexed terms. Use the `_analyze` API to see exactly what a field produces.
+
+*Figure: analysis turns raw text into index terms; the same chain must apply at query time.*
+
+```mermaid
+flowchart LR
+  A["Raw text"] --> B["Character filter"]
+  B --> C["Tokenizer"]
+  C --> D["Token filters: lowercase, stop words, stemming, synonyms"]
+  D --> E["Terms in inverted index"]
+```
 
 ## 5. SEARCH SCORING: BM25
 

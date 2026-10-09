@@ -109,6 +109,16 @@ Failure 3: No Error Learning
 
 The patterns in the rest of this page are what these tools implement; know them so you can choose and debug, not necessarily to rebuild them.
 
+*Figure: how the memory types relate to the agent and context window.*
+
+```mermaid
+flowchart TD
+  STM["Short-term: recent turns and summaries"] --> WM["Working memory: goal, sub-tasks, intermediate results"]
+  WM --> LTM["Long-term: preferences, facts, summaries (KV, vector, graph)"]
+  LTM --> EP["Episodic and procedural: past resolutions, tool-use workflows"]
+  EP -. "retrieved into context" .-> STM
+```
+
 ---
 
 ## 3. Short-Term (Working) Memory
@@ -491,6 +501,21 @@ class MemoryAwareAgent:
 
 Caveats: a past *failure* may have been a transient outage, not a bad approach, so record the failure reason and don't steer away on timeouts. Past episodes can be stale (the API changed) or poisoned, so present them as hints, not instructions. And measure: episodic memory helps only if eval runs show higher task success with it than without.
 
+*Figure: consult episodic memory before acting and store the new episode afterwards.*
+
+```mermaid
+flowchart TD
+  A["New task"] --> B["find_similar_episode"]
+  B --> C{"Similar episode?"}
+  C -- "success" --> D["Hint: adapt the past approach"]
+  C -- "failed" --> E["Hint: try a different approach"]
+  C -- "none" --> F["No extra context"]
+  D --> G["ReAct loop with context"]
+  E --> G
+  F --> G
+  G --> H["Store episode"]
+```
+
 ---
 
 ## 6. Procedural Memory — Learned Behaviors
@@ -725,6 +750,19 @@ class ThreeTierMemory:
             )
         
         return "\n\n---\n\n".join(context_parts)
+```
+
+*Figure: context assembled from session, episodic and semantic tiers.*
+
+```mermaid
+flowchart LR
+  Q["Query"] --> T1["Tier 1: session state"]
+  Q --> T2["Tier 2: similar past episodes"]
+  Q --> T3["Tier 3: semantic vector search"]
+  T1 --> C["Assembled context"]
+  T2 --> C
+  T3 --> C
+  C --> M["Model"]
 ```
 
 ### Architecture 3: Importance-Weighted Memory

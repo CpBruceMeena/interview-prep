@@ -28,6 +28,22 @@ class BotPlayer(Player):
 
 **Why Strategy over if-else?** With if-else, adding a new AI difficulty means modifying the `get_move` method. With Strategy, you add a class and the game loop doesn't change (OCP).
 
+*Figure: Player strategies; the game depends only on the Player interface.*
+
+```mermaid
+classDiagram
+  class Player {
+    <<abstract>>
+    +get_move(board)
+  }
+  class HumanPlayer
+  class BotPlayer
+  Player <|-- HumanPlayer
+  Player <|-- BotPlayer
+  TicTacToeGame --> Player
+  TicTacToeGame --> Board
+```
+
 **Board encapsulation:**
 ```python
 class Board:
@@ -42,6 +58,16 @@ The game (`TicTacToeGame.make_move(symbol, pos)`) adds what the board shouldn't 
 ### 💡 Technical Deep Dive: Win Detection
 
 **K = N (classic):** keep a running sum per row, column and the two diagonals (+1 for X, −1 for O). After placing at `(r, c)`, the move won iff `abs(rows[r]) == n or abs(cols[c]) == n or abs(diag) == n or abs(anti) == n`. O(1) per move, O(N) memory. This is what `Board._bump` does, and `undo` just subtracts.
+
+*Figure: O(1) win check with running sums per row, column and diagonal (K = N).*
+
+```mermaid
+flowchart LR
+  A["Place symbol at (r, c)"] --> B["Add +1 for X or -1 for O to row r, col c, diagonals"]
+  B --> C{"abs(any affected sum) == N?"}
+  C -- Yes --> D[Win]
+  C -- No --> E[Continue]
+```
 
 **K < N (gomoku-style):** sums don't work. Only lines through the *last move* can be new wins, so walk the 4 directions from it and count consecutive same symbols: O(K) per move.
 

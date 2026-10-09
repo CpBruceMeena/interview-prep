@@ -79,6 +79,22 @@ Two things candidates get wrong:
 - **Claude Code doesn't pre-scan your repo.** It doesn't read every file before the first call. The model *chooses* to search and read via tools. What's preloaded is a small, deliberate set: CLAUDE.md, memory, git status, environment info, tool and skill descriptions.
 - **You're in the loop.** Press `Esc` to stop the current step, or type a message while Claude works; it's queued and read after the current tool calls finish.
 
+*Figure: one Claude Code turn as messages between you, the harness and the API.*
+
+```mermaid
+sequenceDiagram
+  participant U as You
+  participant H as Claude Code harness
+  participant A as Messages API
+  U->>H: Prompt
+  H->>A: system + tools + messages (streaming)
+  A-->>H: text + tool_use (stop_reason tool_use)
+  H->>H: Permission check, run tool locally
+  H->>A: Resend with tool_result appended
+  A-->>H: Final text (stop_reason end_turn)
+  H-->>U: Answer, wait for next prompt
+```
+
 ---
 
 ## 3. WHAT DATA IS SENT TO THE MODEL?
@@ -240,6 +256,20 @@ Non-streaming responses return the same content blocks in one JSON `Message` obj
 
 These are rough orders of magnitude, not documented figures. Parallel tool calls reduce the count: one turn can read five files at once.
 
+*Figure: the loop branches on stop_reason after every call.*
+
+```mermaid
+flowchart TD
+  A["POST /v1/messages"] --> B{"stop_reason?"}
+  B -- "end_turn" --> C["Show answer, wait for you"]
+  B -- "tool_use" --> D["Permission check + PreToolUse hooks"]
+  D --> E["Run tool locally"]
+  E --> F["PostToolUse hooks"]
+  F --> G["Append tool_result"]
+  G --> A
+  B -- "max_tokens / refusal / pause_turn" --> H["Handle specially"]
+```
+
 ---
 
 ## 6. HOW CONTEXT GROWS AND IS MANAGED
@@ -277,6 +307,19 @@ Claude Code's levers, all documented:
 | **Hooks** | Your scripts run on events (`PreToolUse`, `PostToolUse`, `Stop`, …) and can block, allow, or rewrite a tool call |
 | **Checkpoints** | Files are snapshotted before edits; `Esc Esc` or `/rewind` restores. Remote side effects (DB writes, deploys, pushed commits) can't be rewound |
 | **Sessions** | Stored locally as JSONL under `~/.claude/projects/`; `--continue`, `--resume`, and forking |
+
+*Figure: where permissions, hooks and checkpoints sit around a tool call.*
+
+```mermaid
+flowchart LR
+  A["tool_use block"] --> B{"Permission rules and mode"}
+  B -- "deny" --> X["Error tool_result"]
+  B -- "allow / approved" --> C["PreToolUse hook"]
+  C --> D["Checkpoint files"]
+  D --> E["Execute"]
+  E --> F["PostToolUse hook"]
+  F --> G["tool_result to model"]
+```
 
 ---
 

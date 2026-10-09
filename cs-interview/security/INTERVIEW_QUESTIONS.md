@@ -208,6 +208,27 @@ Mobile app                         Google (authorization server)        Your bac
     │◄──────────────────────────────── 10. your own session / tokens ─────────────│
 ```
 
+*Diagram: Authorization Code + PKCE with a confidential backend redeeming the code.*
+
+```mermaid
+sequenceDiagram
+    participant M as Mobile app
+    participant A as Authorization server
+    participant B as Backend
+    M->>M: Create code_verifier, code_challenge, state, nonce
+    M->>A: /authorize with code_challenge (S256)
+    A->>A: User signs in and consents
+    A-->>M: Redirect with code and state
+    M->>M: Check state
+    M->>B: code + code_verifier (+ nonce) over TLS
+    B->>A: Token request: code, verifier, client auth
+    A->>A: Check SHA256(verifier) equals challenge
+    A-->>B: id_token, access_token, refresh token
+    B->>B: Validate id_token
+    B-->>M: Own session or tokens
+```
+
+
 Two valid shapes: the app redeems the code itself as a **public client** (no client secret can be kept in a mobile binary), or it forwards code + verifier to its backend, which redeems it as a **confidential client** (shown above). Either way PKCE is required (RFC 9700 requires it for public clients and recommends it for all).
 
 **Why `S256`, not `plain`:** with `plain` the challenge equals the verifier, so anyone who sees the authorization request (logs, a malicious app watching the redirect) learns the verifier. Servers should reject `plain` when the client can do `S256`.
@@ -518,6 +539,21 @@ class EnvelopeEncryption:
         return AESGCM(dek).decrypt(blob["nonce"], blob["ciphertext"], record_id.encode())
 ```
 
+*Diagram: envelope encryption, where the KEK never leaves KMS.*
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant KMS
+    participant DB
+    App->>KMS: generate_data_key(KEK, encryption context)
+    KMS-->>App: plaintext DEK + encrypted DEK
+    App->>App: AES-GCM encrypt record with DEK and fresh nonce
+    App->>DB: ciphertext, nonce, encrypted DEK
+    Note over App,DB: Decrypt: send encrypted DEK to KMS with the same context, get DEK back
+```
+
+
 At scale, calling KMS per record is slow and costly: cache plaintext DEKs briefly in memory (the AWS Encryption SDK's caching materials manager does this with limits on age and use count), or use one DEK per tenant/partition. Searching encrypted fields needs a separate design: a keyed hash (HMAC) column for exact-match lookups, or tokenization.
 
 **Key rotation and compromise — distinguish three cases:**
@@ -582,6 +618,24 @@ Vault Agent sidecar / Secrets Store CSI driver
   ▼
 App reads the file (and reloads on change)        Audit device logs every read
 ```
+
+*Diagram: how a pod obtains short-lived database credentials.*
+
+```mermaid
+sequenceDiagram
+    participant Pod
+    participant V as Vault
+    participant K as Kubernetes API
+    participant PG as Postgres
+    Pod->>V: Login with projected service account token
+    V->>K: Validate token
+    K-->>V: Namespace and service account
+    V-->>Pod: Vault token with TTL and policy
+    Pod->>V: Read database/creds/orders-rw
+    V->>PG: Create new user with TTL
+    V-->>Pod: Username and password (lease)
+```
+
 
 **Dynamic database credentials:**
 
@@ -716,6 +770,17 @@ class TokenBucket:
                 return True
             return False
 ```
+
+*Diagram: token bucket decision for each request.*
+
+```mermaid
+flowchart TD
+    R["Request arrives"] --> F["Refill tokens at rate r, up to capacity b"]
+    F --> T{"Tokens >= 1?"}
+    T -->|Yes| A["Take one token, allow request"]
+    T -->|No| D["Reject with 429"]
+```
+
 
 **Distributed limiting (Redis, atomic Lua, server-side clock):**
 
@@ -1378,6 +1443,22 @@ spec:
 ```
 
 (Whether `ipBlock` applies to traffic that the node itself handles differs by CNI; verify with a test pod. On EKS, also block IMDS via hop limit 1.)
+
+*Diagram: the layered checks for a user-supplied URL.*
+
+```mermaid
+flowchart TD
+    U["User-supplied URL"] --> S{"Scheme is https?"}
+    S -->|No| X["Reject"]
+    S -->|Yes| D["Resolve DNS once"]
+    D --> P{"Address is public?"}
+    P -->|No| X
+    P -->|Yes| C["Connect to that exact IP, verify TLS for hostname"]
+    C --> R{"Redirect response?"}
+    R -->|Yes| V["Do not follow automatically, re-validate target"]
+    R -->|No| OK["Return body"]
+```
+
 
 **Defense layer 3: application code (tested):**
 

@@ -40,6 +40,19 @@
 - Without the lock this is a classic check-then-act race: both threads see "unassigned", both dispatch, two cars arrive.
 - `HallCall` is a record, so `(7, UP)` from both threads is the same map key.
 
+*Figure: two UP presses on floor 7 serialize on dispatchLock, so only one car is sent.*
+
+```mermaid
+sequenceDiagram
+  participant T1 as Thread 1
+  participant T2 as Thread 2
+  participant C as Controller (dispatchLock)
+  T1->>C: requestElevator(7, UP)
+  T2->>C: requestElevator(7, UP)
+  C->>C: T1: unassigned, choose car, assign
+  C->>C: T2: already assigned, no-op
+```
+
 ## Q6: Why fire listener callbacks after releasing the car's lock?
 
 **Answer:**
@@ -53,6 +66,17 @@
 - `Elevator.enterMaintenance()` clears its stops and returns the hall calls it owed. The controller, under `dispatchLock`, removes those assignments and re-dispatches each one to the remaining cars.
 - Car calls are dropped: in reality the car is taken out of service at a floor and passengers get out.
 - If no car is in service, `requestElevator` throws; the hall lamp should not light for a request nobody will serve.
+
+*Figure: a car entering maintenance hands back its hall calls for re-dispatch.*
+
+```mermaid
+flowchart LR
+  A["Car enterMaintenance()"] --> B["Clear stops, return owed hall calls"]
+  B --> C["Controller (under dispatchLock) removes assignments"]
+  C --> D["Re-dispatch each call to another car"]
+  D --> E{"Any car in service?"}
+  E -- No --> X["requestElevator throws"]
+```
 
 ## Q8: Now add capacity. A full car should not stop for hall calls.
 

@@ -16,6 +16,19 @@
 - In each gap emit grid-aligned candidates (15-minute grid) of length 1 hour; the first is the answer.
 - Equivalent framing: merge-intervals (LeetCode 56) followed by "employee free time" (LeetCode 759). With k sorted per-person lists you can also do a k-way merge with a heap in O(N log k).
 
+*Figure: sweep over merged busy intervals to find common free gaps.*
+
+```mermaid
+flowchart LR
+  A["Collect busy intervals per person, incl. off-hours"] --> B["Sort by start"]
+  B --> C["Sweep with a cursor"]
+  C --> D{"Next busy starts after cursor?"}
+  D -- Yes --> E["Gap from cursor to next start: emit grid-aligned slots"]
+  D -- No --> F["cursor = max(cursor, end)"]
+  E --> F
+  F --> C
+```
+
 ## Q3: Two organizers book overlapping meetings that both include Bob, at the same instant. What happens?
 
 **Answer:**
@@ -23,6 +36,17 @@
 - Both need `person:bob`. Whoever gets it first completes; the other blocks, then sees Bob's new entry and throws `ConflictException` without writing anything.
 - Sorted acquisition is what prevents deadlock: if one booking locked `alice → bob` and the other `bob → alice`, each could hold one lock and wait forever.
 - Alternative: one global lock. Correct and simple, but it serialises every booking in the company; mention it as the fallback.
+
+*Figure: booking locks room and attendee calendars in sorted order, checks all, then inserts into all.*
+
+```mermaid
+flowchart TD
+  A[schedule meeting] --> B["Lock calendars sorted by key"]
+  B --> C{"Any conflict in room or attendees?"}
+  C -- Yes --> X["ConflictException, nothing written"]
+  C -- No --> D["Insert into all calendars"]
+  D --> E[Unlock and return]
+```
 
 ## Q4: Why not check availability first and then book?
 

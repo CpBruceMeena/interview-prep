@@ -28,6 +28,18 @@
 - **Fencing:** completion must check `lease_id`, so a worker whose lease expired can't overwrite the new owner's result.
 - Kafka is a poor fit for per-task retries, priorities and delays, because it's an ordered log. Use it for streams, not job queues.
 
+*Figure: a crashed worker simply stops renewing its lease; the task becomes ready again and a new owner takes it.*
+
+```mermaid
+flowchart LR
+  A["Worker leases task (lease_until)"] --> B["Heartbeat extends lease"]
+  B --> B
+  A --> C{"Worker crashes?"}
+  C -- Yes --> D["Lease expires, sweeper sets ready"]
+  D --> E["Another worker leases it"]
+  C -- No --> F["Complete with lease_id check"]
+```
+
 ## Q4: How do you handle duplicate task execution (at-least-once vs exactly-once)?
 
 **Answer:**

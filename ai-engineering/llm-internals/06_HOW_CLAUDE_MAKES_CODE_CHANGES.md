@@ -35,6 +35,17 @@
 
 Those three phases (gather context, take action, verify) are how Anthropic describes the loop. They blend: a question about the code may only need the first; a bug fix cycles through all three many times.
 
+*Figure: the gather, act, verify loop.*
+
+```mermaid
+flowchart TD
+  A["Gather context: search and read"] --> B["Take action: Edit / Write"]
+  B --> C["Verify: tests, lint, type check"]
+  C --> D{"Failures?"}
+  D -- "yes" --> A
+  D -- "no" --> E["Report changes and verification"]
+```
+
 ---
 
 ## 2. A TRACED EXAMPLE
@@ -187,6 +198,18 @@ Bug fixing leans harder on the gather and verify phases:
 
 Habits that make Claude Code better at this, all things you control: give the exact error and how to reproduce it, point to the test that should pass, and ask it to write a failing test first.
 
+*Figure: debugging loops between diagnose and verify.*
+
+```mermaid
+flowchart TD
+  A["Reproduce"] --> B["Locate"]
+  B --> C["Diagnose root cause"]
+  C --> D["Fix"]
+  D --> E["Verify"]
+  E -- "still failing" --> C
+  E -- "passing" --> F["Generalise: search for same pattern"]
+```
+
 ---
 
 ## 5. WHEN DOES CLAUDE ASK YOU?
@@ -292,6 +315,18 @@ What Claude Code does with each `tool_use` block (documented behaviour; details 
 ```
 
 Things Claude Code does **not** claim to do: automatically mask secrets in tool output, or rate-limit individual tools. Protect secrets with `deny` rules (e.g. `Read(./.env)`), sandboxing, and hooks.
+
+*Figure: what the harness does with each tool_use block.*
+
+```mermaid
+flowchart TD
+  A["Parse tool_use"] --> B["Permission check"]
+  B --> C["PreToolUse hooks"]
+  C --> D["Execute (checkpoint first for edits)"]
+  D --> E["PostToolUse hooks"]
+  E --> F["Format and cap output"]
+  F --> G["Append tool_result, next model call"]
+```
 
 ---
 

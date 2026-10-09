@@ -17,6 +17,16 @@
 - **Content-level:** an exact hash (SHA-256) for mirrors, and SimHash/MinHash for near-duplicates (Google's 2007 paper: 64-bit SimHash, Hamming distance ≤ 3).
 - **At scale:** a Bloom filter in front of a disk or KV set. 1 B URLs at a 1% false-positive rate is about 1.2 GB (9.6 bits per element). A false positive means a page is wrongly skipped, which is usually acceptable for a crawler.
 
+*Figure: URL dedup before a link enters the frontier.*
+
+```mermaid
+flowchart LR
+  U["Discovered URL"] --> N["Normalize"]
+  N --> S{"In seen-set?"}
+  S -- Yes --> X[Drop]
+  S -- No --> A["Mark seen and enqueue (one step)"]
+```
+
 ## Q3: How would you distribute crawling across multiple machines?
 
 **Answer:**
@@ -25,6 +35,16 @@
 - The **frontier per node** follows the Mercator design: front queues by priority, back queues one per host, and a heap of hosts keyed by the next allowed fetch time.
 - **Checkpoint** the frontier and seen-set (RocksDB, or a DB). On node failure its host partition moves and resumes from the checkpoint. Pages fetched since the checkpoint are refetched, which is at-least-once and fine for crawling.
 - The original answer of "Redis BRPOPLPUSH + heartbeat" works for small fleets, but it centralizes the frontier and puts politeness state on the hot path of a shared store.
+
+*Figure: partition crawling by host so politeness state stays on one node.*
+
+```mermaid
+flowchart TB
+  L["Discovered link"] --> H["hash(registered domain)"]
+  H --> N1["Crawler node 1: frontier + host state"]
+  H --> N2["Crawler node 2: frontier + host state"]
+  N1 -. "forward links owned by other nodes" .-> N2
+```
 
 ## Q4: How do you handle JavaScript-rendered pages?
 

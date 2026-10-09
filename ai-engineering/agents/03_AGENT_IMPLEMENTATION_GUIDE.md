@@ -317,6 +317,21 @@ def run(user_msg: str, dispatch) -> str:
 
 Production details the loop above leaves out: prompt caching of the stable prefix (system + tools), retries with backoff on 429/5xx, a token budget across the loop, streaming, and tracing each model and tool call. Agent SDKs (OpenAI Agents SDK, Anthropic's tool runner, LangGraph) wrap exactly this loop.
 
+*Figure: the native tool-calling loop; all results for one turn go back in one user message.*
+
+```mermaid
+flowchart TD
+  A["messages.create with tools"] --> B{"stop_reason == tool_use?"}
+  B -- "no" --> C["Return text"]
+  B -- "yes" --> D["Append full assistant content"]
+  D --> E["dispatch each tool_use: validate, authorize, run"]
+  E --> F["Collect tool_result blocks (is_error on failure)"]
+  F --> G["Append ONE user message with all results"]
+  G --> H{"MAX_STEPS reached?"}
+  H -- "no" --> A
+  H -- "yes" --> I["Stopped: step limit"]
+```
+
 ---
 
 ## 3. IMPLEMENTATION — AGENT WITH TOOL REGISTRY
@@ -673,6 +688,20 @@ if __name__ == "__main__":
 
 This runs "waves" of ready tasks: a slow task in wave 1 delays every wave-2 task, even ones that only depended on a fast task. For better latency, start each task as soon as its own dependencies finish (one `asyncio.Task` per node awaiting its parents), which is what graph runtimes like LangGraph do.
 
+*Figure: tasks whose dependencies are met run in parallel, round after round.*
+
+```mermaid
+flowchart TD
+  A["User request"] --> B["Create plan: tasks with dependencies"]
+  B --> C{"All tasks completed?"}
+  C -- "no" --> D["Find ready tasks"]
+  D --> E{"Any ready?"}
+  E -- "no" --> X["Deadlock error"]
+  E -- "yes" --> F["Run ready tasks in parallel with per-task timeout"]
+  F --> C
+  C -- "yes" --> G["Synthesize final answer"]
+```
+
 ---
 
 ## 5. IMPLEMENTATION — AGENT WITH MCP TOOLS
@@ -801,6 +830,22 @@ Answer: <final answer>"""
             history.append(f"Observation: {result}")
         
         return "Exceeded maximum steps."
+```
+
+*Figure: the agent discovers tools from each MCP server and routes calls back to the owning server.*
+
+```mermaid
+sequenceDiagram
+  participant A as MCPToolAgent
+  participant S as MCP server
+  participant L as LLM
+  A->>S: connect and tools/list (client kept open)
+  S-->>A: tool definitions
+  A->>L: Prompt with unified tool list
+  L-->>A: Action: tool_name + arguments
+  A->>S: call_tool on the owning server
+  S-->>A: result or is_error
+  A->>L: Observation
 ```
 
 ---

@@ -46,6 +46,20 @@ Mobile App / Web (React/PWA)
 └─────────────────────────────────────────────┘
 ```
 
+*Figure: services, queue and database.*
+
+```mermaid
+flowchart TB
+  C["Mobile / web"] --> G["API gateway: OAuth2, rate limit"]
+  G --> E["Expense service"]
+  G --> S["Settlement service"]
+  G --> N["Notification service"]
+  E --> Q["Message queue"]
+  S --> Q
+  N --> Q
+  Q --> P[("PostgreSQL: expenses, balances, settlements")]
+```
+
 ### 🎬 Animated Sequence Diagram
 
 <p align="center">
@@ -93,6 +107,18 @@ This guarantees `sum(shares) == total` and that nobody is more than one cent fro
 3. **Exact** for small groups: bitmask DP over subsets, O(2ⁿ · n). Most groups have well under 15 active members, so 2ⁿ · n stays in the hundreds of thousands of steps; cap n and fall back to greedy above the cap.
 
 Simplification can make someone pay a person they never shared an expense with, so offer it as an opt-in group setting.
+
+*Figure: greedy debt simplification from net balances.*
+
+```mermaid
+flowchart TD
+  A["Read net balances per member"] --> B["Put debtors and creditors in two heaps"]
+  B --> C["Match largest debtor with largest creditor"]
+  C --> D["Transfer the smaller amount"]
+  D --> E{"Anyone non-zero?"}
+  E -- Yes --> C
+  E -- No --> F[Done]
+```
 
 ---
 
@@ -160,6 +186,23 @@ CREATE TABLE settlements (
 | **Payment provider timeouts** | Settlement is `PENDING` until the provider confirms; retries reuse the same provider idempotency key; a reconciliation job closes the gap. |
 | **Balance drift (bug or bad migration)** | Balances are derived data. Recompute from `expense_shares` + `settlements` per group and compare; the ledger is the source of truth. |
 | **Non-group (friend-to-friend) expenses** | Model as an implicit two-person group so the same per-group transaction and sharding rule apply. |
+
+*Figure: adding an expense; shares and balances commit atomically, notification goes through an outbox.*
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant E as Expense service
+  participant D as PostgreSQL
+  participant R as Outbox relay
+  participant N as Notification
+  C->>E: Create expense (request_id)
+  E->>D: One txn: expense, shares, balance deltas, outbox row
+  D-->>E: Commit (retry hits UNIQUE request_id)
+  E-->>C: Created
+  R->>D: Read outbox
+  R->>N: Publish expense.created
+```
 
 **Capacity (from the numbers in §1):** 50M expenses/month ≈ 20 writes/s average, perhaps 200/s at peak (weekend evenings, month-end rent). Each expense is ~1 KB with ~4 share rows, so ~50 GB/year including indexes. A single well-sized Postgres primary with read replicas handles this comfortably; sharding by `group_id` is a growth plan, not a day-one need.
 

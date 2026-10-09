@@ -68,6 +68,20 @@ phase Running; "CrashLoopBackOff" is a container waiting reason, not a phase.
 "Terminating" in kubectl output is also not a phase: it means deletionTimestamp is set.
 ```
 
+*Diagram: pod phase transitions.*
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending
+  Pending --> Running: bound, containers created
+  Running --> Succeeded: all exit 0
+  Running --> Failed: a container failed, no restart
+  Pending --> Failed
+  Running --> Unknown: node unreachable
+  Succeeded --> [*]
+  Failed --> [*]
+```
+
 **Why is my pod Pending? (diagnosis order)**
 
 | Symptom in `kubectl describe pod` | Cause | Fix |
@@ -279,6 +293,15 @@ spec:
 # - Init containers with restartPolicy: Always are native sidecars (GA in 1.33)
 ```
 
+*Diagram: init containers run one by one before the main container starts.*
+
+```mermaid
+flowchart LR
+  A["wait-for-db"] --> B["run-migrations"] --> C["main-app starts"]
+  B -.->|"fails"| D["kubelet retry with backoff"]
+  D -.-> B
+```
+
 **Init Container Use Cases:**
 
 ```yaml
@@ -414,6 +437,19 @@ kubectl debug my-app-7d4f8b9c6-abc12 \
 # Purpose: Detect deadlocks, infinite loops, unrecoverable states
 # Runs: Continuously throughout pod lifetime
 # Failure: Container killed and restarted by kubelet
+```
+
+*Diagram: how the three probes gate each other and affect traffic.*
+
+```mermaid
+flowchart TD
+  S["Startup probe"] -->|"first success"| RL["Readiness and liveness begin"]
+  S -->|"fails past budget"| K["Container killed and restarted"]
+  RL --> R{"Readiness OK?"}
+  R -->|"yes"| T["In Service endpoints"]
+  R -->|"no"| X["Removed from endpoints"]
+  RL --> L{"Liveness OK?"}
+  L -->|"no"| K
 ```
 
 **JVM Application Probe Strategy (90s Warmup):**
@@ -593,6 +629,26 @@ kubectl delete / rollout / drain sets deletionTimestamp. Then IN PARALLEL:
                                                main containers
 ```
 
+*Diagram: endpoint removal and SIGTERM run in parallel, so preStop holds SIGTERM back.*
+
+```mermaid
+sequenceDiagram
+  participant API as Control plane
+  participant R as kube-proxy, LBs, mesh
+  participant Kl as kubelet
+  participant App as Container
+  API->>API: deletionTimestamp set
+  par Routing path
+    API->>R: Endpoint ready=false
+    R->>R: Stop sending traffic
+  and Kubelet path
+    Kl->>App: preStop hook
+    Kl->>App: SIGTERM after preStop
+  end
+  App->>App: Drain and exit
+  Kl->>App: SIGKILL if grace period expires
+```
+
 - **Race:** if the app exits on SIGTERM immediately, requests still routed by slower components hit a closed socket → 502/connection reset. A `preStop` sleep holds SIGTERM until routing has converged.
 - **Use the native sleep action** (`lifecycle.preStop.sleep.seconds`, GA in v1.34) instead of `exec: sleep`, so distroless images without a shell work.
 - **The app must still handle SIGTERM**: stop accepting, finish in-flight requests, close keep-alive connections, then exit. PID 1 must actually receive the signal (use `exec` form in the Dockerfile or `tini`; a shell wrapper swallows it).
@@ -710,6 +766,17 @@ C. Kernel OOM killer (node ran out before the kubelet could evict)
        BestEffort:  1000
        Burstable:   min(max(2, 1000 - (1000 × memoryRequest / nodeMemoryCapacity)), 999)
    - So a Burstable pod with a small request relative to node size is a likely victim.
+```
+
+*Diagram: the three memory-kill mechanisms in the order they usually apply.*
+
+```mermaid
+flowchart TD
+  A["Memory pressure"] --> B{"Container over its own limit?"}
+  B -->|"yes"| C["cgroup OOM, exit 137"]
+  B -->|"no"| D{"Kubelet reacts in time?"}
+  D -->|"yes"| E["Evict: over requests, then priority, then overshoot"]
+  D -->|"no"| F["Kernel OOM killer, oom_score plus QoS adj"]
 ```
 
 **Resource Management Design Patterns:**
