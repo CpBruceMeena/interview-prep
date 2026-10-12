@@ -20,6 +20,9 @@ docs_dir: docs/
 # /overrides/main.html. It is a template, not a page.
 exclude_docs: |
   overrides/
+  # private practice material, kept in the repo but not published
+  golang-interview/ANDELA_ASSESSMENT_PART2_PERMISSIONS.md
+  golang-interview/permissions-practice/
 
 theme:
   name: material
